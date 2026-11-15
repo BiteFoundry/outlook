@@ -458,7 +458,7 @@ impl AuthManager {
             .await
             .with_context(|| format!("로컬 콜백 포트(127.0.0.1:{bind_port}) 바인딩 실패"))?;
         let actual_port = listener.local_addr()?.port();
-        let redirect_uri = format!("http://localhost:{actual_port}/callback");
+        let redirect_uri = format!("http://localhost:{actual_port}");
         let scope = self.config.effective_scopes().join(" ");
 
         let mut auth_url = Url::parse(&self.authorize_endpoint(tenant_id))
@@ -773,7 +773,7 @@ async fn accept_pkce_callback(listener: &TcpListener, expected_state: &str) -> R
             }
         };
 
-        if parsed.path() != "/callback" {
+        if !matches!(parsed.path(), "/" | "/callback") {
             let _ =
                 write_http_response(&mut socket, "404 Not Found", "<h1>Not Found</h1>").await;
             continue;

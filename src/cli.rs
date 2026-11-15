@@ -580,6 +580,7 @@ async fn cmd_tui(cfg: &mut AppConfig) -> Result<()> {
     let auth = AuthManager::new(cfg.clone())?;
     if auth.current_tokens().await.is_none() {
         println!("저장된 로그인 정보가 없습니다. Microsoft 계정 로그인을 시작합니다.");
+        println!("(자체 Azure App 사용 시: teams login --client-id <APP_ID> --tenant-id <TENANT_ID>)");
         cmd_login(cfg, LoginOptions::default(), false).await?;
         println!();
     }
