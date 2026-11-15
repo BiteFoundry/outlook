@@ -2,6 +2,10 @@
   "name": "@shinick/teams",
   "version": "0.3.0",
   "description": "Unified Microsoft Teams, Outlook & OneNote terminal client & AI agent toolkit (CLI, TUI, HTTP API, MCP)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shinick-dev/teams.git"
+  },
   "license": "MIT",
   "bin": {
     "teams": "bin/teams.js",

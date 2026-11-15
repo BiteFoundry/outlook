@@ -2,6 +2,11 @@
   "name": "@shinick/teams-darwin-arm64",
   "version": "0.3.0",
   "description": "Prebuilt teams binary for macOS arm64",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shinick-dev/teams.git",
+    "directory": "npm/teams-darwin-arm64"
+  },
   "license": "MIT",
   "os": [
     "darwin"

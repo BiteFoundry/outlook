@@ -2,6 +2,11 @@
   "name": "@shinick/teams-linux-arm64",
   "version": "0.3.0",
   "description": "Prebuilt teams binary for Linux arm64 (glibc)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shinick-dev/teams.git",
+    "directory": "npm/teams-linux-arm64"
+  },
   "license": "MIT",
   "os": [
     "linux"
