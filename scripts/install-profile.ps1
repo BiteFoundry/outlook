@@ -1,13 +1,16 @@
 <#
 .SYNOPSIS
-    Idempotently installs the `teams` terminal launcher on any Windows PC.
+    Idempotently installs both `teams` and `outlook` terminal launchers on any Windows PC.
 
 .DESCRIPTION
     1. Ensures <RepoRoot>\target\release\teams.exe exists (downloads the prebuilt
        release binary from GitHub `shinick-dev/teams` via `gh` when missing, so
        Rust/Cargo is NOT required on target PCs).
-    2. Registers/updates `# >>> teams launcher >>>` (`function teams`) in PowerShell $PROFILE.
-    3. If $HOME\Tools\bin exists, also writes `teams.cmd` there so already-open shells find `teams`.
+    2. Registers/updates `# >>> teams launcher >>>` (`function teams` + `function outlook`)
+       in PowerShell $PROFILE. Both commands share the single `teams.exe` binary,
+       with `outlook` setting `TEAMS_PERSONA=outlook` for the invocation.
+    3. If $HOME\Tools\bin exists, also writes both `teams.cmd` and `outlook.cmd`
+       there so already-open shells find both commands.
 
 .EXAMPLE
     pwsh -File .\scripts\install-profile.ps1
@@ -48,7 +51,7 @@ $endMarker = '# <<< teams launcher <<<'
 
 $block = @"
 $startMarker
-# Opens the Microsoft Teams terminal client (CLI/TUI) from anywhere.
+# Opens the unified Microsoft Teams + Outlook terminal client (CLI/TUI) from anywhere.
 function teams {
     `$root = '$escapedRoot'
     `$exe = Join-Path `$root 'target\release\teams.exe'
@@ -64,6 +67,21 @@ function teams {
         if (`$LASTEXITCODE -ne 0) { return }
     }
     & `$exe @args
+}
+
+# Opens the unified binary in Outlook persona (Mail, Calendar, Contacts, To Do).
+function outlook {
+    `$prevPersona = `$env:TEAMS_PERSONA
+    `$env:TEAMS_PERSONA = 'outlook'
+    try {
+        teams @args
+    } finally {
+        if (`$null -eq `$prevPersona) {
+            Remove-Item Env:TEAMS_PERSONA -ErrorAction SilentlyContinue
+        } else {
+            `$env:TEAMS_PERSONA = `$prevPersona
+        }
+    }
 }
 $endMarker
 "@.TrimEnd("`r", "`n")
@@ -107,10 +125,17 @@ if ($updated -ne $existing) {
 
 $toolsBin = Join-Path $HOME 'Tools\bin'
 if (Test-Path -LiteralPath $toolsBin) {
-    $shimPath = Join-Path $toolsBin 'teams.cmd'
-    $shimContent = "@echo off`r`nchcp 65001 >nul`r`n`"$resolvedRoot\teams.cmd`" %*`r`n"
-    if ($PSCmdlet.ShouldProcess($shimPath, 'Write PATH shim teams.cmd')) {
-        [System.IO.File]::WriteAllText($shimPath, $shimContent, [System.Text.Encoding]::ASCII)
-        Write-Output "Updated PATH shim: $shimPath"
+    $teamsShimPath = Join-Path $toolsBin 'teams.cmd'
+    $teamsShimContent = "@echo off`r`nchcp 65001 >nul`r`n`"$resolvedRoot\teams.cmd`" %*`r`n"
+    if ($PSCmdlet.ShouldProcess($teamsShimPath, 'Write PATH shim teams.cmd')) {
+        [System.IO.File]::WriteAllText($teamsShimPath, $teamsShimContent, [System.Text.Encoding]::ASCII)
+        Write-Output "Updated PATH shim: $teamsShimPath"
+    }
+
+    $outlookShimPath = Join-Path $toolsBin 'outlook.cmd'
+    $outlookShimContent = "@echo off`r`nchcp 65001 >nul`r`n`"$resolvedRoot\outlook.cmd`" %*`r`n"
+    if ($PSCmdlet.ShouldProcess($outlookShimPath, 'Write PATH shim outlook.cmd')) {
+        [System.IO.File]::WriteAllText($outlookShimPath, $outlookShimContent, [System.Text.Encoding]::ASCII)
+        Write-Output "Updated PATH shim: $outlookShimPath"
     }
 }

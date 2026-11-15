@@ -1,3 +1,5 @@
 * text=auto
 teams text eol=lf
+outlook text eol=lf
 *.sh text eol=lf
+bin/*.js text eol=lf

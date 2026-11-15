@@ -101,11 +101,116 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             oldest_msg_ts TEXT,
             synced_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS mail_folders (
+            id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            well_known_name TEXT,
+            parent_folder_id TEXT,
+            unread_item_count INTEGER NOT NULL DEFAULT 0,
+            total_item_count INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS mail_messages (
+            id TEXT PRIMARY KEY,
+            conversation_id TEXT,
+            folder_id TEXT,
+            subject TEXT NOT NULL,
+            from_json TEXT,
+            to_json TEXT NOT NULL,
+            cc_json TEXT NOT NULL,
+            bcc_json TEXT NOT NULL,
+            from_display TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            sent_at TEXT,
+            is_read INTEGER NOT NULL DEFAULT 0,
+            is_draft INTEGER NOT NULL DEFAULT 0,
+            flagged INTEGER NOT NULL DEFAULT 0,
+            importance TEXT NOT NULL,
+            has_attachments INTEGER NOT NULL DEFAULT 0,
+            preview TEXT NOT NULL,
+            body_html TEXT NOT NULL,
+            body_plain TEXT NOT NULL,
+            attachments_json TEXT NOT NULL,
+            web_link TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mail_messages_folder_received
+            ON mail_messages(folder_id, received_at DESC);
+
+        CREATE TABLE IF NOT EXISTS calendar_events (
+            id TEXT PRIMARY KEY,
+            subject TEXT NOT NULL,
+            start_iso TEXT NOT NULL,
+            end_iso TEXT NOT NULL,
+            time_zone TEXT NOT NULL,
+            is_all_day INTEGER NOT NULL DEFAULT 0,
+            location TEXT,
+            organizer_name TEXT,
+            organizer_email TEXT,
+            attendees_json TEXT NOT NULL,
+            response_status TEXT NOT NULL,
+            is_online_meeting INTEGER NOT NULL DEFAULT 0,
+            online_meeting_url TEXT,
+            body_html TEXT NOT NULL,
+            body_plain TEXT NOT NULL,
+            is_cancelled INTEGER NOT NULL DEFAULT 0,
+            web_link TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_calendar_events_start
+            ON calendar_events(start_iso ASC);
+
+        CREATE TABLE IF NOT EXISTS contacts (
+            id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            given_name TEXT,
+            surname TEXT,
+            emails_json TEXT NOT NULL,
+            mobile_phone TEXT,
+            business_phones_json TEXT NOT NULL,
+            company_name TEXT,
+            job_title TEXT,
+            department TEXT,
+            notes TEXT,
+            source TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_contacts_display_name
+            ON contacts(display_name COLLATE NOCASE ASC);
+
+        CREATE TABLE IF NOT EXISTS todo_lists (
+            id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            wellknown_list_name TEXT,
+            is_owner INTEGER NOT NULL DEFAULT 1,
+            is_shared INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS todo_tasks (
+            id TEXT PRIMARY KEY,
+            list_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL,
+            importance TEXT NOT NULL,
+            body_plain TEXT,
+            due_date_iso TEXT,
+            reminder_iso TEXT,
+            completed_at TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_todo_tasks_list_status
+            ON todo_tasks(list_id, status);
         ",
     )
     .context("SQLite 기본 스키마 생성 실패")?;
 
-    let trigram_sql = "
+    let messages_trigram = ensure_fts5_table(
+        conn,
+        "messages_fts",
+        "
         CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
             msg_key UNINDEXED,
             conv_key UNINDEXED,
@@ -114,8 +219,8 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             subject,
             tokenize='trigram'
         );
-    ";
-    let unicode61_sql = "
+        ",
+        "
         CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
             msg_key UNINDEXED,
             conv_key UNINDEXED,
@@ -124,18 +229,53 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             subject,
             tokenize='unicode61'
         );
-    ";
+        ",
+    )?;
 
+    let mail_trigram = ensure_fts5_table(
+        conn,
+        "mail_fts",
+        "
+        CREATE VIRTUAL TABLE IF NOT EXISTS mail_fts USING fts5(
+            msg_id UNINDEXED,
+            folder_id UNINDEXED,
+            subject,
+            from_display,
+            body_plain,
+            tokenize='trigram'
+        );
+        ",
+        "
+        CREATE VIRTUAL TABLE IF NOT EXISTS mail_fts USING fts5(
+            msg_id UNINDEXED,
+            folder_id UNINDEXED,
+            subject,
+            from_display,
+            body_plain,
+            tokenize='unicode61'
+        );
+        ",
+    )?;
+
+    Ok(messages_trigram && mail_trigram)
+}
+
+fn ensure_fts5_table(
+    conn: &Connection,
+    table_name: &str,
+    trigram_sql: &str,
+    unicode61_sql: &str,
+) -> Result<bool> {
     if conn.execute_batch(trigram_sql).is_err() {
         conn.execute_batch(unicode61_sql)
-            .context("FTS5 가상 테이블 생성 실패 (unicode61)")?;
+            .with_context(|| format!("FTS5 가상 테이블 생성 실패 ({table_name}, unicode61)"))?;
         return Ok(false);
     }
 
     let sql_def: Option<String> = conn
         .query_row(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'",
-            [],
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table_name],
             |row| row.get(0),
         )
         .ok();

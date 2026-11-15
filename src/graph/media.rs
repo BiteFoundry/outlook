@@ -327,6 +327,38 @@ impl GraphClient {
     pub async fn download_hosted_bytes(&self, hosted_url: &str) -> Result<Vec<u8>> {
         self.get_bytes(hosted_url).await
     }
+
+    /// Downloads raw attachment bytes in memory (for inline terminal image preview) along with `(file_name, content_type, bytes)`.
+    pub async fn fetch_attachment_bytes(
+        &self,
+        attachment: &AttachmentInfo,
+    ) -> Result<(String, String, Vec<u8>)> {
+        let content_url = attachment
+            .content_url
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow!("첨부파일에 다운로드할 content_url이 없습니다."))?;
+        let raw_name = attachment
+            .name
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| filename_from_url(content_url))
+            .unwrap_or_else(|| format!("attachment_{}", attachment.id));
+        let is_hosted = content_url.contains("/hostedContents/")
+            || attachment.content_type.eq_ignore_ascii_case("hostedContent");
+        let bytes = if is_hosted {
+            self.get_bytes(content_url).await?
+        } else {
+            let share_token = encode_graph_share_token(content_url);
+            let share_path = format!("/shares/{share_token}/driveItem/content");
+            match self.get_bytes(&share_path).await {
+                Ok(b) => b,
+                Err(_) => self.get_bytes(content_url).await?,
+            }
+        };
+        Ok((raw_name, attachment.content_type.clone(), bytes))
+    }
 }
 
 /// Extracts a lowercase GUID from a DriveItem `eTag` (e.g. `"{153FA47D-18C9-4179-BE08-9879815A9F90},1"`),

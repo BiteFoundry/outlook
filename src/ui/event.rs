@@ -11,8 +11,32 @@ pub fn key_to_action(
     keymap: &Keymap,
     text_input: bool,
 ) -> Option<Action> {
+    key_to_action_for_tab(key, focus, 0, keymap, text_input)
+}
+
+/// Tab-aware variant of `key_to_action` supporting Outlook Mail / Calendar / Contacts / To Do keys.
+pub fn key_to_action_for_tab(
+    key: KeyEvent,
+    focus: Focus,
+    active_nav_tab: usize,
+    keymap: &Keymap,
+    text_input: bool,
+) -> Option<Action> {
     if key.kind != KeyEventKind::Press {
         return None;
+    }
+
+    if text_input && focus == Focus::Chat {
+        match key.code {
+            KeyCode::Backspace => return Some(Action::Backspace),
+            KeyCode::Enter => return Some(Action::Activate),
+            KeyCode::Esc => return Some(Action::CloseOverlay),
+            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Some(Action::PasteClipboard)
+            }
+            KeyCode::Char(ch) if is_plain_text(key) => return Some(Action::Input(ch)),
+            _ => {}
+        }
     }
 
     if text_input || focus == Focus::Overlay {
@@ -26,7 +50,7 @@ pub fn key_to_action(
         }
     }
 
-    keymap.resolve(focus, key)
+    keymap.resolve_for_tab(focus, active_nav_tab, key)
 }
 
 fn is_plain_text(key: KeyEvent) -> bool {
@@ -105,6 +129,101 @@ mod tests {
                 false,
             ),
             Some(Action::OpenThreadForSelected)
+        );
+    }
+
+    #[test]
+    fn unified_tabs_persona_image_and_outlook_keys() {
+        let keymap = Keymap::default_teams();
+        assert_eq!(
+            key_to_action_for_tab(
+                press(KeyCode::Char('4'), KeyModifiers::CONTROL),
+                Focus::Nav,
+                0,
+                &keymap,
+                false,
+            ),
+            Some(Action::SelectNavTab(3))
+        );
+        assert_eq!(
+            key_to_action_for_tab(
+                press(KeyCode::Char('7'), KeyModifiers::CONTROL),
+                Focus::Nav,
+                3,
+                &keymap,
+                false,
+            ),
+            Some(Action::SelectNavTab(6))
+        );
+        assert_eq!(
+            key_to_action_for_tab(
+                press(KeyCode::Char('o'), KeyModifiers::ALT),
+                Focus::Nav,
+                0,
+                &keymap,
+                false,
+            ),
+            Some(Action::SwitchPersona(crate::config::Persona::Outlook))
+        );
+        assert_eq!(
+            key_to_action_for_tab(
+                press(KeyCode::Char('t'), KeyModifiers::ALT),
+                Focus::Nav,
+                3,
+                &keymap,
+                false,
+            ),
+            Some(Action::SwitchPersona(crate::config::Persona::Teams))
+        );
+        assert_eq!(
+            key_to_action_for_tab(
+                press(KeyCode::Char('v'), KeyModifiers::NONE),
+                Focus::Chat,
+                0,
+                &keymap,
+                false,
+            ),
+            Some(Action::OpenImagePreview)
+        );
+        assert_eq!(
+            key_to_action_for_tab(
+                press(KeyCode::Char('c'), KeyModifiers::NONE),
+                Focus::Nav,
+                3,
+                &keymap,
+                false,
+            ),
+            Some(Action::OpenMailComposeNew)
+        );
+        assert_eq!(
+            key_to_action_for_tab(
+                press(KeyCode::Char('j'), KeyModifiers::NONE),
+                Focus::Chat,
+                4,
+                &keymap,
+                false,
+            ),
+            Some(Action::JoinCalendarMeeting)
+        );
+        assert_eq!(
+            key_to_action_for_tab(
+                press(KeyCode::Char(' '), KeyModifiers::NONE),
+                Focus::Nav,
+                6,
+                &keymap,
+                false,
+            ),
+            Some(Action::TodoToggleSelected)
+        );
+        assert_eq!(
+            key_to_action_for_tab(
+                press(KeyCode::Char('q'), KeyModifiers::NONE),
+                Focus::Chat,
+                6,
+                &keymap,
+                true,
+            ),
+            Some(Action::Input('q'))
         );
     }
 }

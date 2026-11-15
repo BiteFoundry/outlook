@@ -14,6 +14,7 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
+    img_preview::{self, RenderedTerminalImage},
     models::{
         AttachmentInfo, ConversationKind, ConversationSummary, MessageItem, PresenceStatus,
         RichBlock, RichSpan,
@@ -85,7 +86,7 @@ impl<'a> ChatRender<'a> {
     }
 }
 
-pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hitmap: &mut HitMap) {
+pub fn draw(frame: &mut Frame, area: Rect, app: &mut AppState, ui: &mut UiState, hitmap: &mut HitMap) {
     let theme = &ui.theme;
     let focused = ui.focus == Focus::Chat;
     let block = Block::default()
@@ -140,7 +141,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hit
         return;
     }
 
-    let lines = build_lines(app, ui, message_area.width as usize);
+    let lines = build_lines_with_images(app, ui, message_area.width as usize);
     if lines.is_empty() {
         return;
     }
@@ -316,6 +317,77 @@ pub fn build_lines(app: &AppState, ui: &UiState, width: usize) -> Vec<RenderedLi
     )
 }
 
+pub fn build_lines_with_images(
+    app: &mut AppState,
+    ui: &UiState,
+    width: usize,
+) -> Vec<RenderedLine> {
+    let thumb_cols = width.saturating_sub(4).clamp(16, 40) as u16;
+    let thumb_rows = 10u16;
+    if ui.inline_images {
+        let len = app.messages.len();
+        let start = len.saturating_sub(15);
+        let to_fetch: Vec<(String, AttachmentInfo)> = app.messages[start..]
+            .iter()
+            .flat_map(|m| {
+                m.attachments
+                    .iter()
+                    .filter(|att| img_preview::is_image_mime_or_name(&att.content_type, att.name.as_deref()))
+                    .map(move |att| (m.msg_id.clone(), att.clone()))
+            })
+            .collect();
+        for (msg_id, att) in to_fetch {
+            app.request_teams_image(msg_id, att, thumb_cols, thumb_rows);
+        }
+    }
+
+    let hyperlinks = hyperlinks_enabled();
+    let view = ChatRender::from_app(app, ui);
+    let width = width.max(12);
+    let mut out = Vec::new();
+    let mut last_date: Option<String> = None;
+
+    for (msg_index, msg) in view.messages.iter().enumerate() {
+        let date = format_date(&msg.created_at);
+        if last_date.as_deref() != Some(date.as_str()) {
+            out.push(RenderedLine::plain(Line::from(Span::styled(
+                format!("── {date} ──"),
+                Style::default()
+                    .fg(theme_date_color(&ui.theme))
+                    .add_modifier(Modifier::BOLD),
+            ))));
+            last_date = Some(date);
+        }
+
+        let selected = view.selected_index == Some(msg_index);
+        let thumbs: Option<&std::collections::HashMap<String, RenderedTerminalImage>> =
+            if ui.inline_images {
+                Some(&app.image_cache)
+            } else {
+                None
+            };
+        render_message_item_with_thumbs(
+            &mut out,
+            msg,
+            msg_index,
+            MessageScope::Chat,
+            view.is_channel,
+            selected,
+            &ui.theme,
+            width,
+            hyperlinks,
+            thumbs,
+            (thumb_cols, thumb_rows),
+        );
+    }
+
+    out
+}
+
+fn theme_date_color(theme: &Theme) -> ratatui::style::Color {
+    theme.date_separator
+}
+
 pub fn build_lines_with_hyperlinks(
     view: &ChatRender,
     theme: &Theme,
@@ -367,6 +439,35 @@ pub fn render_message_item(
     theme: &Theme,
     width: usize,
     hyperlinks: bool,
+) {
+    render_message_item_with_thumbs(
+        out,
+        msg,
+        msg_index,
+        scope,
+        is_channel,
+        selected,
+        theme,
+        width,
+        hyperlinks,
+        None,
+        (0, 0),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_message_item_with_thumbs(
+    out: &mut Vec<RenderedLine>,
+    msg: &MessageItem,
+    msg_index: usize,
+    scope: MessageScope,
+    is_channel: bool,
+    selected: bool,
+    theme: &Theme,
+    width: usize,
+    hyperlinks: bool,
+    image_cache: Option<&std::collections::HashMap<String, RenderedTerminalImage>>,
+    thumb_dims: (u16, u16),
 ) {
     let target = HitTarget::Message { scope, msg_index };
 
@@ -450,183 +551,11 @@ pub fn render_message_item(
     }
 
     let indent = "  ";
-    let body_w = width.saturating_sub(2).max(6);
     let mut emitted_attach_indices: Vec<usize> = Vec::new();
+    let mut emitted_thumb_ids: Vec<String> = Vec::new();
 
     for block in &blocks {
         match block {
-            RichBlock::Paragraph(spans) => {
-                let wrapped = wrap_rich_spans(spans, body_w, theme, hyperlinks);
-                for line_spans in wrapped {
-                    let mut full = vec![Span::raw(indent)];
-                    full.extend(line_spans);
-                    let mut line = Line::from(full);
-                    if selected {
-                        line = line.style(theme.selection());
-                    }
-                    out.push(RenderedLine::clickable(line, target));
-                }
-            }
-            RichBlock::Heading { level, spans } => {
-                let prefix = match level {
-                    1 => "# ",
-                    2 => "## ",
-                    _ => "### ",
-                };
-                let wrapped = wrap_rich_spans(spans, body_w.saturating_sub(prefix.len()), theme, hyperlinks);
-                for (i, line_spans) in wrapped.into_iter().enumerate() {
-                    let mut full = vec![Span::styled(
-                        if i == 0 {
-                            format!("{indent}{prefix}")
-                        } else {
-                            format!("{indent}  ")
-                        },
-                        theme.accent_style().add_modifier(Modifier::BOLD),
-                    )];
-                    for s in line_spans {
-                        full.push(Span::styled(
-                            s.content.into_owned(),
-                            s.style.add_modifier(Modifier::BOLD),
-                        ));
-                    }
-                    let mut line = Line::from(full);
-                    if selected {
-                        line = line.style(theme.selection());
-                    }
-                    out.push(RenderedLine::clickable(line, target));
-                }
-            }
-            RichBlock::Quote(spans) => {
-                let wrapped = wrap_rich_spans(spans, body_w.saturating_sub(2), theme, hyperlinks);
-                for line_spans in wrapped {
-                    let mut full = vec![Span::styled("  │ ", theme.quote_style())];
-                    for s in line_spans {
-                        full.push(Span::styled(s.content.into_owned(), theme.quote_style()));
-                    }
-                    let mut line = Line::from(full);
-                    if selected {
-                        line = line.style(theme.selection());
-                    }
-                    out.push(RenderedLine::clickable(line, target));
-                }
-            }
-            RichBlock::CodeBlock { lang, code } => {
-                let top = match lang.as_deref().filter(|l| !l.is_empty()) {
-                    Some(l) => format!("  ┌─ {l} ─"),
-                    None => "  ┌─ code ─".to_string(),
-                };
-                out.push(RenderedLine::clickable(
-                    Line::from(Span::styled(truncate(&top, width), theme.muted_style())),
-                    target,
-                ));
-                for raw_line in code.lines() {
-                    let content = truncate(raw_line, body_w.saturating_sub(2));
-                    out.push(RenderedLine::clickable(
-                        Line::from(vec![
-                            Span::styled("  │ ", theme.muted_style()),
-                            Span::styled(content, theme.code_style()),
-                        ]),
-                        target,
-                    ));
-                }
-                out.push(RenderedLine::clickable(
-                    Line::from(Span::styled("  └───────", theme.muted_style())),
-                    target,
-                ));
-            }
-            RichBlock::BulletList(items) => {
-                for item in items {
-                    let wrapped = wrap_rich_spans(item, body_w.saturating_sub(2), theme, hyperlinks);
-                    for (i, line_spans) in wrapped.into_iter().enumerate() {
-                        let mut full = vec![Span::styled(
-                            if i == 0 { "  • " } else { "    " },
-                            theme.accent_style(),
-                        )];
-                        full.extend(line_spans);
-                        let mut line = Line::from(full);
-                        if selected {
-                            line = line.style(theme.selection());
-                        }
-                        out.push(RenderedLine::clickable(line, target));
-                    }
-                }
-            }
-            RichBlock::Card {
-                title,
-                subtitle,
-                facts,
-                body_lines,
-                actions,
-            } => {
-                out.push(RenderedLine::clickable(
-                    Line::from(Span::styled("  ┌─ Adaptive Card ─────────", theme.accent_style())),
-                    target,
-                ));
-                if let Some(t) = title {
-                    out.push(RenderedLine::clickable(
-                        Line::from(vec![
-                            Span::styled("  │ ", theme.accent_style()),
-                            Span::styled(
-                                truncate(t, body_w.saturating_sub(2)),
-                                Style::default().add_modifier(Modifier::BOLD),
-                            ),
-                        ]),
-                        target,
-                    ));
-                }
-                if let Some(sub) = subtitle {
-                    out.push(RenderedLine::clickable(
-                        Line::from(vec![
-                            Span::styled("  │ ", theme.accent_style()),
-                            Span::styled(truncate(sub, body_w.saturating_sub(2)), theme.muted_style()),
-                        ]),
-                        target,
-                    ));
-                }
-                for (k, v) in facts {
-                    let text = format!("{k}: {v}");
-                    out.push(RenderedLine::clickable(
-                        Line::from(vec![
-                            Span::styled("  │ ", theme.accent_style()),
-                            Span::raw(truncate(&text, body_w.saturating_sub(2))),
-                        ]),
-                        target,
-                    ));
-                }
-                for bl in body_lines {
-                    out.push(RenderedLine::clickable(
-                        Line::from(vec![
-                            Span::styled("  │ ", theme.accent_style()),
-                            Span::raw(truncate(bl, body_w.saturating_sub(2))),
-                        ]),
-                        target,
-                    ));
-                }
-                for (label, url) in actions {
-                    let link_label = format!("[{label}]");
-                    let rendered = if hyperlinks && !url.is_empty() {
-                        osc8(url, &link_label)
-                    } else if !url.is_empty() {
-                        format!("{link_label} ({url})")
-                    } else {
-                        link_label
-                    };
-                    out.push(RenderedLine::clickable(
-                        Line::from(vec![
-                            Span::styled("  │ ", theme.accent_style()),
-                            Span::styled(
-                                rendered,
-                                theme.accent_style().add_modifier(Modifier::UNDERLINED),
-                            ),
-                        ]),
-                        target,
-                    ));
-                }
-                out.push(RenderedLine::clickable(
-                    Line::from(Span::styled("  └─────────────────────────", theme.accent_style())),
-                    target,
-                ));
-            }
             RichBlock::AttachmentChip { id, name } => {
                 let attach_idx = resolve_attachment_index(&msg.attachments, Some(id.as_str()), None)
                     .unwrap_or(0);
@@ -635,7 +564,11 @@ pub fn render_message_item(
                     .as_deref()
                     .or_else(|| msg.attachments.get(attach_idx).and_then(|a| a.name.as_deref()))
                     .unwrap_or("첨부파일");
-                let chip = format!("  [📎 {display_name}]");
+                let is_img = msg.attachments.get(attach_idx).is_some_and(|a| {
+                    img_preview::is_image_mime_or_name(&a.content_type, a.name.as_deref())
+                });
+                let icon = if is_img { "🖼" } else { "📎" };
+                let chip = format!("  [{icon} {display_name}]");
                 let chip_w = UnicodeWidthStr::width(chip.trim_start()) as u16;
                 out.push(RenderedLine::with_inline(
                     Line::from(Span::styled(
@@ -653,6 +586,12 @@ pub fn render_message_item(
                         },
                     )],
                 ));
+                if let (Some(cache), Some(att)) = (image_cache, msg.attachments.get(attach_idx)) {
+                    if is_img && !emitted_thumb_ids.contains(&att.id) {
+                        emitted_thumb_ids.push(att.id.clone());
+                        emit_inline_thumb(out, &msg.msg_id, att, cache, thumb_dims, theme, target);
+                    }
+                }
             }
             RichBlock::InlineImageChip { src, index } => {
                 let attach_idx =
@@ -677,6 +616,24 @@ pub fn render_message_item(
                         },
                     )],
                 ));
+                if let (Some(cache), Some(att)) = (image_cache, msg.attachments.get(attach_idx)) {
+                    if !emitted_thumb_ids.contains(&att.id) {
+                        emitted_thumb_ids.push(att.id.clone());
+                        emit_inline_thumb(out, &msg.msg_id, att, cache, thumb_dims, theme, target);
+                    }
+                }
+            }
+            other => {
+                render_rich_blocks(
+                    out,
+                    std::slice::from_ref(other),
+                    indent,
+                    selected,
+                    Some(target),
+                    theme,
+                    width,
+                    hyperlinks,
+                );
             }
         }
     }
@@ -694,7 +651,9 @@ pub fn render_message_item(
             continue;
         }
         let name = att.name.as_deref().unwrap_or(&att.id);
-        let chip = format!("  [📎 {name}]");
+        let is_img = img_preview::is_image_mime_or_name(&att.content_type, att.name.as_deref());
+        let icon = if is_img { "🖼" } else { "📎" };
+        let chip = format!("  [{icon} {name}]");
         let chip_w = UnicodeWidthStr::width(chip.trim_start()) as u16;
         out.push(RenderedLine::with_inline(
             Line::from(Span::styled(
@@ -712,6 +671,12 @@ pub fn render_message_item(
                 },
             )],
         ));
+        if let Some(cache) = image_cache {
+            if is_img && !emitted_thumb_ids.contains(&att.id) {
+                emitted_thumb_ids.push(att.id.clone());
+                emit_inline_thumb(out, &msg.msg_id, att, cache, thumb_dims, theme, target);
+            }
+        }
     }
 
     // Reaction badges row (`[👍 2] [❤️ 1]`)
@@ -762,6 +727,231 @@ pub fn render_message_item(
             Some(target),
             vec![(2, label_w, HitTarget::OpenThread { msg_index })],
         ));
+    }
+}
+
+fn emit_inline_thumb(
+    out: &mut Vec<RenderedLine>,
+    msg_id: &str,
+    att: &AttachmentInfo,
+    cache: &std::collections::HashMap<String, RenderedTerminalImage>,
+    thumb_dims: (u16, u16),
+    theme: &Theme,
+    target: HitTarget,
+) {
+    let key = AppState::image_cache_key(msg_id, &att.id, thumb_dims.0, thumb_dims.1);
+    if let Some(rendered) = cache.get(&key) {
+        for thumb_line in &rendered.lines {
+            let mut full = vec![Span::raw("  ")];
+            full.extend(thumb_line.spans.clone());
+            out.push(RenderedLine::clickable(Line::from(full), target));
+        }
+        out.push(RenderedLine::clickable(
+            Line::from(Span::styled(
+                format!(
+                    "  ↳ {}x{} ({}) · v 키로 크게보기",
+                    rendered.width_px, rendered.height_px, rendered.format_label
+                ),
+                theme.muted_style(),
+            )),
+            target,
+        ));
+    }
+}
+
+/// Shared `RichBlock` renderer used by both Teams chat/thread views and Outlook Mail/Calendar detail views.
+#[allow(clippy::too_many_arguments)]
+pub fn render_rich_blocks(
+    out: &mut Vec<RenderedLine>,
+    blocks: &[RichBlock],
+    indent: &str,
+    selected: bool,
+    target: Option<HitTarget>,
+    theme: &Theme,
+    width: usize,
+    hyperlinks: bool,
+) {
+    let indent_w = UnicodeWidthStr::width(indent);
+    let body_w = width.saturating_sub(indent_w).max(6);
+    let mut push_line = |line: Line<'static>| {
+        if let Some(t) = target {
+            out.push(RenderedLine::clickable(line, t));
+        } else {
+            out.push(RenderedLine::plain(line));
+        }
+    };
+
+    for block in blocks {
+        match block {
+            RichBlock::Paragraph(spans) => {
+                let wrapped = wrap_rich_spans(spans, body_w, theme, hyperlinks);
+                for line_spans in wrapped {
+                    let mut full = if indent.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![Span::raw(indent.to_string())]
+                    };
+                    full.extend(line_spans);
+                    let mut line = Line::from(full);
+                    if selected {
+                        line = line.style(theme.selection());
+                    }
+                    push_line(line);
+                }
+            }
+            RichBlock::Heading { level, spans } => {
+                let prefix = match level {
+                    1 => "# ",
+                    2 => "## ",
+                    _ => "### ",
+                };
+                let wrapped =
+                    wrap_rich_spans(spans, body_w.saturating_sub(prefix.len()), theme, hyperlinks);
+                for (i, line_spans) in wrapped.into_iter().enumerate() {
+                    let mut full = vec![Span::styled(
+                        if i == 0 {
+                            format!("{indent}{prefix}")
+                        } else {
+                            format!("{indent}  ")
+                        },
+                        theme.accent_style().add_modifier(Modifier::BOLD),
+                    )];
+                    for s in line_spans {
+                        full.push(Span::styled(
+                            s.content.into_owned(),
+                            s.style.add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                    let mut line = Line::from(full);
+                    if selected {
+                        line = line.style(theme.selection());
+                    }
+                    push_line(line);
+                }
+            }
+            RichBlock::Quote(spans) => {
+                let wrapped = wrap_rich_spans(spans, body_w.saturating_sub(2), theme, hyperlinks);
+                for line_spans in wrapped {
+                    let mut full = vec![Span::styled(format!("{indent}│ "), theme.quote_style())];
+                    for s in line_spans {
+                        full.push(Span::styled(s.content.into_owned(), theme.quote_style()));
+                    }
+                    let mut line = Line::from(full);
+                    if selected {
+                        line = line.style(theme.selection());
+                    }
+                    push_line(line);
+                }
+            }
+            RichBlock::CodeBlock { lang, code } => {
+                let top = match lang.as_deref().filter(|l| !l.is_empty()) {
+                    Some(l) => format!("{indent}┌─ {l} ─"),
+                    None => format!("{indent}┌─ code ─"),
+                };
+                push_line(Line::from(Span::styled(
+                    truncate(&top, width),
+                    theme.muted_style(),
+                )));
+                for raw_line in code.lines() {
+                    let content = truncate(raw_line, body_w.saturating_sub(2));
+                    push_line(Line::from(vec![
+                        Span::styled(format!("{indent}│ "), theme.muted_style()),
+                        Span::styled(content, theme.code_style()),
+                    ]));
+                }
+                push_line(Line::from(Span::styled(
+                    format!("{indent}└───────"),
+                    theme.muted_style(),
+                )));
+            }
+            RichBlock::BulletList(items) => {
+                for item in items {
+                    let wrapped =
+                        wrap_rich_spans(item, body_w.saturating_sub(2), theme, hyperlinks);
+                    for (i, line_spans) in wrapped.into_iter().enumerate() {
+                        let mut full = vec![Span::styled(
+                            if i == 0 {
+                                format!("{indent}• ")
+                            } else {
+                                format!("{indent}  ")
+                            },
+                            theme.accent_style(),
+                        )];
+                        full.extend(line_spans);
+                        let mut line = Line::from(full);
+                        if selected {
+                            line = line.style(theme.selection());
+                        }
+                        push_line(line);
+                    }
+                }
+            }
+            RichBlock::Card {
+                title,
+                subtitle,
+                facts,
+                body_lines,
+                actions,
+            } => {
+                push_line(Line::from(Span::styled(
+                    format!("{indent}┌─ Adaptive Card ─────────"),
+                    theme.accent_style(),
+                )));
+                if let Some(t) = title {
+                    push_line(Line::from(vec![
+                        Span::styled(format!("{indent}│ "), theme.accent_style()),
+                        Span::styled(
+                            truncate(t, body_w.saturating_sub(2)),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                }
+                if let Some(sub) = subtitle {
+                    push_line(Line::from(vec![
+                        Span::styled(format!("{indent}│ "), theme.accent_style()),
+                        Span::styled(
+                            truncate(sub, body_w.saturating_sub(2)),
+                            theme.muted_style(),
+                        ),
+                    ]));
+                }
+                for (k, v) in facts {
+                    let text = format!("{k}: {v}");
+                    push_line(Line::from(vec![
+                        Span::styled(format!("{indent}│ "), theme.accent_style()),
+                        Span::raw(truncate(&text, body_w.saturating_sub(2))),
+                    ]));
+                }
+                for bl in body_lines {
+                    push_line(Line::from(vec![
+                        Span::styled(format!("{indent}│ "), theme.accent_style()),
+                        Span::raw(truncate(bl, body_w.saturating_sub(2))),
+                    ]));
+                }
+                for (label, url) in actions {
+                    let link_label = format!("[{label}]");
+                    let rendered = if hyperlinks && !url.is_empty() {
+                        osc8(url, &link_label)
+                    } else if !url.is_empty() {
+                        format!("{link_label} ({url})")
+                    } else {
+                        link_label
+                    };
+                    push_line(Line::from(vec![
+                        Span::styled(format!("{indent}│ "), theme.accent_style()),
+                        Span::styled(
+                            rendered,
+                            theme.accent_style().add_modifier(Modifier::UNDERLINED),
+                        ),
+                    ]));
+                }
+                push_line(Line::from(Span::styled(
+                    format!("{indent}└─────────────────────────"),
+                    theme.accent_style(),
+                )));
+            }
+            RichBlock::AttachmentChip { .. } | RichBlock::InlineImageChip { .. } => {}
+        }
     }
 }
 

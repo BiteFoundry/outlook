@@ -330,6 +330,19 @@ pub enum CoreEvent {
         notify_candidate: Option<NotificationCandidate>,
     },
     PresenceUpdated(Vec<PresenceStatus>),
+    MailFoldersUpdated(Vec<MailFolder>),
+    MailMessagesUpdated {
+        folder_id: String,
+        messages: Vec<MailMessage>,
+        notify_candidate: Option<NotificationCandidate>,
+    },
+    CalendarEventsUpdated(Vec<CalendarEvent>),
+    ContactsUpdated(Vec<ContactItem>),
+    TodoUpdated {
+        lists: Vec<TodoList>,
+        list_id: Option<String>,
+        tasks: Vec<TodoTask>,
+    },
     SyncStateChanged {
         busy: bool,
         summary: String,
@@ -403,4 +416,237 @@ pub enum RichBlock {
         src: String,
         index: usize,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Outlook Mail, Calendar, Contacts, Microsoft To Do, and Self-Updater Models
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmailRecipient {
+    pub name: Option<String>,
+    pub address: String,
+}
+
+impl EmailRecipient {
+    pub fn display(&self) -> String {
+        match self.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(n) if !n.eq_ignore_ascii_case(&self.address) => {
+                format!("{n} <{}>", self.address)
+            }
+            _ => self.address.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailFolder {
+    pub id: String,
+    pub display_name: String,
+    pub well_known_name: Option<String>,
+    pub parent_folder_id: Option<String>,
+    pub unread_item_count: i32,
+    pub total_item_count: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailAttachment {
+    pub id: String,
+    pub name: String,
+    pub content_type: String,
+    pub size: u64,
+    pub is_inline: bool,
+    pub content_id: Option<String>,
+    /// Optional inline base64 bytes when expanded from Graph (`fileAttachment`).
+    pub content_bytes_b64: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailMessage {
+    pub id: String,
+    pub conversation_id: Option<String>,
+    pub folder_id: Option<String>,
+    pub subject: String,
+    pub from: Option<EmailRecipient>,
+    pub to_recipients: Vec<EmailRecipient>,
+    pub cc_recipients: Vec<EmailRecipient>,
+    pub bcc_recipients: Vec<EmailRecipient>,
+    pub received_at: String,
+    pub sent_at: Option<String>,
+    pub is_read: bool,
+    pub is_draft: bool,
+    pub flagged: bool,
+    pub importance: String,
+    pub has_attachments: bool,
+    pub preview: String,
+    pub body_html: String,
+    pub body_plain: String,
+    pub attachments: Vec<MailAttachment>,
+    pub web_link: Option<String>,
+}
+
+impl MailMessage {
+    pub fn from_display(&self) -> String {
+        self.from
+            .as_ref()
+            .map(EmailRecipient::display)
+            .unwrap_or_else(|| "(발신자 없음)".to_string())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutgoingMail {
+    pub subject: String,
+    pub body_html: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub importance: Option<String>,
+    pub attachments: Vec<PathBuf>,
+    pub save_to_sent_items: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailSearchHit {
+    pub id: String,
+    pub folder_id: Option<String>,
+    pub subject: String,
+    pub from_display: String,
+    pub received_at: String,
+    pub snippet: String,
+    pub has_attachments: bool,
+    pub is_read: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventAttendee {
+    pub name: Option<String>,
+    pub address: String,
+    /// `required`, `optional`, `resource`.
+    pub attendee_type: String,
+    /// `none`, `organizer`, `tentativelyAccepted`, `accepted`, `declined`, `notResponded`.
+    pub response_status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalendarEvent {
+    pub id: String,
+    pub subject: String,
+    pub start_iso: String,
+    pub end_iso: String,
+    pub time_zone: String,
+    pub is_all_day: bool,
+    pub location: Option<String>,
+    pub organizer_name: Option<String>,
+    pub organizer_email: Option<String>,
+    pub attendees: Vec<EventAttendee>,
+    /// Current user's response (`accepted`, `tentativelyAccepted`, `declined`, `notResponded`, `organizer`, `none`).
+    pub response_status: String,
+    pub is_online_meeting: bool,
+    pub online_meeting_url: Option<String>,
+    pub body_html: String,
+    pub body_plain: String,
+    pub is_cancelled: bool,
+    pub web_link: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutgoingEvent {
+    pub subject: String,
+    pub start_iso: String,
+    pub end_iso: String,
+    pub time_zone: Option<String>,
+    pub is_all_day: bool,
+    pub location: Option<String>,
+    pub body_html: Option<String>,
+    pub attendees: Vec<String>,
+    pub is_online_meeting: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactItem {
+    pub id: String,
+    pub display_name: String,
+    pub given_name: Option<String>,
+    pub surname: Option<String>,
+    pub email_addresses: Vec<String>,
+    pub mobile_phone: Option<String>,
+    pub business_phones: Vec<String>,
+    pub company_name: Option<String>,
+    pub job_title: Option<String>,
+    pub department: Option<String>,
+    pub notes: Option<String>,
+    /// `"contact"` (personal Outlook contact) or `"directory"` (Entra org directory user).
+    pub source: String,
+}
+
+impl ContactItem {
+    pub fn primary_email(&self) -> Option<&str> {
+        self.email_addresses.first().map(String::as_str)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutgoingContact {
+    pub display_name: String,
+    pub given_name: Option<String>,
+    pub surname: Option<String>,
+    pub email_addresses: Vec<String>,
+    pub mobile_phone: Option<String>,
+    pub company_name: Option<String>,
+    pub job_title: Option<String>,
+    pub department: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoList {
+    pub id: String,
+    pub display_name: String,
+    pub wellknown_list_name: Option<String>,
+    pub is_owner: bool,
+    pub is_shared: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoTask {
+    pub id: String,
+    pub list_id: String,
+    pub title: String,
+    /// `notStarted`, `inProgress`, `completed`, `waitingOnOthers`, `deferred`.
+    pub status: String,
+    /// `low`, `normal`, `high`.
+    pub importance: String,
+    pub body_plain: Option<String>,
+    pub due_date_iso: Option<String>,
+    pub reminder_iso: Option<String>,
+    pub completed_at: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+impl TodoTask {
+    pub fn is_completed(&self) -> bool {
+        self.status.eq_ignore_ascii_case("completed")
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutgoingTodoTask {
+    pub title: String,
+    pub body_plain: Option<String>,
+    pub due_date_iso: Option<String>,
+    pub importance: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateCheckResult {
+    pub current_version: String,
+    pub latest_version: String,
+    pub update_available: bool,
+    pub release_url: String,
+    pub asset_name: Option<String>,
+    pub asset_size: Option<u64>,
+    pub updated: bool,
+    pub binary_path: PathBuf,
 }

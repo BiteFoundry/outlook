@@ -1,9 +1,9 @@
 openapi: 3.1.0
 info:
-  title: teams HTTP JSON API
-  version: 0.1.0
+  title: teams / outlook HTTP JSON API
+  version: 0.2.0
   description: |
-    Local HTTP/JSON contract exposed by `teams serve` (alias `teams api`).
+    Local HTTP/JSON contract exposed by `teams serve` or `outlook serve` (alias `api`).
 
     Backed by Microsoft Graph v1.0, local SQLite WAL/FTS5 caching, and the
     background sync engine. Binds to `127.0.0.1:8788` by default. When started
@@ -26,6 +26,10 @@ tags:
   - name: files
   - name: search
   - name: presence
+  - name: mail
+  - name: calendar
+  - name: contacts
+  - name: todo
 paths:
   /health:
     get:
@@ -579,6 +583,865 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "500":
           $ref: "#/components/responses/InternalError"
+  /mail/folders:
+    get:
+      tags: [mail]
+      summary: List Outlook mail folders
+      parameters:
+        - name: refresh
+          in: query
+          schema:
+            type: boolean
+            default: false
+        - name: offline
+          in: query
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Mail folders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [folders]
+                properties:
+                  folders:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/MailFolder"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /mail/messages:
+    get:
+      tags: [mail]
+      summary: List Outlook mail messages in a folder
+      parameters:
+        - name: folder
+          in: query
+          schema:
+            type: string
+            default: inbox
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 30
+        - name: unread
+          in: query
+          schema:
+            type: boolean
+            default: false
+        - name: refresh
+          in: query
+          schema:
+            type: boolean
+            default: false
+        - name: offline
+          in: query
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Mail message list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [folder, messages]
+                properties:
+                  folder:
+                    type: string
+                  messages:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/MailMessage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /mail/messages/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [mail]
+      summary: Get an Outlook mail message by ID
+      parameters:
+        - name: offline
+          in: query
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Mail message details
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message]
+                properties:
+                  message:
+                    $ref: "#/components/schemas/MailMessage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    patch:
+      tags: [mail]
+      summary: Update read or flagged status on a mail message
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                is_read:
+                  type: [boolean, "null"]
+                flagged:
+                  type: [boolean, "null"]
+      responses:
+        "200":
+          description: Updated state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, message_id]
+                properties:
+                  ok:
+                    type: boolean
+                  message_id:
+                    type: string
+                  is_read:
+                    type: [boolean, "null"]
+                  flagged:
+                    type: [boolean, "null"]
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      tags: [mail]
+      summary: Delete a mail message
+      responses:
+        "200":
+          description: Mail deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, message_id]
+                properties:
+                  ok:
+                    type: boolean
+                  message_id:
+                    type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /mail/send:
+    post:
+      tags: [mail]
+      summary: Send a new Outlook email
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendMailRequest"
+      responses:
+        "200":
+          description: Mail sent
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, to, subject]
+                properties:
+                  ok:
+                    type: boolean
+                  to:
+                    type: array
+                    items:
+                      type: string
+                  subject:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /mail/messages/{id}/reply:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [mail]
+      summary: Reply or reply-all to a mail message
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [markdown]
+              properties:
+                markdown:
+                  type: string
+                  minLength: 1
+                reply_all:
+                  type: boolean
+                  default: false
+      responses:
+        "200":
+          description: Reply sent
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, message_id, reply_all]
+                properties:
+                  ok:
+                    type: boolean
+                  message_id:
+                    type: string
+                  reply_all:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /mail/messages/{id}/forward:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [mail]
+      summary: Forward a mail message
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to]
+              properties:
+                to:
+                  type: array
+                  items:
+                    type: string
+                  minItems: 1
+                markdown:
+                  type: string
+                  default: ""
+      responses:
+        "200":
+          description: Forward sent
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, message_id, to]
+                properties:
+                  ok:
+                    type: boolean
+                  message_id:
+                    type: string
+                  to:
+                    type: array
+                    items:
+                      type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /mail/messages/{id}/move:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [mail]
+      summary: Move a mail message to another folder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [destination_folder]
+              properties:
+                destination_folder:
+                  type: string
+      responses:
+        "200":
+          description: Mail moved
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, message]
+                properties:
+                  ok:
+                    type: boolean
+                  message:
+                    $ref: "#/components/schemas/MailMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /mail/messages/{id}/attachments/{att_id}/download:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: att_id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [mail]
+      summary: Download a mail attachment to local disk
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                out_dir:
+                  type: [string, "null"]
+      responses:
+        "200":
+          description: Attachment saved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DownloadResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /mail/search:
+    get:
+      tags: [mail]
+      summary: Search cached mail via FTS5 and optionally Graph $search
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: folder
+          in: query
+          schema:
+            type: string
+        - name: remote
+          in: query
+          schema:
+            type: boolean
+            default: false
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 30
+      responses:
+        "200":
+          description: Mail search results
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [query, hits, remote]
+                properties:
+                  query:
+                    type: string
+                  hits:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/MailSearchHit"
+                  remote:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/MailMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /calendar/events:
+    get:
+      tags: [calendar]
+      summary: List calendar events in a time window
+      parameters:
+        - name: start
+          in: query
+          schema:
+            type: string
+        - name: end
+          in: query
+          schema:
+            type: string
+        - name: days
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 365
+            default: 7
+        - name: offline
+          in: query
+          schema:
+            type: boolean
+            default: false
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 50
+      responses:
+        "200":
+          description: Calendar events
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [start, end, events]
+                properties:
+                  start:
+                    type: string
+                  end:
+                    type: string
+                  events:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/CalendarEvent"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      tags: [calendar]
+      summary: Create a calendar event
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCalendarEventRequest"
+      responses:
+        "200":
+          description: Event created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, event]
+                properties:
+                  ok:
+                    type: boolean
+                  event:
+                    $ref: "#/components/schemas/CalendarEvent"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /calendar/events/{id}/rsvp:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [calendar]
+      summary: Respond to a calendar meeting invitation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [response]
+              properties:
+                response:
+                  type: string
+                  enum: [accept, tentative, decline]
+                comment:
+                  type: [string, "null"]
+      responses:
+        "200":
+          description: RSVP sent
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, event_id, response]
+                properties:
+                  ok:
+                    type: boolean
+                  event_id:
+                    type: string
+                  response:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /calendar/events/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      tags: [calendar]
+      summary: Delete a calendar event
+      responses:
+        "200":
+          description: Event deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, event_id]
+                properties:
+                  ok:
+                    type: boolean
+                  event_id:
+                    type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /contacts:
+    get:
+      tags: [contacts]
+      summary: List contacts or search contacts and Entra directory
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 50
+        - name: offline
+          in: query
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Contacts list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [contacts]
+                properties:
+                  contacts:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ContactItem"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      tags: [contacts]
+      summary: Create a personal Outlook contact
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateContactRequest"
+      responses:
+        "200":
+          description: Contact created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, contact]
+                properties:
+                  ok:
+                    type: boolean
+                  contact:
+                    $ref: "#/components/schemas/ContactItem"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /contacts/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      tags: [contacts]
+      summary: Delete a personal Outlook contact
+      responses:
+        "200":
+          description: Contact deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, contact_id]
+                properties:
+                  ok:
+                    type: boolean
+                  contact_id:
+                    type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /todo/lists:
+    get:
+      tags: [todo]
+      summary: List Microsoft To Do task lists
+      parameters:
+        - name: refresh
+          in: query
+          schema:
+            type: boolean
+            default: false
+        - name: offline
+          in: query
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: To Do lists
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [lists]
+                properties:
+                  lists:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TodoList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /todo/lists/{list_id}/tasks:
+    parameters:
+      - name: list_id
+        in: path
+        required: true
+        description: Task list ID or list display name
+        schema:
+          type: string
+    get:
+      tags: [todo]
+      summary: List tasks in a To Do list
+      parameters:
+        - name: include_completed
+          in: query
+          schema:
+            type: boolean
+            default: false
+        - name: refresh
+          in: query
+          schema:
+            type: boolean
+            default: false
+        - name: offline
+          in: query
+          schema:
+            type: boolean
+            default: false
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 50
+      responses:
+        "200":
+          description: To Do tasks
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [list_id, tasks]
+                properties:
+                  list_id:
+                    type: string
+                  tasks:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TodoTask"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      tags: [todo]
+      summary: Create a task in a To Do list
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTodoTaskRequest"
+      responses:
+        "200":
+          description: Task created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, task]
+                properties:
+                  ok:
+                    type: boolean
+                  task:
+                    $ref: "#/components/schemas/TodoTask"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /todo/lists/{list_id}/tasks/{task_id}:
+    parameters:
+      - name: list_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: task_id
+        in: path
+        required: true
+        schema:
+          type: string
+    patch:
+      tags: [todo]
+      summary: Mark a To Do task completed or incomplete
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                completed:
+                  type: boolean
+                  default: true
+      responses:
+        "200":
+          description: Task updated
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, task]
+                properties:
+                  ok:
+                    type: boolean
+                  task:
+                    $ref: "#/components/schemas/TodoTask"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      tags: [todo]
+      summary: Delete a To Do task
+      responses:
+        "200":
+          description: Task deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, list_id, task_id]
+                properties:
+                  ok:
+                    type: boolean
+                  list_id:
+                    type: string
+                  task_id:
+                    type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
 components:
   securitySchemes:
     bearerAuth:
@@ -1037,3 +1900,335 @@ components:
           type: [integer, "null"]
           minimum: 1
           maximum: 1440
+    EmailRecipient:
+      type: object
+      required: [address]
+      properties:
+        name:
+          type: [string, "null"]
+        address:
+          type: string
+    MailFolder:
+      type: object
+      required: [id, display_name, unread_item_count, total_item_count]
+      properties:
+        id:
+          type: string
+        display_name:
+          type: string
+        well_known_name:
+          type: [string, "null"]
+        parent_folder_id:
+          type: [string, "null"]
+        unread_item_count:
+          type: integer
+        total_item_count:
+          type: integer
+    MailAttachment:
+      type: object
+      required: [id, name, content_type, size, is_inline]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        content_type:
+          type: string
+        size:
+          type: integer
+        is_inline:
+          type: boolean
+        content_id:
+          type: [string, "null"]
+        content_bytes_b64:
+          type: [string, "null"]
+    MailMessage:
+      type: object
+      required: [id, subject, to_recipients, cc_recipients, bcc_recipients, received_at, is_read, is_draft, flagged, importance, has_attachments, preview, body_html, body_plain, attachments]
+      properties:
+        id:
+          type: string
+        conversation_id:
+          type: [string, "null"]
+        folder_id:
+          type: [string, "null"]
+        subject:
+          type: string
+        from:
+          anyOf:
+            - $ref: "#/components/schemas/EmailRecipient"
+            - type: "null"
+        to_recipients:
+          type: array
+          items:
+            $ref: "#/components/schemas/EmailRecipient"
+        cc_recipients:
+          type: array
+          items:
+            $ref: "#/components/schemas/EmailRecipient"
+        bcc_recipients:
+          type: array
+          items:
+            $ref: "#/components/schemas/EmailRecipient"
+        received_at:
+          type: string
+        sent_at:
+          type: [string, "null"]
+        is_read:
+          type: boolean
+        is_draft:
+          type: boolean
+        flagged:
+          type: boolean
+        importance:
+          type: string
+        has_attachments:
+          type: boolean
+        preview:
+          type: string
+        body_html:
+          type: string
+        body_plain:
+          type: string
+        attachments:
+          type: array
+          items:
+            $ref: "#/components/schemas/MailAttachment"
+        web_link:
+          type: [string, "null"]
+    MailSearchHit:
+      type: object
+      required: [id, subject, from_display, received_at, snippet, has_attachments, is_read]
+      properties:
+        id:
+          type: string
+        folder_id:
+          type: [string, "null"]
+        subject:
+          type: string
+        from_display:
+          type: string
+        received_at:
+          type: string
+        snippet:
+          type: string
+        has_attachments:
+          type: boolean
+        is_read:
+          type: boolean
+    SendMailRequest:
+      type: object
+      required: [to, subject, markdown]
+      properties:
+        to:
+          type: array
+          items:
+            type: string
+          minItems: 1
+        cc:
+          type: array
+          items:
+            type: string
+        bcc:
+          type: array
+          items:
+            type: string
+        subject:
+          type: string
+        markdown:
+          type: string
+        attachments:
+          type: array
+          items:
+            type: string
+        important:
+          type: boolean
+          default: false
+    EventAttendee:
+      type: object
+      required: [address, attendee_type, response_status]
+      properties:
+        name:
+          type: [string, "null"]
+        address:
+          type: string
+        attendee_type:
+          type: string
+        response_status:
+          type: string
+    CalendarEvent:
+      type: object
+      required: [id, subject, start_iso, end_iso, time_zone, is_all_day, attendees, response_status, is_online_meeting, body_html, body_plain, is_cancelled]
+      properties:
+        id:
+          type: string
+        subject:
+          type: string
+        start_iso:
+          type: string
+        end_iso:
+          type: string
+        time_zone:
+          type: string
+        is_all_day:
+          type: boolean
+        location:
+          type: [string, "null"]
+        organizer_name:
+          type: [string, "null"]
+        organizer_email:
+          type: [string, "null"]
+        attendees:
+          type: array
+          items:
+            $ref: "#/components/schemas/EventAttendee"
+        response_status:
+          type: string
+        is_online_meeting:
+          type: boolean
+        online_meeting_url:
+          type: [string, "null"]
+        body_html:
+          type: string
+        body_plain:
+          type: string
+        is_cancelled:
+          type: boolean
+        web_link:
+          type: [string, "null"]
+    CreateCalendarEventRequest:
+      type: object
+      required: [subject, start_iso, end_iso]
+      properties:
+        subject:
+          type: string
+        start_iso:
+          type: string
+        end_iso:
+          type: string
+        time_zone:
+          type: [string, "null"]
+        location:
+          type: [string, "null"]
+        markdown:
+          type: [string, "null"]
+        attendees:
+          type: array
+          items:
+            type: string
+        is_all_day:
+          type: boolean
+          default: false
+        is_online_meeting:
+          type: boolean
+          default: false
+    ContactItem:
+      type: object
+      required: [id, display_name, email_addresses, business_phones, source]
+      properties:
+        id:
+          type: string
+        display_name:
+          type: string
+        given_name:
+          type: [string, "null"]
+        surname:
+          type: [string, "null"]
+        email_addresses:
+          type: array
+          items:
+            type: string
+        mobile_phone:
+          type: [string, "null"]
+        business_phones:
+          type: array
+          items:
+            type: string
+        company_name:
+          type: [string, "null"]
+        job_title:
+          type: [string, "null"]
+        department:
+          type: [string, "null"]
+        notes:
+          type: [string, "null"]
+        source:
+          type: string
+          enum: [contact, directory]
+    CreateContactRequest:
+      type: object
+      required: [display_name]
+      properties:
+        display_name:
+          type: string
+        given_name:
+          type: [string, "null"]
+        surname:
+          type: [string, "null"]
+        email_addresses:
+          type: array
+          items:
+            type: string
+        mobile_phone:
+          type: [string, "null"]
+        company_name:
+          type: [string, "null"]
+        job_title:
+          type: [string, "null"]
+        department:
+          type: [string, "null"]
+        notes:
+          type: [string, "null"]
+    TodoList:
+      type: object
+      required: [id, display_name, is_owner, is_shared]
+      properties:
+        id:
+          type: string
+        display_name:
+          type: string
+        wellknown_list_name:
+          type: [string, "null"]
+        is_owner:
+          type: boolean
+        is_shared:
+          type: boolean
+    TodoTask:
+      type: object
+      required: [id, list_id, title, status, importance]
+      properties:
+        id:
+          type: string
+        list_id:
+          type: string
+        title:
+          type: string
+        status:
+          type: string
+        importance:
+          type: string
+        body_plain:
+          type: [string, "null"]
+        due_date_iso:
+          type: [string, "null"]
+        reminder_iso:
+          type: [string, "null"]
+        completed_at:
+          type: [string, "null"]
+        created_at:
+          type: [string, "null"]
+        updated_at:
+          type: [string, "null"]
+    CreateTodoTaskRequest:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+        body_plain:
+          type: [string, "null"]
+        due_date_iso:
+          type: [string, "null"]
+        importance:
+          type: [string, "null"]
+          enum: [low, normal, high, "null"]

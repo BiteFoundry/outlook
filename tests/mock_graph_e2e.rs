@@ -2,18 +2,22 @@
 
 use std::{
     collections::HashMap,
+    io::Cursor,
     sync::{Arc, Once, RwLock},
 };
 
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{get, patch, post, put},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use image::{ImageBuffer, Rgba, RgbaImage};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
@@ -21,10 +25,14 @@ use teams_cli::{
     auth::{AuthManager, StoredTokens},
     config::AppConfig,
     graph::GraphClient,
-    mcp,
-    models::{AttachmentInfo, ConversationTarget, MentionInfo, MessageItem, TeamSummary},
+    img_preview, mcp,
+    models::{
+        AttachmentInfo, ConversationTarget, MentionInfo, MessageItem, OutgoingContact,
+        OutgoingEvent, OutgoingMail, OutgoingTodoTask, TeamSummary,
+    },
     parser, resolver, serve,
     storage::Storage,
+    updater,
 };
 
 static INIT_TEST_ENV: Once = Once::new();
@@ -99,6 +107,27 @@ struct MockState {
     posted_reply_payloads: RwLock<Vec<Value>>,
 }
 
+fn check_bearer_header(headers: &HeaderMap, expected: &str) -> Result<(), Response> {
+    let actual = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if actual == Some(expected) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": {
+                    "code": "InvalidAuthenticationToken",
+                    "message": "Access token has expired or is not valid."
+                }
+            })),
+        )
+            .into_response())
+    }
+}
+
 impl MockState {
     fn new(initial_token: &str) -> Self {
         let state = Self::default();
@@ -115,24 +144,7 @@ impl MockState {
 
     fn check_bearer(&self, headers: &HeaderMap) -> Result<(), Response> {
         let expected = self.expected_token.read().unwrap().clone();
-        let actual = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        if actual == Some(expected.as_str()) {
-            Ok(())
-        } else {
-            Err((
-                StatusCode::UNAUTHORIZED,
-                Json(json!({
-                    "error": {
-                        "code": "InvalidAuthenticationToken",
-                        "message": "Access token has expired or is not valid."
-                    }
-                })),
-            )
-                .into_response())
-        }
+        check_bearer_header(headers, &expected)
     }
 }
 
@@ -1188,4 +1200,1002 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
     let _: Option<MessageItem> = storage
         .get_message(&deploy_chan.conv_key, &root_msg.msg_id)
         .unwrap();
+}
+
+// ===========================================================================
+// v0.2.0 Outlook (Mail / Calendar / Contacts / To Do), Image Preview & Updater E2E
+// ===========================================================================
+
+struct OutlookMockState {
+    token: String,
+    mail_messages: RwLock<Vec<Value>>,
+    mail_attachments: RwLock<HashMap<(String, String), Value>>,
+    sent_mails: RwLock<Vec<Value>>,
+    mail_replies: RwLock<Vec<(String, Value)>>,
+    calendar_events: RwLock<Vec<Value>>,
+    calendar_rsvps: RwLock<Vec<(String, String, Value)>>,
+    contacts: RwLock<Vec<Value>>,
+    directory_users: RwLock<Vec<Value>>,
+    todo_lists: RwLock<Vec<Value>>,
+    todo_tasks: RwLock<HashMap<String, Vec<Value>>>,
+}
+
+impl OutlookMockState {
+    fn new(token: &str) -> Self {
+        let att_b64 = BASE64_STANDARD.encode(b"Outlook Attachment Payload \xed\x95\x9c\xea\xb8\x80");
+        let att_obj = json!({
+            "id": "att-1",
+            "name": "architecture-note.txt",
+            "contentType": "text/plain",
+            "size": 34,
+            "isInline": false,
+            "contentBytes": att_b64
+        });
+        let mut mail_attachments = HashMap::new();
+        mail_attachments.insert(("mail-1".to_string(), "att-1".to_string()), att_obj.clone());
+
+        let mail_messages = vec![
+            json!({
+                "id": "mail-1",
+                "conversationId": "conv-mail-1",
+                "parentFolderId": "folder-inbox",
+                "subject": "아키텍처 리뷰 및 Kubernetes 결재 요청",
+                "from": {
+                    "emailAddress": { "name": "김철수", "address": "kim@contoso.com" }
+                },
+                "toRecipients": [
+                    { "emailAddress": { "name": "나(테스터)", "address": "tester@contoso.com" } }
+                ],
+                "receivedDateTime": "2026-11-15T08:00:00Z",
+                "sentDateTime": "2026-11-15T07:59:50Z",
+                "isRead": false,
+                "isDraft": false,
+                "flag": { "flagStatus": "notFlagged" },
+                "importance": "high",
+                "hasAttachments": true,
+                "bodyPreview": "아키텍처 문서와 Kubernetes 배포 일정 확인 부탁드립니다.",
+                "body": {
+                    "contentType": "html",
+                    "content": "<p>안녕하세요, <strong>아키텍처</strong> 문서와 <em>Kubernetes</em> 배포 결재 요청드립니다.</p>"
+                },
+                "attachments": [att_obj],
+                "webLink": "https://outlook.office.com/mail/id/mail-1"
+            }),
+            json!({
+                "id": "mail-2",
+                "conversationId": "conv-mail-2",
+                "parentFolderId": "folder-inbox",
+                "subject": "Weekly Sprint Sync",
+                "from": {
+                    "emailAddress": { "name": "Alice", "address": "alice@contoso.com" }
+                },
+                "toRecipients": [
+                    { "emailAddress": { "name": "나(테스터)", "address": "tester@contoso.com" } }
+                ],
+                "receivedDateTime": "2026-11-15T07:00:00Z",
+                "isRead": true,
+                "isDraft": false,
+                "flag": { "flagStatus": "notFlagged" },
+                "importance": "normal",
+                "hasAttachments": false,
+                "bodyPreview": "Sprint sync notes inside.",
+                "body": { "contentType": "text", "content": "Sprint sync notes inside." }
+            }),
+        ];
+
+        let calendar_events = vec![json!({
+            "id": "ev-seed-1",
+            "subject": "주간 스탠드업",
+            "start": { "dateTime": "2026-11-16T01:00:00", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-11-16T01:30:00", "timeZone": "UTC" },
+            "isAllDay": false,
+            "location": { "displayName": "본사 3층" },
+            "organizer": { "emailAddress": { "name": "김철수", "address": "kim@contoso.com" } },
+            "attendees": [{
+                "emailAddress": { "name": "나(테스터)", "address": "tester@contoso.com" },
+                "type": "required",
+                "status": { "response": "notResponded" }
+            }],
+            "responseStatus": { "response": "notResponded" },
+            "isOnlineMeeting": false
+        })];
+
+        let contacts = vec![json!({
+            "id": "contact-1",
+            "displayName": "김철수 (개인)",
+            "givenName": "철수",
+            "surname": "김",
+            "emailAddresses": [{ "address": "kim@contoso.com", "name": "김철수" }],
+            "mobilePhone": "010-1111-2222",
+            "companyName": "Contoso",
+            "jobTitle": "Staff Engineer",
+            "department": "Platform"
+        })];
+
+        let directory_users = vec![json!({
+            "id": "dir-user-1",
+            "displayName": "김영희 (조직)",
+            "givenName": "영희",
+            "surname": "김",
+            "mail": "younghee.kim@contoso.com",
+            "userPrincipalName": "younghee.kim@contoso.com",
+            "companyName": "Contoso",
+            "jobTitle": "Product Manager",
+            "department": "Core"
+        })];
+
+        let todo_lists = vec![json!({
+            "id": "list-default",
+            "displayName": "Tasks",
+            "wellknownListName": "defaultList",
+            "isOwner": true,
+            "isShared": false
+        })];
+
+        let mut todo_tasks = HashMap::new();
+        todo_tasks.insert(
+            "list-default".to_string(),
+            vec![json!({
+                "id": "task-seed-1",
+                "title": "기존 할 일",
+                "status": "notStarted",
+                "importance": "normal"
+            })],
+        );
+
+        Self {
+            token: token.to_string(),
+            mail_messages: RwLock::new(mail_messages),
+            mail_attachments: RwLock::new(mail_attachments),
+            sent_mails: RwLock::new(Vec::new()),
+            mail_replies: RwLock::new(Vec::new()),
+            calendar_events: RwLock::new(calendar_events),
+            calendar_rsvps: RwLock::new(Vec::new()),
+            contacts: RwLock::new(contacts),
+            directory_users: RwLock::new(directory_users),
+            todo_lists: RwLock::new(todo_lists),
+            todo_tasks: RwLock::new(todo_tasks),
+        }
+    }
+
+    fn check_bearer(&self, headers: &HeaderMap) -> Result<(), Response> {
+        check_bearer_header(headers, &self.token)
+    }
+}
+
+async fn outlook_mail_folders_handler(
+    State(state): State<Arc<OutlookMockState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = state.check_bearer(&headers) {
+        return resp;
+    }
+    Json(json!({
+        "value": [
+            {
+                "id": "folder-inbox",
+                "displayName": "받은 편지함",
+                "unreadItemCount": 1,
+                "totalItemCount": 2
+            },
+            {
+                "id": "folder-sent",
+                "displayName": "보낸 편지함",
+                "unreadItemCount": 0,
+                "totalItemCount": 0
+            }
+        ]
+    }))
+    .into_response()
+}
+
+async fn outlook_folder_messages_handler(
+    State(state): State<Arc<OutlookMockState>>,
+    headers: HeaderMap,
+    Path(folder): Path<String>,
+) -> Response {
+    if let Err(resp) = state.check_bearer(&headers) {
+        return resp;
+    }
+    let msgs = state.mail_messages.read().unwrap();
+    let filtered: Vec<Value> = msgs
+        .iter()
+        .filter(|m| {
+            folder.eq_ignore_ascii_case("inbox")
+                && m["parentFolderId"].as_str() == Some("folder-inbox")
+                || m["parentFolderId"].as_str() == Some(folder.as_str())
+        })
+        .cloned()
+        .collect();
+    Json(json!({ "value": filtered })).into_response()
+}
+
+async fn outlook_get_message_handler(
+    State(state): State<Arc<OutlookMockState>>,
+    headers: HeaderMap,
+    Path(msg_id): Path<String>,
+) -> Response {
+    if let Err(resp) = state.check_bearer(&headers) {
+        return resp;
+    }
+    let guard = state.mail_messages.read().unwrap();
+    match guard.iter().find(|m| m["id"].as_str() == Some(msg_id.as_str())) {
+        Some(m) => Json(m.clone()).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(json!({ "error": { "code": "NotFound", "message": "mail not found" } }))).into_response(),
+    }
+}
+
+async fn outlook_patch_message_handler(
+    State(state): State<Arc<OutlookMockState>>,
+    headers: HeaderMap,
+    Path(msg_id): Path<String>,
+    Json(payload): Json<Value>,
+) -> Response {
+    if let Err(resp) = state.check_bearer(&headers) {
+        return resp;
+    }
+    let mut guard = state.mail_messages.write().unwrap();
+    let Some(msg) = guard
+        .iter_mut()
+        .find(|m| m["id"].as_str() == Some(msg_id.as_str()))
+    else {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": { "code": "NotFound", "message": "mail not found" } }))).into_response();
+    };
+    if let Some(is_read) = payload.get("isRead").and_then(|v| v.as_bool()) {
+        msg["isRead"] = Value::Bool(is_read);
+    }
+    if let Some(flag_status) = payload.pointer("/flag/flagStatus").and_then(|v| v.as_str()) {
+        msg["flag"] = json!({ "flagStatus": flag_status });
+    }
+    Json(msg.clone()).into_response()
+}
+
+async fn outlook_send_mail_handler(
+    State(state): State<Arc<OutlookMockState>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    if let Err(resp) = state.check_bearer(&headers) {
+        return resp;
+    }
+    state.sent_mails.write().unwrap().push(payload);
+    StatusCode::ACCEPTED.into_response()
+}
+
+async fn outlook_reply_mail_handler(
+    State(state): State<Arc<OutlookMockState>>,
+    headers: HeaderMap,
+    Path(msg_id): Path<String>,
+    Json(payload): Json<Value>,
+) -> Response {
+    if let Err(resp) = state.check_bearer(&headers) {
+        return resp;
+    }
+    state.mail_replies.write().unwrap().push((msg_id, payload));
+    StatusCode::ACCEPTED.into_response()
+}
+
+async fn outlook_get_attachment_handler(
+    State(state): State<Arc<OutlookMockState>>,
+    headers: HeaderMap,
+    Path((msg_id, att_id)): Path<(String, String)>,
+) -> Response {
+    if let Err(resp) = state.check_bearer(&headers) {
+        return resp;
+    }
+    let guard = state.mail_attachments.read().unwrap();
+    match guard.get(&(msg_id, att_id)) {
+        Some(att) => Json(att.clone()).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(json!({ "error": { "code": "NotFound", "message": "attachment not found" } }))).into_response(),
+    }
+}
+
+async fn outlook_calendar_view_handler(
+    State(state): State<Arc<OutlookMockState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(resp) = state.check_bearer(&headers) {
+        return resp;
+    }
+    assert_eq!(
+        headers.get("prefer").and_then(|v| v.to_str().ok()),
+        Some("outlook.timezone=\"UTC\"")
+    );
+    assert!(params.contains_key("startDateTime"));
+    assert!(params.contains_key("endDateTime"));
+    let events = state.calendar_events.read().unwrap().clone();
+    Json(json!({ "value": events })).into_response()
+}
+
+async fn outlook_create_event_handler(
+    State(state): State<Arc<OutlookMockState>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    if let Err(resp) = state.check_bearer(&headers) {
+        return resp;
+    }
+    let is_online = payload
+        .get("isOnlineMeeting")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut created = json!({
+        "id": "ev-created-1",
+        "subject": payload["subject"],
+        "start": payload["start"],
+        "end": payload["end"],
+        "isAllDay": payload["isAllDay"],
+        "location": payload.get("location").cloned().unwrap_or(Value::Null),
+        "attendees": payload.get("attendees").cloned().unwrap_or_else(|| json!([])),
+        "responseStatus": { "response": "organizer" },
+        "isOnlineMeeting": is_online,
+        "body": payload.get("body").cloned().unwrap_or(Value::Null),
+    });
+    if is_online {
+        created["onlineMeeting"] = json!({
+            "joinUrl": "https://teams.microsoft.com/l/meetup-join/19%3ameeting_v2_e2e/0"
+        });
+    }
+    state.calendar_events.write().unwrap().push(created.clone());
+    (StatusCode::CREATED, Json(created)).into_response()
+}
+
+async fn outlook_rsvp_event_handler(
+    State(state): State<Arc<OutlookMockState>>,
+    headers: HeaderMap,
+    Path((event_id, action)): Path<(String, String)>,
+    Json(payload): Json<Value>,
+) -> Response {
+    if let Err(resp) = state.check_bearer(&headers) {
+        return resp;
+    }
+    state
+        .calendar_rsvps
+        .write()
+        .unwrap()
+        .push((event_id.clone(), action.clone(), payload));
+
+    let mapped_resp = match action.as_str() {
+        "accept" => "accepted",
+        "tentativelyAccept" => "tentativelyAccepted",
+        "decline" => "declined",
+        other => other,
+    };
+    let mut guard = state.calendar_events.write().unwrap();
+    if let Some(ev) = guard.iter_mut().find(|e| e["id"].as_str() == Some(event_id.as_str())) {
+        ev["responseStatus"] = json!({ "response": mapped_resp });
+    }
+    StatusCode::ACCEPTED.into_response()
+}
+
+async fn outlook_contacts_handler(
+    State(state): State<Arc<OutlookMockState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = state.check_bearer(&headers) {
+        return resp;
+    }
+    let list = state.contacts.read().unwrap().clone();
+    Json(json!({ "value": list })).into_response()
+}
+
+async fn outlook_create_contact_handler(
+    State(state): State<Arc<OutlookMockState>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    if let Err(resp) = state.check_bearer(&headers) {
+        return resp;
+    }
+    let created = json!({
+        "id": "contact-created-1",
+        "displayName": payload["displayName"],
+        "givenName": payload.get("givenName").cloned().unwrap_or(Value::Null),
+        "surname": payload.get("surname").cloned().unwrap_or(Value::Null),
+        "emailAddresses": payload.get("emailAddresses").cloned().unwrap_or_else(|| json!([])),
+        "mobilePhone": payload.get("mobilePhone").cloned().unwrap_or(Value::Null),
+        "companyName": payload.get("companyName").cloned().unwrap_or(Value::Null),
+        "jobTitle": payload.get("jobTitle").cloned().unwrap_or(Value::Null),
+        "department": payload.get("department").cloned().unwrap_or(Value::Null),
+        "personalNotes": payload.get("personalNotes").cloned().unwrap_or(Value::Null),
+    });
+    state.contacts.write().unwrap().push(created.clone());
+    (StatusCode::CREATED, Json(created)).into_response()
+}
+
+async fn outlook_directory_users_handler(
+    State(state): State<Arc<OutlookMockState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(resp) = state.check_bearer(&headers) {
+        return resp;
+    }
+    let users = state.directory_users.read().unwrap().clone();
+    let search_q = params
+        .get("$search")
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+    let filtered: Vec<Value> = if search_q.is_empty() {
+        users
+    } else {
+        users
+            .into_iter()
+            .filter(|u| {
+                let dn = u["displayName"].as_str().unwrap_or("").to_lowercase();
+                let mail = u["mail"].as_str().unwrap_or("").to_lowercase();
+                search_q.contains("김") && (dn.contains("김") || mail.contains("kim"))
+                    || (!dn.is_empty() && search_q.contains(&dn))
+            })
+            .collect()
+    };
+    Json(json!({ "value": filtered })).into_response()
+}
+
+async fn outlook_todo_lists_handler(
+    State(state): State<Arc<OutlookMockState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = state.check_bearer(&headers) {
+        return resp;
+    }
+    let lists = state.todo_lists.read().unwrap().clone();
+    Json(json!({ "value": lists })).into_response()
+}
+
+async fn outlook_create_todo_task_handler(
+    State(state): State<Arc<OutlookMockState>>,
+    headers: HeaderMap,
+    Path(list_id): Path<String>,
+    Json(payload): Json<Value>,
+) -> Response {
+    if let Err(resp) = state.check_bearer(&headers) {
+        return resp;
+    }
+    let created = json!({
+        "id": "task-created-1",
+        "title": payload["title"],
+        "status": "notStarted",
+        "importance": payload.get("importance").cloned().unwrap_or_else(|| json!("normal")),
+        "body": payload.get("body").cloned().unwrap_or(Value::Null),
+        "dueDateTime": payload.get("dueDateTime").cloned().unwrap_or(Value::Null),
+    });
+    state
+        .todo_tasks
+        .write()
+        .unwrap()
+        .entry(list_id)
+        .or_default()
+        .push(created.clone());
+    (StatusCode::CREATED, Json(created)).into_response()
+}
+
+async fn outlook_patch_todo_task_handler(
+    State(state): State<Arc<OutlookMockState>>,
+    headers: HeaderMap,
+    Path((list_id, task_id)): Path<(String, String)>,
+    Json(payload): Json<Value>,
+) -> Response {
+    if let Err(resp) = state.check_bearer(&headers) {
+        return resp;
+    }
+    let mut guard = state.todo_tasks.write().unwrap();
+    let list = guard.entry(list_id).or_default();
+    let Some(task) = list
+        .iter_mut()
+        .find(|t| t["id"].as_str() == Some(task_id.as_str()))
+    else {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": { "code": "NotFound", "message": "task not found" } }))).into_response();
+    };
+    if let Some(status) = payload.get("status").and_then(|v| v.as_str()) {
+        task["status"] = Value::String(status.to_string());
+    }
+    Json(task.clone()).into_response()
+}
+
+async fn spawn_mock_outlook_graph_server(token: &str) -> (String, Arc<OutlookMockState>) {
+    let state = Arc::new(OutlookMockState::new(token));
+    let app = Router::new()
+        .route("/v1.0/me/mailFolders", get(outlook_mail_folders_handler))
+        .route(
+            "/v1.0/me/mailFolders/{folder}/messages",
+            get(outlook_folder_messages_handler),
+        )
+        .route(
+            "/v1.0/me/messages/{msg_id}",
+            get(outlook_get_message_handler).patch(outlook_patch_message_handler),
+        )
+        .route("/v1.0/me/sendMail", post(outlook_send_mail_handler))
+        .route(
+            "/v1.0/me/messages/{msg_id}/reply",
+            post(outlook_reply_mail_handler),
+        )
+        .route(
+            "/v1.0/me/messages/{msg_id}/attachments/{att_id}",
+            get(outlook_get_attachment_handler),
+        )
+        .route("/v1.0/me/calendarView", get(outlook_calendar_view_handler))
+        .route("/v1.0/me/events", post(outlook_create_event_handler))
+        .route(
+            "/v1.0/me/events/{event_id}/{action}",
+            post(outlook_rsvp_event_handler),
+        )
+        .route(
+            "/v1.0/me/contacts",
+            get(outlook_contacts_handler).post(outlook_create_contact_handler),
+        )
+        .route("/v1.0/users", get(outlook_directory_users_handler))
+        .route("/v1.0/me/todo/lists", get(outlook_todo_lists_handler))
+        .route(
+            "/v1.0/me/todo/lists/{list_id}/tasks",
+            post(outlook_create_todo_task_handler),
+        )
+        .route(
+            "/v1.0/me/todo/lists/{list_id}/tasks/{task_id}",
+            patch(outlook_patch_todo_task_handler),
+        )
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock Outlook Graph server");
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve mock Outlook Graph");
+    });
+
+    (format!("http://{addr}"), state)
+}
+
+fn build_outlook_graph_client(
+    base_url: &str,
+    download_dir: &std::path::Path,
+    token: &str,
+) -> (AppConfig, GraphClient) {
+    let cfg = build_test_config(base_url, download_dir);
+    let tokens = StoredTokens {
+        access_token: token.to_string(),
+        refresh_token: None,
+        expires_at: chrono::Utc::now().timestamp() + 3600,
+        client_id: cfg.client_id.clone(),
+        tenant_id: cfg.tenant_id.clone(),
+        user_id: Some("me-user-1".to_string()),
+        user_display_name: Some("나(테스터)".to_string()),
+        user_email: Some("tester@contoso.com".to_string()),
+        auth_mode: "pkce".to_string(),
+    };
+    let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+    let graph = GraphClient::new(cfg.clone(), auth)
+        .expect("build Outlook GraphClient")
+        .with_my_user_id("me-user-1");
+    (cfg, graph)
+}
+
+#[tokio::test]
+async fn e2e_mock_graph_outlook_mail() {
+    ensure_isolated_env();
+    let temp = tempfile::tempdir().expect("create mail test tempdir");
+    let db_path = temp.path().join("data").join("cache.db");
+    let download_dir = temp.path().join("downloads");
+    let token = "outlook-mail-tok-2026";
+
+    let (base_url, mock) = spawn_mock_outlook_graph_server(token).await;
+    let (_cfg, graph) = build_outlook_graph_client(&base_url, &download_dir, token);
+    let storage = Storage::open(&db_path).expect("open SQLite storage");
+
+    // 1. Mail folders + Inbox listing
+    let folders = graph.list_mail_folders().await.expect("list_mail_folders");
+    assert_eq!(folders.len(), 2);
+    assert_eq!(folders[0].well_known_name.as_deref(), Some("inbox"));
+    storage
+        .upsert_mail_folders(&folders)
+        .expect("upsert_mail_folders");
+
+    let inbox = graph
+        .list_mail_messages("inbox", 20)
+        .await
+        .expect("list_mail_messages");
+    assert_eq!(inbox.len(), 2);
+    assert_eq!(inbox[0].id, "mail-1");
+    assert!(inbox[0].has_attachments);
+
+    // 2. Get mail message with expanded attachments + download attachment
+    let detail = graph
+        .get_mail_message("mail-1")
+        .await
+        .expect("get_mail_message");
+    assert_eq!(detail.attachments.len(), 1);
+    assert_eq!(detail.attachments[0].name, "architecture-note.txt");
+
+    let downloaded = graph
+        .download_mail_attachment("mail-1", &detail.attachments[0].id, &download_dir)
+        .await
+        .expect("download_mail_attachment");
+    assert!(downloaded.path.exists());
+    assert_eq!(
+        std::fs::read(&downloaded.path).expect("read downloaded mail attachment"),
+        b"Outlook Attachment Payload \xed\x95\x9c\xea\xb8\x80"
+    );
+
+    // 3. send_mail (with file attachment) & reply_mail
+    let attach_path = temp.path().join("release-summary.txt");
+    std::fs::write(&attach_path, b"Release v0.2.0 summary").expect("write mail attachment");
+    graph
+        .send_mail(&OutgoingMail {
+            subject: "v0.2.0 릴리즈 보고".to_string(),
+            body_html: "<p>첨부파일 확인 부탁드립니다.</p>".to_string(),
+            to: vec!["alice@contoso.com".to_string()],
+            cc: vec![],
+            bcc: vec![],
+            importance: Some("high".to_string()),
+            attachments: vec![attach_path],
+            save_to_sent_items: true,
+        })
+        .await
+        .expect("send_mail");
+
+    {
+        let sent = mock.sent_mails.read().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["saveToSentItems"], true);
+        assert_eq!(sent[0]["message"]["subject"], "v0.2.0 릴리즈 보고");
+        assert_eq!(
+            sent[0]["message"]["attachments"][0]["name"],
+            "release-summary.txt"
+        );
+    }
+
+    graph
+        .reply_mail("mail-1", "<p>검토 완료했습니다.</p>", false)
+        .await
+        .expect("reply_mail");
+    assert_eq!(mock.mail_replies.read().unwrap().len(), 1);
+
+    // 4. set_mail_read & set_mail_flag
+    graph
+        .set_mail_read("mail-1", true)
+        .await
+        .expect("set_mail_read");
+    graph
+        .set_mail_flag("mail-1", true)
+        .await
+        .expect("set_mail_flag");
+    let updated_mail = graph
+        .get_mail_message("mail-1")
+        .await
+        .expect("get_mail_message after patch");
+    assert!(updated_mail.is_read);
+    assert!(updated_mail.flagged);
+
+    // 5. SQLite upsert_mail_messages + Korean/English search_mail_messages
+    let mut persisted = inbox;
+    persisted[0] = updated_mail;
+    storage
+        .upsert_mail_messages(&persisted)
+        .expect("upsert_mail_messages");
+
+    let ko_hits = storage
+        .search_mail_messages("아키텍처", None, 10)
+        .expect("Korean trigram search");
+    assert_eq!(ko_hits.len(), 1);
+    assert_eq!(ko_hits[0].id, "mail-1");
+
+    let ko_2char = storage
+        .search_mail_messages("결재", Some("inbox"), 10)
+        .expect("Korean 2-char fallback search");
+    assert_eq!(ko_2char.len(), 1);
+    assert_eq!(ko_2char[0].id, "mail-1");
+
+    let en_hits = storage
+        .search_mail_messages("Kubernetes", None, 10)
+        .expect("English search");
+    assert_eq!(en_hits.len(), 1);
+    assert_eq!(en_hits[0].id, "mail-1");
+
+    let en_mail2 = storage
+        .search_mail_messages("Sprint", None, 10)
+        .expect("English mail-2 search");
+    assert_eq!(en_mail2.len(), 1);
+    assert_eq!(en_mail2[0].id, "mail-2");
+}
+
+#[tokio::test]
+async fn e2e_mock_graph_outlook_calendar() {
+    ensure_isolated_env();
+    let temp = tempfile::tempdir().expect("create calendar test tempdir");
+    let db_path = temp.path().join("data").join("cache.db");
+    let download_dir = temp.path().join("downloads");
+    let token = "outlook-cal-tok-2026";
+
+    let (base_url, mock) = spawn_mock_outlook_graph_server(token).await;
+    let (_cfg, graph) = build_outlook_graph_client(&base_url, &download_dir, token);
+    let storage = Storage::open(&db_path).expect("open SQLite storage");
+
+    // 1. list_calendar_view
+    let initial_events = graph
+        .list_calendar_view("2026-11-15T00:00:00Z", "2026-11-22T00:00:00Z", 50)
+        .await
+        .expect("list_calendar_view");
+    assert_eq!(initial_events.len(), 1);
+    assert_eq!(initial_events[0].id, "ev-seed-1");
+
+    // 2. create_calendar_event with is_online_meeting: true -> Teams joinUrl
+    let created = graph
+        .create_calendar_event(&OutgoingEvent {
+            subject: "v0.2.0 릴리즈 아키텍처 회의".to_string(),
+            start_iso: "2026-11-17T02:00:00".to_string(),
+            end_iso: "2026-11-17T03:00:00".to_string(),
+            time_zone: Some("UTC".to_string()),
+            is_all_day: false,
+            location: Some("Teams 온라인".to_string()),
+            body_html: Some("<p>릴리즈 체크리스트 점검</p>".to_string()),
+            attendees: vec!["alice@contoso.com".to_string()],
+            is_online_meeting: true,
+        })
+        .await
+        .expect("create_calendar_event");
+    assert_eq!(created.id, "ev-created-1");
+    assert!(created.is_online_meeting);
+    assert_eq!(
+        created.online_meeting_url.as_deref(),
+        Some("https://teams.microsoft.com/l/meetup-join/19%3ameeting_v2_e2e/0")
+    );
+
+    // 3. respond_calendar_event("accept")
+    graph
+        .respond_calendar_event("ev-seed-1", "accept", Some("참석하겠습니다"))
+        .await
+        .expect("respond_calendar_event");
+    assert_eq!(mock.calendar_rsvps.read().unwrap().len(), 1);
+    assert_eq!(mock.calendar_rsvps.read().unwrap()[0].1, "accept");
+
+    // 4. SQLite persistence
+    let refreshed = graph
+        .list_calendar_view("2026-11-15T00:00:00Z", "2026-11-22T00:00:00Z", 50)
+        .await
+        .expect("list_calendar_view after rsvp");
+    assert_eq!(refreshed.len(), 2);
+    storage
+        .upsert_calendar_events(&refreshed)
+        .expect("upsert_calendar_events");
+
+    let stored = storage
+        .list_calendar_events(Some("2026-11-15T00:00:00"), Some("2026-11-22T00:00:00"), 20)
+        .expect("list_calendar_events from SQLite");
+    assert_eq!(stored.len(), 2);
+    let stored_seed = stored.iter().find(|e| e.id == "ev-seed-1").unwrap();
+    assert_eq!(stored_seed.response_status, "accepted");
+    let stored_created = stored.iter().find(|e| e.id == "ev-created-1").unwrap();
+    assert_eq!(
+        stored_created.online_meeting_url.as_deref(),
+        Some("https://teams.microsoft.com/l/meetup-join/19%3ameeting_v2_e2e/0")
+    );
+}
+
+#[tokio::test]
+async fn e2e_mock_graph_outlook_contacts_and_todo() {
+    ensure_isolated_env();
+    let temp = tempfile::tempdir().expect("create contacts/todo test tempdir");
+    let db_path = temp.path().join("data").join("cache.db");
+    let download_dir = temp.path().join("downloads");
+    let token = "outlook-contacts-todo-tok-2026";
+
+    let (base_url, _mock) = spawn_mock_outlook_graph_server(token).await;
+    let (_cfg, graph) = build_outlook_graph_client(&base_url, &download_dir, token);
+    let storage = Storage::open(&db_path).expect("open SQLite storage");
+
+    // 1. Contacts: list_contacts, search_contacts_and_directory, create_contact
+    let contacts = graph.list_contacts(20).await.expect("list_contacts");
+    assert_eq!(contacts.len(), 1);
+    assert_eq!(contacts[0].source, "contact");
+
+    let merged = graph
+        .search_contacts_and_directory("김", 20)
+        .await
+        .expect("search_contacts_and_directory");
+    assert!(merged.iter().any(|c| c.source == "contact" && c.primary_email() == Some("kim@contoso.com")));
+    assert!(merged.iter().any(|c| c.source == "directory" && c.primary_email() == Some("younghee.kim@contoso.com")));
+
+    let created_contact = graph
+        .create_contact(&OutgoingContact {
+            display_name: "박민수".to_string(),
+            given_name: Some("민수".to_string()),
+            surname: Some("박".to_string()),
+            email_addresses: vec!["park@contoso.com".to_string()],
+            mobile_phone: Some("010-9999-8888".to_string()),
+            company_name: Some("Contoso".to_string()),
+            job_title: Some("Security Lead".to_string()),
+            department: Some("Security".to_string()),
+            notes: Some("E2E 연락처".to_string()),
+        })
+        .await
+        .expect("create_contact");
+    assert_eq!(created_contact.id, "contact-created-1");
+    assert_eq!(created_contact.primary_email(), Some("park@contoso.com"));
+
+    storage
+        .upsert_contacts(&[created_contact])
+        .expect("upsert_contacts");
+    let stored_contacts = storage
+        .list_contacts(Some("박민수"), 10)
+        .expect("list_contacts from SQLite");
+    assert_eq!(stored_contacts.len(), 1);
+    assert_eq!(stored_contacts[0].id, "contact-created-1");
+
+    // 2. Microsoft To Do: list_todo_lists, create_todo_task, set_todo_task_completed(true)
+    let lists = graph.list_todo_lists().await.expect("list_todo_lists");
+    assert_eq!(lists.len(), 1);
+    assert_eq!(lists[0].id, "list-default");
+    storage
+        .upsert_todo_lists(&lists)
+        .expect("upsert_todo_lists");
+
+    let created_task = graph
+        .create_todo_task(
+            "default",
+            &OutgoingTodoTask {
+                title: "v0.2.0 통합 테스트 검증".to_string(),
+                body_plain: Some("Mail/Cal/Contacts/ToDo E2E".to_string()),
+                due_date_iso: Some("2026-11-18T09:00:00".to_string()),
+                importance: Some("high".to_string()),
+            },
+        )
+        .await
+        .expect("create_todo_task");
+    assert_eq!(created_task.id, "task-created-1");
+    assert!(!created_task.is_completed());
+
+    let completed_task = graph
+        .set_todo_task_completed("default", &created_task.id, true)
+        .await
+        .expect("set_todo_task_completed");
+    assert!(completed_task.is_completed());
+
+    storage
+        .upsert_todo_tasks(std::slice::from_ref(&completed_task))
+        .expect("upsert_todo_tasks");
+    let stored_tasks = storage
+        .list_todo_tasks("list-default", true, 20)
+        .expect("list_todo_tasks from SQLite");
+    assert_eq!(stored_tasks.len(), 1);
+    assert!(stored_tasks[0].is_completed());
+}
+
+#[tokio::test]
+async fn e2e_inline_image_preview_and_self_updater() {
+    // 1. Inline Terminal Image Preview: generate in-memory PNG via image::RgbaImage
+    let img: RgbaImage = ImageBuffer::from_fn(16, 12, |x, y| {
+        Rgba([((x * 16) % 256) as u8, ((y * 20) % 256) as u8, 180, 255])
+    });
+    let mut png_bytes = Vec::new();
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+        .expect("encode RGBA image to PNG");
+
+    let rendered = img_preview::decode_and_render_halfblocks(&png_bytes, 16, 8, (0, 0, 0))
+        .expect("decode_and_render_halfblocks");
+    assert_eq!(rendered.width_px, 16);
+    assert_eq!(rendered.height_px, 12);
+    assert_eq!(rendered.cols, 16);
+    assert_eq!(rendered.rows, 6);
+    assert_eq!(rendered.format_label, "PNG");
+    assert_eq!(rendered.lines.len(), 6);
+    for line in &rendered.lines {
+        assert!(!line.spans.is_empty());
+        assert!(line.spans.iter().all(|s| !s.content.is_empty() && s.content.chars().all(|c| c == '▀')));
+    }
+
+    let ansi_stdout = img_preview::render_ansi_stdout(&png_bytes, 16, 8)
+        .expect("render_ansi_stdout");
+    assert!(!ansi_stdout.trim().is_empty());
+    assert!(
+        ansi_stdout.contains('▀')
+            || ansi_stdout.starts_with("\x1b]")
+            || ansi_stdout.starts_with("\x1b_G"),
+        "expected valid halfblock, iTerm2, or Kitty escape output"
+    );
+
+    // 2. Self-Updater E2E against mock GitHub Releases server
+    #[derive(Clone)]
+    struct MockGhState {
+        base_url: String,
+        asset_name: String,
+        asset_bytes: Vec<u8>,
+        sums_text: String,
+    }
+
+    let asset_name = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => "teams.exe".to_string(),
+        ("windows", "aarch64") => "teams-9.9.9-aarch64-pc-windows-msvc.zip".to_string(),
+        ("macos", "x86_64") => "teams-9.9.9-x86_64-apple-darwin.tar.gz".to_string(),
+        ("macos", "aarch64") => "teams-9.9.9-aarch64-apple-darwin.tar.gz".to_string(),
+        ("linux", "x86_64") => "teams-9.9.9-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+        ("linux", "aarch64") => "teams-9.9.9-aarch64-unknown-linux-gnu.tar.gz".to_string(),
+        _ => "teams".to_string(),
+    };
+    let asset_bytes = b"MOCK-RELEASE-BINARY-V9.9.9".to_vec();
+    let digest = hex::encode(Sha256::digest(&asset_bytes));
+    let sums_text = format!("{digest}  {asset_name}\n");
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock GitHub server");
+    let addr = listener.local_addr().unwrap();
+    let gh_base = format!("http://{addr}");
+
+    let gh_state = MockGhState {
+        base_url: gh_base.clone(),
+        asset_name: asset_name.clone(),
+        asset_bytes,
+        sums_text,
+    };
+
+    let gh_app = Router::new()
+        .route(
+            "/repos/shinick-dev/teams/releases/latest",
+            get(|State(st): State<MockGhState>| async move {
+                Json(json!({
+                    "tag_name": "v9.9.9",
+                    "html_url": format!("{}/shinick-dev/teams/releases/tag/v9.9.9", st.base_url),
+                    "assets": [
+                        {
+                            "name": st.asset_name,
+                            "size": st.asset_bytes.len() as u64,
+                            "url": format!("{}/assets/binary", st.base_url),
+                            "browser_download_url": format!("{}/download/{}", st.base_url, st.asset_name)
+                        },
+                        {
+                            "name": "SHA256SUMS.txt",
+                            "size": st.sums_text.len() as u64,
+                            "url": format!("{}/assets/sums", st.base_url),
+                            "browser_download_url": format!("{}/download/SHA256SUMS.txt", st.base_url)
+                        }
+                    ]
+                }))
+            }),
+        )
+        .route(
+            "/assets/sums",
+            get(|State(st): State<MockGhState>| async move { (StatusCode::OK, st.sums_text) }),
+        )
+        .route(
+            "/download/SHA256SUMS.txt",
+            get(|State(st): State<MockGhState>| async move { (StatusCode::OK, st.sums_text) }),
+        )
+        .route(
+            "/assets/binary",
+            get(|State(st): State<MockGhState>| async move { (StatusCode::OK, st.asset_bytes) }),
+        )
+        .route(
+            &format!("/download/{asset_name}"),
+            get(|State(st): State<MockGhState>| async move { (StatusCode::OK, st.asset_bytes) }),
+        )
+        .with_state(gh_state);
+
+    let gh_server = tokio::spawn(async move {
+        axum::serve(listener, gh_app)
+            .await
+            .expect("serve mock GitHub");
+    });
+
+    let result = updater::check_or_apply_update_with_api_base(
+        &gh_base,
+        "shinick-dev/teams",
+        true,
+        false,
+    )
+    .await
+    .expect("check_or_apply_update_with_api_base");
+
+    assert_eq!(result.current_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(result.latest_version, "9.9.9");
+    assert!(result.update_available);
+    assert!(!result.updated);
+    assert_eq!(result.asset_name.as_deref(), Some(asset_name.as_str()));
+    assert!(result.release_url.contains("v9.9.9"));
+
+    gh_server.abort();
 }

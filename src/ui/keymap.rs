@@ -4,7 +4,15 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::ui::{action::Action, app::Focus, overlays::OverlayKind};
+use crate::{
+    config::Persona,
+    ui::{
+        action::Action,
+        app::Focus,
+        nav_pane::{TAB_CALENDAR, TAB_CONTACTS, TAB_MAIL, TAB_TODO},
+        overlays::OverlayKind,
+    },
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Key {
@@ -42,9 +50,17 @@ impl Keymap {
         map.bind(Some(Focus::Overlay), Esc, M::NONE, Action::CloseOverlay);
         map.bind(Some(Focus::Overlay), Up, M::NONE, Action::MoveUp);
         map.bind(Some(Focus::Overlay), Down, M::NONE, Action::MoveDown);
-        map.bind(Some(Focus::Overlay), Tab, M::NONE, Action::MoveDown);
-        map.bind(Some(Focus::Overlay), BackTab, M::SHIFT, Action::MoveUp);
+        map.bind(Some(Focus::Overlay), Left, M::NONE, Action::CursorLeft);
+        map.bind(Some(Focus::Overlay), Right, M::NONE, Action::CursorRight);
+        map.bind(Some(Focus::Overlay), Tab, M::NONE, Action::Tab);
+        map.bind(Some(Focus::Overlay), BackTab, M::SHIFT, Action::PrevFocus);
         map.bind(Some(Focus::Overlay), Enter, M::NONE, Action::Activate);
+        map.bind(Some(Focus::Overlay), Enter, M::CONTROL, Action::OverlaySubmit);
+        map.bind(Some(Focus::Overlay), Char('s'), M::CONTROL, Action::OverlaySubmit);
+        map.bind(Some(Focus::Overlay), Enter, M::SHIFT, Action::InsertNewline);
+        map.bind(Some(Focus::Overlay), Enter, M::ALT, Action::InsertNewline);
+        map.bind(Some(Focus::Overlay), Char('j'), M::CONTROL, Action::InsertNewline);
+        map.bind(Some(Focus::Overlay), Char('v'), M::CONTROL, Action::PasteClipboard);
         map.bind(Some(Focus::Overlay), Backspace, M::NONE, Action::Backspace);
         map.bind(
             Some(Focus::Overlay),
@@ -202,6 +218,13 @@ impl Keymap {
         map.bind(any, Char('1'), M::CONTROL, Action::SelectNavTab(0));
         map.bind(any, Char('2'), M::CONTROL, Action::SelectNavTab(1));
         map.bind(any, Char('3'), M::CONTROL, Action::SelectNavTab(2));
+        map.bind(any, Char('4'), M::CONTROL, Action::SelectNavTab(3));
+        map.bind(any, Char('5'), M::CONTROL, Action::SelectNavTab(4));
+        map.bind(any, Char('6'), M::CONTROL, Action::SelectNavTab(5));
+        map.bind(any, Char('7'), M::CONTROL, Action::SelectNavTab(6));
+        map.bind(any, Char('t'), M::ALT, Action::SwitchPersona(Persona::Teams));
+        map.bind(any, Char('o'), M::ALT, Action::SwitchPersona(Persona::Outlook));
+        map.bind(any, Char('v'), M::NONE, Action::OpenImagePreview);
 
         // Overlays & Teams actions
         map.bind(
@@ -279,6 +302,23 @@ impl Keymap {
         self.resolve_with(focus, key, true)
     }
 
+    pub fn resolve_for_tab(
+        &self,
+        focus: Focus,
+        active_nav_tab: usize,
+        key: KeyEvent,
+    ) -> Option<Action> {
+        if key.kind != KeyEventKind::Press {
+            return None;
+        }
+        if matches!(focus, Focus::Nav | Focus::Chat) {
+            if let Some(tab_act) = resolve_outlook_tab_key(active_nav_tab, key) {
+                return Some(tab_act);
+            }
+        }
+        self.resolve_with(focus, key, true)
+    }
+
     pub fn resolve_scoped(&self, focus: Focus, key: KeyEvent) -> Option<Action> {
         self.resolve_with(focus, key, false)
     }
@@ -294,6 +334,55 @@ impl Keymap {
                     && key_matches(binding.key, key)
             })
             .map(|binding| binding.action.clone())
+    }
+}
+
+fn resolve_outlook_tab_key(active_nav_tab: usize, key: KeyEvent) -> Option<Action> {
+    use KeyCode::*;
+    if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+        return None;
+    }
+    match active_nav_tab {
+        TAB_MAIL => match key.code {
+            Char('c') => Some(Action::OpenMailComposeNew),
+            Char('r') => Some(Action::OpenMailReply { reply_all: false }),
+            Char('R') => Some(Action::OpenMailReply { reply_all: true }),
+            Char('f') => Some(Action::OpenMailForward),
+            Char('u') => Some(Action::MailToggleRead),
+            Char('g') => Some(Action::MailToggleFlag),
+            Char('a') => Some(Action::MailArchive),
+            Char('d') => Some(Action::MailDownloadAttachment),
+            Delete => Some(Action::MailDeleteRequest),
+            _ => None,
+        },
+        TAB_CALENDAR => match key.code {
+            Char('j') | Char('o') => Some(Action::JoinCalendarMeeting),
+            Char('n') => Some(Action::OpenOverlay(OverlayKind::EventCreate)),
+            Char('y') => Some(Action::RespondCalendarEvent("accept".to_string())),
+            Char('t') => Some(Action::RespondCalendarEvent(
+                "tentativelyAccept".to_string(),
+            )),
+            Char('x') => Some(Action::RespondCalendarEvent("decline".to_string())),
+            Delete => Some(Action::DeleteCalendarEventRequest),
+            _ => None,
+        },
+        TAB_CONTACTS => match key.code {
+            Char('m') => Some(Action::ContactSendMail),
+            Char('c') => Some(Action::ContactStartChat),
+            Char('n') => Some(Action::OpenOverlay(OverlayKind::ContactCreate)),
+            Delete => Some(Action::DeleteContactRequest),
+            _ => None,
+        },
+        TAB_TODO => match key.code {
+            Char(' ') | Char('x') => Some(Action::TodoToggleSelected),
+            Char('n') => Some(Action::TodoFocusInput),
+            Char('c') => Some(Action::TodoToggleShowCompleted),
+            Char('[') => Some(Action::TodoCycleList(-1)),
+            Char(']') => Some(Action::TodoCycleList(1)),
+            Delete => Some(Action::TodoDeleteRequest),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

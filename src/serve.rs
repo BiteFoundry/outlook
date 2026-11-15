@@ -9,7 +9,7 @@ use axum::{
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,10 @@ use crate::{
     cli,
     config::AppConfig,
     graph::GraphClient,
-    models::{ConversationKind, ConversationTarget, MentionInfo},
+    models::{
+        ConversationKind, ConversationTarget, MentionInfo, OutgoingContact, OutgoingEvent,
+        OutgoingMail, OutgoingTodoTask,
+    },
     parser, resolver,
     storage::Storage,
     sync::{self, SyncCommand},
@@ -235,6 +238,202 @@ pub struct SetPresenceBody {
     pub expiration_mins: Option<u32>,
 }
 
+// --- Outlook Mail, Calendar, Contacts, To Do Query & Body DTOs ---
+
+#[derive(Debug, Default, Deserialize)]
+pub struct RefreshQuery {
+    #[serde(default)]
+    pub refresh: bool,
+    #[serde(default)]
+    pub offline: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct MailMessagesQuery {
+    #[serde(default)]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub unread: bool,
+    #[serde(default)]
+    pub refresh: bool,
+    #[serde(default)]
+    pub offline: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct OfflineQuery {
+    #[serde(default)]
+    pub offline: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SendMailBody {
+    pub to: Vec<String>,
+    #[serde(default)]
+    pub cc: Vec<String>,
+    #[serde(default)]
+    pub bcc: Vec<String>,
+    pub subject: String,
+    pub markdown: String,
+    #[serde(default)]
+    pub attachments: Vec<String>,
+    #[serde(default)]
+    pub important: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReplyMailBody {
+    pub markdown: String,
+    #[serde(default)]
+    pub reply_all: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ForwardMailBody {
+    pub to: Vec<String>,
+    #[serde(default)]
+    pub markdown: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PatchMailBody {
+    #[serde(default)]
+    pub is_read: Option<bool>,
+    #[serde(default)]
+    pub flagged: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MoveMailBody {
+    pub destination_folder: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct MailAttachmentDownloadBody {
+    #[serde(default)]
+    pub out_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MailSearchQuery {
+    pub q: String,
+    #[serde(default)]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub remote: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct CalendarEventsQuery {
+    #[serde(default)]
+    pub start: Option<String>,
+    #[serde(default)]
+    pub end: Option<String>,
+    #[serde(default)]
+    pub days: Option<i64>,
+    #[serde(default)]
+    pub offline: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateCalendarEventBody {
+    pub subject: String,
+    pub start_iso: String,
+    pub end_iso: String,
+    #[serde(default)]
+    pub time_zone: Option<String>,
+    #[serde(default)]
+    pub location: Option<String>,
+    #[serde(default)]
+    pub markdown: Option<String>,
+    #[serde(default)]
+    pub attendees: Vec<String>,
+    #[serde(default)]
+    pub is_online_meeting: bool,
+    #[serde(default)]
+    pub is_all_day: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RsvpEventBody {
+    pub response: String,
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ContactsQuery {
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub offline: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateContactBody {
+    pub display_name: String,
+    #[serde(default)]
+    pub given_name: Option<String>,
+    #[serde(default)]
+    pub surname: Option<String>,
+    #[serde(default)]
+    pub email_addresses: Vec<String>,
+    #[serde(default)]
+    pub mobile_phone: Option<String>,
+    #[serde(default)]
+    pub company_name: Option<String>,
+    #[serde(default)]
+    pub job_title: Option<String>,
+    #[serde(default)]
+    pub department: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TodoListsQuery {
+    #[serde(default)]
+    pub refresh: bool,
+    #[serde(default)]
+    pub offline: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TodoTasksQuery {
+    #[serde(default = "default_true")]
+    pub include_completed: bool,
+    #[serde(default)]
+    pub refresh: bool,
+    #[serde(default)]
+    pub offline: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTodoTaskBody {
+    pub title: String,
+    #[serde(default)]
+    pub body_plain: Option<String>,
+    #[serde(default)]
+    pub due_date_iso: Option<String>,
+    #[serde(default)]
+    pub importance: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PatchTodoTaskBody {
+    pub completed: bool,
+}
+
 /// Build the `axum::Router` for the local HTTP JSON API.
 pub fn build_router(
     config: AppConfig,
@@ -280,6 +479,44 @@ pub fn build_router(
         .route("/conversations/{key}/members", get(list_members))
         .route("/search", get(search))
         .route("/presence", get(get_presence).post(set_presence))
+        // Outlook Mail
+        .route("/mail/folders", get(list_mail_folders))
+        .route("/mail/messages", get(list_mail_messages))
+        .route(
+            "/mail/messages/{id}",
+            get(get_mail_message)
+                .patch(patch_mail_message)
+                .delete(delete_mail_message),
+        )
+        .route("/mail/send", post(send_mail))
+        .route("/mail/messages/{id}/reply", post(reply_mail))
+        .route("/mail/messages/{id}/forward", post(forward_mail))
+        .route("/mail/messages/{id}/move", post(move_mail_message))
+        .route(
+            "/mail/messages/{id}/attachments/{att_id}/download",
+            post(download_mail_attachment),
+        )
+        .route("/mail/search", get(search_mail))
+        // Outlook Calendar
+        .route(
+            "/calendar/events",
+            get(list_calendar_events).post(create_calendar_event),
+        )
+        .route("/calendar/events/{id}/rsvp", post(rsvp_calendar_event))
+        .route("/calendar/events/{id}", delete(delete_calendar_event))
+        // Outlook Contacts
+        .route("/contacts", get(list_contacts).post(create_contact))
+        .route("/contacts/{id}", delete(delete_contact))
+        // Microsoft To Do
+        .route("/todo/lists", get(list_todo_lists))
+        .route(
+            "/todo/lists/{list_id}/tasks",
+            get(list_todo_tasks).post(create_todo_task),
+        )
+        .route(
+            "/todo/lists/{list_id}/tasks/{task_id}",
+            patch(patch_todo_task).delete(delete_todo_task),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -298,6 +535,7 @@ pub async fn run(
     let sync_ctl =
         sync::spawn_sync_engine(config.clone(), graph.clone(), storage.clone(), event_tx);
     sync_ctl.request(SyncCommand::RefreshConversations);
+    sync_ctl.request(SyncCommand::RefreshOutlook);
 
     let app = build_router(config, graph, storage, opts.token);
 
@@ -860,6 +1098,680 @@ async fn set_presence(
     })))
 }
 
+// ---------------------------------------------------------------------------
+// Outlook Mail HTTP handlers
+// ---------------------------------------------------------------------------
+
+async fn list_mail_folders(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<RefreshQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let cached = state.storage.list_mail_folders()?;
+    let folders = if !query.offline && (query.refresh || cached.is_empty()) {
+        let fetched = state.graph.list_mail_folders().await?;
+        state.storage.upsert_mail_folders(&fetched)?;
+        let stored = state.storage.list_mail_folders()?;
+        if stored.is_empty() {
+            fetched
+        } else {
+            stored
+        }
+    } else {
+        cached
+    };
+    Ok(Json(json!({ "folders": folders })))
+}
+
+async fn list_mail_messages(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<MailMessagesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = cli::clamp_limit(query.limit.unwrap_or(30));
+    let folder_arg = query
+        .folder
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("inbox");
+    let folder_id =
+        cli::resolve_mail_folder_id(&state.storage, &state.graph, folder_arg, query.offline)
+            .await?;
+
+    let cached = state.storage.list_mail_messages(Some(&folder_id), limit)?;
+    let mut messages = if !query.offline && (query.refresh || cached.is_empty()) {
+        let fetched = state.graph.list_mail_messages(&folder_id, limit).await?;
+        state.storage.upsert_mail_messages(&fetched)?;
+        let stored = state.storage.list_mail_messages(Some(&folder_id), limit)?;
+        if stored.is_empty() {
+            fetched
+        } else {
+            stored
+        }
+    } else {
+        cached
+    };
+
+    if query.unread {
+        messages.retain(|m| !m.is_read);
+    }
+    messages.truncate(limit);
+
+    Ok(Json(json!({
+        "folder": folder_id,
+        "messages": messages,
+    })))
+}
+
+async fn get_mail_message(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<OfflineQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let msg = if query.offline {
+        state
+            .storage
+            .get_mail_message(&id)?
+            .ok_or_else(|| ApiError::not_found(format!("mail message not found in cache: {id}")))?
+    } else {
+        let fetched = state.graph.get_mail_message(&id).await?;
+        let _ = state
+            .storage
+            .upsert_mail_messages(std::slice::from_ref(&fetched));
+        fetched
+    };
+    Ok(Json(json!({ "message": msg })))
+}
+
+async fn send_mail(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SendMailBody>,
+) -> Result<Json<Value>, ApiError> {
+    let to: Vec<String> = body
+        .to
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if to.is_empty() {
+        return Err(ApiError::bad_request("to must not be empty"));
+    }
+    if body.subject.trim().is_empty() {
+        return Err(ApiError::bad_request("subject must not be empty"));
+    }
+    if body.markdown.trim().is_empty() {
+        return Err(ApiError::bad_request("markdown must not be empty"));
+    }
+
+    let mut attachments = Vec::with_capacity(body.attachments.len());
+    for raw in &body.attachments {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let p = PathBuf::from(trimmed);
+        if !p.exists() || !p.is_file() {
+            return Err(ApiError::bad_request(format!(
+                "attachment file does not exist on host: {}",
+                p.display()
+            )));
+        }
+        attachments.push(p);
+    }
+
+    let body_html =
+        parser::compile_outgoing_markdown(&body.markdown, None, vec![], vec![], vec![], None)
+            .body_html;
+
+    let mail = OutgoingMail {
+        subject: body.subject.clone(),
+        body_html,
+        to: to.clone(),
+        cc: body.cc,
+        bcc: body.bcc,
+        importance: if body.important {
+            Some("high".to_string())
+        } else {
+            None
+        },
+        attachments,
+        save_to_sent_items: true,
+    };
+    state.graph.send_mail(&mail).await?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "to": to,
+        "subject": body.subject,
+    })))
+}
+
+async fn reply_mail(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ReplyMailBody>,
+) -> Result<Json<Value>, ApiError> {
+    if body.markdown.trim().is_empty() {
+        return Err(ApiError::bad_request("markdown must not be empty"));
+    }
+    let html =
+        parser::compile_outgoing_markdown(&body.markdown, None, vec![], vec![], vec![], None)
+            .body_html;
+    state
+        .graph
+        .reply_mail(&id, &html, body.reply_all)
+        .await?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "message_id": id,
+        "reply_all": body.reply_all,
+    })))
+}
+
+async fn forward_mail(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ForwardMailBody>,
+) -> Result<Json<Value>, ApiError> {
+    let to: Vec<String> = body
+        .to
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if to.is_empty() {
+        return Err(ApiError::bad_request("to must not be empty"));
+    }
+    let html = if body.markdown.trim().is_empty() {
+        String::new()
+    } else {
+        parser::compile_outgoing_markdown(&body.markdown, None, vec![], vec![], vec![], None)
+            .body_html
+    };
+    state.graph.forward_mail(&id, &to, &html).await?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "message_id": id,
+        "to": to,
+    })))
+}
+
+async fn patch_mail_message(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<PatchMailBody>,
+) -> Result<Json<Value>, ApiError> {
+    if body.is_read.is_none() && body.flagged.is_none() {
+        return Err(ApiError::bad_request(
+            "at least one of is_read or flagged must be provided",
+        ));
+    }
+    if let Some(is_read) = body.is_read {
+        state.graph.set_mail_read(&id, is_read).await?;
+    }
+    if let Some(flagged) = body.flagged {
+        state.graph.set_mail_flag(&id, flagged).await?;
+    }
+    if let Ok(Some(mut cached)) = state.storage.get_mail_message(&id) {
+        if let Some(is_read) = body.is_read {
+            cached.is_read = is_read;
+        }
+        if let Some(flagged) = body.flagged {
+            cached.flagged = flagged;
+        }
+        let _ = state.storage.upsert_mail_messages(&[cached]);
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "message_id": id,
+        "is_read": body.is_read,
+        "flagged": body.flagged,
+    })))
+}
+
+async fn move_mail_message(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<MoveMailBody>,
+) -> Result<Json<Value>, ApiError> {
+    let dest = body.destination_folder.trim();
+    if dest.is_empty() {
+        return Err(ApiError::bad_request("destination_folder must not be empty"));
+    }
+    let folder_id = cli::resolve_mail_folder_id(&state.storage, &state.graph, dest, false).await?;
+    let moved = state.graph.move_mail_message(&id, &folder_id).await?;
+    let _ = state
+        .storage
+        .upsert_mail_messages(std::slice::from_ref(&moved));
+
+    Ok(Json(json!({
+        "ok": true,
+        "message": moved,
+    })))
+}
+
+async fn delete_mail_message(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    state.graph.delete_mail_message(&id).await?;
+    let _ = state.storage.delete_mail_messages_by_ids(&[id.clone()]);
+    Ok(Json(json!({
+        "ok": true,
+        "message_id": id,
+    })))
+}
+
+async fn download_mail_attachment(
+    State(state): State<Arc<AppState>>,
+    Path((id, att_id)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let parsed: MailAttachmentDownloadBody = if body.iter().all(u8::is_ascii_whitespace) {
+        MailAttachmentDownloadBody::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| ApiError::bad_request(format!("invalid JSON body: {e}")))?
+    };
+
+    let dest_dir = parsed
+        .out_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state.config.resolved_download_dir());
+
+    let downloaded = state
+        .graph
+        .download_mail_attachment(&id, &att_id, &dest_dir)
+        .await?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "path": downloaded.path,
+        "file_name": downloaded.file_name,
+        "bytes_written": downloaded.bytes_written,
+    })))
+}
+
+async fn search_mail(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<MailSearchQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let q = query.q.trim();
+    if q.is_empty() {
+        return Err(ApiError::bad_request("q must not be empty"));
+    }
+    let limit = cli::clamp_limit(query.limit.unwrap_or(30));
+    let folder_filter = match query.folder.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(f) => {
+            Some(cli::resolve_mail_folder_id(&state.storage, &state.graph, f, !query.remote).await?)
+        }
+        None => None,
+    };
+
+    let hits = state
+        .storage
+        .search_mail_messages(q, folder_filter.as_deref(), limit)?;
+    let remote = if query.remote {
+        let msgs = state.graph.search_mail_remote(q, limit).await?;
+        let _ = state.storage.upsert_mail_messages(&msgs);
+        msgs
+    } else {
+        Vec::new()
+    };
+
+    Ok(Json(json!({
+        "query": q,
+        "hits": hits,
+        "remote": remote,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Outlook Calendar HTTP handlers
+// ---------------------------------------------------------------------------
+
+async fn list_calendar_events(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<CalendarEventsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = cli::clamp_limit(query.limit.unwrap_or(50));
+    let (start_iso, end_iso) = cli::default_calendar_window(
+        query.start.as_deref(),
+        query.end.as_deref(),
+        query.days.unwrap_or(7),
+    )
+    .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+
+    let events = if query.offline {
+        state.storage.list_calendar_events(
+            query.start.as_deref().map(|_| start_iso.as_str()),
+            query.end.as_deref().map(|_| end_iso.as_str()),
+            limit,
+        )?
+    } else {
+        let fetched = state
+            .graph
+            .list_calendar_view(&start_iso, &end_iso, limit)
+            .await?;
+        let _ = state.storage.upsert_calendar_events(&fetched);
+        fetched
+    };
+
+    Ok(Json(json!({
+        "start": start_iso,
+        "end": end_iso,
+        "events": events,
+    })))
+}
+
+async fn create_calendar_event(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateCalendarEventBody>,
+) -> Result<Json<Value>, ApiError> {
+    if body.subject.trim().is_empty() {
+        return Err(ApiError::bad_request("subject must not be empty"));
+    }
+    let start_iso = cli::normalize_datetime_iso(&body.start_iso)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    let end_iso = cli::normalize_datetime_iso(&body.end_iso)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    let body_html = body
+        .markdown
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|md| {
+            parser::compile_outgoing_markdown(md, None, vec![], vec![], vec![], None).body_html
+        });
+
+    let outgoing = OutgoingEvent {
+        subject: body.subject,
+        start_iso,
+        end_iso,
+        time_zone: body.time_zone,
+        is_all_day: body.is_all_day,
+        location: body.location,
+        body_html,
+        attendees: body.attendees,
+        is_online_meeting: body.is_online_meeting,
+    };
+    let created = state.graph.create_calendar_event(&outgoing).await?;
+    let _ = state
+        .storage
+        .upsert_calendar_events(std::slice::from_ref(&created));
+
+    Ok(Json(json!({
+        "ok": true,
+        "event": created,
+    })))
+}
+
+async fn rsvp_calendar_event(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<RsvpEventBody>,
+) -> Result<Json<Value>, ApiError> {
+    let normalized = cli::normalize_rsvp_response(&body.response)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    state
+        .graph
+        .respond_calendar_event(&id, normalized, body.comment.as_deref())
+        .await?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "event_id": id,
+        "response": normalized,
+    })))
+}
+
+async fn delete_calendar_event(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    state.graph.delete_calendar_event(&id).await?;
+    let _ = state.storage.delete_calendar_event(&id);
+    Ok(Json(json!({
+        "ok": true,
+        "event_id": id,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Outlook Contacts HTTP handlers
+// ---------------------------------------------------------------------------
+
+async fn list_contacts(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ContactsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = cli::clamp_limit(query.limit.unwrap_or(50));
+    let q = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let contacts = if query.offline {
+        state.storage.list_contacts(q, limit)?
+    } else if let Some(q_str) = q {
+        let fetched = state
+            .graph
+            .search_contacts_and_directory(q_str, limit)
+            .await?;
+        let _ = state.storage.upsert_contacts(&fetched);
+        fetched
+    } else {
+        let fetched = state.graph.list_contacts(limit).await?;
+        let _ = state.storage.upsert_contacts(&fetched);
+        fetched
+    };
+
+    Ok(Json(json!({ "contacts": contacts })))
+}
+
+async fn create_contact(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateContactBody>,
+) -> Result<Json<Value>, ApiError> {
+    if body.display_name.trim().is_empty() {
+        return Err(ApiError::bad_request("display_name must not be empty"));
+    }
+    let outgoing = OutgoingContact {
+        display_name: body.display_name,
+        given_name: body.given_name,
+        surname: body.surname,
+        email_addresses: body.email_addresses,
+        mobile_phone: body.mobile_phone,
+        company_name: body.company_name,
+        job_title: body.job_title,
+        department: body.department,
+        notes: body.notes,
+    };
+    let created = state.graph.create_contact(&outgoing).await?;
+    let _ = state
+        .storage
+        .upsert_contacts(std::slice::from_ref(&created));
+
+    Ok(Json(json!({
+        "ok": true,
+        "contact": created,
+    })))
+}
+
+async fn delete_contact(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    state.graph.delete_contact(&id).await?;
+    let _ = state.storage.delete_contact(&id);
+    Ok(Json(json!({
+        "ok": true,
+        "contact_id": id,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Microsoft To Do HTTP handlers
+// ---------------------------------------------------------------------------
+
+async fn list_todo_lists(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<TodoListsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let cached = state.storage.list_todo_lists()?;
+    let lists = if !query.offline && (query.refresh || cached.is_empty()) {
+        let fetched = state.graph.list_todo_lists().await?;
+        state.storage.upsert_todo_lists(&fetched)?;
+        let stored = state.storage.list_todo_lists()?;
+        if stored.is_empty() {
+            fetched
+        } else {
+            stored
+        }
+    } else {
+        cached
+    };
+    Ok(Json(json!({ "lists": lists })))
+}
+
+async fn list_todo_tasks(
+    State(state): State<Arc<AppState>>,
+    Path(list_id): Path<String>,
+    Query(query): Query<TodoTasksQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = cli::clamp_limit(query.limit.unwrap_or(50));
+    let resolved_list_id =
+        cli::resolve_todo_list_id(&state.storage, &state.graph, &list_id, query.offline)
+            .await
+            .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
+
+    let cached =
+        state
+            .storage
+            .list_todo_tasks(&resolved_list_id, query.include_completed, limit)?;
+    let mut tasks = if !query.offline && (query.refresh || cached.is_empty()) {
+        let fetched = state
+            .graph
+            .list_todo_tasks(&resolved_list_id, query.include_completed, limit)
+            .await?;
+        state.storage.upsert_todo_tasks(&fetched)?;
+        let stored =
+            state
+                .storage
+                .list_todo_tasks(&resolved_list_id, query.include_completed, limit)?;
+        if stored.is_empty() {
+            fetched
+        } else {
+            stored
+        }
+    } else {
+        cached
+    };
+    tasks.truncate(limit);
+
+    Ok(Json(json!({
+        "list_id": resolved_list_id,
+        "tasks": tasks,
+    })))
+}
+
+async fn create_todo_task(
+    State(state): State<Arc<AppState>>,
+    Path(list_id): Path<String>,
+    Json(body): Json<CreateTodoTaskBody>,
+) -> Result<Json<Value>, ApiError> {
+    if body.title.trim().is_empty() {
+        return Err(ApiError::bad_request("title must not be empty"));
+    }
+    let due_date_iso = body
+        .due_date_iso
+        .as_deref()
+        .map(cli::normalize_todo_due_iso)
+        .transpose()
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    let importance = body
+        .importance
+        .as_deref()
+        .map(cli::normalize_todo_importance)
+        .transpose()
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?
+        .map(str::to_string);
+
+    let resolved_list_id =
+        cli::resolve_todo_list_id(&state.storage, &state.graph, &list_id, false)
+            .await
+            .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
+
+    let outgoing = OutgoingTodoTask {
+        title: body.title,
+        body_plain: body.body_plain,
+        due_date_iso,
+        importance,
+    };
+    let created = state
+        .graph
+        .create_todo_task(&resolved_list_id, &outgoing)
+        .await?;
+    let _ = state
+        .storage
+        .upsert_todo_tasks(std::slice::from_ref(&created));
+
+    Ok(Json(json!({
+        "ok": true,
+        "task": created,
+    })))
+}
+
+async fn patch_todo_task(
+    State(state): State<Arc<AppState>>,
+    Path((list_id, task_id)): Path<(String, String)>,
+    Json(body): Json<PatchTodoTaskBody>,
+) -> Result<Json<Value>, ApiError> {
+    let resolved_list_id =
+        cli::resolve_todo_list_id(&state.storage, &state.graph, &list_id, false)
+            .await
+            .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
+    let updated = state
+        .graph
+        .set_todo_task_completed(&resolved_list_id, &task_id, body.completed)
+        .await?;
+    let _ = state
+        .storage
+        .upsert_todo_tasks(std::slice::from_ref(&updated));
+
+    Ok(Json(json!({
+        "ok": true,
+        "task": updated,
+    })))
+}
+
+async fn delete_todo_task(
+    State(state): State<Arc<AppState>>,
+    Path((list_id, task_id)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let resolved_list_id =
+        cli::resolve_todo_list_id(&state.storage, &state.graph, &list_id, false)
+            .await
+            .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
+    state
+        .graph
+        .delete_todo_task(&resolved_list_id, &task_id)
+        .await?;
+    let _ = state.storage.delete_todo_task(&task_id);
+
+    Ok(Json(json!({
+        "ok": true,
+        "list_id": resolved_list_id,
+        "task_id": task_id,
+    })))
+}
+
 fn parse_kind_filter(raw: &str) -> Result<ConversationKind, ApiError> {
     match raw.to_ascii_lowercase().as_str() {
         "oneonone" | "one_on_one" | "1:1" => Ok(ConversationKind::OneOnOne),
@@ -1123,5 +2035,105 @@ mod tests {
         let search_body: Value = res.json().await.unwrap();
         assert_eq!(search_body["hits"].as_array().unwrap().len(), 1);
         assert_eq!(search_body["hits"][0]["msg_id"], "m1");
+    }
+
+    #[tokio::test]
+    async fn outlook_routes_require_bearer_and_validate_inputs() {
+        let base = spawn_test_server(Some("tok-123".to_string())).await;
+        let client = reqwest::Client::new();
+
+        // Bearer token enforced on new Outlook endpoints
+        for path in [
+            "/mail/folders",
+            "/mail/messages?offline=true",
+            "/calendar/events?offline=true",
+            "/contacts?offline=true",
+            "/todo/lists?offline=true",
+        ] {
+            let res = client.get(format!("{base}{path}")).send().await.unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+
+        // Offline GET endpoints succeed with valid token
+        for (path, key) in [
+            ("/mail/folders?offline=true", "folders"),
+            ("/mail/messages?offline=true", "messages"),
+            ("/calendar/events?offline=true", "events"),
+            ("/contacts?offline=true", "contacts"),
+            ("/todo/lists?offline=true", "lists"),
+        ] {
+            let res = client
+                .get(format!("{base}{path}"))
+                .bearer_auth("tok-123")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{path}");
+            let body: Value = res.json().await.unwrap();
+            assert!(body[key].is_array(), "{path}: {body}");
+        }
+
+        // Validation errors -> 400
+        let res = client
+            .post(format!("{base}/mail/send"))
+            .bearer_auth("tok-123")
+            .json(&json!({ "to": [], "subject": "Hi", "markdown": "Body" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let res = client
+            .patch(format!("{base}/mail/messages/m1"))
+            .bearer_auth("tok-123")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let res = client
+            .get(format!("{base}/mail/search?q=%20%20"))
+            .bearer_auth("tok-123")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let res = client
+            .post(format!("{base}/calendar/events/ev1/rsvp"))
+            .bearer_auth("tok-123")
+            .json(&json!({ "response": "maybe" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let res = client
+            .post(format!("{base}/calendar/events"))
+            .bearer_auth("tok-123")
+            .json(&json!({ "subject": " ", "start_iso": "2026-11-16T09:00:00Z", "end_iso": "2026-11-16T10:00:00Z" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let res = client
+            .post(format!("{base}/contacts"))
+            .bearer_auth("tok-123")
+            .json(&json!({ "display_name": "  " }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let res = client
+            .post(format!("{base}/todo/lists/default/tasks"))
+            .bearer_auth("tok-123")
+            .json(&json!({ "title": "  " }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 }

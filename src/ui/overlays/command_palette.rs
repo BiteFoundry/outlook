@@ -39,9 +39,59 @@ fn palette_items() -> Vec<PaletteItem> {
             action: Action::SelectNavTab(2),
         },
         PaletteItem {
+            label: "메일(Outlook) 탭으로 이동",
+            shortcut: "Ctrl+4",
+            action: Action::SelectNavTab(3),
+        },
+        PaletteItem {
+            label: "캘린더 탭으로 이동",
+            shortcut: "Ctrl+5",
+            action: Action::SelectNavTab(4),
+        },
+        PaletteItem {
+            label: "연락처 탭으로 이동",
+            shortcut: "Ctrl+6",
+            action: Action::SelectNavTab(5),
+        },
+        PaletteItem {
+            label: "할 일(To Do) 탭으로 이동",
+            shortcut: "Ctrl+7",
+            action: Action::SelectNavTab(6),
+        },
+        PaletteItem {
+            label: "Teams 모드로 전환",
+            shortcut: "Alt+T",
+            action: Action::SwitchPersona(crate::config::Persona::Teams),
+        },
+        PaletteItem {
+            label: "Outlook 모드로 전환",
+            shortcut: "Alt+O",
+            action: Action::SwitchPersona(crate::config::Persona::Outlook),
+        },
+        PaletteItem {
             label: "새 채팅 만들기",
             shortcut: "Ctrl+N",
             action: Action::OpenOverlay(OverlayKind::NewChat),
+        },
+        PaletteItem {
+            label: "새 메일 작성",
+            shortcut: "c (메일탭)",
+            action: Action::OpenMailComposeNew,
+        },
+        PaletteItem {
+            label: "새 일정 만들기",
+            shortcut: "n (일정탭)",
+            action: Action::OpenOverlay(OverlayKind::EventCreate),
+        },
+        PaletteItem {
+            label: "새 연락처 추가",
+            shortcut: "n (연락처)",
+            action: Action::OpenOverlay(OverlayKind::ContactCreate),
+        },
+        PaletteItem {
+            label: "이미지 첨부 크게보기",
+            shortcut: "v",
+            action: Action::OpenImagePreview,
         },
         PaletteItem {
             label: "내 상태(Presence) 변경",
@@ -132,6 +182,21 @@ fn palette_items() -> Vec<PaletteItem> {
             label: "알림 토글",
             shortcut: "설정",
             action: Action::ToggleNotify,
+        },
+        PaletteItem {
+            label: "인라인 이미지 미리보기 토글",
+            shortcut: "설정",
+            action: Action::ToggleInlineImages,
+        },
+        PaletteItem {
+            label: "새 버전(업데이트) 확인",
+            shortcut: "",
+            action: Action::CheckForUpdates,
+        },
+        PaletteItem {
+            label: "자체 업데이트 설치",
+            shortcut: "",
+            action: Action::ApplySelfUpdate,
         },
         PaletteItem {
             label: "설정",

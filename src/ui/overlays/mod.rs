@@ -3,7 +3,11 @@
 pub mod attachments;
 pub mod command_palette;
 pub mod confirm;
+pub mod contact_form;
 pub mod context_menu;
+pub mod event_form;
+pub mod image_preview;
+pub mod mail_compose;
 pub mod mentions;
 pub mod new_chat;
 pub mod path_input;
@@ -26,7 +30,9 @@ use crate::ui::{
     hitmap::{HitMap, MessageScope},
     overlays::{
         attachments::AttachmentsState, command_palette::CommandPalette, confirm::ConfirmDialog,
-        context_menu::ContextMenu, new_chat::NewChatState, path_input::PathInputState,
+        contact_form::ContactCreateOverlay, context_menu::ContextMenu,
+        event_form::EventCreateOverlay, image_preview::ImagePreviewOverlay,
+        mail_compose::MailComposeOverlay, new_chat::NewChatState, path_input::PathInputState,
         presence::PresenceOverlay, reactions::ReactionsOverlay, room_info::RoomInfoState,
         search::SearchOverlay, settings::SettingsState,
     },
@@ -44,6 +50,10 @@ pub enum OverlayKind {
     PathInput,
     NewChat,
     RoomInfo,
+    MailCompose,
+    ImagePreview,
+    EventCreate,
+    ContactCreate,
     Help,
     Confirm,
 }
@@ -75,6 +85,10 @@ pub enum Overlay {
     PathInput(PathInputState),
     NewChat(NewChatState),
     RoomInfo(RoomInfoState),
+    MailCompose(MailComposeOverlay),
+    ImagePreview(ImagePreviewOverlay),
+    EventCreate(EventCreateOverlay),
+    ContactCreate(ContactCreateOverlay),
     Help(HelpOverlay),
     Confirm(ConfirmDialog),
 }
@@ -92,6 +106,10 @@ impl Overlay {
             Overlay::PathInput(_) => OverlayKind::PathInput,
             Overlay::NewChat(_) => OverlayKind::NewChat,
             Overlay::RoomInfo(_) => OverlayKind::RoomInfo,
+            Overlay::MailCompose(_) => OverlayKind::MailCompose,
+            Overlay::ImagePreview(_) => OverlayKind::ImagePreview,
+            Overlay::EventCreate(_) => OverlayKind::EventCreate,
+            Overlay::ContactCreate(_) => OverlayKind::ContactCreate,
             Overlay::Help(_) => OverlayKind::Help,
             Overlay::Confirm(_) => OverlayKind::Confirm,
         }
@@ -104,6 +122,9 @@ impl Overlay {
                 | Overlay::CommandPalette(_)
                 | Overlay::PathInput(_)
                 | Overlay::NewChat(_)
+                | Overlay::MailCompose(_)
+                | Overlay::EventCreate(_)
+                | Overlay::ContactCreate(_)
         )
     }
 
@@ -147,6 +168,14 @@ impl Overlay {
         Overlay::RoomInfo(RoomInfoState::default())
     }
 
+    pub fn event_create() -> Self {
+        Overlay::EventCreate(EventCreateOverlay::new())
+    }
+
+    pub fn contact_create() -> Self {
+        Overlay::ContactCreate(ContactCreateOverlay::new())
+    }
+
     pub fn help() -> Self {
         Overlay::Help(HelpOverlay)
     }
@@ -173,15 +202,31 @@ impl Overlay {
                 }
                 _ => OverlayOutcome::NotHandled,
             },
-            Overlay::CommandPalette(palette) => palette.handle(action),
-            Overlay::Settings(settings) => settings.handle(action),
+            Overlay::CommandPalette(palette) => match action {
+                Action::Tab => palette.handle(&Action::MoveDown),
+                Action::PrevFocus => palette.handle(&Action::MoveUp),
+                other => palette.handle(other),
+            },
+            Overlay::Settings(settings) => match action {
+                Action::Tab => settings.handle(&Action::MoveDown),
+                Action::PrevFocus => settings.handle(&Action::MoveUp),
+                other => settings.handle(other),
+            },
             Overlay::Search(search) => search.handle(action, app),
             Overlay::Presence(presence) => presence.handle(action),
             Overlay::Reactions(reactions) => reactions.handle(action),
             Overlay::Attachments(tray) => tray.handle(action, app),
             Overlay::PathInput(input) => input.handle(action),
-            Overlay::NewChat(new_chat) => new_chat.handle(action, app),
+            Overlay::NewChat(new_chat) => match action {
+                Action::Tab => new_chat.handle(&Action::MoveDown, app),
+                Action::PrevFocus => new_chat.handle(&Action::MoveUp, app),
+                other => new_chat.handle(other, app),
+            },
             Overlay::RoomInfo(info) => info.handle(action),
+            Overlay::MailCompose(compose) => compose.handle(action, app),
+            Overlay::ImagePreview(preview) => preview.handle(action),
+            Overlay::EventCreate(form) => form.handle(action),
+            Overlay::ContactCreate(form) => form.handle(action),
             Overlay::Help(_) => match action {
                 Action::CloseOverlay | Action::Activate => OverlayOutcome::Close,
                 Action::Quit => OverlayOutcome::NotHandled,
@@ -202,7 +247,10 @@ impl Overlay {
             Overlay::Attachments(tray) => tray.select(index),
             Overlay::NewChat(new_chat) => new_chat.select(index),
             Overlay::RoomInfo(info) => info.select(index),
-            Overlay::PathInput(_) | Overlay::Help(_) | Overlay::Confirm(_) => {}
+            Overlay::MailCompose(compose) => compose.select(index),
+            Overlay::EventCreate(form) => form.select(index),
+            Overlay::ContactCreate(form) => form.select(index),
+            Overlay::ImagePreview(_) | Overlay::PathInput(_) | Overlay::Help(_) | Overlay::Confirm(_) => {}
         }
     }
 
@@ -225,6 +273,10 @@ impl Overlay {
             Overlay::PathInput(input) => input.draw(frame, area, ui),
             Overlay::NewChat(new_chat) => new_chat.draw(frame, area, app, ui, hitmap),
             Overlay::RoomInfo(info) => info.draw(frame, area, app, ui, hitmap),
+            Overlay::MailCompose(compose) => compose.draw(frame, area, app, ui, hitmap),
+            Overlay::ImagePreview(preview) => preview.draw(frame, area, app, ui, hitmap),
+            Overlay::EventCreate(form) => form.draw(frame, area, ui, hitmap),
+            Overlay::ContactCreate(form) => form.draw(frame, area, ui, hitmap),
             Overlay::Help(_) => draw_help(frame, area, ui),
             Overlay::Confirm(dialog) => dialog.draw(frame, area, ui),
         }
@@ -240,48 +292,43 @@ pub struct HelpOverlay;
 
 const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
     (
-        "탐색",
+        "탐색 · 워크스페이스",
         &[
-            ("Ctrl+1 / 2 / 3", "채팅 / 팀·채널 / 활동 탭"),
-            ("↑/↓, j/k", "목록/메시지 이동"),
+            ("Ctrl+1~3 / 4~7", "Teams(채팅·팀·활동) / Outlook(메일·일정·연락처·할일)"),
+            ("Alt+T / Alt+O", "Teams / Outlook 워크스페이스 전환"),
+            ("↑/↓, j/k", "목록·메시지·본문 이동"),
             ("Tab / Shift+Tab", "포커스 순환"),
-            ("Enter", "열기 / 스레드 / 전송"),
-            ("Esc", "오버레이·스레드 닫기"),
+            ("Enter / Esc", "열기·전송 / 오버레이·스레드 닫기"),
         ],
     ),
     (
-        "메시지 · 스레드",
+        "Teams 메시지 · 이미지",
         &[
-            ("t", "채널 스레드 열기"),
-            ("+ / e", "메시지 반응(이모지) 추가"),
-            ("r", "메시지 답장(인용)/스레드"),
-            ("y / Del", "메시지 복사 / 삭제(확인)"),
+            ("t / +", "채널 스레드 열기 / 반응 추가"),
+            ("v", "선택 이미지 첨부 크게보기 (모달)"),
+            ("r / y / Del", "답장 / 복사 / 삭제(확인)"),
             ("d", "최신 첨부 다운로드"),
             ("m / 우클릭", "컨텍스트 메뉴"),
-            ("F5 / R", "전체 새로고침"),
+            ("F5 / R / s", "새로고침 / 전체 동기화"),
         ],
     ),
     (
-        "입력 (Markdown)",
+        "Outlook (메일·일정·할일)",
         &[
-            ("Enter", "전송 / 멘션 확정"),
-            ("Shift+Enter / Ctrl+J", "줄바꿈"),
-            ("Ctrl+S", "채널 게시물 제목 토글"),
-            ("Ctrl+V", "텍스트·클립보드 이미지 붙여넣기"),
-            ("@", "멤버 멘션 자동완성"),
-            ("Ctrl+E", "외부 에디터 ($EDITOR)"),
-            ("Ctrl+Z / Ctrl+Y", "실행 취소 / 다시 실행"),
+            ("메일: c/r/R/f", "새 메일 / 답장 / 전체답장 / 전달"),
+            ("메일: u/g/a/d", "읽음 / 중요★ / 보관 / 첨부다운로드"),
+            ("일정: j/n/y/t/x", "회의참가 / 새일정 / 수락·미정·거절"),
+            ("연락처: m/c/n", "메일쓰기 / 채팅시작 / 새연락처"),
+            ("할일: Space/n/[/]", "완료토글 / 빠른추가 / 목록전환"),
         ],
     ),
     (
-        "기능 · 창",
+        "입력 · 기능 · 창",
         &[
-            ("Ctrl+K", "명령 팔레트"),
-            ("Ctrl+F / /", "로컬 메시지 검색"),
-            ("Ctrl+N", "새 1:1 / 그룹 채팅"),
-            ("Ctrl+P", "내 상태 (Presence) 변경"),
-            ("Ctrl+O", "로컬 파일 업로드/전송"),
-            ("Ctrl+T / Ctrl+U", "첨부 목록 / 멤버·정보"),
+            ("Enter / Ctrl+Enter", "전송 (모달 본문 Ctrl+Enter)"),
+            ("Ctrl+V / Ctrl+S", "이미지 붙여넣기 / 제목 토글"),
+            ("Ctrl+K / Ctrl+F", "명령 팔레트 / 통합 검색(Tab 전환)"),
+            ("Ctrl+N / Ctrl+O", "새 채팅 / 파일 전송"),
             ("Ctrl+B / Ctrl+,", "좌측 레일 토글 / 설정"),
             ("? / q", "도움말 / 종료"),
         ],

@@ -19,6 +19,30 @@ pub enum ButtonId {
     ComposerTargetToggle,
     SubjectToggle,
     NarrowToggle,
+    // Outlook & Image Preview toolbar buttons
+    NewMail,
+    MailReply,
+    MailReplyAll,
+    MailForward,
+    MailToggleRead,
+    MailToggleFlag,
+    MailArchive,
+    MailDelete,
+    ImagePreview,
+    NewEvent,
+    JoinMeeting,
+    RsvpAccept,
+    RsvpTentative,
+    RsvpDecline,
+    DeleteEvent,
+    NewContact,
+    ContactMail,
+    ContactChat,
+    DeleteContact,
+    NewTodo,
+    TodoToggle,
+    DeleteTodo,
+    TodoInputFocus,
 }
 
 /// Identifies which list a message belongs to.
@@ -32,7 +56,7 @@ pub enum MessageScope {
 /// Clickable targets on the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitTarget {
-    /// Navigation tab (`0` = 채팅, `1` = 팀/채널, `2` = 활동).
+    /// Navigation tab (`0` = 채팅, `1` = 팀/채널, `2` = 활동, `3` = 메일, `4` = 캘린더, `5` = 연락처, `6` = 할 일).
     NavTab(usize),
     /// A row in the active navigation pane list.
     NavRow(usize),

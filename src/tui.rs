@@ -19,7 +19,7 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use crate::auth::AuthManager;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, Persona};
 use crate::graph::GraphClient;
 use crate::models::CoreEvent;
 use crate::storage::Storage;
@@ -107,13 +107,31 @@ pub async fn run(
     graph: GraphClient,
     storage: Storage,
 ) -> Result<()> {
+    run_with_persona(config, Persona::detect(), auth, graph, storage).await
+}
+
+pub async fn run_with_persona(
+    config: AppConfig,
+    persona: Persona,
+    auth: AuthManager,
+    graph: GraphClient,
+    storage: Storage,
+) -> Result<()> {
     let (core_tx, mut core_rx) = mpsc::unbounded_channel::<CoreEvent>();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMsg>();
 
     let sync_ctrl = sync::spawn_sync_engine(config.clone(), graph.clone(), storage.clone(), core_tx);
 
-    let mut ui = UiState::from_config(&config);
-    let mut app = AppState::new(config, auth, graph, storage, sync_ctrl.clone(), ui_tx);
+    let mut ui = UiState::from_config_with_persona(&config, persona);
+    let mut app = AppState::new_with_persona(
+        config,
+        persona,
+        auth,
+        graph,
+        storage,
+        sync_ctrl.clone(),
+        ui_tx,
+    );
     app.load_cached_initial();
     app.spawn_bootstrap(&mut ui);
 
@@ -187,9 +205,10 @@ pub async fn run(
             maybe_ev = events.next() => {
                 match maybe_ev {
                     Some(Ok(CrosstermEvent::Key(key))) => {
-                        if let Some(act) = event::key_to_action(
+                        if let Some(act) = event::key_to_action_for_tab(
                             key,
                             ui.focus(),
+                            ui.active_nav_tab,
                             &ui.keymap,
                             ui.accepts_text_input(),
                         ) {

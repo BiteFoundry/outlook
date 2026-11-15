@@ -1,6 +1,7 @@
 //! Local SQLite WAL persistence + FTS5 (`trigram` + `LIKE` hybrid) search repository.
 
 pub mod db;
+pub mod outlook;
 pub mod repo;
 pub mod search;
 
@@ -13,8 +14,9 @@ use std::{
 use anyhow::Result;
 
 use crate::models::{
-    ConversationSummary, MemberInfo, MessageItem, PresenceStatus, SearchHit, SyncCursor,
-    TeamSummary, ThreadView,
+    CalendarEvent, ContactItem, ConversationSummary, MailFolder, MailMessage, MailSearchHit,
+    MemberInfo, MessageItem, PresenceStatus, SearchHit, SyncCursor, TeamSummary, ThreadView,
+    TodoList, TodoTask,
 };
 
 #[derive(Clone)]
@@ -187,6 +189,116 @@ impl Storage {
     pub fn save_sync_cursor(&self, cursor: &SyncCursor) -> Result<()> {
         let conn = self.lock_conn()?;
         repo::save_sync_cursor(&conn, cursor)
+    }
+
+    // --- Outlook Mail, Calendar, Contacts, & Microsoft To Do ---
+    pub fn upsert_mail_folders(&self, folders: &[MailFolder]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        outlook::upsert_mail_folders(&mut conn, folders)
+    }
+
+    pub fn list_mail_folders(&self) -> Result<Vec<MailFolder>> {
+        let conn = self.lock_conn()?;
+        outlook::list_mail_folders(&conn)
+    }
+
+    pub fn upsert_mail_messages(&self, messages: &[MailMessage]) -> Result<usize> {
+        let mut conn = self.lock_conn()?;
+        outlook::upsert_mail_messages(&mut conn, messages)
+    }
+
+    pub fn list_mail_messages(
+        &self,
+        folder_id_or_wellknown: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MailMessage>> {
+        let conn = self.lock_conn()?;
+        outlook::list_mail_messages(&conn, folder_id_or_wellknown, limit)
+    }
+
+    pub fn get_mail_message(&self, message_id: &str) -> Result<Option<MailMessage>> {
+        let conn = self.lock_conn()?;
+        outlook::get_mail_message(&conn, message_id)
+    }
+
+    pub fn delete_mail_messages_by_ids(&self, ids: &[String]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        outlook::delete_mail_messages_by_ids(&mut conn, ids)
+    }
+
+    pub fn search_mail_messages(
+        &self,
+        query: &str,
+        folder_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MailSearchHit>> {
+        let conn = self.lock_conn()?;
+        outlook::search_mail_messages(&conn, query, folder_filter, limit, self.trigram_enabled)
+    }
+
+    pub fn upsert_calendar_events(&self, events: &[CalendarEvent]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        outlook::upsert_calendar_events(&mut conn, events)
+    }
+
+    pub fn list_calendar_events(
+        &self,
+        start_iso: Option<&str>,
+        end_iso: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CalendarEvent>> {
+        let conn = self.lock_conn()?;
+        outlook::list_calendar_events(&conn, start_iso, end_iso, limit)
+    }
+
+    pub fn delete_calendar_event(&self, event_id: &str) -> Result<()> {
+        let conn = self.lock_conn()?;
+        outlook::delete_calendar_event(&conn, event_id)
+    }
+
+    pub fn upsert_contacts(&self, contacts: &[ContactItem]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        outlook::upsert_contacts(&mut conn, contacts)
+    }
+
+    pub fn list_contacts(&self, query: Option<&str>, limit: usize) -> Result<Vec<ContactItem>> {
+        let conn = self.lock_conn()?;
+        outlook::list_contacts(&conn, query, limit)
+    }
+
+    pub fn delete_contact(&self, contact_id: &str) -> Result<()> {
+        let conn = self.lock_conn()?;
+        outlook::delete_contact(&conn, contact_id)
+    }
+
+    pub fn upsert_todo_lists(&self, lists: &[TodoList]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        outlook::upsert_todo_lists(&mut conn, lists)
+    }
+
+    pub fn list_todo_lists(&self) -> Result<Vec<TodoList>> {
+        let conn = self.lock_conn()?;
+        outlook::list_todo_lists(&conn)
+    }
+
+    pub fn upsert_todo_tasks(&self, tasks: &[TodoTask]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        outlook::upsert_todo_tasks(&mut conn, tasks)
+    }
+
+    pub fn list_todo_tasks(
+        &self,
+        list_id: &str,
+        include_completed: bool,
+        limit: usize,
+    ) -> Result<Vec<TodoTask>> {
+        let conn = self.lock_conn()?;
+        outlook::list_todo_tasks(&conn, list_id, include_completed, limit)
+    }
+
+    pub fn delete_todo_task(&self, task_id: &str) -> Result<()> {
+        let conn = self.lock_conn()?;
+        outlook::delete_todo_task(&conn, task_id)
     }
 }
 

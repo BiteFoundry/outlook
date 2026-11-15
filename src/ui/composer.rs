@@ -15,6 +15,7 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
+    img_preview::{self, RenderedTerminalImage},
     models::{ConversationKind, InlineImageUpload, MemberInfo, MentionInfo},
     ui::{
         app::{AppState, Focus, UiState},
@@ -63,6 +64,7 @@ pub struct ComposerState {
     pub reply: Option<ReplyPreview>,
     mentions: Vec<MentionRef>,
     pub pending_images: Vec<InlineImageUpload>,
+    pub pending_preview: Option<RenderedTerminalImage>,
     anchor: Option<usize>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
@@ -223,10 +225,12 @@ impl ComposerState {
         self.anchor = None;
         self.mentions.clear();
         self.pending_images.clear();
+        self.pending_preview = None;
         self.popup.close();
     }
 
     pub fn stage_inline_image(&mut self, bytes: Vec<u8>, mime_type: &str, file_name: Option<String>) {
+        self.pending_preview = img_preview::decode_and_render_halfblocks(&bytes, 24, 5, (20, 22, 26)).ok();
         let temp_id = (self.pending_images.len() + 1).to_string();
         self.pending_images.push(InlineImageUpload {
             temp_id,
@@ -238,6 +242,7 @@ impl ComposerState {
 
     pub fn clear_pending_images(&mut self) {
         self.pending_images.clear();
+        self.pending_preview = None;
     }
 
     pub fn reset_after_send(&mut self) {
@@ -249,6 +254,7 @@ impl ComposerState {
         self.anchor = None;
         self.mentions.clear();
         self.pending_images.clear();
+        self.pending_preview = None;
         self.reply = None;
         self.popup.close();
         self.undo.clear();
@@ -264,6 +270,7 @@ impl ComposerState {
         self.anchor = None;
         self.mentions.clear();
         self.pending_images.clear();
+        self.pending_preview = None;
         self.popup.close();
         self.undo.clear();
         self.redo.clear();
@@ -647,8 +654,11 @@ impl ComposerState {
         }
         if !self.pending_images.is_empty() {
             extra += 1;
+            if let Some(ref preview) = self.pending_preview {
+                extra = extra.saturating_add(preview.rows.min(4));
+            }
         }
-        ((self.line_count() as u16) + 2 + extra).clamp(3, 10)
+        ((self.line_count() as u16) + 2 + extra).clamp(3, 14)
     }
 }
 
@@ -749,7 +759,12 @@ pub fn draw(
 
     if !ui.composer.pending_images.is_empty() && y < inner.y + inner.height {
         let count = ui.composer.pending_images.len();
-        let chip = if count == 1 {
+        let chip = if let Some(ref preview) = ui.composer.pending_preview {
+            format!(
+                "[📋 클립보드 이미지 {}개 ({}x{}) — 전송 시 인라인 업로드]",
+                count, preview.width_px, preview.height_px
+            )
+        } else if count == 1 {
             "[📋 클립보드 이미지 첨부됨 — 전송 시 인라인 업로드]".to_string()
         } else {
             format!("[📋 클립보드 이미지 {count}개 첨부됨 — 전송 시 인라인 업로드]")
@@ -764,6 +779,21 @@ pub fn draw(
             Rect::new(inner.x, y, inner.width, 1),
         );
         y = y.saturating_add(1);
+
+        if ui.inline_images {
+            if let Some(ref preview) = ui.composer.pending_preview {
+                for thumb_line in preview.lines.iter().take(4) {
+                    if y >= inner.y + inner.height.saturating_sub(1) {
+                        break;
+                    }
+                    frame.render_widget(
+                        Paragraph::new(thumb_line.clone()),
+                        Rect::new(inner.x, y, inner.width, 1),
+                    );
+                    y = y.saturating_add(1);
+                }
+            }
+        }
     }
 
     let text_height = (inner.y + inner.height).saturating_sub(y);

@@ -1,11 +1,14 @@
-# `teams` HTTP JSON API
+# `teams` / `outlook` HTTP JSON API
 
-Local HTTP/JSON server for AI agents, scripts, and integrations. Exposed by `teams serve` (alias `teams api`), backed by Microsoft Graph v1.0, local SQLite WAL/FTS5 caching, and the background sync engine (`sync::spawn_sync_engine`).
+Local HTTP/JSON server for AI agents, scripts, and integrations. Exposed by `teams serve` or `outlook serve` (alias `api`), backed by Microsoft Graph v1.0, local SQLite WAL/FTS5 caching, and the background sync engine (`sync::spawn_sync_engine`).
+
+Both binary personas (`teams` and `outlook`) mount the complete Microsoft Teams + Outlook Mail, Calendar, Contacts, and Microsoft To Do route surface on the same HTTP server.
 
 ## Starting the server
 
 ```bash
 teams serve                     # http://127.0.0.1:8788
+outlook serve                   # same API server under the outlook persona
 teams serve --port 9000         # custom port
 teams serve --bind 127.0.0.1 --port 8788
 teams serve --token secret123   # require Authorization: Bearer secret123
@@ -44,7 +47,7 @@ curl http://127.0.0.1:8788/health
 {
   "ok": true,
   "user_id": "00000000-0000-0000-0000-000000000000",
-  "version": "0.1.0"
+  "version": "0.2.0"
 }
 ```
 
@@ -319,13 +322,230 @@ Searches local SQLite FTS5 message cache. `target` is optional (conv_key or fuzz
 }
 ```
 
+## Outlook Mail Endpoints
+
+### `GET /mail/folders?refresh=false&offline=false`
+
+Lists mail folders (`MailFolder[]`). Uses local SQLite cache unless `refresh=true` or cache is empty (when `offline=false`).
+
+```json
+{
+  "folders": [
+    {
+      "id": "AAMk...",
+      "display_name": "Inbox",
+      "well_known_name": "inbox",
+      "parent_folder_id": null,
+      "unread_item_count": 3,
+      "total_item_count": 42
+    }
+  ]
+}
+```
+
+### `GET /mail/messages?folder=inbox&limit=30&unread=false&refresh=false&offline=false`
+
+Lists messages in a mail folder. `folder` accepts a well-known name (`inbox`, `sentitems`, `drafts`, `deleteditems`, `junkemail`, `archive`, or aliases `sent`, `trash`, `junk`), folder display name, or folder ID.
+
+```json
+{
+  "folder": "inbox",
+  "messages": [
+    {
+      "id": "AAMk...",
+      "conversation_id": "AAQk...",
+      "folder_id": "inbox",
+      "subject": "Quarterly Review",
+      "from": { "name": "Alice Kim", "address": "alice@example.com" },
+      "received_at": "2026-11-15T06:00:00Z",
+      "is_read": false,
+      "flagged": false,
+      "has_attachments": false,
+      "preview": "Here are the Q4 numbers..."
+    }
+  ]
+}
+```
+
+### `GET /mail/messages/{id}?offline=false`
+
+Returns `{ "message": <MailMessage> }` including `body_html`, `body_plain`, recipients, and `attachments`. Set `offline=true` to read strictly from the SQLite cache.
+
+### `POST /mail/send`
+
+Sends a new email. Compiles `markdown` to HTML and attaches any local files listed in `attachments`.
+
+```json
+{
+  "to": ["alice@example.com"],
+  "cc": ["bob@example.com"],
+  "bcc": [],
+  "subject": "Weekly Sync Notes",
+  "markdown": "Hi team,\n\n- Action item 1",
+  "attachments": [],
+  "important": false
+}
+```
+
+Returns `{ "ok": true, "to": [...], "subject": "..." }`.
+
+### `POST /mail/messages/{id}/reply`
+
+Replies to a mail message (`reply_all` defaults to `false`).
+
+```json
+{
+  "markdown": "Thanks, confirmed.",
+  "reply_all": false
+}
+```
+
+### `POST /mail/messages/{id}/forward`
+
+Forwards a mail message to one or more recipients (`markdown` optional).
+
+```json
+{
+  "to": ["carol@example.com"],
+  "markdown": "FYI for Tuesday's review."
+}
+```
+
+### `PATCH /mail/messages/{id}`
+
+Updates read and/or flagged status in Graph and SQLite cache (at least one of `is_read` or `flagged` required).
+
+```json
+{
+  "is_read": true,
+  "flagged": false
+}
+```
+
+### `POST /mail/messages/{id}/move`
+
+Moves a mail message to `destination_folder` (well-known name, display name, or folder ID).
+
+```json
+{
+  "destination_folder": "archive"
+}
+```
+
+Returns `{ "ok": true, "message": <MailMessage> }`.
+
+### `DELETE /mail/messages/{id}`
+
+Deletes a mail message from Exchange/Graph and local cache. Returns `{ "ok": true, "message_id": "..." }`.
+
+### `POST /mail/messages/{id}/attachments/{att_id}/download`
+
+Downloads mail attachment `att_id` to `out_dir` (defaults to configured `download_dir`).
+
+```json
+{
+  "out_dir": null
+}
+```
+
+Returns `{ "ok": true, "path": "...", "file_name": "...", "bytes_written": 12345 }`.
+
+### `GET /mail/search?q=...&folder=&limit=30&remote=false`
+
+Searches cached messages via SQLite FTS5 (`hits`). Pass `remote=true` to also execute a Microsoft Graph `$search` (`remote`).
+
+## Outlook Calendar Endpoints
+
+### `GET /calendar/events?start=&end=&days=7&limit=50&offline=false`
+
+Lists calendar events in `[start, end]`. When `start`/`end` are omitted, defaults to now through `+days` days (clamped `1..=365`).
+
+```json
+{
+  "start": "2026-11-15T00:00:00Z",
+  "end": "2026-11-22T00:00:00Z",
+  "events": []
+}
+```
+
+### `POST /calendar/events`
+
+Creates a calendar event. `start_iso` and `end_iso` accept RFC3339 timestamps, `YYYY-MM-DD HH:MM`, or `YYYY-MM-DD`.
+
+```json
+{
+  "subject": "Architecture Review",
+  "start_iso": "2026-11-16T10:00:00Z",
+  "end_iso": "2026-11-16T11:00:00Z",
+  "time_zone": "Asia/Seoul",
+  "is_all_day": false,
+  "location": "Room 3B",
+  "markdown": "Agenda:\n- API review",
+  "attendees": ["alice@example.com"],
+  "is_online_meeting": true
+}
+```
+
+Returns `{ "ok": true, "event": <CalendarEvent> }`.
+
+### `POST /calendar/events/{id}/rsvp`
+
+Responds to a calendar meeting invitation (`response`: `accept`, `tentative`, or `decline`; `comment` optional).
+
+```json
+{
+  "response": "accept",
+  "comment": "See you there!"
+}
+```
+
+### `DELETE /calendar/events/{id}`
+
+Deletes/cancels a calendar event in Graph and local SQLite cache.
+
+## Outlook Contacts Endpoints
+
+### `GET /contacts?q=&limit=50&offline=false`
+
+Lists personal contacts, or searches personal contacts + Entra organization directory when `q` is provided.
+
+### `POST /contacts`
+
+Creates a personal Outlook contact (`display_name` required; `given_name`, `surname`, `email_addresses`, `mobile_phone`, `company_name`, `job_title`, `department`, `notes` optional).
+
+### `DELETE /contacts/{id}`
+
+Deletes a personal Outlook contact from Graph and SQLite cache.
+
+## Microsoft To Do Endpoints
+
+### `GET /todo/lists?refresh=false&offline=false`
+
+Lists Microsoft To Do task lists (`{ "lists": [...] }`).
+
+### `GET /todo/lists/{list_id}/tasks?include_completed=false&limit=50&refresh=false&offline=false`
+
+Lists tasks in a To Do list (`{list_id}` accepts list ID or list display name / `"Tasks"`).
+
+### `POST /todo/lists/{list_id}/tasks`
+
+Creates a To Do task (`title` required; `body_plain`, `due_date_iso` [`YYYY-MM-DD` or RFC3339], `importance` [`low|normal|high`] optional).
+
+### `PATCH /todo/lists/{list_id}/tasks/{task_id}`
+
+Marks a To Do task completed or active (`{ "completed": true }`).
+
+### `DELETE /todo/lists/{list_id}/tasks/{task_id}`
+
+Deletes a To Do task from Graph and local SQLite cache.
+
 ## Errors
 
 All failing endpoints return `{"error": "<message>"}`:
 
 | HTTP Status | Meaning |
 | --- | --- |
-| `400` | Validation error (empty body, invalid reaction/kind/presence, missing local file, etc.) |
+| `400` | Validation error (empty body, invalid reaction/kind/presence/rsvp/importance/datetime, missing local file, etc.) |
 | `401` | `--token` is enabled and `Authorization: Bearer <token>` is missing or invalid |
-| `404` | Target conversation or cached thread not found |
+| `404` | Target conversation, cached thread, mail message, folder, or To Do list not found |
 | `500` | Microsoft Graph or SQLite error |

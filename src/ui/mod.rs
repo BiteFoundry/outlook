@@ -9,6 +9,7 @@ pub mod hitmap;
 pub mod keymap;
 pub mod nav_pane;
 pub mod notification;
+pub mod outlook_view;
 pub mod overlays;
 pub mod theme;
 pub mod thread_view;
@@ -23,8 +24,11 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::config::Persona;
+
 use self::app::{AppState, NarrowPane, UiState};
 use self::hitmap::{ButtonId, HitTarget};
+use self::nav_pane::{TAB_LABELS, TAB_MAIL};
 use self::toast::ToastKind;
 
 /// 3-tier responsive terminal width modes.
@@ -51,6 +55,7 @@ pub fn layout_mode(width: u16) -> LayoutMode {
 #[derive(Debug, Clone, Default)]
 pub struct LayoutPlan {
     pub mode: Option<LayoutMode>,
+    pub top_bar: Option<Rect>,
     pub compact_bar: Option<Rect>,
     pub rail: Option<Rect>,
     pub nav: Option<Rect>,
@@ -68,15 +73,52 @@ pub fn compute_layout(
     narrow_pane: NarrowPane,
     composer_height: u16,
 ) -> LayoutPlan {
+    compute_layout_with_options(
+        area,
+        show_nav_rail,
+        thread_open,
+        auto_thread_pane,
+        narrow_pane,
+        composer_height,
+        true,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compute_layout_with_options(
+    area: Rect,
+    show_nav_rail: bool,
+    thread_open: bool,
+    auto_thread_pane: bool,
+    narrow_pane: NarrowPane,
+    composer_height: u16,
+    show_composer: bool,
+    show_top_bar: bool,
+) -> LayoutPlan {
     let mode = layout_mode(area.width);
+    let top_h = if show_top_bar && mode != LayoutMode::Narrow && area.height >= 8 {
+        1
+    } else {
+        0
+    };
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(top_h),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(area);
-    let body = rows[0];
-    let status = rows[1];
+    let top_bar = (top_h > 0).then_some(rows[0]);
+    let body = rows[1];
+    let status = rows[2];
 
-    let comp_h = composer_height.clamp(3, (body.height / 2).max(3));
+    let comp_h = if show_composer {
+        composer_height.clamp(3, (body.height / 2).max(3))
+    } else {
+        0
+    };
 
     match mode {
         LayoutMode::Wide => {
@@ -99,19 +141,25 @@ pub fn compute_layout(
                 ])
                 .split(body);
 
-            let center_rows = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(4), Constraint::Length(comp_h)])
-                .split(cols[2]);
+            let (chat_rect, comp_rect) = if show_composer {
+                let center_rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(4), Constraint::Length(comp_h)])
+                    .split(cols[2]);
+                (Some(center_rows[0]), Some(center_rows[1]))
+            } else {
+                (Some(cols[2]), None)
+            };
 
             LayoutPlan {
                 mode: Some(mode),
+                top_bar,
                 compact_bar: None,
                 rail: (rail_w > 0).then_some(cols[0]),
                 nav: Some(cols[1]),
-                chat: Some(center_rows[0]),
+                chat: chat_rect,
                 thread: (thread_w > 0).then_some(cols[3]),
-                composer: Some(center_rows[1]),
+                composer: comp_rect,
                 status,
             }
         }
@@ -127,25 +175,31 @@ pub fn compute_layout(
                 ])
                 .split(body);
 
-            let main_rows = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(4), Constraint::Length(comp_h)])
-                .split(cols[2]);
+            let (main_rect, comp_rect) = if show_composer {
+                let main_rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(4), Constraint::Length(comp_h)])
+                    .split(cols[2]);
+                (main_rows[0], Some(main_rows[1]))
+            } else {
+                (cols[2], None)
+            };
 
             let (chat, thread) = if thread_open {
-                (None, Some(main_rows[0]))
+                (None, Some(main_rect))
             } else {
-                (Some(main_rows[0]), None)
+                (Some(main_rect), None)
             };
 
             LayoutPlan {
                 mode: Some(mode),
+                top_bar,
                 compact_bar: None,
                 rail: (rail_w > 0).then_some(cols[0]),
                 nav: Some(cols[1]),
                 chat,
                 thread,
-                composer: Some(main_rows[1]),
+                composer: comp_rect,
                 status,
             }
         }
@@ -160,6 +214,7 @@ pub fn compute_layout(
             match narrow_pane {
                 NarrowPane::List => LayoutPlan {
                     mode: Some(mode),
+                    top_bar,
                     compact_bar,
                     rail: None,
                     nav: Some(content),
@@ -169,34 +224,46 @@ pub fn compute_layout(
                     status,
                 },
                 NarrowPane::Chat => {
-                    let split = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([Constraint::Min(4), Constraint::Length(comp_h)])
-                        .split(content);
+                    let (chat_rect, comp_rect) = if show_composer {
+                        let split = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([Constraint::Min(4), Constraint::Length(comp_h)])
+                            .split(content);
+                        (Some(split[0]), Some(split[1]))
+                    } else {
+                        (Some(content), None)
+                    };
                     LayoutPlan {
                         mode: Some(mode),
+                        top_bar,
                         compact_bar,
                         rail: None,
                         nav: None,
-                        chat: Some(split[0]),
+                        chat: chat_rect,
                         thread: None,
-                        composer: Some(split[1]),
+                        composer: comp_rect,
                         status,
                     }
                 }
                 NarrowPane::Thread => {
-                    let split = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([Constraint::Min(4), Constraint::Length(comp_h)])
-                        .split(content);
+                    let (thread_rect, comp_rect) = if show_composer {
+                        let split = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([Constraint::Min(4), Constraint::Length(comp_h)])
+                            .split(content);
+                        (Some(split[0]), Some(split[1]))
+                    } else {
+                        (Some(content), None)
+                    };
                     LayoutPlan {
                         mode: Some(mode),
+                        top_bar,
                         compact_bar,
                         rail: None,
                         nav: None,
                         chat: None,
-                        thread: Some(split[0]),
-                        composer: Some(split[1]),
+                        thread: thread_rect,
+                        composer: comp_rect,
                         status,
                     }
                 }
@@ -242,22 +309,34 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
         ui.nav_selected = row_count - 1;
     }
 
-    let thread_open = ui.thread_drawer_open && app.active_thread.is_some();
-    let show_subject = ui.show_subject
+    let is_outlook_tab = ui.active_nav_tab >= TAB_MAIL;
+    let thread_open = !is_outlook_tab && ui.thread_drawer_open && app.active_thread.is_some();
+    let show_subject = !is_outlook_tab
+        && ui.show_subject
         && app
             .active_target
             .as_ref()
             .is_some_and(|t| t.is_channel())
         && !(thread_open && ui.composer_target_thread);
-    let comp_h = ui.composer.desired_height(show_subject);
-    let plan = compute_layout(
+    let comp_h = if is_outlook_tab {
+        0
+    } else {
+        ui.composer.desired_height(show_subject)
+    };
+    let plan = compute_layout_with_options(
         area,
         ui.show_nav_rail,
         thread_open,
         ui.auto_thread_pane,
         ui.narrow_pane,
         comp_h,
+        !is_outlook_tab,
+        true,
     );
+
+    if let Some(top_area) = plan.top_bar {
+        draw_top_bar(frame, top_area, app, ui);
+    }
 
     if let Some(bar_area) = plan.compact_bar {
         draw_compact_bar(frame, bar_area, app, ui);
@@ -274,7 +353,11 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
     }
 
     if let Some(chat_area) = plan.chat {
-        chat_view::draw(frame, chat_area, app, ui, &mut hitmap);
+        if is_outlook_tab {
+            outlook_view::draw(frame, chat_area, app, ui, &mut hitmap);
+        } else {
+            chat_view::draw(frame, chat_area, app, ui, &mut hitmap);
+        }
     }
 
     if let Some(thread_area) = plan.thread {
@@ -297,6 +380,67 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
     cursor_pos
 }
 
+fn draw_top_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState) {
+    let bar_style = Style::default().bg(ui.theme.selection_bg).fg(ui.theme.fg);
+    frame.render_widget(Paragraph::new("").style(bar_style), area);
+
+    let (persona_label, persona_target) = match ui.persona {
+        Persona::Teams => (" [Teams] ", Persona::Outlook),
+        Persona::Outlook => (" [Outlook] ", Persona::Teams),
+    };
+    let mut x = area.x;
+    let badge_w = persona_label.width() as u16;
+    if x + badge_w <= area.x + area.width {
+        let rect = Rect::new(x, area.y, badge_w, 1);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                persona_label,
+                ui.theme.accent_style().bg(ui.theme.selection_bg).add_modifier(Modifier::BOLD),
+            )),
+            rect,
+        );
+        // Clicking the badge opens command palette or toggles between Teams/Outlook via Tab clicks;
+        // tabs below jump directly.
+        let _ = persona_target;
+        x = x.saturating_add(badge_w + 1);
+    }
+
+    let chat_unread = app.unread_chat_count();
+    let channel_unread = app.unread_channel_count();
+    let mail_unread = app.unread_mail_count();
+    let tabs: [(&str, i32, usize); 7] = [
+        ("1:채팅", chat_unread, 0),
+        ("2:팀", channel_unread, 1),
+        ("3:활동", 0, 2),
+        ("4:메일", mail_unread, 3),
+        ("5:캘린더", 0, 4),
+        ("6:연락처", 0, 5),
+        ("7:할일", 0, 6),
+    ];
+
+    for (name, unread, tab_idx) in tabs {
+        let label = if unread > 0 {
+            format!(" {name}({unread}) ")
+        } else {
+            format!(" {name} ")
+        };
+        let w = label.width() as u16;
+        if x.saturating_sub(area.x) + w > area.width {
+            break;
+        }
+        let active = ui.active_nav_tab == tab_idx;
+        let style = if active {
+            ui.theme.selection().add_modifier(Modifier::BOLD)
+        } else {
+            bar_style
+        };
+        let rect = Rect::new(x, area.y, w, 1);
+        frame.render_widget(Paragraph::new(label).style(style), rect);
+        ui.hitmap.add(rect, HitTarget::NavTab(tab_idx));
+        x = x.saturating_add(w + 1);
+    }
+}
+
 fn draw_rail(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState) {
     let block = Block::default()
         .borders(Borders::RIGHT)
@@ -311,11 +455,14 @@ fn draw_rail(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState) {
         .theme
         .presence_indicator(app.my_presence.as_ref().map(|p| p.availability.as_str()));
 
-    let items: [(&str, HitTarget, Option<ratatui::style::Color>); 7] = [
+    let items: [(&str, HitTarget, Option<ratatui::style::Color>); 10] = [
         ("💬", HitTarget::NavTab(0), None),
         ("👥", HitTarget::NavTab(1), None),
         ("🔔", HitTarget::NavTab(2), None),
-        ("＋", HitTarget::Button(ButtonId::NewChat), None),
+        ("✉", HitTarget::NavTab(3), None),
+        ("📅", HitTarget::NavTab(4), None),
+        ("👤", HitTarget::NavTab(5), None),
+        ("☑", HitTarget::NavTab(6), None),
         ("🔍", HitTarget::Button(ButtonId::Search), None),
         (
             presence_dot,
@@ -441,8 +588,20 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState) 
         .map(|t| format!(" | ⏳ {}", t.display()))
         .unwrap_or_default();
 
-    let left = format!(" [{focus_label}] {avail} | {sync_tag}{task_note}");
-    let right = " Ctrl+K 팔레트  Ctrl+F 검색  ? 도움말 ";
+    let persona_tag = match ui.persona {
+        Persona::Teams => "Teams",
+        Persona::Outlook => "Outlook",
+    };
+    let tab_tag = TAB_LABELS.get(ui.active_nav_tab).copied().unwrap_or("채팅");
+
+    let left = format!(" [{persona_tag}·{tab_tag}·{focus_label}] {avail} | {sync_tag}{task_note}");
+    let right = match ui.active_nav_tab {
+        3 => " c 새메일  r 답장  v 이미지  Ctrl+K 팔레트 ",
+        4 => " j 회의참가  n 새일정  y/t/x 응답  ? 도움말 ",
+        5 => " m 메일  c 채팅  n 추가  Ctrl+F 검색 ",
+        6 => " Space 완료  n 빠른추가  [/] 목록  ? 도움말 ",
+        _ => " v 이미지  Ctrl+K 팔레트  Ctrl+F 검색  ? 도움말 ",
+    };
 
     let right_w = right.width() as u16;
     let left_w = area.width.saturating_sub(right_w + 3) as usize;

@@ -15,8 +15,8 @@ use crate::{
     config::AppConfig,
     graph::GraphClient,
     models::{
-        ConversationKind, ConversationSummary, ConversationTarget, CoreEvent, MessageItem,
-        NotificationCandidate, SyncCursor,
+        ConversationKind, ConversationSummary, ConversationTarget, CoreEvent, MailMessage,
+        MessageItem, NotificationCandidate, SyncCursor,
     },
     storage::Storage,
 };
@@ -36,6 +36,13 @@ pub struct SyncController {
 #[derive(Debug, Clone)]
 pub enum SyncCommand {
     RefreshConversations,
+    RefreshOutlook,
+    SyncMailFolder {
+        folder_id: String,
+    },
+    SyncTodoList {
+        list_id: String,
+    },
     SyncActiveNow,
     SyncChannelHistory {
         team_id: String,
@@ -55,6 +62,10 @@ impl SyncController {
     pub fn request(&self, cmd: SyncCommand) {
         let _ = self.nudge_tx.send(cmd);
     }
+
+    pub fn send(&self, cmd: SyncCommand) {
+        self.request(cmd);
+    }
 }
 
 /// Performs an initial bootstrap sync (chats + joined teams/channels) into SQLite.
@@ -64,6 +75,38 @@ pub async fn bootstrap_conversations(graph: &GraphClient, storage: &Storage) -> 
     if let Ok(teams) = graph.list_joined_teams_with_channels().await {
         storage.upsert_teams(&teams)?;
     }
+    Ok(())
+}
+
+/// Performs an initial bootstrap sync of Outlook Mail folders/inbox, Calendar, Contacts, and To Do into SQLite.
+/// Best-effort per service so Teams-only tokens without Outlook scopes never fail bootstrap.
+pub async fn bootstrap_outlook(graph: &GraphClient, storage: &Storage) -> Result<()> {
+    if let Ok(folders) = graph.list_mail_folders().await {
+        storage.upsert_mail_folders(&folders)?;
+    }
+
+    if let Ok(messages) = graph.list_mail_messages("inbox", 40).await {
+        storage.upsert_mail_messages(&messages)?;
+    }
+
+    let (start_iso, end_iso) = default_calendar_window();
+    if let Ok(events) = graph.list_calendar_view(&start_iso, &end_iso, 50).await {
+        storage.upsert_calendar_events(&events)?;
+    }
+
+    if let Ok(contacts) = graph.list_contacts(100).await {
+        storage.upsert_contacts(&contacts)?;
+    }
+
+    if let Ok(lists) = graph.list_todo_lists().await {
+        storage.upsert_todo_lists(&lists)?;
+        if let Some(default_list) = pick_default_todo_list(&lists) {
+            if let Ok(tasks) = graph.list_todo_tasks(&default_list.id, true, 50).await {
+                storage.upsert_todo_tasks(&tasks)?;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -112,6 +155,27 @@ pub fn spawn_sync_engine(
                                 summary: "동기화 완료".to_string(),
                             });
                         }
+                        Some(SyncCommand::RefreshOutlook) => {
+                            let _ = event_tx.send(CoreEvent::SyncStateChanged {
+                                busy: true,
+                                summary: "Outlook 동기화 중...".to_string(),
+                            });
+                            refresh_outlook_best_effort(&graph, &storage, &event_tx).await;
+                            let _ = event_tx.send(CoreEvent::SyncStateChanged {
+                                busy: false,
+                                summary: "Outlook 동기화 완료".to_string(),
+                            });
+                        }
+                        Some(SyncCommand::SyncMailFolder { folder_id }) => {
+                            if let Err(err) = sync_mail_folder(&folder_id, &graph, &storage, &event_tx).await {
+                                let _ = event_tx.send(CoreEvent::SyncError(format!("메일 폴더 동기화 실패: {err}")));
+                            }
+                        }
+                        Some(SyncCommand::SyncTodoList { list_id }) => {
+                            if let Err(err) = sync_todo_list(&list_id, &graph, &storage, &event_tx).await {
+                                let _ = event_tx.send(CoreEvent::SyncError(format!("To Do 동기화 실패: {err}")));
+                            }
+                        }
                         Some(SyncCommand::SyncActiveNow) => {
                             let focus = focus_rx.borrow().clone();
                             if let Err(err) = sync_active_focus(&focus, &graph, &storage, &event_tx).await {
@@ -157,6 +221,7 @@ pub fn spawn_sync_engine(
                     if let Err(err) = poll_presences_tier3(&graph, &storage, &event_tx).await {
                         let _ = event_tx.send(CoreEvent::SyncError(format!("상태 폴링 오류: {err}")));
                     }
+                    refresh_outlook_best_effort(&graph, &storage, &event_tx).await;
                 }
             }
         }
@@ -372,6 +437,231 @@ async fn sync_channel_history(
     Ok(())
 }
 
+fn default_calendar_window() -> (String, String) {
+    let now = chrono::Utc::now();
+    let start = (now - chrono::Duration::days(1)).to_rfc3339();
+    let end = (now + chrono::Duration::days(14)).to_rfc3339();
+    (start, end)
+}
+
+fn pick_default_todo_list(lists: &[crate::models::TodoList]) -> Option<&crate::models::TodoList> {
+    lists
+        .iter()
+        .find(|l| {
+            l.wellknown_list_name
+                .as_deref()
+                .map(|w| w.eq_ignore_ascii_case("defaultList"))
+                .unwrap_or(false)
+        })
+        .or_else(|| lists.first())
+}
+
+async fn refresh_outlook_best_effort(
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+) {
+    if let Ok(folders) = graph.list_mail_folders().await {
+        if storage.upsert_mail_folders(&folders).is_ok() {
+            let _ = event_tx.send(CoreEvent::MailFoldersUpdated(folders));
+        }
+    }
+
+    if let Ok(messages) = graph.list_mail_messages("inbox", 40).await {
+        let had_initial = storage
+            .list_mail_messages(Some("inbox"), 1)
+            .map(|existing| !existing.is_empty())
+            .unwrap_or(false);
+        let notify_candidate = if had_initial {
+            find_new_unread_mail_candidate("inbox", storage, &messages)
+        } else {
+            None
+        };
+        if storage.upsert_mail_messages(&messages).is_ok() {
+            let _ = event_tx.send(CoreEvent::MailMessagesUpdated {
+                folder_id: "inbox".to_string(),
+                messages,
+                notify_candidate,
+            });
+        }
+    }
+
+    let (start_iso, end_iso) = default_calendar_window();
+    if let Ok(events) = graph.list_calendar_view(&start_iso, &end_iso, 50).await {
+        if storage.upsert_calendar_events(&events).is_ok() {
+            let _ = event_tx.send(CoreEvent::CalendarEventsUpdated(events));
+        }
+    }
+
+    if let Ok(contacts) = graph.list_contacts(100).await {
+        if storage.upsert_contacts(&contacts).is_ok() {
+            let _ = event_tx.send(CoreEvent::ContactsUpdated(contacts));
+        }
+    }
+
+    if let Ok(lists) = graph.list_todo_lists().await {
+        if storage.upsert_todo_lists(&lists).is_ok() {
+            let (list_id, tasks) = if let Some(default_list) = pick_default_todo_list(&lists) {
+                match graph.list_todo_tasks(&default_list.id, true, 50).await {
+                    Ok(tasks) => {
+                        let _ = storage.upsert_todo_tasks(&tasks);
+                        (Some(default_list.id.clone()), tasks)
+                    }
+                    Err(_) => (Some(default_list.id.clone()), Vec::new()),
+                }
+            } else {
+                (None, Vec::new())
+            };
+            let _ = event_tx.send(CoreEvent::TodoUpdated {
+                lists,
+                list_id,
+                tasks,
+            });
+        }
+    }
+}
+
+async fn sync_mail_folder(
+    folder_id: &str,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+) -> Result<()> {
+    let scope_key = format!("mail_delta:{folder_id}");
+    let prev_cursor = storage.get_sync_cursor(&scope_key)?;
+    let had_initial = prev_cursor.is_some()
+        || storage
+            .list_mail_messages(Some(folder_id), 1)
+            .map(|existing| !existing.is_empty())
+            .unwrap_or(false);
+
+    match graph
+        .delta_mail_messages(
+            folder_id,
+            prev_cursor.as_ref().and_then(|c| c.delta_link.as_deref()),
+        )
+        .await
+    {
+        Ok((delta_msgs, deleted_ids, new_delta_link)) => {
+            let notify_candidate = if had_initial {
+                find_new_unread_mail_candidate(folder_id, storage, &delta_msgs)
+            } else {
+                None
+            };
+            if !deleted_ids.is_empty() {
+                storage.delete_mail_messages_by_ids(&deleted_ids)?;
+            }
+            if !delta_msgs.is_empty() {
+                storage.upsert_mail_messages(&delta_msgs)?;
+            }
+            let oldest_ts = delta_msgs
+                .iter()
+                .map(|m| m.received_at.as_str())
+                .min()
+                .map(str::to_string);
+            storage.save_sync_cursor(&SyncCursor {
+                scope_key,
+                delta_link: new_delta_link,
+                oldest_msg_ts: oldest_ts,
+                synced_at: chrono::Utc::now().to_rfc3339(),
+            })?;
+            let messages = storage.list_mail_messages(Some(folder_id), 50)?;
+            let _ = event_tx.send(CoreEvent::MailMessagesUpdated {
+                folder_id: folder_id.to_string(),
+                messages,
+                notify_candidate,
+            });
+        }
+        Err(_) => {
+            let messages = graph.list_mail_messages(folder_id, 50).await?;
+            let notify_candidate = if had_initial {
+                find_new_unread_mail_candidate(folder_id, storage, &messages)
+            } else {
+                None
+            };
+            storage.upsert_mail_messages(&messages)?;
+            let oldest_ts = messages
+                .iter()
+                .map(|m| m.received_at.as_str())
+                .min()
+                .map(str::to_string);
+            storage.save_sync_cursor(&SyncCursor {
+                scope_key,
+                delta_link: prev_cursor.and_then(|c| c.delta_link),
+                oldest_msg_ts: oldest_ts,
+                synced_at: chrono::Utc::now().to_rfc3339(),
+            })?;
+            let _ = event_tx.send(CoreEvent::MailMessagesUpdated {
+                folder_id: folder_id.to_string(),
+                messages,
+                notify_candidate,
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn sync_todo_list(
+    list_id: &str,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+) -> Result<()> {
+    let tasks = graph.list_todo_tasks(list_id, true, 100).await?;
+    storage.upsert_todo_tasks(&tasks)?;
+    let lists = storage.list_todo_lists()?;
+    let _ = event_tx.send(CoreEvent::TodoUpdated {
+        lists,
+        list_id: Some(list_id.to_string()),
+        tasks,
+    });
+    Ok(())
+}
+
+fn find_new_unread_mail_candidate(
+    folder_id: &str,
+    storage: &Storage,
+    incoming: &[MailMessage],
+) -> Option<NotificationCandidate> {
+    let newest = incoming
+        .iter()
+        .filter(|m| !m.is_read && !m.is_draft)
+        .filter(|m| matches!(storage.get_mail_message(&m.id), Ok(None)))
+        .max_by(|a, b| a.received_at.cmp(&b.received_at).then(a.id.cmp(&b.id)))?;
+    let folder_title = storage
+        .list_mail_folders()
+        .ok()
+        .and_then(|folders| {
+            folders.into_iter().find(|f| {
+                f.id == folder_id
+                    || f.well_known_name
+                        .as_deref()
+                        .map(|w| w.eq_ignore_ascii_case(folder_id))
+                        .unwrap_or(false)
+            })
+        })
+        .map(|f| f.display_name)
+        .unwrap_or_else(|| folder_id.to_string());
+    let preview_body = newest
+        .preview
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let preview = if preview_body.is_empty() {
+        newest.subject.clone()
+    } else if newest.subject.trim().is_empty() {
+        preview_body
+    } else {
+        format!("{} - {}", newest.subject.trim(), preview_body)
+    };
+    Some(NotificationCandidate {
+        conv_key: format!("mail:{folder_id}"),
+        conv_title: folder_title,
+        sender: newest.from_display(),
+        preview,
+    })
+}
+
 pub(crate) fn collect_dirty_chat_ids(
     fresh_chats: &[ConversationSummary],
     cached_by_key: &HashMap<String, ConversationSummary>,
@@ -521,5 +811,112 @@ mod tests {
         );
         ctrl.request(SyncCommand::Shutdown);
         tokio::task::yield_now().await;
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_outlook_is_best_effort_on_scope_or_graph_errors() {
+        let config = AppConfig::default();
+        let auth = AuthManager::new(config.clone()).unwrap();
+        let graph = GraphClient::new(config, auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+
+        bootstrap_outlook(&graph, &storage).await.unwrap();
+    }
+
+    #[test]
+    fn test_outlook_mail_notification_candidate_and_default_todo_picker() {
+        use crate::models::{EmailRecipient, MailFolder, TodoList};
+
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_mail_folders(&[MailFolder {
+                id: "fld-inbox".to_string(),
+                display_name: "받은 편지함".to_string(),
+                well_known_name: Some("inbox".to_string()),
+                parent_folder_id: None,
+                unread_item_count: 1,
+                total_item_count: 1,
+            }])
+            .unwrap();
+
+        let existing = MailMessage {
+            id: "m-old".to_string(),
+            conversation_id: None,
+            folder_id: Some("fld-inbox".to_string()),
+            subject: "기존 메일".to_string(),
+            from: Some(EmailRecipient {
+                name: Some("김철수".to_string()),
+                address: "kim@example.com".to_string(),
+            }),
+            to_recipients: Vec::new(),
+            cc_recipients: Vec::new(),
+            bcc_recipients: Vec::new(),
+            received_at: "2026-11-15T09:00:00Z".to_string(),
+            sent_at: None,
+            is_read: false,
+            is_draft: false,
+            flagged: false,
+            importance: "normal".to_string(),
+            has_attachments: false,
+            preview: "이미 있음".to_string(),
+            body_html: String::new(),
+            body_plain: String::new(),
+            attachments: Vec::new(),
+            web_link: None,
+        };
+        storage.upsert_mail_messages(&[existing.clone()]).unwrap();
+
+        // Already-stored unread message must not re-notify
+        assert!(find_new_unread_mail_candidate("inbox", &storage, &[existing]).is_none());
+
+        // Brand-new unread message produces NotificationCandidate with folder display name
+        let fresh_unread = MailMessage {
+            id: "m-new".to_string(),
+            conversation_id: None,
+            folder_id: Some("fld-inbox".to_string()),
+            subject: "긴급 공지".to_string(),
+            from: Some(EmailRecipient {
+                name: Some("홍길동".to_string()),
+                address: "hong@example.com".to_string(),
+            }),
+            to_recipients: Vec::new(),
+            cc_recipients: Vec::new(),
+            bcc_recipients: Vec::new(),
+            received_at: "2026-11-15T11:00:00Z".to_string(),
+            sent_at: None,
+            is_read: false,
+            is_draft: false,
+            flagged: false,
+            importance: "high".to_string(),
+            has_attachments: false,
+            preview: "배포 일정 확인\n부탁드립니다".to_string(),
+            body_html: String::new(),
+            body_plain: String::new(),
+            attachments: Vec::new(),
+            web_link: None,
+        };
+        let cand = find_new_unread_mail_candidate("inbox", &storage, &[fresh_unread]).unwrap();
+        assert_eq!(cand.conv_key, "mail:inbox");
+        assert_eq!(cand.conv_title, "받은 편지함");
+        assert_eq!(cand.sender, "홍길동 <hong@example.com>");
+        assert_eq!(cand.preview, "긴급 공지 - 배포 일정 확인 부탁드립니다");
+
+        let lists = vec![
+            TodoList {
+                id: "l1".to_string(),
+                display_name: "개인".to_string(),
+                wellknown_list_name: None,
+                is_owner: true,
+                is_shared: false,
+            },
+            TodoList {
+                id: "l2".to_string(),
+                display_name: "작업".to_string(),
+                wellknown_list_name: Some("defaultList".to_string()),
+                is_owner: true,
+                is_shared: false,
+            },
+        ];
+        assert_eq!(pick_default_todo_list(&lists).unwrap().id, "l2");
     }
 }

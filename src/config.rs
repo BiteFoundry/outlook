@@ -18,6 +18,45 @@ pub const DEFAULT_AUTH_BASE_URL: &str = "https://login.microsoftonline.com";
 /// Users can always override via `--client-id`, `TEAMS_CLIENT_ID`, `AZURE_CLIENT_ID`, or `config.toml`.
 pub const DEFAULT_PUBLIC_CLIENT_ID: &str = "14d82eec-204b-4c2f-b7e8-296a70dab67e";
 pub const DEFAULT_TENANT_ID: &str = "common";
+pub const DEFAULT_GITHUB_REPO: &str = "shinick-dev/teams";
+
+/// Entry persona (`teams` vs `outlook`), sharing the exact same Entra OAuth token, Graph client, and SQLite DB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Persona {
+    #[default]
+    Teams,
+    Outlook,
+}
+
+impl Persona {
+    /// Detects whether the user invoked `outlook` (via `TEAMS_PERSONA=outlook` or `argv[0]` stem `outlook*`) or `teams`.
+    pub fn detect() -> Self {
+        if let Ok(env_val) = std::env::var("TEAMS_PERSONA") {
+            if env_val.trim().eq_ignore_ascii_case("outlook") {
+                return Self::Outlook;
+            }
+            if env_val.trim().eq_ignore_ascii_case("teams") {
+                return Self::Teams;
+            }
+        }
+        if let Some(arg0) = std::env::args_os().next() {
+            if let Some(stem) = Path::new(&arg0).file_stem().and_then(|s| s.to_str()) {
+                if stem.to_ascii_lowercase().starts_with("outlook") {
+                    return Self::Outlook;
+                }
+            }
+        }
+        Self::Teams
+    }
+
+    pub fn bin_name(self) -> &'static str {
+        match self {
+            Self::Teams => "teams",
+            Self::Outlook => "outlook",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -26,25 +65,29 @@ pub struct AppConfig {
     pub client_id: String,
     /// Entra ID Tenant ID (`common`, `organizations`, domain, or tenant GUID).
     pub tenant_id: String,
-    /// Optional OAuth scopes override. Empty uses the standard Teams delegated scope set.
+    /// Optional OAuth scopes override. Empty uses the standard Teams + Outlook M365 delegated scope set.
     pub scopes: Vec<String>,
     /// Base URL for Microsoft Graph v1.0 (overridable for sovereign clouds or mock testing).
     pub graph_base_url: String,
     /// Base URL for Entra OAuth2 endpoints (overridable for sovereign clouds or mock testing).
     pub auth_base_url: String,
+    /// GitHub `owner/repo` used by `teams update` / `outlook update`.
+    pub github_repo: String,
     /// Enable desktop toast/bell notifications in TUI.
     pub notify: bool,
     /// Show left navigation rail in wide layout.
     pub show_nav_rail: bool,
     /// Automatically open right thread/info pane on wide terminals.
     pub auto_thread_pane: bool,
+    /// Render inline image thumbnails directly inside terminal Chat/Mail views.
+    pub inline_images: bool,
     /// Custom download directory. Empty defaults to `Downloads/teams`.
     pub download_dir: String,
     /// Fast poll interval (ms) for active conversation in TUI.
     pub active_poll_ms: u64,
     /// Background chat preview diff interval (ms).
     pub chat_poll_ms: u64,
-    /// Background channel delta & presence interval (ms).
+    /// Background channel delta, Outlook mail/calendar, & presence interval (ms).
     pub channel_poll_ms: u64,
 }
 
@@ -70,9 +113,14 @@ impl Default for AppConfig {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_AUTH_BASE_URL.to_string()),
+            github_repo: std::env::var("TEAMS_GITHUB_REPO")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_GITHUB_REPO.to_string()),
             notify: true,
             show_nav_rail: true,
             auto_thread_pane: true,
+            inline_images: true,
             download_dir: String::new(),
             active_poll_ms: 2_500,
             chat_poll_ms: 8_000,
@@ -103,6 +151,11 @@ impl AppConfig {
         if let Ok(aurl) = std::env::var("TEAMS_AUTH_BASE_URL") {
             if !aurl.trim().is_empty() {
                 cfg.auth_base_url = aurl.trim().to_string();
+            }
+        }
+        if let Ok(repo) = std::env::var("TEAMS_GITHUB_REPO") {
+            if !repo.trim().is_empty() {
+                cfg.github_repo = repo.trim().to_string();
             }
         }
         cfg
@@ -139,6 +192,11 @@ impl AppConfig {
             "ChannelMessage.Send".to_string(),
             "Files.ReadWrite.All".to_string(),
             "Presence.ReadWrite".to_string(),
+            "Mail.ReadWrite".to_string(),
+            "Mail.Send".to_string(),
+            "Calendars.ReadWrite".to_string(),
+            "Contacts.ReadWrite".to_string(),
+            "Tasks.ReadWrite".to_string(),
         ]
     }
 

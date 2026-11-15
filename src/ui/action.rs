@@ -1,16 +1,22 @@
 //! Central `Action` enum and single `dispatch(action, app, ui) -> bool` reducer.
 
+use std::path::PathBuf;
+
 use chrono::Utc;
 use ratatui::layout::Position;
 
-use crate::models::ConversationTarget;
+use crate::config::Persona;
+use crate::models::{ConversationTarget, OutgoingContact, OutgoingEvent};
 use crate::sync::SyncCommand;
 
 use super::app::{AppState, Focus, NarrowPane, UiState};
 use super::composer::{self, ReplyPreview};
 use super::hitmap::{ButtonId, HitTarget, MessageScope};
-use super::nav_pane;
+use super::nav_pane::{self, TAB_CALENDAR, TAB_CONTACTS, TAB_COUNT, TAB_MAIL, TAB_TODO};
 use super::overlays::context_menu::{ContextMenu, ContextTarget};
+use super::overlays::image_preview::ImagePreviewOverlay;
+use super::overlays::mail_compose::{MailComposeMode, MailComposeOverlay};
+use super::overlays::search::{SearchOverlay, SearchScope};
 use super::overlays::{Overlay, OverlayKind, OverlayOutcome};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,11 +192,70 @@ pub enum Action {
         on_confirm: Option<Box<Action>>,
     },
     OverlaySelect(usize),
+    OverlaySubmit,
     Click {
         column: u16,
         row: u16,
     },
     ShowToast(String),
+
+    // Persona, Inline Images & Updater
+    SwitchPersona(Persona),
+    ToggleInlineImages,
+    OpenImagePreview,
+    LoadPreviewImage,
+    DownloadPreviewImage,
+    CheckForUpdates,
+    ApplySelfUpdate,
+
+    // Outlook Mail
+    OpenMailComposeNew,
+    OpenMailReply {
+        reply_all: bool,
+    },
+    OpenMailForward,
+    SubmitMailCompose {
+        mode: MailComposeMode,
+        to: Vec<String>,
+        cc: Vec<String>,
+        subject: String,
+        body_markdown: String,
+        attachments: Vec<PathBuf>,
+    },
+    MailToggleRead,
+    MailToggleFlag,
+    MailArchive,
+    MailDeleteRequest,
+    MailDeleteConfirm,
+    MailDownloadAttachment,
+
+    // Outlook Calendar
+    CreateCalendarEvent(OutgoingEvent),
+    JoinCalendarMeeting,
+    RespondCalendarEvent(String),
+    DeleteCalendarEventRequest,
+    DeleteCalendarEventConfirm,
+
+    // Outlook Contacts
+    CreateContact(OutgoingContact),
+    DeleteContactRequest,
+    DeleteContactConfirm,
+    ContactSendMail,
+    ContactStartChat,
+
+    // Microsoft To Do
+    TodoToggleSelected,
+    TodoCycleList(isize),
+    TodoToggleShowCompleted,
+    TodoFocusInput,
+    TodoDeleteRequest,
+    TodoDeleteConfirm,
+
+    // Scoped Search
+    SearchMail(String),
+    SearchContacts(String),
+    JumpToMailSearchHit(usize),
+    JumpToContactSearchHit(usize),
 }
 
 /// Dispatches an `Action`, mutating `app` and `ui`.
@@ -231,6 +296,38 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             OverlayOutcome::NotHandled => {
                 ui.overlays.push(top);
             }
+        }
+    }
+
+    // Quick To Do input bar interception when focused on TAB_TODO center pane.
+    if matches!(ui.focus(), Focus::Chat)
+        && ui.active_nav_tab == TAB_TODO
+        && ui.todo_input_active
+    {
+        match action {
+            Action::Input(ch) => {
+                ui.todo_input.push(ch);
+                return false;
+            }
+            Action::Paste(text) => {
+                ui.todo_input.push_str(&text.replace(['\r', '\n'], " "));
+                return false;
+            }
+            Action::Backspace => {
+                ui.todo_input.pop();
+                return false;
+            }
+            Action::SendMessage | Action::Activate => {
+                let title = std::mem::take(&mut ui.todo_input);
+                ui.todo_input_active = false;
+                app.create_todo_task(ui, title);
+                return false;
+            }
+            Action::CloseOverlay | Action::ComposerEscape => {
+                ui.todo_input_active = false;
+                return false;
+            }
+            _ => {}
         }
     }
 
@@ -316,10 +413,16 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
 
         // Navigation pane
         Action::SelectNavTab(tab) => {
-            ui.active_nav_tab = tab.min(2);
+            ui.active_nav_tab = tab.min(TAB_COUNT - 1);
             ui.nav_selected = 0;
+            ui.todo_input_active = false;
             ui.narrow_pane = NarrowPane::List;
             ui.set_focus(Focus::Nav);
+            if ui.active_nav_tab >= TAB_MAIL {
+                ui.persona = Persona::Outlook;
+            } else {
+                ui.persona = Persona::Teams;
+            }
         }
         Action::SelectNavRow(idx) => {
             app.select_nav_row(ui, idx);
@@ -717,8 +820,9 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::RefreshAll => {
             app.sync_ctrl.request(SyncCommand::RefreshConversations);
+            app.sync_ctrl.request(SyncCommand::RefreshOutlook);
             app.sync_ctrl.request(SyncCommand::SyncActiveNow);
-            ui.info("대화 목록과 메시지를 새로고침합니다...");
+            ui.info("Teams · Outlook 목록과 메시지를 새로고침합니다...");
         }
         Action::SyncHistory => {
             if let Some(ConversationTarget::Channel {
@@ -821,16 +925,293 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 top.select(index);
             }
         }
+        Action::OverlaySubmit => {}
         Action::Click { .. } | Action::OpenContextMenuAt { .. } => unreachable!(),
         Action::ShowToast(msg) => {
             ui.info(msg);
+        }
+
+        // Persona, Inline Images & Updater
+        Action::SwitchPersona(persona) => {
+            ui.persona = persona;
+            ui.todo_input_active = false;
+            match persona {
+                Persona::Teams => {
+                    if ui.active_nav_tab >= TAB_MAIL {
+                        ui.active_nav_tab = 0;
+                        ui.nav_selected = 0;
+                    }
+                    ui.info("Teams 워크스페이스 모드로 전환했습니다");
+                }
+                Persona::Outlook => {
+                    if ui.active_nav_tab < TAB_MAIL {
+                        ui.active_nav_tab = TAB_MAIL;
+                        ui.nav_selected = 0;
+                    }
+                    ui.info("Outlook 워크스페이스 모드로 전환했습니다");
+                }
+            }
+            ui.set_focus(Focus::Nav);
+        }
+        Action::ToggleInlineImages => {
+            ui.inline_images = !ui.inline_images;
+            app.config.inline_images = ui.inline_images;
+            let _ = app.config.save();
+            ui.info(if ui.inline_images {
+                "인라인 이미지 미리보기 켜짐"
+            } else {
+                "인라인 이미지 미리보기 꺼짐"
+            });
+        }
+        Action::OpenImagePreview => {
+            open_image_preview(app, ui);
+        }
+        Action::LoadPreviewImage => {
+            let dims = (ui.term_width, ui.term_height);
+            let target_and_dims = ui.overlays.last().and_then(|top| {
+                if let Overlay::ImagePreview(preview) = top {
+                    preview
+                        .current()
+                        .cloned()
+                        .map(|t| (t, preview.target_dimensions(dims.0, dims.1)))
+                } else {
+                    None
+                }
+            });
+            if let Some((target, (cols, rows))) = target_and_dims {
+                app.request_preview_image(&target, cols, rows);
+            }
+        }
+        Action::DownloadPreviewImage => {
+            let current = ui.overlays.last().and_then(|top| {
+                if let Overlay::ImagePreview(preview) = top {
+                    preview.current().cloned()
+                } else {
+                    None
+                }
+            });
+            if let Some(target) = current {
+                match target {
+                    super::overlays::image_preview::PreviewTarget::Teams { attachment, .. } => {
+                        let graph = app.graph.clone();
+                        let dir = app.download_dir.clone();
+                        let tx = app.ui_tx.clone();
+                        let label = format!("이미지 저장: {}", attachment.name.as_deref().unwrap_or(&attachment.id));
+                        ui.tasks.begin(label.clone());
+                        tokio::spawn(async move {
+                            match graph.download_attachment(&attachment, &dir).await {
+                                Ok(file) => {
+                                    let _ = tx.send(super::app::UiMsg::TaskDone {
+                                        label,
+                                        error: None,
+                                        toast: Some((
+                                            format!("저장됨: {}", file.path.display()),
+                                            super::toast::ToastKind::Success,
+                                        )),
+                                    });
+                                }
+                                Err(err) => {
+                                    let _ = tx.send(super::app::UiMsg::TaskDone {
+                                        label,
+                                        error: Some(err.to_string()),
+                                        toast: Some((format!("저장 실패: {err}"), super::toast::ToastKind::Error)),
+                                    });
+                                }
+                            }
+                        });
+                    }
+                    super::overlays::image_preview::PreviewTarget::Mail { mail_id, attachment } => {
+                        app.download_mail_attachment(ui, mail_id, attachment.id, attachment.name);
+                    }
+                }
+            }
+        }
+        Action::CheckForUpdates => {
+            app.check_for_updates(ui, true, false);
+        }
+        Action::ApplySelfUpdate => {
+            app.check_for_updates(ui, false, false);
+        }
+
+        // Outlook Mail
+        Action::OpenMailComposeNew => {
+            ui.push_overlay(Overlay::MailCompose(MailComposeOverlay::new()));
+        }
+        Action::OpenMailReply { reply_all } => {
+            if let Some(mail) = app.active_mail() {
+                ui.push_overlay(Overlay::MailCompose(MailComposeOverlay::reply(
+                    mail, reply_all,
+                )));
+            } else {
+                ui.info("답장할 메일을 먼저 선택하세요");
+            }
+        }
+        Action::OpenMailForward => {
+            if let Some(mail) = app.active_mail() {
+                ui.push_overlay(Overlay::MailCompose(MailComposeOverlay::forward(mail)));
+            } else {
+                ui.info("전달할 메일을 먼저 선택하세요");
+            }
+        }
+        Action::SubmitMailCompose {
+            mode,
+            to,
+            cc,
+            subject,
+            body_markdown,
+            attachments,
+        } => {
+            app.submit_mail_compose(ui, mode, to, cc, subject, body_markdown, attachments);
+        }
+        Action::MailToggleRead => {
+            app.toggle_active_mail_read(ui);
+        }
+        Action::MailToggleFlag => {
+            app.toggle_active_mail_flag(ui);
+        }
+        Action::MailArchive => {
+            app.archive_active_mail(ui);
+        }
+        Action::MailDeleteRequest => {
+            if let Some(mail) = app.active_mail() {
+                let subj = if mail.subject.is_empty() {
+                    "(제목 없음)"
+                } else {
+                    mail.subject.as_str()
+                };
+                let msg = format!("메일 '{subj}' 을(를) 삭제하시겠습니까?");
+                ui.push_overlay(Overlay::confirm(msg, Some(Action::MailDeleteConfirm)));
+            }
+        }
+        Action::MailDeleteConfirm => {
+            app.delete_active_mail(ui);
+        }
+        Action::MailDownloadAttachment => {
+            if let Some(mail) = app.active_mail().cloned() {
+                if let Some(att) = mail
+                    .attachments
+                    .get(ui.mail_attach_index)
+                    .or_else(|| mail.attachments.first())
+                {
+                    app.download_mail_attachment(ui, mail.id, att.id.clone(), att.name.clone());
+                } else {
+                    ui.info("다운로드할 메일 첨부파일이 없습니다");
+                }
+            }
+        }
+
+        // Outlook Calendar
+        Action::CreateCalendarEvent(event) => {
+            app.create_calendar_event(ui, event);
+        }
+        Action::JoinCalendarMeeting => {
+            app.open_active_event_meeting(ui);
+        }
+        Action::RespondCalendarEvent(response) => {
+            app.respond_active_event(ui, &response);
+        }
+        Action::DeleteCalendarEventRequest => {
+            if let Some(ev) = app.active_event() {
+                let msg = format!("일정 '{}' 을(를) 삭제하시겠습니까?", ev.subject);
+                ui.push_overlay(Overlay::confirm(
+                    msg,
+                    Some(Action::DeleteCalendarEventConfirm),
+                ));
+            }
+        }
+        Action::DeleteCalendarEventConfirm => {
+            app.delete_active_event(ui);
+        }
+
+        // Outlook Contacts
+        Action::CreateContact(contact) => {
+            app.create_contact(ui, contact);
+        }
+        Action::DeleteContactRequest => {
+            if let Some(contact) = app.active_contact() {
+                let msg = format!("연락처 '{}' 을(를) 삭제하시겠습니까?", contact.display_name);
+                ui.push_overlay(Overlay::confirm(msg, Some(Action::DeleteContactConfirm)));
+            }
+        }
+        Action::DeleteContactConfirm => {
+            app.delete_active_contact(ui);
+        }
+        Action::ContactSendMail => {
+            if let Some(contact) = app.active_contact() {
+                let compose = if let Some(email) = contact.primary_email() {
+                    MailComposeOverlay::new_to(email)
+                } else {
+                    MailComposeOverlay::new()
+                };
+                ui.push_overlay(Overlay::MailCompose(compose));
+            } else {
+                ui.info("연락처를 먼저 선택하세요");
+            }
+        }
+        Action::ContactStartChat => {
+            app.start_chat_with_contact(ui);
+        }
+
+        // Microsoft To Do
+        Action::TodoToggleSelected => {
+            app.toggle_active_todo_completed(ui);
+        }
+        Action::TodoCycleList(delta) => {
+            app.cycle_todo_list(ui, delta);
+        }
+        Action::TodoToggleShowCompleted => {
+            app.toggle_todo_show_completed(ui);
+        }
+        Action::TodoFocusInput => {
+            ui.active_nav_tab = TAB_TODO;
+            ui.narrow_pane = NarrowPane::Chat;
+            ui.set_focus(Focus::Chat);
+            ui.todo_input_active = true;
+        }
+        Action::TodoDeleteRequest => {
+            if let Some(task) = app.active_todo_task() {
+                let msg = format!("할 일 '{}' 을(를) 삭제하시겠습니까?", task.title);
+                ui.push_overlay(Overlay::confirm(msg, Some(Action::TodoDeleteConfirm)));
+            }
+        }
+        Action::TodoDeleteConfirm => {
+            app.delete_active_todo(ui);
+        }
+
+        // Scoped Search
+        Action::SearchMail(query) => {
+            app.search_mail(query);
+        }
+        Action::SearchContacts(query) => {
+            app.search_contacts(query);
+        }
+        Action::JumpToMailSearchHit(idx) => {
+            if let Some(hit) = app.mail_search_results.get(idx).cloned() {
+                ui.active_nav_tab = TAB_MAIL;
+                ui.persona = Persona::Outlook;
+                app.select_mail(ui, hit.id);
+                ui.narrow_pane = NarrowPane::Chat;
+                ui.set_focus(Focus::Chat);
+            }
+        }
+        Action::JumpToContactSearchHit(idx) => {
+            if let Some(contact) = app.contact_search_results.get(idx).cloned() {
+                ui.active_nav_tab = TAB_CONTACTS;
+                ui.persona = Persona::Outlook;
+                if !app.contacts.iter().any(|c| c.id == contact.id) {
+                    app.contacts.insert(0, contact.clone());
+                }
+                app.select_contact(ui, contact.id);
+                ui.narrow_pane = NarrowPane::Chat;
+                ui.set_focus(Focus::Chat);
+            }
         }
     }
 
     false
 }
 
-fn open_overlay(kind: OverlayKind, app: &AppState, ui: &mut UiState) {
+fn open_overlay(kind: OverlayKind, app: &mut AppState, ui: &mut UiState) {
     if kind.is_singleton() {
         ui.close_overlays_of(kind);
     }
@@ -840,7 +1221,14 @@ fn open_overlay(kind: OverlayKind, app: &AppState, ui: &mut UiState) {
         }
         OverlayKind::CommandPalette => Overlay::command_palette(),
         OverlayKind::Settings => Overlay::settings(),
-        OverlayKind::Search => Overlay::search(),
+        OverlayKind::Search => {
+            let scope = match ui.active_nav_tab {
+                TAB_MAIL => SearchScope::Mail,
+                TAB_CONTACTS => SearchScope::Contacts,
+                _ => SearchScope::TeamsMessages,
+            };
+            Overlay::Search(SearchOverlay::with_scope(scope))
+        }
         OverlayKind::Presence => Overlay::presence(),
         OverlayKind::Reactions => {
             let (scope, idx) =
@@ -851,18 +1239,56 @@ fn open_overlay(kind: OverlayKind, app: &AppState, ui: &mut UiState) {
         OverlayKind::PathInput => Overlay::path_input(),
         OverlayKind::NewChat => Overlay::new_chat(),
         OverlayKind::RoomInfo => Overlay::room_info(),
+        OverlayKind::MailCompose => Overlay::MailCompose(MailComposeOverlay::new()),
+        OverlayKind::EventCreate => Overlay::event_create(),
+        OverlayKind::ContactCreate => Overlay::contact_create(),
+        OverlayKind::ImagePreview => {
+            open_image_preview(app, ui);
+            return;
+        }
         OverlayKind::Help => Overlay::help(),
         OverlayKind::Confirm => Overlay::confirm("확인하시겠습니까?", None),
     };
     ui.push_overlay(overlay);
 }
 
+fn open_image_preview(app: &mut AppState, ui: &mut UiState) {
+    let preview_opt = if ui.active_nav_tab == TAB_MAIL {
+        app.active_mail()
+            .and_then(|mail| ImagePreviewOverlay::from_mail_message(mail, Some(ui.mail_attach_index)))
+    } else {
+        selected_message_scope_and_index(app, ui)
+            .and_then(|(scope, idx)| app.message_at(scope, idx))
+            .and_then(|msg| ImagePreviewOverlay::from_teams_message(msg, Some(ui.attach_index)))
+            .or_else(|| {
+                app.messages
+                    .iter()
+                    .rev()
+                    .find_map(|msg| ImagePreviewOverlay::from_teams_message(msg, None))
+            })
+    };
+
+    let Some(preview) = preview_opt else {
+        ui.info("미리볼 수 있는 이미지 첨부가 없습니다");
+        return;
+    };
+
+    ui.close_overlays_of(OverlayKind::ImagePreview);
+    if let Some(target) = preview.current().cloned() {
+        let (cols, rows) = preview.target_dimensions(ui.term_width, ui.term_height);
+        app.request_preview_image(&target, cols, rows);
+    }
+    ui.push_overlay(Overlay::ImagePreview(preview));
+}
+
 fn cycle_focus(app: &AppState, ui: &mut UiState, forward: bool) {
     let mut order = vec![Focus::Nav, Focus::Chat];
-    if ui.thread_drawer_open && app.active_thread.is_some() {
-        order.push(Focus::Thread);
+    if ui.active_nav_tab < TAB_MAIL {
+        if ui.thread_drawer_open && app.active_thread.is_some() {
+            order.push(Focus::Thread);
+        }
+        order.push(Focus::Composer);
     }
-    order.push(Focus::Composer);
 
     let pos = order.iter().position(|f| *f == ui.focus).unwrap_or(0);
     let next_pos = if forward {
@@ -929,6 +1355,14 @@ fn move_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
             ui.nav_selected = next;
         }
         Focus::Chat => {
+            if ui.active_nav_tab >= TAB_MAIL {
+                if delta < 0 {
+                    ui.mail_scroll.scroll_up((-delta) as u16);
+                } else if delta > 0 {
+                    ui.mail_scroll.scroll_down(delta as u16);
+                }
+                return;
+            }
             let len = app.messages.len();
             if len == 0 {
                 return;
@@ -967,6 +1401,7 @@ fn move_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
 fn scroll_focused(ui: &mut UiState, delta: i32) {
     let target = match ui.focus() {
         Focus::Thread => &mut ui.thread_scroll,
+        _ if ui.active_nav_tab >= TAB_MAIL => &mut ui.mail_scroll,
         _ => &mut ui.chat_scroll,
     };
     if delta < 0 {
@@ -983,22 +1418,38 @@ fn handle_activate(app: &mut AppState, ui: &mut UiState) {
             app.select_nav_row(ui, idx);
         }
         Focus::Chat => {
-            if let Some(idx) = selected_chat_index(app, ui) {
-                if app
-                    .active_target
-                    .as_ref()
-                    .is_some_and(ConversationTarget::is_channel)
-                {
-                    app.open_thread(ui, idx);
-                } else {
-                    let _ = dispatch(
-                        Action::ReplyTo {
-                            scope: MessageScope::Chat,
-                            msg_index: idx,
-                        },
-                        app,
-                        ui,
-                    );
+            match ui.active_nav_tab {
+                TAB_MAIL => {
+                    let _ = dispatch(Action::OpenMailReply { reply_all: false }, app, ui);
+                }
+                TAB_CALENDAR => {
+                    app.open_active_event_meeting(ui);
+                }
+                TAB_CONTACTS => {
+                    let _ = dispatch(Action::ContactSendMail, app, ui);
+                }
+                TAB_TODO => {
+                    app.toggle_active_todo_completed(ui);
+                }
+                _ => {
+                    if let Some(idx) = selected_chat_index(app, ui) {
+                        if app
+                            .active_target
+                            .as_ref()
+                            .is_some_and(ConversationTarget::is_channel)
+                        {
+                            app.open_thread(ui, idx);
+                        } else {
+                            let _ = dispatch(
+                                Action::ReplyTo {
+                                    scope: MessageScope::Chat,
+                                    msg_index: idx,
+                                },
+                                app,
+                                ui,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1042,7 +1493,7 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
     let pos = Position { x: column, y: row };
     if ui.thread_drawer_open && ui.thread_scroll.area.contains(pos) {
         ui.set_focus(Focus::Thread);
-    } else if ui.chat_scroll.area.contains(pos) {
+    } else if ui.chat_scroll.area.contains(pos) || ui.mail_scroll.area.contains(pos) {
         ui.set_focus(Focus::Chat);
     }
     false
@@ -1085,6 +1536,30 @@ fn action_for_target(target: HitTarget) -> Action {
             ButtonId::ComposerTargetToggle => Action::ToggleComposerTarget,
             ButtonId::SubjectToggle => Action::ToggleSubject,
             ButtonId::NarrowToggle => Action::ToggleNarrowPane,
+            ButtonId::NewMail => Action::OpenMailComposeNew,
+            ButtonId::MailReply => Action::OpenMailReply { reply_all: false },
+            ButtonId::MailReplyAll => Action::OpenMailReply { reply_all: true },
+            ButtonId::MailForward => Action::OpenMailForward,
+            ButtonId::MailToggleRead => Action::MailToggleRead,
+            ButtonId::MailToggleFlag => Action::MailToggleFlag,
+            ButtonId::MailArchive => Action::MailArchive,
+            ButtonId::MailDelete => Action::MailDeleteRequest,
+            ButtonId::ImagePreview => Action::OpenImagePreview,
+            ButtonId::NewEvent => Action::OpenOverlay(OverlayKind::EventCreate),
+            ButtonId::JoinMeeting => Action::JoinCalendarMeeting,
+            ButtonId::RsvpAccept => Action::RespondCalendarEvent("accept".to_string()),
+            ButtonId::RsvpTentative => {
+                Action::RespondCalendarEvent("tentativelyAccept".to_string())
+            }
+            ButtonId::RsvpDecline => Action::RespondCalendarEvent("decline".to_string()),
+            ButtonId::DeleteEvent => Action::DeleteCalendarEventRequest,
+            ButtonId::NewContact => Action::OpenOverlay(OverlayKind::ContactCreate),
+            ButtonId::ContactMail => Action::ContactSendMail,
+            ButtonId::ContactChat => Action::ContactStartChat,
+            ButtonId::DeleteContact => Action::DeleteContactRequest,
+            ButtonId::NewTodo | ButtonId::TodoInputFocus => Action::TodoFocusInput,
+            ButtonId::TodoToggle => Action::TodoToggleSelected,
+            ButtonId::DeleteTodo => Action::TodoDeleteRequest,
         },
         HitTarget::SubjectInput => Action::FocusSubject,
         HitTarget::Composer => Action::OpenComposer,

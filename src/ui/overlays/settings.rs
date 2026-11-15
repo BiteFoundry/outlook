@@ -18,7 +18,7 @@ use crate::{
     },
 };
 
-const ITEMS: usize = 7;
+const ITEMS: usize = 8;
 
 #[derive(Debug, Clone, Default)]
 pub struct SettingsState {
@@ -37,6 +37,7 @@ impl SettingsState {
             ("알림", toggle(ui.notify)),
             ("좌측 레일", toggle(ui.show_nav_rail)),
             ("자동 스레드창", toggle(ui.auto_thread_pane)),
+            ("인라인 이미지 미리보기", toggle(ui.inline_images)),
             (
                 "다운로드 경로",
                 app.download_dir.to_string_lossy().to_string(),
@@ -61,9 +62,10 @@ impl SettingsState {
                 0 => OverlayOutcome::Dispatch(Action::ToggleNotify),
                 1 => OverlayOutcome::Dispatch(Action::ToggleNavRail),
                 2 => OverlayOutcome::Dispatch(Action::ToggleAutoThreadPane),
-                3 => OverlayOutcome::Dispatch(Action::ShowDownloadDir),
-                4 => OverlayOutcome::CloseAndDispatch(Action::OpenOverlay(OverlayKind::Help)),
-                5 => OverlayOutcome::CloseAndDispatch(Action::OpenOverlay(OverlayKind::Presence)),
+                3 => OverlayOutcome::Dispatch(Action::ToggleInlineImages),
+                4 => OverlayOutcome::Dispatch(Action::ShowDownloadDir),
+                5 => OverlayOutcome::CloseAndDispatch(Action::OpenOverlay(OverlayKind::Help)),
+                6 => OverlayOutcome::CloseAndDispatch(Action::OpenOverlay(OverlayKind::Presence)),
                 _ => OverlayOutcome::Dispatch(Action::ShowToast(
                     config::config_file_path().display().to_string(),
                 )),

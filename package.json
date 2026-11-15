@@ -1,13 +1,15 @@
 {
   "name": "@shinick/teams",
-  "version": "0.1.0",
-  "description": "Microsoft Teams terminal client & AI agent toolkit (CLI, TUI, HTTP API, MCP)",
+  "version": "0.2.0",
+  "description": "Unified Microsoft Teams & Outlook terminal client & AI agent toolkit (CLI, TUI, HTTP API, MCP)",
   "license": "MIT",
   "bin": {
-    "teams": "bin/teams.js"
+    "teams": "bin/teams.js",
+    "outlook": "bin/outlook.js"
   },
   "files": [
     "bin/teams.js",
+    "bin/outlook.js",
     "docs/NPM.md",
     "README.md"
   ],
@@ -17,6 +19,10 @@
   "keywords": [
     "microsoft-teams",
     "teams",
+    "outlook",
+    "calendar",
+    "microsoft-todo",
+    "microsoft-365",
     "microsoft-graph",
     "cli",
     "tui",
@@ -27,11 +33,11 @@
     "build:npm": "node scripts/build-npm.mjs"
   },
   "optionalDependencies": {
-    "@shinick/teams-win32-x64": "0.1.0",
-    "@shinick/teams-win32-arm64": "0.1.0",
-    "@shinick/teams-darwin-x64": "0.1.0",
-    "@shinick/teams-darwin-arm64": "0.1.0",
-    "@shinick/teams-linux-x64": "0.1.0",
-    "@shinick/teams-linux-arm64": "0.1.0"
+    "@shinick/teams-win32-x64": "0.2.0",
+    "@shinick/teams-win32-arm64": "0.2.0",
+    "@shinick/teams-darwin-x64": "0.2.0",
+    "@shinick/teams-darwin-arm64": "0.2.0",
+    "@shinick/teams-linux-x64": "0.2.0",
+    "@shinick/teams-linux-arm64": "0.2.0"
   }
 }
