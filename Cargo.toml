@@ -1,8 +1,8 @@
 [package]
 name = "teams-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "Microsoft Teams & Outlook terminal client & AI agent toolkit (CLI, TUI, HTTP API, MCP)"
+description = "Microsoft Teams, Outlook & OneNote terminal client & AI agent toolkit (CLI, TUI, HTTP API, MCP)"
 license = "MIT"
 
 [lib]

@@ -168,6 +168,7 @@ jobs:
 
           test -f bin/teams.js
           test -f bin/outlook.js
+          test -f bin/onenote.js
           test -f dist/teams-win32-x64/bin/teams.exe
           test -f dist/teams-win32-arm64/bin/teams.exe
           test -f dist/teams-darwin-x64/bin/teams
@@ -215,4 +216,4 @@ jobs:
           files: release-assets/*
           generate_release_notes: true
           body: |
-            Single unified binary (`teams` / `teams.exe`) powers both `teams` and `outlook` (`TEAMS_PERSONA=outlook`).
+            Single unified binary (`teams` / `teams.exe`) powers `teams`, `outlook` (`TEAMS_PERSONA=outlook`), and `onenote` (`TEAMS_PERSONA=onenote`).

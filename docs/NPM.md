@@ -6,9 +6,9 @@ and exec it, so there is no compiler, Node native addon, or postinstall download
 step.
 
 The Rust crate is named `teams-cli` and produces a single unified binary
-(`teams` / `teams.exe`) that powers both Teams and Outlook (`TEAMS_PERSONA=outlook`).
-The npm package is scoped as `@shinick/teams` and installs **both** `teams` and
-`outlook` commands.
+(`teams` / `teams.exe`) that powers Teams, Outlook, and OneNote
+(`TEAMS_PERSONA=outlook` / `TEAMS_PERSONA=onenote`). The npm package is scoped
+as `@shinick/teams` and installs **`teams`, `outlook`, and `onenote`** commands.
 
 ## Install and run
 
@@ -16,22 +16,26 @@ The npm package is scoped as `@shinick/teams` and installs **both** `teams` and
 # one-off
 npx @shinick/teams --version
 npx --yes -p @shinick/teams outlook --version
+npx --yes -p @shinick/teams onenote --version
 
-# global install (installs both `teams` and `outlook`)
+# global install (installs `teams`, `outlook`, and `onenote`)
 npm install -g @shinick/teams
 teams --version
 outlook --version
+onenote --version
 
 # project-local
 npm install @shinick/teams
 npx teams chats
 npx outlook inbox
+npx onenote notebooks
 ```
 
-Both commands share the exact same Entra ID login, SQLite FTS5 cache, HTTP API,
+All three commands share the exact same Entra ID login, SQLite FTS5 cache, HTTP API,
 and MCP server:
-- `teams login`, `teams chats`, `teams read <target>`, `teams send <target> <message>`, `teams tui`, `teams serve`, `teams mcp`, `teams update`
-- `outlook`, `outlook inbox`, `outlook read`, `outlook send`, `outlook reply`, `outlook cal`, `outlook contacts`, `outlook todo`, `outlook update`
+- `teams login`, `teams chats`, `teams read <target>`, `teams send <target> <message>`, `teams notes <cmd>`, `teams tui`, `teams serve`, `teams mcp`, `teams update`
+- `outlook`, `outlook inbox`, `outlook read`, `outlook send`, `outlook reply`, `outlook cal`, `outlook contacts`, `outlook todo`, `outlook notes`, `outlook update`
+- `onenote`, `onenote notebooks`, `onenote sections`, `onenote pages`, `onenote read`, `onenote create`, `onenote append`, `onenote update`, `onenote check`, `onenote delete`, `onenote search`, `onenote resource`, `onenote self-update`
 
 ## Supported platforms
 
@@ -49,25 +53,27 @@ source with Cargo; there is no musl package yet.
 
 ## How resolution works
 
-`bin/teams.js` and `bin/outlook.js` look up `@shinick/teams-<platform>-<arch>`
-through `require.resolve`, then execute
+`bin/teams.js`, `bin/outlook.js`, and `bin/onenote.js` look up
+`@shinick/teams-<platform>-<arch>` through `require.resolve`, then execute
 `node_modules/@shinick/teams-<platform>-<arch>/bin/teams` (or `teams.exe` on
-Windows) with `stdio: 'inherit'`. `bin/outlook.js` sets
-`TEAMS_PERSONA=outlook` before spawning the binary so the unified executable
-boots directly in Outlook mode. Signals (`SIGINT`, `SIGTERM`, `SIGHUP`) are
-forwarded and the launcher exits with the child's exit code. If the platform
-package is missing (for example because optional dependencies were skipped), the
-launcher prints the supported platforms and the `--include=optional` hint instead
-of a stack trace.
+Windows) with `stdio: 'inherit'`. `bin/outlook.js` and `bin/onenote.js` set
+`TEAMS_PERSONA=outlook` / `TEAMS_PERSONA=onenote` before spawning the binary so
+the unified executable boots directly in the matching persona. Signals (`SIGINT`,
+`SIGTERM`, `SIGHUP`) are forwarded and the launcher exits with the child's exit
+code. If the platform package is missing (for example because optional
+dependencies were skipped), the launcher prints the supported platforms and the
+`--include=optional` hint instead of a stack trace.
 
 ## Layout
 
 ```
-package.json                  # @shinick/teams launcher package (bin: teams, outlook)
+package.json                  # @shinick/teams launcher package (bin: teams, outlook, onenote)
 bin/teams.js                  # teams launcher
 bin/outlook.js                # outlook launcher (sets TEAMS_PERSONA=outlook)
+bin/onenote.js                # onenote launcher (sets TEAMS_PERSONA=onenote)
 teams / teams.cmd             # repo-local Teams launchers
 outlook / outlook.cmd         # repo-local Outlook launchers (sets TEAMS_PERSONA=outlook)
+onenote / onenote.cmd         # repo-local OneNote launchers (sets TEAMS_PERSONA=onenote)
 npm/teams-<platform>/         # one package per platform
   package.json                # os/cpu/files, same version as root
   bin/teams[.exe]             # added by scripts/build-npm.mjs, never committed
@@ -96,8 +102,8 @@ version because the root package pins its platform packages exactly.
 Tag the release with a matching `v` prefix:
 
 ```sh
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 ## Publishing
@@ -134,6 +140,7 @@ npm publish --access public
 node scripts/build-npm.mjs --target x86_64-pc-windows-msvc
 node bin/teams.js --version
 node bin/outlook.js --version
+node bin/onenote.js --version
 
 npm pack --dry-run
 npm pack --dry-run ./npm/teams-win32-x64

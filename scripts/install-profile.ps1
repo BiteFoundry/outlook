@@ -1,16 +1,16 @@
 <#
 .SYNOPSIS
-    Idempotently installs both `teams` and `outlook` terminal launchers on any Windows PC.
+    Idempotently installs `teams`, `outlook`, and `onenote` terminal launchers on any Windows PC.
 
 .DESCRIPTION
     1. Ensures <RepoRoot>\target\release\teams.exe exists (downloads the prebuilt
        release binary from GitHub `shinick-dev/teams` via `gh` when missing, so
        Rust/Cargo is NOT required on target PCs).
-    2. Registers/updates `# >>> teams launcher >>>` (`function teams` + `function outlook`)
-       in PowerShell $PROFILE. Both commands share the single `teams.exe` binary,
-       with `outlook` setting `TEAMS_PERSONA=outlook` for the invocation.
-    3. If $HOME\Tools\bin exists, also writes both `teams.cmd` and `outlook.cmd`
-       there so already-open shells find both commands.
+    2. Registers/updates `# >>> teams launcher >>>` (`function teams` + `function outlook` + `function onenote`)
+       in PowerShell $PROFILE. All three commands share the single `teams.exe` binary,
+       with `outlook` and `onenote` setting `TEAMS_PERSONA` for the invocation.
+    3. If $HOME\Tools\bin exists, also writes `teams.cmd`, `outlook.cmd`, and `onenote.cmd`
+       there so already-open shells find all three commands.
 
 .EXAMPLE
     pwsh -File .\scripts\install-profile.ps1
@@ -51,7 +51,7 @@ $endMarker = '# <<< teams launcher <<<'
 
 $block = @"
 $startMarker
-# Opens the unified Microsoft Teams + Outlook terminal client (CLI/TUI) from anywhere.
+# Opens the unified Microsoft Teams + Outlook + OneNote terminal client (CLI/TUI) from anywhere.
 function teams {
     `$root = '$escapedRoot'
     `$exe = Join-Path `$root 'target\release\teams.exe'
@@ -73,6 +73,21 @@ function teams {
 function outlook {
     `$prevPersona = `$env:TEAMS_PERSONA
     `$env:TEAMS_PERSONA = 'outlook'
+    try {
+        teams @args
+    } finally {
+        if (`$null -eq `$prevPersona) {
+            Remove-Item Env:TEAMS_PERSONA -ErrorAction SilentlyContinue
+        } else {
+            `$env:TEAMS_PERSONA = `$prevPersona
+        }
+    }
+}
+
+# Opens the unified binary in OneNote persona (Personal + Team/Group Shared Notebooks, Sections, Pages).
+function onenote {
+    `$prevPersona = `$env:TEAMS_PERSONA
+    `$env:TEAMS_PERSONA = 'onenote'
     try {
         teams @args
     } finally {
@@ -137,5 +152,12 @@ if (Test-Path -LiteralPath $toolsBin) {
     if ($PSCmdlet.ShouldProcess($outlookShimPath, 'Write PATH shim outlook.cmd')) {
         [System.IO.File]::WriteAllText($outlookShimPath, $outlookShimContent, [System.Text.Encoding]::ASCII)
         Write-Output "Updated PATH shim: $outlookShimPath"
+    }
+
+    $onenoteShimPath = Join-Path $toolsBin 'onenote.cmd'
+    $onenoteShimContent = "@echo off`r`nchcp 65001 >nul`r`nsetlocal`r`nset `"TEAMS_PERSONA=onenote`"`r`ncall `"$resolvedRoot\teams.cmd`" %*`r`nexit /b %errorlevel%`r`n"
+    if ($PSCmdlet.ShouldProcess($onenoteShimPath, 'Write PATH shim onenote.cmd')) {
+        [System.IO.File]::WriteAllText($onenoteShimPath, $onenoteShimContent, [System.Text.Encoding]::ASCII)
+        Write-Output "Updated PATH shim: $onenoteShimPath"
     }
 }

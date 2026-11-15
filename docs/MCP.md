@@ -1,27 +1,29 @@
-# `teams` / `outlook` MCP Server
+# `teams` / `outlook` / `onenote` MCP Server
 
-`teams mcp` or `outlook mcp` (alias `mcp-server`) runs a [Model Context Protocol](https://modelcontextprotocol.io/) server over **stdio** using newline-delimited JSON-RPC 2.0. It exposes Microsoft Teams (chats, channels, threads, files, reactions, search, presence) as well as Outlook Mail, Outlook Calendar, Contacts / Entra Directory, and Microsoft To Do to MCP-capable agents such as Claude Desktop, Claude Code, and Codex.
+`teams mcp`, `outlook mcp`, or `onenote mcp` (alias `mcp-server`) runs a [Model Context Protocol](https://modelcontextprotocol.io/) server over **stdio** using newline-delimited JSON-RPC 2.0. It exposes Microsoft Teams (chats, channels, threads, files, reactions, search, presence) as well as Outlook Mail, Outlook Calendar, Contacts / Entra Directory, Microsoft To Do, and Microsoft OneNote (notebooks, sections, pages, blocks, to-do tags) to MCP-capable agents such as Claude Desktop, Claude Code, and Codex.
 
 ## Requirements
 
-1. Build or install the `teams` (and optionally `outlook` copy/symlink) binary:
+1. Build or install the `teams` (and optionally `outlook` / `onenote` copy/symlink) binary:
    ```bash
    cargo build --release
    ```
 2. Authenticate once (the MCP server never prompts interactively on stdin):
    ```bash
    teams login
-   # or, if invoking under the outlook persona with M365 scopes:
+   # or, if invoking under the outlook or onenote persona with M365 scopes:
    outlook login
+   onenote login
    ```
    Or set `TEAMS_ACCESS_TOKEN` in the process environment.
-3. Ensure `teams` (or `outlook`, e.g. `target/release/teams.exe` on Windows or on `PATH`) is accessible to your MCP host.
+3. Ensure `teams` (or `outlook` / `onenote`, e.g. `target/release/teams.exe` on Windows or on `PATH`) is accessible to your MCP host.
 
 ## Starting manually
 
 ```bash
 teams mcp          # stdio: one JSON-RPC 2.0 object per line
-outlook mcp        # same 36-tool MCP server via the outlook persona
+outlook mcp        # same 46-tool MCP server via the outlook persona
+onenote mcp        # same 46-tool MCP server via the onenote persona
 teams mcp-server   # alias
 ```
 
@@ -85,7 +87,7 @@ args = ["mcp"]
 - **Error codes**: `-32700` parse error, `-32600` invalid JSON-RPC envelope, `-32601` method not found.
 - **`tools/call`**: returns `{ "content": [{ "type": "text", "text": "<pretty JSON>" }], "isError": false }` on success, or `"isError": true` with an error message on validation/Graph failures.
 
-## Tools (36)
+## Tools (46)
 
 ### Microsoft Teams Tools (17)
 
@@ -135,13 +137,36 @@ args = ["mcp"]
 | `complete_todo_task` | `list?`, `task_id`, `completed?` (default `true`) | `{ "ok": true, "task": {...} }` |
 | `delete_todo_task` | `list?`, `task_id`, `confirm` (must be literal `true`) | `{ "ok": true, "list_id": "...", "task_id": "..." }` |
 
+### Microsoft OneNote Tools (10)
+
+`section` and `page` arguments accept a `section_key`/`page_key` (`me|...`, `group:{gid}|...`), a `"Notebook/Section"` string, a unique display name/title, or a raw Graph ID. `onenote_get_page` returns the block `element_id`s that `onenote_update_page` and `onenote_toggle_todo` operate on.
+
+| Tool | Arguments | Returns |
+| --- | --- | --- |
+| `onenote_list_notebooks` | `include_teams?` (bool, default `true`), `refresh?` (bool) | `{ "notebooks": [...] }` |
+| `onenote_list_sections` | `notebook?` (name, `"Owner/Notebook"`, key, or ID), `refresh?` (bool) | `{ "notebook": {...} \| null, "sections": [...] }` |
+| `onenote_list_pages` | `section`, `limit?` (1..1000, default `50`), `refresh?` (bool) | `{ "section": {...}, "pages": [...] }` |
+| `onenote_get_page` | `page`, `offline?` (bool) | `{ "page": { "summary", "raw_xhtml", "body_markdown", "body_plain", "blocks", "resources", "primary_div_id", "synced_at" } }` |
+| `onenote_create_page` | `section`, `title`, `markdown_body`, `image_paths?` (`string[]`), `level?` (0..2) | `{ "ok": true, "section": {...}, "page": {...} }` |
+| `onenote_append_page` | `page`, `markdown_body`, `image_paths?` (`string[]`) | `{ "ok": true, "page_key": "...", "page_id": "...", "primary_div_id": ..., "page": {...} }` |
+| `onenote_update_page` | `page`, `title?`, `markdown_body?`, `block_id?` (at least one of `title`/`markdown_body`; `block_id` requires `markdown_body`) | `{ "ok": true, "page_key": "...", "page_id": "...", "commands_applied": ..., "page": {...} }` |
+| `onenote_toggle_todo` | `page`, `block_id?`, `todo_index?` (one of the two required) | `{ "ok": true, "page_key": "...", "page_id": "...", "element_id": "...", "completed": ..., "command": {...}, "page": {...} }` |
+| `onenote_search` | `query`, `section?`, `limit?` (1..1000, default `30`), `refresh?` (bool) | `{ "hits": [...] }` |
+| `onenote_delete_page` | `page`, `confirm` (must be literal `true`) | `{ "ok": true, "page_key": "...", "page_id": "..." }` |
+
+- `onenote_create_page` converts GitHub-flavored Markdown (tables, `- [ ]` task lists → OneNote to-do tags) and embeds `image_paths` as inline images. `level` controls page indentation (`0` = root, `1` = subpage, `2` = sub-subpage).
+- `onenote_get_page` derives `blocks[].element_id` and `blocks[].tag` from Graph `?includeIDs=true`; pass an `element_id` as `block_id` to replace a single block or to toggle its checkbox.
+- `onenote_search` queries the local SQLite FTS5 cache and bootstraps the OneNote cache first when it is empty or `refresh=true`.
+
+> **Not exposed as MCP tools yet:** `onenote_create_notebook`, `onenote_create_section`, and OneNote resource/attachment download. Notebook and section creation are CLI-only (`onenote create-notebook` / `onenote create-section`), and resource download is CLI-only (`onenote resource`).
+
 ### Mentions in `send_message`
 
 `mentions` accepts either `"user_id:DisplayName"` strings or `{ "id"?: 0, "user_id": "...", "display_name": "..." }` objects.
 
 ### Destructive tool guard (`confirm: true`)
 
-`delete_message`, `delete_mail`, `delete_calendar_event`, and `delete_todo_task` require `"confirm": true` as a literal JSON boolean. Omitting `confirm`, passing `false`, `"true"`, or `1` is rejected during argument validation before any Graph API call is made.
+`delete_message`, `delete_mail`, `delete_calendar_event`, `delete_todo_task`, and `onenote_delete_page` require `"confirm": true` as a literal JSON boolean. Omitting `confirm`, passing `false`, `"true"`, or `1` is rejected during argument validation before any Graph API call is made.
 
 ### Example JSON-RPC session
 
@@ -152,6 +177,8 @@ args = ["mcp"]
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_chats","arguments":{"refresh":true,"limit":20}}}
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"send_message","arguments":{"target":"Engineering/General","markdown":"Build **passed**!","subject":"CI","mentions":["u1:Alice"]}}}
 {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"delete_message","arguments":{"target":"Engineering/General","msg_id":"1700000000000","confirm":true}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"onenote_list_pages","arguments":{"section":"Engineering/Meetings","limit":20}}}
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"onenote_toggle_todo","arguments":{"page":"Weekly sync","todo_index":0}}}
 ```
 
 ## Notes and limitations
@@ -159,3 +186,5 @@ args = ["mcp"]
 - `send_file` reads `path` on the host running `teams mcp`, not on a remote MCP client.
 - `search_messages` queries the local SQLite FTS5 cache (`cache.db`); run `teams sync` or `get_messages` first if local history is empty.
 - `react_message` supports `like`, `heart`, `laugh`, `surprised`, `sad`, `angry`, and unicode emoji.
+- `onenote_create_page` / `onenote_append_page` read `image_paths` on the host running `teams mcp`, not on a remote MCP client.
+- `onenote_search` reads the local OneNote cache (`cache.db`); it bootstraps the cache when empty, and `refresh: true` re-syncs before searching.

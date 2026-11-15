@@ -1,14 +1,19 @@
 openapi: 3.1.0
 info:
-  title: teams / outlook HTTP JSON API
-  version: 0.2.0
+  title: teams / outlook / onenote HTTP JSON API
+  version: 0.3.0
   description: |
-    Local HTTP/JSON contract exposed by `teams serve` or `outlook serve` (alias `api`).
+    Local HTTP/JSON contract exposed by `teams serve`, `outlook serve`, or
+    `onenote serve` (alias `api`).
 
     Backed by Microsoft Graph v1.0, local SQLite WAL/FTS5 caching, and the
     background sync engine. Binds to `127.0.0.1:8788` by default. When started
     with `--token`, every endpoint except `GET /health` requires
     `Authorization: Bearer <token>`.
+
+    Microsoft OneNote endpoints are mounted at both `/v1/onenote/*` (canonical)
+    and `/onenote/*` (alias); the alias path items below reference their
+    canonical twins.
 
     All errors return `{"error": "<message>"}` with an appropriate HTTP status.
 servers:
@@ -30,6 +35,7 @@ tags:
   - name: calendar
   - name: contacts
   - name: todo
+  - name: onenote
 paths:
   /health:
     get:
@@ -1442,6 +1448,473 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalError"
+  /v1/onenote/notebooks:
+    get:
+      tags: [onenote]
+      summary: List personal and team/group OneNote notebooks
+      description: |
+        Personal (`/me/onenote`) notebooks plus notebooks shared through joined
+        Teams / M365 groups. Also served at `/onenote/notebooks`.
+      parameters:
+        - name: include_teams
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: true
+        - name: refresh
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: offline
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Notebook list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [notebooks]
+                properties:
+                  notebooks:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/OnenoteNotebook"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      tags: [onenote]
+      summary: Create a OneNote notebook
+      description: |
+        `group_id` and `site_id` are mutually exclusive; omit both to create a
+        personal notebook. Also served at `POST /onenote/notebooks`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateOnenoteNotebookRequest"
+      responses:
+        "200":
+          description: Notebook created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, notebook]
+                properties:
+                  ok:
+                    type: boolean
+                  notebook:
+                    $ref: "#/components/schemas/OnenoteNotebook"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/onenote/sections:
+    get:
+      tags: [onenote]
+      summary: List OneNote sections
+      description: |
+        Lists sections of one notebook when `notebook` is supplied, otherwise of
+        every accessible notebook. `notebook` accepts a display name,
+        `"Owner/Notebook"`, a `notebook_key`, or a Graph ID. Also served at
+        `/onenote/sections`.
+      parameters:
+        - name: notebook
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: refresh
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: offline
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Section list (the resolved notebook is `null` when unscoped)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [notebook, sections]
+                properties:
+                  notebook:
+                    oneOf:
+                      - $ref: "#/components/schemas/OnenoteNotebook"
+                      - type: "null"
+                  sections:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/OnenoteSection"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      tags: [onenote]
+      summary: Create a OneNote section in a notebook
+      description: |
+        `notebook` accepts a display name, `"Owner/Notebook"`, a `notebook_key`,
+        or a Graph ID. Also served at `POST /onenote/sections`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateOnenoteSectionRequest"
+      responses:
+        "200":
+          description: Section created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, notebook, section]
+                properties:
+                  ok:
+                    type: boolean
+                  notebook:
+                    $ref: "#/components/schemas/OnenoteNotebook"
+                  section:
+                    $ref: "#/components/schemas/OnenoteSection"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/onenote/sections/{section_key}/pages:
+    parameters:
+      - $ref: "#/components/parameters/OnenoteSectionKey"
+    get:
+      tags: [onenote]
+      summary: List pages in a OneNote section
+      description: Also served at `GET /onenote/sections/{section_key}/pages`.
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - name: refresh
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: offline
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Page list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [section, pages]
+                properties:
+                  section:
+                    $ref: "#/components/schemas/OnenoteSection"
+                  pages:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/OnenotePageSummary"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      tags: [onenote]
+      summary: Create a OneNote page from Markdown
+      description: |
+        Compiles GitHub-flavored Markdown (tables, `- [ ]` task lists → OneNote
+        to-do tags) and optional inline images into a new page. `image_paths` are
+        read on the host running `teams serve`. Also served at
+        `POST /onenote/sections/{section_key}/pages`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateOnenotePageRequest"
+      responses:
+        "200":
+          description: Page created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, section, page]
+                properties:
+                  ok:
+                    type: boolean
+                  section:
+                    $ref: "#/components/schemas/OnenoteSection"
+                  page:
+                    $ref: "#/components/schemas/OnenotePageSummary"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/onenote/pages/{page_key}:
+    parameters:
+      - $ref: "#/components/parameters/OnenotePageKey"
+    get:
+      tags: [onenote]
+      summary: Read a OneNote page
+      description: |
+        Returns the cached summary, raw XHTML, derived Markdown/plain text,
+        parsed blocks (with Graph `element_id` values), resources, and the
+        primary `div` container ID. `offline` is the only supported query
+        parameter; `offline=true` reads strictly from the SQLite cache and
+        returns `404` when the page is not cached. Also served at
+        `GET /onenote/pages/{page_key}`.
+      parameters:
+        - name: offline
+          in: query
+          required: false
+          description: Read from the local SQLite cache only.
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Page detail
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [page]
+                properties:
+                  page:
+                    $ref: "#/components/schemas/OnenotePageDetail"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    patch:
+      tags: [onenote]
+      summary: Update a OneNote page title/body or a single block
+      description: |
+        At least one of `title` or `markdown` is required; `block_id` requires
+        `markdown` and replaces only that block. Also served at
+        `PATCH /onenote/pages/{page_key}`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PatchOnenotePageRequest"
+      responses:
+        "200":
+          description: Patch commands applied
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OnenotePageMutationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      tags: [onenote]
+      summary: Delete a OneNote page
+      description: Also served at `DELETE /onenote/pages/{page_key}`.
+      responses:
+        "200":
+          description: Page deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, page_key, page_id]
+                properties:
+                  ok:
+                    type: boolean
+                  page_key:
+                    type: string
+                  page_id:
+                    type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/onenote/pages/{page_key}/append:
+    parameters:
+      - $ref: "#/components/parameters/OnenotePageKey"
+    post:
+      tags: [onenote]
+      summary: Append Markdown/images to a OneNote page
+      description: |
+        Requires at least one of `markdown` or `image_paths`. Also served at
+        `POST /onenote/pages/{page_key}/append`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AppendOnenotePageRequest"
+      responses:
+        "200":
+          description: Content appended
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OnenotePageAppendResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/onenote/pages/{page_key}/toggle-todo:
+    parameters:
+      - $ref: "#/components/parameters/OnenotePageKey"
+    post:
+      tags: [onenote]
+      summary: Toggle a OneNote to-do checkbox
+      description: |
+        Requires at least one of `block_id` (an `element_id`) or `todo_index`
+        (zero-based index among the page's to-do blocks); `block_id` wins when
+        both are supplied. Also served at
+        `POST /onenote/pages/{page_key}/toggle-todo`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ToggleOnenoteTodoRequest"
+      responses:
+        "200":
+          description: To-do toggled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OnenoteTodoToggleResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/onenote/search:
+    get:
+      tags: [onenote]
+      summary: Search cached OneNote pages via SQLite FTS5
+      description: |
+        Cache-only search (no `offline` parameter). `refresh=true` re-bootstraps
+        the OneNote cache before searching. Also served at `/onenote/search`.
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+        - name: section
+          in: query
+          required: false
+          description: Optional section filter (name, key, ID, or `"Notebook/Section"`).
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 30
+        - name: refresh
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Search hits
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hits]
+                properties:
+                  hits:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/OnenoteSearchHit"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  # Unversioned alias: `src/serve.rs` nests the same OneNote router at both
+  # `/v1/onenote` and `/onenote`, so each path item below is the identical twin
+  # of its canonical `/v1/onenote` counterpart.
+  /onenote/notebooks:
+    $ref: "#/paths/~1v1~1onenote~1notebooks"
+  /onenote/sections:
+    $ref: "#/paths/~1v1~1onenote~1sections"
+  /onenote/sections/{section_key}/pages:
+    $ref: "#/paths/~1v1~1onenote~1sections~1{section_key}~1pages"
+  /onenote/pages/{page_key}:
+    $ref: "#/paths/~1v1~1onenote~1pages~1{page_key}"
+  /onenote/pages/{page_key}/append:
+    $ref: "#/paths/~1v1~1onenote~1pages~1{page_key}~1append"
+  /onenote/pages/{page_key}/toggle-todo:
+    $ref: "#/paths/~1v1~1onenote~1pages~1{page_key}~1toggle-todo"
+  /onenote/search:
+    $ref: "#/paths/~1v1~1onenote~1search"
 components:
   securitySchemes:
     bearerAuth:
@@ -1471,6 +1944,26 @@ components:
         minimum: 1
         maximum: 1000
         default: 50
+    OnenoteSectionKey:
+      name: section_key
+      in: path
+      required: true
+      description: |
+        OneNote section key `<scope_key>|<graph_id>` (for example `me|2-def` or
+        `group:{gid}|2-def`). Percent-encoded (`%7C` → `|`, `%3A` → `:`); raw
+        Graph IDs and section names also resolve.
+      schema:
+        type: string
+    OnenotePageKey:
+      name: page_key
+      in: path
+      required: true
+      description: |
+        OneNote page key `<scope_key>|<graph_id>` (for example `me|3-ghi`) or a
+        raw Graph page ID. Percent-encoded; page titles are also accepted where
+        the handler resolves a name.
+      schema:
+        type: string
   responses:
     BadRequest:
       description: Invalid parameters or malformed JSON body
@@ -2232,3 +2725,345 @@ components:
         importance:
           type: [string, "null"]
           enum: [low, normal, high, "null"]
+    OnenoteScope:
+      type: object
+      required: [scope_type]
+      description: |
+        OneNote container scope: personal (`me`), a Teams/M365 group (`group`),
+        or a SharePoint site (`site`).
+      properties:
+        scope_type:
+          type: string
+          enum: [me, group, site]
+        group_id:
+          type: string
+        group_name:
+          type: [string, "null"]
+        site_id:
+          type: string
+        site_name:
+          type: [string, "null"]
+    OnenoteNotebook:
+      type: object
+      required: [notebook_key, id, display_name]
+      properties:
+        notebook_key:
+          type: string
+          description: Composite key `"{scope_key}|{id}"`.
+        id:
+          type: string
+        scope:
+          $ref: "#/components/schemas/OnenoteScope"
+        display_name:
+          type: string
+        color:
+          type: [string, "null"]
+        is_default:
+          type: boolean
+        is_shared:
+          type: boolean
+        user_role:
+          type: [string, "null"]
+        created_at:
+          type: [string, "null"]
+        last_modified_at:
+          type: [string, "null"]
+        created_by:
+          type: [string, "null"]
+        web_url:
+          type: [string, "null"]
+    OnenoteSection:
+      type: object
+      required: [section_key, id, display_name]
+      properties:
+        section_key:
+          type: string
+          description: Composite key `"{scope_key}|{id}"`.
+        id:
+          type: string
+        scope:
+          $ref: "#/components/schemas/OnenoteScope"
+        notebook_id:
+          type: [string, "null"]
+        notebook_name:
+          type: [string, "null"]
+        parent_section_group_id:
+          type: [string, "null"]
+        parent_section_group_name:
+          type: [string, "null"]
+        display_name:
+          type: string
+        color:
+          type: [string, "null"]
+        is_default:
+          type: boolean
+        pages_url:
+          type: [string, "null"]
+        created_at:
+          type: [string, "null"]
+        last_modified_at:
+          type: [string, "null"]
+        web_url:
+          type: [string, "null"]
+    OnenotePageSummary:
+      type: object
+      required: [page_key, id, title]
+      properties:
+        page_key:
+          type: string
+          description: Composite key `"{scope_key}|{id}"`.
+        id:
+          type: string
+        scope:
+          $ref: "#/components/schemas/OnenoteScope"
+        section_id:
+          type: string
+        section_name:
+          type: [string, "null"]
+        notebook_id:
+          type: [string, "null"]
+        notebook_name:
+          type: [string, "null"]
+        title:
+          type: string
+        level:
+          type: integer
+          description: Page indentation level (`0` = root, `1` = subpage, `2` = sub-subpage).
+        order:
+          type: integer
+        created_at:
+          type: [string, "null"]
+        last_modified_at:
+          type: [string, "null"]
+        content_url:
+          type: [string, "null"]
+        web_url:
+          type: [string, "null"]
+        preview_text:
+          type: [string, "null"]
+        has_todo:
+          type: boolean
+    OnenoteBlock:
+      type: object
+      description: |
+        Parsed page block derived from Graph `?includeIDs=true` XHTML.
+      properties:
+        element_id:
+          type: [string, "null"]
+          description: Graph element ID used as `block_id` for PATCH / toggle-todo.
+        tag:
+          type: [object, "null"]
+          description: 'OneNote `data-tag`, e.g. `{"todo": {"completed": false}}`.'
+        raw_html:
+          type: [string, "null"]
+        kind:
+          type: object
+          description: |
+            Internally tagged block payload; `block_type` is one of `heading`,
+            `paragraph`, `list_item`, `quote`, `code_block`, `table`, `image`,
+            `attachment`, or `divider`.
+    OnenoteResource:
+      type: object
+      required: [resource_url, mime_type, is_image]
+      properties:
+        element_id:
+          type: [string, "null"]
+        resource_url:
+          type: string
+        fullres_url:
+          type: [string, "null"]
+        mime_type:
+          type: string
+        file_name:
+          type: [string, "null"]
+        is_image:
+          type: boolean
+        alt_text:
+          type: [string, "null"]
+    OnenotePageDetail:
+      type: object
+      required: [summary, raw_xhtml, body_markdown, body_plain, blocks, resources]
+      properties:
+        summary:
+          $ref: "#/components/schemas/OnenotePageSummary"
+        raw_xhtml:
+          type: string
+        body_markdown:
+          type: string
+        body_plain:
+          type: string
+        blocks:
+          type: array
+          items:
+            $ref: "#/components/schemas/OnenoteBlock"
+        resources:
+          type: array
+          items:
+            $ref: "#/components/schemas/OnenoteResource"
+        primary_div_id:
+          type: [string, "null"]
+          description: Primary `div:{...}` content container used for clean PATCH append/replace.
+        synced_at:
+          type: [string, "null"]
+    OnenoteSearchHit:
+      type: object
+      required: [page_key, page_id, title, snippet]
+      properties:
+        page_key:
+          type: string
+        page_id:
+          type: string
+        scope:
+          $ref: "#/components/schemas/OnenoteScope"
+        notebook_name:
+          type: [string, "null"]
+        section_id:
+          type: string
+        section_name:
+          type: [string, "null"]
+        title:
+          type: string
+        last_modified_at:
+          type: [string, "null"]
+        snippet:
+          type: string
+        web_url:
+          type: [string, "null"]
+    CreateOnenoteNotebookRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        group_id:
+          type: [string, "null"]
+        site_id:
+          type: [string, "null"]
+      description: Mutually exclusive — supply `group_id` or `site_id`, or omit both for a personal notebook.
+    CreateOnenoteSectionRequest:
+      type: object
+      required: [notebook, name]
+      properties:
+        notebook:
+          type: string
+          description: Notebook name, `"Owner/Notebook"`, `notebook_key`, or Graph ID.
+          minLength: 1
+        name:
+          type: string
+          minLength: 1
+    CreateOnenotePageRequest:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+          minLength: 1
+        markdown:
+          type: string
+          description: GitHub-flavored Markdown body. The server also accepts the key `markdown_body`.
+        image_paths:
+          type: array
+          description: Local image files on the host running `teams serve`, embedded inline.
+          items:
+            type: string
+        level:
+          type: integer
+          minimum: 0
+          maximum: 2
+          description: Page indentation level (`0` = root, `1` = subpage, `2` = sub-subpage).
+    PatchOnenotePageRequest:
+      type: object
+      description: At least one of `title` or `markdown` is required; `block_id` requires `markdown`.
+      properties:
+        title:
+          type: [string, "null"]
+        markdown:
+          type: [string, "null"]
+          description: Replacement Markdown body. The server also accepts the key `markdown_body`.
+        block_id:
+          type: [string, "null"]
+          description: Target `element_id`; replaces only that block.
+    AppendOnenotePageRequest:
+      type: object
+      description: At least one of `markdown` or `image_paths` is required.
+      properties:
+        markdown:
+          type: string
+          description: Markdown to append. The server also accepts the key `markdown_body`.
+        image_paths:
+          type: array
+          items:
+            type: string
+    ToggleOnenoteTodoRequest:
+      type: object
+      description: At least one of `block_id` or `todo_index` is required; `block_id` wins when both are supplied.
+      properties:
+        block_id:
+          type: [string, "null"]
+        todo_index:
+          type: [integer, "null"]
+          minimum: 0
+    OnenotePageMutationResult:
+      type: object
+      required: [ok, page_key, page_id, commands_applied, page]
+      properties:
+        ok:
+          type: boolean
+        page_key:
+          type: string
+        page_id:
+          type: string
+        commands_applied:
+          type: integer
+        page:
+          oneOf:
+            - $ref: "#/components/schemas/OnenotePageDetail"
+            - type: "null"
+    OnenotePageAppendResult:
+      type: object
+      required: [ok, page_key, page_id, page]
+      properties:
+        ok:
+          type: boolean
+        page_key:
+          type: string
+        page_id:
+          type: string
+        primary_div_id:
+          type: [string, "null"]
+        page:
+          oneOf:
+            - $ref: "#/components/schemas/OnenotePageDetail"
+            - type: "null"
+    OnenoteTodoToggleResult:
+      type: object
+      required: [ok, page_key, page_id, completed, command, page]
+      properties:
+        ok:
+          type: boolean
+        page_key:
+          type: string
+        page_id:
+          type: string
+        element_id:
+          type: [string, "null"]
+        completed:
+          type: boolean
+        command:
+          type: object
+          required: [target, action, content]
+          description: OneNote PATCH command actually sent to Graph.
+          properties:
+            target:
+              type: string
+            action:
+              type: string
+            position:
+              type: [string, "null"]
+            content:
+              type: string
+        page:
+          oneOf:
+            - $ref: "#/components/schemas/OnenotePageDetail"
+            - type: "null"

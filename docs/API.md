@@ -1,14 +1,15 @@
-# `teams` / `outlook` HTTP JSON API
+# `teams` / `outlook` / `onenote` HTTP JSON API
 
-Local HTTP/JSON server for AI agents, scripts, and integrations. Exposed by `teams serve` or `outlook serve` (alias `api`), backed by Microsoft Graph v1.0, local SQLite WAL/FTS5 caching, and the background sync engine (`sync::spawn_sync_engine`).
+Local HTTP/JSON server for AI agents, scripts, and integrations. Exposed by `teams serve`, `outlook serve`, or `onenote serve` (alias `api`), backed by Microsoft Graph v1.0, local SQLite WAL/FTS5 caching, and the background sync engine (`sync::spawn_sync_engine`).
 
-Both binary personas (`teams` and `outlook`) mount the complete Microsoft Teams + Outlook Mail, Calendar, Contacts, and Microsoft To Do route surface on the same HTTP server.
+All three binary personas (`teams`, `outlook`, and `onenote`) mount the complete Microsoft Teams + Outlook Mail, Calendar, Contacts, Microsoft To Do, and OneNote route surface on the same HTTP server.
 
 ## Starting the server
 
 ```bash
 teams serve                     # http://127.0.0.1:8788
 outlook serve                   # same API server under the outlook persona
+onenote serve                   # same API server under the onenote persona
 teams serve --port 9000         # custom port
 teams serve --bind 127.0.0.1 --port 8788
 teams serve --token secret123   # require Authorization: Bearer secret123
@@ -47,7 +48,7 @@ curl http://127.0.0.1:8788/health
 {
   "ok": true,
   "user_id": "00000000-0000-0000-0000-000000000000",
-  "version": "0.2.0"
+  "version": "0.3.0"
 }
 ```
 
@@ -539,13 +540,265 @@ Marks a To Do task completed or active (`{ "completed": true }`).
 
 Deletes a To Do task from Graph and local SQLite cache.
 
+## Microsoft OneNote
+
+OneNote routes live in a dedicated sub-router (`onenote_routes()`) that `build_router` nests **twice**: under the canonical `/v1/onenote` prefix and under the unversioned `/onenote` alias. Both prefixes reach the same handlers with the same bodies and responses, so every endpoint below can be called with either prefix (for example `GET /onenote/notebooks` ≡ `GET /v1/onenote/notebooks`).
+
+Keys:
+- `{section_key}` and `{page_key}` are composite OneNote keys of the form `<scope_key>|<graph_id>`, where `scope_key` is `me`, `group:{group_id}`, or `site:{site_id}`.
+- `axum` percent-decodes path segments (`%7C` → `|`, `%3A` → `:`), so `me%7C1-abc` and `me|1-abc` are equivalent.
+- Raw Graph IDs, `"Notebook/Section"` strings, notebook/section display names, and page titles also work where the handler resolves a name (for example `GET /v1/onenote/sections?notebook=Engineering`).
+
+Responses are ad-hoc `json!` objects assembled by the handlers — there are no dedicated OneNote response DTOs. The JSON examples below show exactly the envelope keys the handlers emit.
+
+### `GET /v1/onenote/notebooks?include_teams=true&refresh=false&offline=false`
+
+Lists personal (`/me/onenote`) plus joined Teams / M365 group shared notebooks. `include_teams` defaults to `true`. `refresh=true` syncs from Graph first; `offline=true` reads strictly from the SQLite cache.
+
+```json
+{
+  "notebooks": [
+    {
+      "notebook_key": "me|1-abc",
+      "id": "1-abc",
+      "scope": { "scope_type": "me" },
+      "display_name": "Engineering",
+      "color": null,
+      "is_default": false,
+      "is_shared": false,
+      "user_role": "Owner",
+      "created_at": "2026-01-02T03:04:05Z",
+      "last_modified_at": "2026-11-15T06:00:00Z",
+      "created_by": "Alice Kim",
+      "web_url": "https://www.onenote.com/notebooks/..."
+    }
+  ]
+}
+```
+
+### `POST /v1/onenote/notebooks`
+
+Creates a notebook. Body: `name` (required, must not be empty), and an optional scope selector — `group_id` **or** `site_id` (specifying both is a `400`; omitting both creates a personal notebook).
+
+```json
+{
+  "name": "Release Notes",
+  "group_id": null,
+  "site_id": null
+}
+```
+
+Returns `{ "ok": true, "notebook": <OnenoteNotebook> }`.
+
+### `GET /v1/onenote/sections?notebook=&refresh=false&offline=false`
+
+Lists sections of one notebook (`notebook` = name, `"Owner/Notebook"`, `notebook_key`, or Graph ID) or of every accessible notebook when `notebook` is omitted.
+
+`notebook` is `null` when the request is unscoped.
+
+```json
+{
+  "notebook": { "notebook_key": "me|1-abc", "display_name": "Engineering" },
+  "sections": [
+    {
+      "section_key": "me|2-def",
+      "id": "2-def",
+      "scope": { "scope_type": "me" },
+      "notebook_id": "1-abc",
+      "notebook_name": "Engineering",
+      "parent_section_group_id": null,
+      "parent_section_group_name": null,
+      "display_name": "Meetings",
+      "color": null,
+      "is_default": false,
+      "pages_url": null,
+      "created_at": "2026-01-02T03:04:05Z",
+      "last_modified_at": "2026-11-15T06:00:00Z",
+      "web_url": null
+    }
+  ]
+}
+```
+
+### `POST /v1/onenote/sections`
+
+Creates a section inside an existing notebook. Body: `notebook` (required, name/key/ID) and `name` (required).
+
+```json
+{
+  "notebook": "Engineering",
+  "name": "Retrospectives"
+}
+```
+
+Returns `{ "ok": true, "notebook": <OnenoteNotebook>, "section": <OnenoteSection> }`.
+
+### `GET /v1/onenote/sections/{section_key}/pages?limit=50&refresh=false&offline=false`
+
+Lists pages in a section. `limit` defaults to `50` and is clamped to `1..=1000`.
+
+```json
+{
+  "section": { "section_key": "me|2-def", "display_name": "Meetings" },
+  "pages": [
+    {
+      "page_key": "me|3-ghi",
+      "id": "3-ghi",
+      "scope": { "scope_type": "me" },
+      "section_id": "2-def",
+      "section_name": "Meetings",
+      "notebook_id": "1-abc",
+      "notebook_name": "Engineering",
+      "title": "Weekly sync",
+      "level": 0,
+      "order": 0,
+      "created_at": "2026-11-10T01:00:00Z",
+      "last_modified_at": "2026-11-15T06:00:00Z",
+      "content_url": null,
+      "web_url": null,
+      "preview_text": "Agenda ...",
+      "has_todo": true
+    }
+  ]
+}
+```
+
+### `POST /v1/onenote/sections/{section_key}/pages`
+
+Creates a page from GitHub-flavored Markdown. Body:
+
+- `title` (required, must not be empty)
+- `markdown` (optional; alias `markdown_body`) — tables and `- [ ]` task lists become OneNote content / to-do tags
+- `image_paths` (optional `string[]`) — local image files **on the host running `teams serve`**, embedded inline (png/jpg/gif/webp/bmp)
+- `level` (optional `0|1|2`) — page indentation (subpage / sub-subpage)
+
+```json
+{
+  "title": "Sprint retro",
+  "markdown": "## What went well\n- Automation\n\n## Actions\n- [ ] Update docs",
+  "image_paths": ["C:\\Users\\me\\Pictures\\chart.png"],
+  "level": 0
+}
+```
+
+Returns `{ "ok": true, "section": <OnenoteSection>, "page": <OnenotePageSummary> }`.
+
+### `GET /v1/onenote/pages/{page_key}?offline=false`
+
+Returns the full page detail: cached summary, raw XHTML, derived Markdown/plain text, parsed blocks (with Graph `element_id` values used by `PATCH` and `toggle-todo`), resources, and the primary `#div:{...}` container ID.
+
+`offline` is the **only** supported query parameter here; `offline=true` reads strictly from the SQLite cache and returns `404` when the page is not cached.
+
+```json
+{
+  "page": {
+    "summary": { "page_key": "me|3-ghi", "title": "Weekly sync", "level": 0 },
+    "raw_xhtml": "<html>...</html>",
+    "body_markdown": "## Agenda\n...",
+    "body_plain": "Agenda ...",
+    "blocks": [
+      {
+        "element_id": "p:{...}",
+        "tag": { "todo": { "completed": false } },
+        "raw_html": "<p data-tag=\"to-do\">...</p>",
+        "kind": { "block_type": "paragraph" }
+      }
+    ],
+    "resources": [
+      {
+        "element_id": "img:{...}",
+        "resource_url": "https://graph.microsoft.com/v1.0/.../resources/...",
+        "fullres_url": null,
+        "mime_type": "image/png",
+        "file_name": "chart.png",
+        "is_image": true,
+        "alt_text": null
+      }
+    ],
+    "primary_div_id": "div:{...}",
+    "synced_at": "2026-11-15T06:00:00Z"
+  }
+}
+```
+
+### `PATCH /v1/onenote/pages/{page_key}`
+
+Updates a page title and/or body. At least one of `title` or `markdown` (alias `markdown_body`) is required; `block_id` requires `markdown` and replaces only that block (`element_id` from `GET /pages/{page_key}`).
+
+```json
+{
+  "title": "Weekly sync (updated)",
+  "markdown": "## Agenda\n- API review",
+  "block_id": null
+}
+```
+
+Returns `{ "ok": true, "page_key": "...", "page_id": "...", "commands_applied": 2, "page": <OnenotePageDetail|null> }` (`page` is the re-fetched detail, or `null` if the refresh call failed).
+
+### `DELETE /v1/onenote/pages/{page_key}`
+
+Deletes the page from Graph and removes it from the local cache.
+
+Returns `{ "ok": true, "page_key": "me|3-ghi", "page_id": "3-ghi" }`.
+
+### `POST /v1/onenote/pages/{page_key}/append`
+
+Appends Markdown and/or inline images to the end of an existing page (`PATCH` under the hood). At least one of `markdown` (alias `markdown_body`) or `image_paths` must be provided.
+
+```json
+{
+  "markdown": "## Follow-up\n- Add alerting",
+  "image_paths": []
+}
+```
+
+Returns `{ "ok": true, "page_key": "...", "page_id": "...", "primary_div_id": "div:{...}", "page": <OnenotePageDetail|null> }`.
+
+### `POST /v1/onenote/pages/{page_key}/toggle-todo`
+
+Toggles a OneNote to-do checkbox (`to-do` ⇄ `to-do:completed`). At least one of `block_id` (an `element_id` from `GET /pages/{page_key}`) or `todo_index` (zero-based index among the page's to-do blocks) must be provided — omitting both is a `400`. `block_id` wins when both are supplied.
+
+```json
+{
+  "block_id": null,
+  "todo_index": 0
+}
+```
+
+Returns `{ "ok": true, "page_key": "...", "page_id": "...", "element_id": "p:{...}", "completed": true, "command": { "target": "p:{...}", "action": "replace", "content": "..." }, "page": <OnenotePageDetail|null> }`.
+
+### `GET /v1/onenote/search?q=...&section=&limit=30&refresh=false`
+
+Full-text search over the cached OneNote pages (SQLite FTS5 trigram + `LIKE`). `q` is required (non-empty). `section` optionally restricts hits to one section (name/key/ID/`"Notebook/Section"`); `limit` defaults to `30` and is clamped to `1..=1000`; `refresh=true` re-bootstraps the OneNote cache before searching. There is no `offline` parameter — the search is cache-only by design.
+
+```json
+{
+  "hits": [
+    {
+      "page_key": "me|3-ghi",
+      "page_id": "3-ghi",
+      "scope": { "scope_type": "me" },
+      "notebook_name": "Engineering",
+      "section_id": "2-def",
+      "section_name": "Meetings",
+      "title": "Weekly sync",
+      "last_modified_at": "2026-11-15T06:00:00Z",
+      "snippet": "...add alerting...",
+      "web_url": null
+    }
+  ]
+}
+```
+
+> **Not exposed over HTTP yet:** downloading a OneNote page resource/attachment. There is no `/v1/onenote/.../resources` route; resource download is CLI-only (`onenote resource <page> --index N --out <dir>`), and MCP has no resource tool either.
+
 ## Errors
 
 All failing endpoints return `{"error": "<message>"}`:
 
 | HTTP Status | Meaning |
 | --- | --- |
-| `400` | Validation error (empty body, invalid reaction/kind/presence/rsvp/importance/datetime, missing local file, etc.) |
+| `400` | Validation error (empty body, invalid reaction/kind/presence/rsvp/importance/datetime, empty OneNote name/title, `group_id` + `site_id` together, `block_id` without markdown, missing local file, etc.) |
 | `401` | `--token` is enabled and `Authorization: Bearer <token>` is missing or invalid |
-| `404` | Target conversation, cached thread, mail message, folder, or To Do list not found |
+| `404` | Target conversation, cached thread, mail message, folder, To Do list, or OneNote notebook/section/page not found |
 | `500` | Microsoft Graph or SQLite error |
