@@ -5,7 +5,15 @@ set "ROOT=%~dp0"
 
 if exist "%ROOT%target\release\teams.exe" goto run
 
-echo [teams] release build not found - building... >&2
+where gh >nul 2>nul
+if %errorlevel% equ 0 (
+    echo [teams] downloading prebuilt binary from GitHub Release ^(shinick-dev/teams^)... >&2
+    if not exist "%ROOT%target\release" mkdir "%ROOT%target\release"
+    gh release download -R shinick-dev/teams --pattern "teams.exe" --dir "%ROOT%target\release" --clobber >nul 2>&1
+    if exist "%ROOT%target\release\teams.exe" goto run
+)
+
+echo [teams] prebuilt binary not found - building from source with cargo... >&2
 cargo build --release --manifest-path "%ROOT%Cargo.toml"
 if errorlevel 1 exit /b 1
 

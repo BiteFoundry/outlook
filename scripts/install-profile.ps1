@@ -1,11 +1,13 @@
 <#
 .SYNOPSIS
-    Idempotently registers or updates the `teams` launcher function in PowerShell $PROFILE.
+    Idempotently installs the `teams` terminal launcher on any Windows PC.
 
 .DESCRIPTION
-    Ensures the directory for $PROFILE exists and inserts (or updates in place) the
-    `# >>> teams launcher >>> ... # <<< teams launcher <<<` block pointing to
-    <RepoRoot>\target\release\teams.exe.
+    1. Ensures <RepoRoot>\target\release\teams.exe exists (downloads the prebuilt
+       release binary from GitHub `shinick-dev/teams` via `gh` when missing, so
+       Rust/Cargo is NOT required on target PCs).
+    2. Registers/updates `# >>> teams launcher >>>` (`function teams`) in PowerShell $PROFILE.
+    3. If $HOME\Tools\bin exists, also writes `teams.cmd` there so already-open shells find `teams`.
 
 .EXAMPLE
     pwsh -File .\scripts\install-profile.ps1
@@ -13,7 +15,7 @@
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [string]$ProfilePath = $PROFILE,
-    [string]$RepoRoot = 'C:\Users\user\source\teams'
+    [string]$RepoRoot = (Split-Path -Parent $PSScriptRoot)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,6 +30,18 @@ $resolvedRoot = if (Test-Path -LiteralPath $RepoRoot) {
     $RepoRoot
 }
 
+$releaseDir = Join-Path $resolvedRoot 'target\release'
+$releaseExe = Join-Path $releaseDir 'teams.exe'
+
+if (-not (Test-Path -LiteralPath $releaseExe)) {
+    $gh = Get-Command gh -ErrorAction SilentlyContinue
+    if ($gh) {
+        Write-Output "[teams] Downloading prebuilt teams.exe from shinick-dev/teams GitHub Release..."
+        New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+        & $gh.Source release download -R 'shinick-dev/teams' --pattern 'teams.exe' --dir $releaseDir --clobber
+    }
+}
+
 $escapedRoot = $resolvedRoot.Replace("'", "''")
 $startMarker = '# >>> teams launcher >>>'
 $endMarker = '# <<< teams launcher <<<'
@@ -38,6 +52,13 @@ $startMarker
 function teams {
     `$root = '$escapedRoot'
     `$exe = Join-Path `$root 'target\release\teams.exe'
+    if (-not (Test-Path -LiteralPath `$exe)) {
+        if (Get-Command gh -ErrorAction SilentlyContinue) {
+            `$relDir = Split-Path -Parent `$exe
+            New-Item -ItemType Directory -Force -Path `$relDir | Out-Null
+            gh release download -R 'shinick-dev/teams' --pattern 'teams.exe' --dir `$relDir --clobber 2>`$null
+        }
+    }
     if (-not (Test-Path -LiteralPath `$exe)) {
         cargo build --release --manifest-path (Join-Path `$root 'Cargo.toml')
         if (`$LASTEXITCODE -ne 0) { return }
@@ -74,13 +95,22 @@ if ([regex]::IsMatch($existing, $pattern)) {
     $action = 'Append teams launcher block'
 }
 
-if ($updated -eq $existing) {
+if ($updated -ne $existing) {
+    if ($PSCmdlet.ShouldProcess($ProfilePath, $action)) {
+        $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+        [System.IO.File]::WriteAllText($ProfilePath, $updated, $utf8NoBom)
+        Write-Output "$action in $ProfilePath."
+    }
+} else {
     Write-Output "teams launcher in $ProfilePath is already up to date."
-    return
 }
 
-if ($PSCmdlet.ShouldProcess($ProfilePath, $action)) {
-    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-    [System.IO.File]::WriteAllText($ProfilePath, $updated, $utf8NoBom)
-    Write-Output "$action in $ProfilePath."
+$toolsBin = Join-Path $HOME 'Tools\bin'
+if (Test-Path -LiteralPath $toolsBin) {
+    $shimPath = Join-Path $toolsBin 'teams.cmd'
+    $shimContent = "@echo off`r`nchcp 65001 >nul`r`n`"$resolvedRoot\teams.cmd`" %*`r`n"
+    if ($PSCmdlet.ShouldProcess($shimPath, 'Write PATH shim teams.cmd')) {
+        [System.IO.File]::WriteAllText($shimPath, $shimContent, [System.Text.Encoding]::ASCII)
+        Write-Output "Updated PATH shim: $shimPath"
+    }
 }

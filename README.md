@@ -35,6 +35,24 @@ Microsoft Teams를 **터미널에서** 읽고, 검색하고, 스레드에 답글
 
 ## 빠른 시작 (Quickstart)
 
+### 다른 PC에 바로 설치 (Rust 컴파일 불필요)
+
+빌드된 단일 실행 파일(`teams.exe`, SQLite·TLS 내장)이 [GitHub Releases](https://github.com/shinick-dev/teams/releases)에 업로드되어 있으므로, 다른 Windows PC에서는 Rust 설치 없이 바로 사용할 수 있습니다.
+
+```powershell
+# 방법 A: 저장소 클론 후 프로필 + 프리빌트 바이너리 자동 설치 (권장)
+gh repo clone shinick-dev/teams
+cd teams
+pwsh -File .\scripts\install-profile.ps1
+. $PROFILE
+teams --version
+
+# 방법 B: 소스 클론 없이 단일 실행 파일(teams.exe)만 바로 다운로드
+gh release download v0.1.0 -R shinick-dev/teams --pattern "teams.exe" --dir "$HOME\.local\bin" --clobber
+```
+
+> GitHub 웹 페이지([Releases -> v0.1.0](https://github.com/shinick-dev/teams/releases/tag/v0.1.0))에서 `teams.exe` 또는 `teams-0.1.0-x86_64-pc-windows-msvc.zip`을 직접 내려받아 실행하셔도 됩니다.
+
 ### 로그인 방법
 
 ```bash
