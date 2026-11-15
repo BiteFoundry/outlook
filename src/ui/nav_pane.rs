@@ -6,10 +6,11 @@
 //! - Tab 4 (`Ctrl+5`): 캘린더 (Outlook Calendar agenda)
 //! - Tab 5 (`Ctrl+6`): 연락처 (Contacts + Entra directory)
 //! - Tab 6 (`Ctrl+7`): 할 일 (Microsoft To Do lists & tasks)
+//! - Tab 7 (`Ctrl+8`): 노트 (Microsoft OneNote notebooks, section groups & sections)
 
 use ratatui::{
     layout::Rect,
-    style::Modifier,
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
@@ -17,7 +18,7 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    models::ConversationKind,
+    models::{ConversationKind, OnenoteNotebook, OnenoteSection},
     ui::{
         app::{AppState, Focus, UiState},
         hitmap::{ButtonId, HitMap, HitTarget},
@@ -31,7 +32,22 @@ pub const TAB_MAIL: usize = 3;
 pub const TAB_CALENDAR: usize = 4;
 pub const TAB_CONTACTS: usize = 5;
 pub const TAB_TODO: usize = 6;
-pub const TAB_COUNT: usize = 7;
+pub const TAB_NOTES: usize = 7;
+pub const TAB_COUNT: usize = 8;
+
+/// Signature OneNote Purple accent (`#8A3FFC` bright highlight & `#7719AA` brand purple).
+pub const ONENOTE_PURPLE: Color = Color::Rgb(138, 63, 252);
+pub const ONENOTE_BRAND_BG: Color = Color::Rgb(119, 25, 170);
+
+/// Crisp 6-color OneNote palette: `[Purple, Cobalt, Emerald, Teal, Amber, Coral]`.
+pub const ONENOTE_PALETTE: [Color; 6] = [
+    Color::Rgb(138, 63, 252), // Purple
+    Color::Rgb(66, 153, 255), // Cobalt
+    Color::Rgb(52, 199, 123), // Emerald
+    Color::Rgb(34, 197, 194), // Teal
+    Color::Rgb(245, 176, 65), // Amber
+    Color::Rgb(242, 107, 107), // Coral
+];
 
 pub const TAB_LABELS: [&str; TAB_COUNT] = [
     "채팅",
@@ -41,6 +57,7 @@ pub const TAB_LABELS: [&str; TAB_COUNT] = [
     "캘린더",
     "연락처",
     "할 일",
+    "노트",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +69,7 @@ pub enum NavTab {
     Calendar = 4,
     Contacts = 5,
     Todo = 6,
+    Notes = 7,
 }
 
 impl NavTab {
@@ -63,6 +81,7 @@ impl NavTab {
             TAB_CALENDAR => Self::Calendar,
             TAB_CONTACTS => Self::Contacts,
             TAB_TODO => Self::Todo,
+            TAB_NOTES => Self::Notes,
             _ => Self::Chats,
         }
     }
@@ -72,7 +91,74 @@ impl NavTab {
     }
 
     pub fn is_outlook(self) -> bool {
-        self.index() >= TAB_MAIL
+        matches!(
+            self,
+            Self::Mail | Self::Calendar | Self::Contacts | Self::Todo
+        )
+    }
+
+    pub fn is_onenote(self) -> bool {
+        self == Self::Notes
+    }
+}
+
+/// Resolves a OneNote notebook/section badge color from an optional hex/named color or deterministic hash.
+pub fn onenote_badge_color(color_hint: Option<&str>, fallback_key: &str) -> Color {
+    if let Some(raw) = color_hint.map(str::trim).filter(|s| !s.is_empty()) {
+        let hex = raw.strip_prefix('#').unwrap_or(raw);
+        if hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            if let (Ok(r), Ok(g), Ok(b)) = (
+                u8::from_str_radix(&hex[0..2], 16),
+                u8::from_str_radix(&hex[2..4], 16),
+                u8::from_str_radix(&hex[4..6], 16),
+            ) {
+                return Color::Rgb(r, g, b);
+            }
+        }
+        let lower = raw.to_ascii_lowercase();
+        if lower.contains("purple") || lower.contains("violet") || lower.contains("lilac") {
+            return ONENOTE_PALETTE[0];
+        }
+        if lower.contains("blue") || lower.contains("cobalt") || lower.contains("cyan") {
+            return ONENOTE_PALETTE[1];
+        }
+        if lower.contains("green") || lower.contains("emerald") || lower.contains("lime") {
+            return ONENOTE_PALETTE[2];
+        }
+        if lower.contains("teal") || lower.contains("aqua") || lower.contains("turquoise") {
+            return ONENOTE_PALETTE[3];
+        }
+        if lower.contains("yellow")
+            || lower.contains("amber")
+            || lower.contains("orange")
+            || lower.contains("gold")
+            || lower.contains("mango")
+        {
+            return ONENOTE_PALETTE[4];
+        }
+        if lower.contains("red")
+            || lower.contains("coral")
+            || lower.contains("pink")
+            || lower.contains("magenta")
+            || lower.contains("rose")
+        {
+            return ONENOTE_PALETTE[5];
+        }
+    }
+    let mut hash: usize = 5381;
+    for b in fallback_key.bytes() {
+        hash = hash.wrapping_mul(33).wrapping_add(b as usize);
+    }
+    ONENOTE_PALETTE[hash % ONENOTE_PALETTE.len()]
+}
+
+pub fn section_belongs_to_notebook(sec: &OnenoteSection, nb: &OnenoteNotebook) -> bool {
+    if sec.scope.scope_key() != nb.scope.scope_key() {
+        return false;
+    }
+    match sec.notebook_id.as_deref() {
+        Some(nb_id) => nb_id == nb.id || nb_id == nb.notebook_key,
+        None => false,
     }
 }
 
@@ -149,6 +235,99 @@ pub enum NavRow {
         important: bool,
         due_date_iso: Option<String>,
     },
+    OnenoteGroupHeader {
+        label: String,
+        personal: bool,
+        count: usize,
+    },
+    OnenoteNotebook {
+        notebook_key: String,
+        display_name: String,
+        color: Option<String>,
+        collapsed: bool,
+        section_count: usize,
+        owner_hint: Option<String>,
+    },
+    OnenoteSectionGroup {
+        notebook_key: String,
+        display_name: String,
+    },
+    OnenoteSection {
+        section_key: String,
+        notebook_key: Option<String>,
+        display_name: String,
+        color: Option<String>,
+        in_section_group: bool,
+    },
+}
+
+fn push_notebook_tree_rows(
+    rows: &mut Vec<NavRow>,
+    nb: &OnenoteNotebook,
+    all_sections: &[OnenoteSection],
+    collapsed_keys: &std::collections::HashSet<String>,
+    include_owner_hint: bool,
+) {
+    let nb_sections: Vec<&OnenoteSection> = all_sections
+        .iter()
+        .filter(|sec| section_belongs_to_notebook(sec, nb))
+        .collect();
+    let collapsed = collapsed_keys.contains(&nb.notebook_key);
+    let owner_hint = if include_owner_hint {
+        let lbl = nb.scope.owner_label();
+        if !lbl.is_empty() && lbl != nb.display_name {
+            Some(lbl)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    rows.push(NavRow::OnenoteNotebook {
+        notebook_key: nb.notebook_key.clone(),
+        display_name: nb.display_name.clone(),
+        color: nb.color.clone(),
+        collapsed,
+        section_count: nb_sections.len(),
+        owner_hint,
+    });
+
+    if !collapsed {
+        let mut last_group: Option<&str> = None;
+        for sec in nb_sections {
+            if let Some(grp) = sec
+                .parent_section_group_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if last_group != Some(grp) {
+                    rows.push(NavRow::OnenoteSectionGroup {
+                        notebook_key: nb.notebook_key.clone(),
+                        display_name: grp.to_string(),
+                    });
+                    last_group = Some(grp);
+                }
+                rows.push(NavRow::OnenoteSection {
+                    section_key: sec.section_key.clone(),
+                    notebook_key: Some(nb.notebook_key.clone()),
+                    display_name: sec.display_name.clone(),
+                    color: sec.color.clone(),
+                    in_section_group: true,
+                });
+            } else {
+                last_group = None;
+                rows.push(NavRow::OnenoteSection {
+                    section_key: sec.section_key.clone(),
+                    notebook_key: Some(nb.notebook_key.clone()),
+                    display_name: sec.display_name.clone(),
+                    color: sec.color.clone(),
+                    in_section_group: false,
+                });
+            }
+        }
+    }
 }
 
 pub fn build_nav_rows(app: &AppState, ui: &UiState) -> Vec<NavRow> {
@@ -283,6 +462,72 @@ pub fn build_nav_rows(app: &AppState, ui: &UiState) -> Vec<NavRow> {
             }
             rows
         }
+        TAB_NOTES => {
+            let mut rows = Vec::new();
+            let personal_nbs: Vec<&OnenoteNotebook> = app
+                .onenote_notebooks
+                .iter()
+                .filter(|nb| nb.scope.is_personal() && !nb.is_shared)
+                .collect();
+            let shared_nbs: Vec<&OnenoteNotebook> = app
+                .onenote_notebooks
+                .iter()
+                .filter(|nb| !nb.scope.is_personal() || nb.is_shared)
+                .collect();
+
+            if !personal_nbs.is_empty() {
+                rows.push(NavRow::OnenoteGroupHeader {
+                    label: "📓 내 필기장".to_string(),
+                    personal: true,
+                    count: personal_nbs.len(),
+                });
+                for nb in &personal_nbs {
+                    push_notebook_tree_rows(
+                        &mut rows,
+                        nb,
+                        &app.onenote_sections,
+                        &ui.collapsed_notebook_keys,
+                        false,
+                    );
+                }
+            }
+
+            if !shared_nbs.is_empty() {
+                rows.push(NavRow::OnenoteGroupHeader {
+                    label: "👥 팀·공유 필기장".to_string(),
+                    personal: false,
+                    count: shared_nbs.len(),
+                });
+                for nb in &shared_nbs {
+                    push_notebook_tree_rows(
+                        &mut rows,
+                        nb,
+                        &app.onenote_sections,
+                        &ui.collapsed_notebook_keys,
+                        true,
+                    );
+                }
+            }
+
+            // Fallback: include any orphan sections not tied to a known notebook
+            for sec in &app.onenote_sections {
+                let matched = app
+                    .onenote_notebooks
+                    .iter()
+                    .any(|nb| section_belongs_to_notebook(sec, nb));
+                if !matched {
+                    rows.push(NavRow::OnenoteSection {
+                        section_key: sec.section_key.clone(),
+                        notebook_key: None,
+                        display_name: sec.display_name.clone(),
+                        color: sec.color.clone(),
+                        in_section_group: false,
+                    });
+                }
+            }
+
+            rows
+        }
         _ => Vec::new(),
     }
 }
@@ -302,6 +547,7 @@ pub fn tab_counts(app: &AppState) -> [usize; TAB_COUNT] {
         app.calendar_events.len(),
         app.contacts.len(),
         app.todo_tasks.len(),
+        app.onenote_notebooks.len(),
     ]
 }
 
@@ -314,6 +560,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
     let count_badge = match ui.active_nav_tab {
         TAB_MAIL => app.mails.len(),
         TAB_TODO => app.todo_tasks.len(),
+        TAB_NOTES => app.onenote_notebooks.len(),
         _ => rows.len(),
     };
     let title = if ui.active_nav_tab == TAB_MAIL {
@@ -324,17 +571,33 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
             .map(|l| l.display_name.as_str())
             .unwrap_or(label);
         format!(" {list_name} · {count_badge} ")
+    } else if ui.active_nav_tab == TAB_NOTES {
+        format!(" 📓 필기장 · {count_badge} ")
     } else {
         format!(" {label} {count_badge} ")
+    };
+
+    let is_onenote = ui.active_nav_tab == TAB_NOTES;
+    let title_style = if is_onenote && focused {
+        Style::default()
+            .fg(ONENOTE_PURPLE)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        theme.title(focused)
+    };
+    let border_style = if is_onenote && focused {
+        Style::default().fg(ONENOTE_PURPLE)
+    } else {
+        theme.border_style(focused)
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Line::from(Span::styled(
             truncate(&title, area.width.saturating_sub(2) as usize),
-            theme.title(focused),
+            title_style,
         )))
-        .border_style(theme.border_style(focused));
+        .border_style(border_style);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -358,6 +621,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
             TAB_CALENDAR => "예정된 일정이 없습니다 (n 새 일정)",
             TAB_CONTACTS => "연락처가 없습니다 (n 추가 · / 검색)",
             TAB_TODO => "할 일이 없습니다 (n 추가)",
+            TAB_NOTES => "필기장이 없습니다 (B 새 필기장 · R 새로고침)",
             _ => "항목 없음",
         };
         frame.render_widget(
@@ -392,6 +656,12 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
                 NavRow::TodoTaskRow { task_id, .. } => {
                     app.active_todo_task_id.as_deref() == Some(task_id.as_str())
                 }
+                NavRow::OnenoteNotebook { notebook_key, .. } => {
+                    app.active_notebook_key.as_deref() == Some(notebook_key.as_str())
+                }
+                NavRow::OnenoteSection { section_key, .. } => {
+                    app.active_section_key.as_deref() == Some(section_key.as_str())
+                }
                 _ => false,
             };
             lines.push(render_nav_row(row, width, is_selected, is_active, app, ui));
@@ -418,13 +688,18 @@ fn draw_footer(frame: &mut Frame, inner: Rect, ui: &UiState, hitmap: &mut HitMap
         TAB_CALENDAR => ("[+ 새 일정]", " n", ButtonId::NewEvent),
         TAB_CONTACTS => ("[+ 새 연락처]", " n", ButtonId::NewContact),
         TAB_TODO => ("[+ 할 일 추가]", " n", ButtonId::NewTodo),
+        TAB_NOTES => ("[+ 새 필기장]", " B · 섹션 S", ButtonId::OnenoteNewNotebook),
         _ => ("[+ 새 채팅]", " Ctrl+N", ButtonId::NewChat),
     };
     let btn_w = UnicodeWidthStr::width(btn) as u16;
-    let mut spans = vec![Span::styled(
-        btn,
-        theme.accent_style().add_modifier(Modifier::BOLD),
-    )];
+    let btn_style = if ui.active_nav_tab == TAB_NOTES {
+        Style::default()
+            .fg(ONENOTE_PURPLE)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        theme.accent_style().add_modifier(Modifier::BOLD)
+    };
+    let mut spans = vec![Span::styled(btn, btn_style)];
     if inner.width > btn_w + UnicodeWidthStr::width(hint) as u16 + 1 {
         spans.push(Span::styled(hint, theme.muted_style()));
     }
@@ -836,6 +1111,140 @@ fn render_nav_row(
                 Span::styled(body, style),
             ])
         }
+        NavRow::OnenoteGroupHeader {
+            label,
+            personal,
+            count,
+        } => {
+            let suffix = format!(" ({count})");
+            let fixed = UnicodeWidthStr::width(marker) + UnicodeWidthStr::width(suffix.as_str());
+            let body = truncate(label, width.saturating_sub(fixed).max(4));
+            let header_style = if selected {
+                theme.selection()
+            } else if *personal {
+                Style::default()
+                    .fg(ONENOTE_PURPLE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                theme.accent_style().add_modifier(Modifier::BOLD)
+            };
+            Line::from(vec![
+                Span::styled(marker.to_string(), header_style),
+                Span::styled(body, header_style),
+                Span::styled(
+                    suffix,
+                    if selected {
+                        header_style
+                    } else {
+                        theme.muted_style()
+                    },
+                ),
+            ])
+        }
+        NavRow::OnenoteNotebook {
+            notebook_key,
+            display_name,
+            color,
+            collapsed,
+            section_count,
+            owner_hint,
+        } => {
+            let arrow = if *collapsed { "▸ " } else { "▾ " };
+            let bar = "▌";
+            let badge_color = onenote_badge_color(color.as_deref(), notebook_key);
+            let full_name = match owner_hint.as_deref() {
+                Some(owner) if !owner.is_empty() => format!("{display_name} · {owner}"),
+                _ => display_name.clone(),
+            };
+            let suffix = format!(" ({section_count})");
+            let fixed = UnicodeWidthStr::width(marker)
+                + UnicodeWidthStr::width(arrow)
+                + UnicodeWidthStr::width(bar)
+                + UnicodeWidthStr::width(suffix.as_str());
+            let body = truncate(&full_name, width.saturating_sub(fixed).max(4));
+            let name_style = if selected {
+                theme.selection()
+            } else if active {
+                Style::default()
+                    .fg(ONENOTE_PURPLE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+            };
+            let bar_style = if selected {
+                theme.selection().fg(badge_color)
+            } else {
+                Style::default().fg(badge_color)
+            };
+            Line::from(vec![
+                Span::styled(marker.to_string(), name_style),
+                Span::styled(arrow, name_style),
+                Span::styled(bar, bar_style),
+                Span::styled(body, name_style),
+                Span::styled(
+                    suffix,
+                    if selected {
+                        name_style
+                    } else {
+                        theme.muted_style()
+                    },
+                ),
+            ])
+        }
+        NavRow::OnenoteSectionGroup { display_name, .. } => {
+            let prefix = "  ▾ 📁 ";
+            let fixed = UnicodeWidthStr::width(marker) + UnicodeWidthStr::width(prefix);
+            let body = truncate(display_name, width.saturating_sub(fixed).max(4));
+            let style = if selected {
+                theme.selection()
+            } else {
+                theme.muted_style().add_modifier(Modifier::BOLD)
+            };
+            Line::from(vec![
+                Span::styled(marker.to_string(), style),
+                Span::styled(prefix, style),
+                Span::styled(body, style),
+            ])
+        }
+        NavRow::OnenoteSection {
+            section_key,
+            display_name,
+            color,
+            in_section_group,
+            ..
+        } => {
+            let indent = if *in_section_group { "    " } else { "  " };
+            let bar = "▌";
+            let badge_color = onenote_badge_color(color.as_deref(), section_key);
+            let fixed = UnicodeWidthStr::width(marker)
+                + UnicodeWidthStr::width(indent)
+                + UnicodeWidthStr::width(bar);
+            let body = truncate(display_name, width.saturating_sub(fixed).max(4));
+            let pad = width
+                .saturating_sub(fixed + UnicodeWidthStr::width(body.as_str()))
+                .max(0);
+            let text_style = if selected {
+                theme.selection()
+            } else if active {
+                Style::default()
+                    .fg(ONENOTE_PURPLE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                base_style
+            };
+            let bar_style = if selected {
+                theme.selection().fg(badge_color)
+            } else {
+                Style::default().fg(badge_color)
+            };
+            Line::from(vec![
+                Span::styled(marker.to_string(), text_style),
+                Span::styled(indent, text_style),
+                Span::styled(bar, bar_style),
+                Span::styled(body, text_style),
+                Span::styled(" ".repeat(pad), text_style),
+            ])
+        }
     }
 }
 
@@ -890,13 +1299,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seven_tabs_map_roundtrip() {
+    fn eight_tabs_map_roundtrip() {
+        assert_eq!(TAB_COUNT, 8);
+        assert_eq!(TAB_NOTES, 7);
         assert_eq!(TAB_LABELS.len(), TAB_COUNT);
+        assert_eq!(TAB_LABELS[TAB_NOTES], "노트");
         for i in 0..TAB_COUNT {
             let tab = NavTab::from_index(i);
             assert_eq!(tab.index(), i);
-            assert_eq!(tab.is_outlook(), i >= TAB_MAIL);
+            assert_eq!(tab.is_outlook(), (TAB_MAIL..=TAB_TODO).contains(&i));
+            assert_eq!(tab.is_onenote(), i == TAB_NOTES);
         }
+    }
+
+    #[test]
+    fn onenote_badge_color_parses_hex_names_and_deterministic_fallback() {
+        assert_eq!(
+            onenote_badge_color(Some("#7719AA"), "me|nb1"),
+            Color::Rgb(0x77, 0x19, 0xAA)
+        );
+        assert_eq!(
+            onenote_badge_color(Some("teal"), "me|nb2"),
+            ONENOTE_PALETTE[3]
+        );
+        let c1 = onenote_badge_color(None, "me|notebook-alpha");
+        let c2 = onenote_badge_color(None, "me|notebook-alpha");
+        assert_eq!(c1, c2);
+        assert!(ONENOTE_PALETTE.contains(&c1));
     }
 
     #[test]

@@ -15,8 +15,9 @@ use crate::{
     config::AppConfig,
     graph::GraphClient,
     models::{
-        ConversationKind, ConversationSummary, ConversationTarget, CoreEvent, MailMessage,
-        MessageItem, NotificationCandidate, SyncCursor,
+        split_onenote_entity_key, ConversationKind, ConversationSummary, ConversationTarget,
+        CoreEvent, MailMessage, MessageItem, NotificationCandidate, OnenoteNotebook,
+        OnenoteSection, SyncCursor,
     },
     storage::Storage,
 };
@@ -37,11 +38,18 @@ pub struct SyncController {
 pub enum SyncCommand {
     RefreshConversations,
     RefreshOutlook,
+    RefreshOneNote,
     SyncMailFolder {
         folder_id: String,
     },
     SyncTodoList {
         list_id: String,
+    },
+    SyncOneNoteSection {
+        section_key: String,
+    },
+    SyncOneNotePage {
+        page_key: String,
     },
     SyncActiveNow,
     SyncChannelHistory {
@@ -110,6 +118,34 @@ pub async fn bootstrap_outlook(graph: &GraphClient, storage: &Storage) -> Result
     Ok(())
 }
 
+/// Performs an initial bootstrap sync of Microsoft OneNote (personal + joined team notebooks,
+/// section groups, sections, and up to 30 pages of the default/first section) into SQLite.
+/// Best-effort so tokens without OneNote scopes never fail bootstrap.
+pub async fn bootstrap_onenote(graph: &GraphClient, storage: &Storage) -> Result<()> {
+    let notebooks = match graph.list_all_accessible_notebooks(true).await {
+        Ok(nbs) => {
+            storage.upsert_onenote_notebooks(&nbs)?;
+            nbs
+        }
+        Err(_) => return Ok(()),
+    };
+
+    if let Ok((section_groups, sections)) = graph.list_all_accessible_sections(&notebooks).await {
+        storage.upsert_onenote_section_groups(&section_groups)?;
+        storage.upsert_onenote_sections(&sections)?;
+        if let Some(default_sec) = pick_default_onenote_section(&notebooks, &sections) {
+            if let Ok(pages) = graph
+                .list_onenote_pages(&default_sec.scope, &default_sec.id, 30)
+                .await
+            {
+                storage.upsert_onenote_pages(&pages)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Spawns the background sync loop and returns a `SyncController` handle.
 pub fn spawn_sync_engine(
     config: AppConfig,
@@ -166,6 +202,19 @@ pub fn spawn_sync_engine(
                                 summary: "Outlook 동기화 완료".to_string(),
                             });
                         }
+                        Some(SyncCommand::RefreshOneNote) => {
+                            let _ = event_tx.send(CoreEvent::SyncStateChanged {
+                                busy: true,
+                                summary: "OneNote 동기화 중...".to_string(),
+                            });
+                            if let Err(err) = refresh_onenote(&graph, &storage, &event_tx).await {
+                                let _ = event_tx.send(CoreEvent::SyncError(format!("OneNote 동기화 실패: {err}")));
+                            }
+                            let _ = event_tx.send(CoreEvent::SyncStateChanged {
+                                busy: false,
+                                summary: "OneNote 동기화 완료".to_string(),
+                            });
+                        }
                         Some(SyncCommand::SyncMailFolder { folder_id }) => {
                             if let Err(err) = sync_mail_folder(&folder_id, &graph, &storage, &event_tx).await {
                                 let _ = event_tx.send(CoreEvent::SyncError(format!("메일 폴더 동기화 실패: {err}")));
@@ -174,6 +223,16 @@ pub fn spawn_sync_engine(
                         Some(SyncCommand::SyncTodoList { list_id }) => {
                             if let Err(err) = sync_todo_list(&list_id, &graph, &storage, &event_tx).await {
                                 let _ = event_tx.send(CoreEvent::SyncError(format!("To Do 동기화 실패: {err}")));
+                            }
+                        }
+                        Some(SyncCommand::SyncOneNoteSection { section_key }) => {
+                            if let Err(err) = sync_onenote_section(&section_key, &graph, &storage, &event_tx).await {
+                                let _ = event_tx.send(CoreEvent::SyncError(format!("OneNote 섹션 동기화 실패: {err}")));
+                            }
+                        }
+                        Some(SyncCommand::SyncOneNotePage { page_key }) => {
+                            if let Err(err) = sync_onenote_page(&page_key, &graph, &storage, &event_tx).await {
+                                let _ = event_tx.send(CoreEvent::SyncError(format!("OneNote 페이지 동기화 실패: {err}")));
                             }
                         }
                         Some(SyncCommand::SyncActiveNow) => {
@@ -618,6 +677,137 @@ async fn sync_todo_list(
     Ok(())
 }
 
+fn pick_default_onenote_section<'a>(
+    notebooks: &[OnenoteNotebook],
+    sections: &'a [OnenoteSection],
+) -> Option<&'a OnenoteSection> {
+    if sections.is_empty() {
+        return None;
+    }
+
+    let default_nb_keys: HashSet<String> = notebooks
+        .iter()
+        .filter(|nb| nb.is_default)
+        .map(|nb| nb.notebook_key.clone())
+        .collect();
+
+    sections
+        .iter()
+        .find(|s| s.scope.is_personal() && s.is_default)
+        .or_else(|| {
+            sections.iter().find(|s| {
+                s.notebook_id
+                    .as_deref()
+                    .map(|nb_id| default_nb_keys.contains(&s.scope.make_entity_key(nb_id)))
+                    .unwrap_or(false)
+            })
+        })
+        .or_else(|| sections.iter().find(|s| s.is_default))
+        .or_else(|| sections.iter().find(|s| s.scope.is_personal()))
+        .or_else(|| sections.first())
+}
+
+async fn refresh_onenote(
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+) -> Result<()> {
+    let fetched_notebooks = graph.list_all_accessible_notebooks(true).await?;
+    storage.upsert_onenote_notebooks(&fetched_notebooks)?;
+
+    let (fetched_sgs, fetched_secs) = graph
+        .list_all_accessible_sections(&fetched_notebooks)
+        .await?;
+    storage.upsert_onenote_section_groups(&fetched_sgs)?;
+    storage.upsert_onenote_sections(&fetched_secs)?;
+
+    let notebooks = storage.list_onenote_notebooks()?;
+    let section_groups = storage.list_onenote_section_groups()?;
+    let sections = storage.list_onenote_sections(None)?;
+
+    let _ = event_tx.send(CoreEvent::OnenoteHierarchyUpdated {
+        notebooks: notebooks.clone(),
+        section_groups,
+        sections: sections.clone(),
+    });
+
+    if let Some(default_sec) = pick_default_onenote_section(&notebooks, &sections) {
+        if let Ok(pages) = graph
+            .list_onenote_pages(&default_sec.scope, &default_sec.id, 50)
+            .await
+        {
+            storage.upsert_onenote_pages(&pages)?;
+            let stored_pages = storage.list_onenote_pages(&default_sec.section_key)?;
+            let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
+                section_key: default_sec.section_key.clone(),
+                pages: stored_pages,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+async fn sync_onenote_section(
+    section_key: &str,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+) -> Result<()> {
+    let trimmed = section_key.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let existing = storage
+        .list_onenote_sections(None)?
+        .into_iter()
+        .find(|s| s.section_key == trimmed || s.id == trimmed);
+
+    let (scope, sec_id, canonical_key) = match existing {
+        Some(sec) => (sec.scope, sec.id, sec.section_key),
+        None => {
+            let (scope, raw_id) = split_onenote_entity_key(trimmed);
+            let canonical = scope.make_entity_key(&raw_id);
+            (scope, raw_id, canonical)
+        }
+    };
+
+    let pages = graph.list_onenote_pages(&scope, &sec_id, 100).await?;
+    storage.upsert_onenote_pages(&pages)?;
+    let stored_pages = storage.list_onenote_pages(&canonical_key)?;
+    let _ = event_tx.send(CoreEvent::OnenotePagesUpdated {
+        section_key: canonical_key,
+        pages: stored_pages,
+    });
+    Ok(())
+}
+
+async fn sync_onenote_page(
+    page_key: &str,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+) -> Result<()> {
+    let trimmed = page_key.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let cached_summary = storage.get_onenote_page_summary(trimmed)?;
+    let (scope, page_id) = match &cached_summary {
+        Some(sum) => (sum.scope.clone(), sum.id.clone()),
+        None => split_onenote_entity_key(trimmed),
+    };
+
+    let detail = graph
+        .get_onenote_page_detail(&scope, &page_id, cached_summary)
+        .await?;
+    storage.upsert_onenote_page_detail(&detail)?;
+    let _ = event_tx.send(CoreEvent::OnenotePageDetailUpdated(Box::new(detail)));
+    Ok(())
+}
+
 fn find_new_unread_mail_candidate(
     folder_id: &str,
     storage: &Storage,
@@ -821,6 +1011,68 @@ mod tests {
         let storage = Storage::open_in_memory().unwrap();
 
         bootstrap_outlook(&graph, &storage).await.unwrap();
+        bootstrap_onenote(&graph, &storage).await.unwrap();
+    }
+
+    #[test]
+    fn test_pick_default_onenote_section_prefers_personal_default() {
+        use crate::models::OnenoteScope;
+
+        let group_scope = OnenoteScope::Group {
+            group_id: "t1".to_string(),
+            group_name: Some("개발팀".to_string()),
+        };
+        let notebooks = vec![OnenoteNotebook {
+            notebook_key: "me|nb-def".to_string(),
+            id: "nb-def".to_string(),
+            scope: OnenoteScope::Me,
+            display_name: "기본 노트".to_string(),
+            color: None,
+            is_default: true,
+            is_shared: false,
+            user_role: None,
+            created_at: None,
+            last_modified_at: None,
+            created_by: None,
+            web_url: None,
+        }];
+        let sections = vec![
+            OnenoteSection {
+                section_key: "group:t1|sec-g".to_string(),
+                id: "sec-g".to_string(),
+                scope: group_scope,
+                notebook_id: Some("nb-g".to_string()),
+                notebook_name: None,
+                parent_section_group_id: None,
+                parent_section_group_name: None,
+                display_name: "팀 섹션".to_string(),
+                color: None,
+                is_default: true,
+                pages_url: None,
+                created_at: None,
+                last_modified_at: None,
+                web_url: None,
+            },
+            OnenoteSection {
+                section_key: "me|sec-me".to_string(),
+                id: "sec-me".to_string(),
+                scope: OnenoteScope::Me,
+                notebook_id: Some("nb-def".to_string()),
+                notebook_name: None,
+                parent_section_group_id: None,
+                parent_section_group_name: None,
+                display_name: "빠른 노트".to_string(),
+                color: None,
+                is_default: false,
+                pages_url: None,
+                created_at: None,
+                last_modified_at: None,
+                web_url: None,
+            },
+        ];
+
+        let picked = pick_default_onenote_section(&notebooks, &sections).unwrap();
+        assert_eq!(picked.section_key, "me|sec-me");
     }
 
     #[test]

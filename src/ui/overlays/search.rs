@@ -21,6 +21,7 @@ pub enum SearchScope {
     TeamsMessages,
     Mail,
     Contacts,
+    Notes,
 }
 
 impl SearchScope {
@@ -28,7 +29,8 @@ impl SearchScope {
         match self {
             Self::TeamsMessages => Self::Mail,
             Self::Mail => Self::Contacts,
-            Self::Contacts => Self::TeamsMessages,
+            Self::Contacts => Self::Notes,
+            Self::Notes => Self::TeamsMessages,
         }
     }
 
@@ -37,6 +39,7 @@ impl SearchScope {
             Self::TeamsMessages => "Teams 메시지",
             Self::Mail => "메일",
             Self::Contacts => "연락처",
+            Self::Notes => "OneNote 노트",
         }
     }
 }
@@ -82,6 +85,7 @@ impl SearchOverlay {
             SearchScope::TeamsMessages => Action::Search(q),
             SearchScope::Mail => Action::SearchMail(q),
             SearchScope::Contacts => Action::SearchContacts(q),
+            SearchScope::Notes => Action::SearchNotes(q),
         }
     }
 
@@ -90,6 +94,7 @@ impl SearchOverlay {
             SearchScope::TeamsMessages => app.search_results.len(),
             SearchScope::Mail => app.mail_search_results.len(),
             SearchScope::Contacts => app.contact_search_results.len(),
+            SearchScope::Notes => app.onenote_search_results.len(),
         }
     }
 
@@ -134,6 +139,7 @@ impl SearchOverlay {
                         SearchScope::TeamsMessages => Action::JumpToSearchHit(self.selected),
                         SearchScope::Mail => Action::JumpToMailSearchHit(self.selected),
                         SearchScope::Contacts => Action::JumpToContactSearchHit(self.selected),
+                        SearchScope::Notes => Action::JumpToNoteSearchHit(self.selected),
                     };
                     return OverlayOutcome::CloseAndDispatch(jump);
                 }
@@ -258,6 +264,16 @@ impl SearchOverlay {
                         c.primary_email().unwrap_or("-")
                     )
                 }
+                SearchScope::Notes => {
+                    let hit = &app.onenote_search_results[index];
+                    let nb = hit.notebook_name.as_deref().unwrap_or("필기장");
+                    let sec = hit.section_name.as_deref().unwrap_or("섹션");
+                    format!(
+                        "[노트] {nb} › {sec} · {} — {}",
+                        hit.title,
+                        hit.snippet.replace(['\n', '\r'], " ")
+                    )
+                }
             };
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
@@ -287,5 +303,19 @@ mod tests {
         assert_eq!(search.selected, 1);
         search.move_down(0);
         assert_eq!(search.selected, 0);
+    }
+
+    #[test]
+    fn search_scope_cycles_through_notes() {
+        let mut scope = SearchScope::TeamsMessages;
+        scope = scope.next();
+        assert_eq!(scope, SearchScope::Mail);
+        scope = scope.next();
+        assert_eq!(scope, SearchScope::Contacts);
+        scope = scope.next();
+        assert_eq!(scope, SearchScope::Notes);
+        assert_eq!(scope.label(), "OneNote 노트");
+        scope = scope.next();
+        assert_eq!(scope, SearchScope::TeamsMessages);
     }
 }

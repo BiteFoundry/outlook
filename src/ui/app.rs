@@ -13,9 +13,11 @@ use crate::graph::GraphClient;
 use crate::img_preview::{self, RenderedTerminalImage};
 use crate::models::{
     AttachmentInfo, CalendarEvent, ChannelSummary, ContactItem, ConversationKind,
-    ConversationSummary, ConversationTarget, CoreEvent, DownloadedFile, MailAttachment, MailFolder,
-    MailMessage, MailSearchHit, MemberInfo, MessageItem, NotificationCandidate, OutgoingContact,
-    OutgoingEvent, OutgoingMail, OutgoingMessage, OutgoingTodoTask, PresenceStatus, QuotedReply,
+    ConversationSummary, ConversationTarget, CoreEvent, DownloadedFile, InlineImageUpload,
+    MailAttachment, MailFolder, MailMessage, MailSearchHit, MemberInfo, MessageItem,
+    NotificationCandidate, OnenoteNotebook, OnenotePageDetail, OnenotePageSummary, OnenoteResource,
+    OnenoteScope, OnenoteSearchHit, OnenoteSection, OutgoingContact, OutgoingEvent, OutgoingMail,
+    OutgoingMessage, OutgoingOnenotePage, OutgoingTodoTask, PresenceStatus, QuotedReply,
     ReactionSummary, SearchHit, TeamSummary, ThreadView, TodoList, TodoTask, UpdateCheckResult,
     UserProfile,
 };
@@ -30,6 +32,7 @@ use super::nav_pane::{self, NavRow};
 use super::notification;
 use super::overlays::image_preview::PreviewTarget;
 use super::overlays::mail_compose::MailComposeMode;
+use super::overlays::onenote_form::OnenoteFormOverlay;
 use super::overlays::{Overlay, OverlayKind};
 use super::theme::Theme;
 use super::toast::{TaskBoard, ToastKind, ToastQueue};
@@ -242,6 +245,14 @@ pub enum UiMsg {
         att_id: String,
         error: String,
     },
+    OnenoteImageDecoded {
+        cache_key: String,
+        rendered: RenderedTerminalImage,
+    },
+    OnenoteImageDecodeFailed {
+        cache_key: String,
+        error: String,
+    },
     UpdateChecked(UpdateCheckResult),
     TaskDone {
         label: String,
@@ -285,6 +296,10 @@ pub struct UiState {
     pub todo_include_completed: bool,
     pub term_width: u16,
     pub term_height: u16,
+    pub collapsed_notebook_keys: HashSet<String>,
+    pub onenote_selected_block: usize,
+    pub onenote_scroll: ScrollState,
+    pub onenote_follow_selection: bool,
 }
 
 impl Default for UiState {
@@ -302,6 +317,7 @@ impl UiState {
         let active_nav_tab = match persona {
             Persona::Teams => 0,
             Persona::Outlook => 3,
+            Persona::OneNote => 7,
         };
         Self {
             persona,
@@ -338,6 +354,10 @@ impl UiState {
             todo_include_completed: false,
             term_width: 120,
             term_height: 40,
+            collapsed_notebook_keys: HashSet::new(),
+            onenote_selected_block: 0,
+            onenote_scroll: ScrollState::default(),
+            onenote_follow_selection: false,
         }
     }
 
@@ -455,6 +475,20 @@ pub struct AppState {
     pub todo_lists: Vec<TodoList>,
     pub todo_tasks: Vec<TodoTask>,
     pub active_todo_task_id: Option<String>,
+    // Microsoft OneNote workspace state
+    pub onenote_notebooks: Vec<OnenoteNotebook>,
+    pub onenote_sections: Vec<OnenoteSection>,
+    pub onenote_pages: Vec<OnenotePageSummary>,
+    pub onenote_search_results: Vec<OnenoteSearchHit>,
+    pub active_notebook_key: Option<String>,
+    pub active_section_key: Option<String>,
+    pub active_page_key: Option<String>,
+    pub active_page_detail: Option<OnenotePageDetail>,
+    pub loading_onenote_pages: bool,
+    pub loading_onenote_detail: bool,
+    pub onenote_image_cache: HashMap<String, RenderedTerminalImage>,
+    pub onenote_image_pending: HashSet<String>,
+    pub onenote_image_errors: HashSet<String>,
     // Terminal inline image preview cache (bounded LRU-style FIFO)
     pub image_cache: HashMap<String, RenderedTerminalImage>,
     pub image_cache_order: VecDeque<String>,
@@ -539,6 +573,19 @@ impl AppState {
             todo_lists: Vec::new(),
             todo_tasks: Vec::new(),
             active_todo_task_id: None,
+            onenote_notebooks: Vec::new(),
+            onenote_sections: Vec::new(),
+            onenote_pages: Vec::new(),
+            onenote_search_results: Vec::new(),
+            active_notebook_key: None,
+            active_section_key: None,
+            active_page_key: None,
+            active_page_detail: None,
+            loading_onenote_pages: false,
+            loading_onenote_detail: false,
+            onenote_image_cache: HashMap::new(),
+            onenote_image_pending: HashSet::new(),
+            onenote_image_errors: HashSet::new(),
             image_cache: HashMap::new(),
             image_cache_order: VecDeque::new(),
             image_pending: HashSet::new(),
@@ -925,6 +972,14 @@ impl AppState {
             NavRow::TodoTaskRow { task_id, .. } => {
                 self.select_todo_task(ui, task_id);
                 self.focus_conversation_pane(ui);
+            }
+            NavRow::OnenoteGroupHeader { .. } => {}
+            NavRow::OnenoteNotebook { notebook_key, .. } => {
+                self.toggle_onenote_notebook(ui, notebook_key);
+            }
+            NavRow::OnenoteSectionGroup { .. } => {}
+            NavRow::OnenoteSection { section_key, .. } => {
+                self.open_onenote_section(ui, section_key);
             }
         }
     }
@@ -1616,7 +1671,92 @@ impl AppState {
             } => {
                 self.request_mail_image(mail_id.clone(), attachment.clone(), cols, rows);
             }
+            PreviewTarget::OneNote {
+                page_key,
+                resource_id,
+                resource,
+                ..
+            } => {
+                self.request_onenote_preview_image(
+                    page_key.clone(),
+                    resource_id.clone(),
+                    resource.clone(),
+                    cols,
+                    rows,
+                );
+            }
         }
+    }
+
+    /// Loads a full-size OneNote page image into the shared preview cache
+    /// (keyed like every other `PreviewTarget` so `ImagePreviewOverlay` can render it).
+    fn request_onenote_preview_image(
+        &mut self,
+        page_key: String,
+        resource_id: String,
+        resource: OnenoteResource,
+        cols: u16,
+        rows: u16,
+    ) {
+        let key = Self::image_cache_key(&page_key, &resource_id, cols, rows);
+        if self.image_cache.contains_key(&key)
+            || self.image_pending.contains(&key)
+            || self.image_errors.contains_key(&key)
+        {
+            return;
+        }
+        let url = resource.resource_url.trim().to_string();
+        if url.is_empty() {
+            self.image_errors.insert(key, "이미지 URL이 없습니다".to_string());
+            return;
+        }
+        self.image_pending.insert(key.clone());
+        let graph = self.graph.clone();
+        let tx = self.ui_tx.clone();
+        let bg = (20, 22, 26);
+
+        tokio::spawn(async move {
+            match graph.download_onenote_resource_bytes(&url).await {
+                Ok(bytes) => {
+                    let decode_res = tokio::task::spawn_blocking(move || {
+                        img_preview::decode_and_render_halfblocks(&bytes, cols, rows, bg)
+                    })
+                    .await;
+                    match decode_res {
+                        Ok(Ok(rendered)) => {
+                            let _ = tx.send(UiMsg::ImageDecoded {
+                                cache_key: key,
+                                rendered,
+                            });
+                        }
+                        Ok(Err(err)) => {
+                            let _ = tx.send(UiMsg::ImageDecodeFailed {
+                                cache_key: key,
+                                owner_id: page_key,
+                                att_id: resource_id,
+                                error: err.to_string(),
+                            });
+                        }
+                        Err(err) => {
+                            let _ = tx.send(UiMsg::ImageDecodeFailed {
+                                cache_key: key,
+                                owner_id: page_key,
+                                att_id: resource_id,
+                                error: err.to_string(),
+                            });
+                        }
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(UiMsg::ImageDecodeFailed {
+                        cache_key: key,
+                        owner_id: page_key,
+                        att_id: resource_id,
+                        error: err.to_string(),
+                    });
+                }
+            }
+        });
     }
 
     pub fn download_mail_attachment(
@@ -2395,6 +2535,685 @@ impl AppState {
         });
     }
 
+    // ------------------------------------------------------------------
+    // Microsoft OneNote Workspace Actions
+    // ------------------------------------------------------------------
+
+    /// Sections that belong to the currently active notebook (clone of in-memory state).
+    pub fn sections_for_active_notebook(&self) -> Vec<OnenoteSection> {
+        let Some(key) = self.active_notebook_key.as_deref() else {
+            return Vec::new();
+        };
+        let Some(nb) = self
+            .onenote_notebooks
+            .iter()
+            .find(|nb| nb.notebook_key == key)
+        else {
+            return Vec::new();
+        };
+        self.onenote_sections
+            .iter()
+            .filter(|sec| nav_pane::section_belongs_to_notebook(sec, nb))
+            .cloned()
+            .collect()
+    }
+
+    pub fn onenote_image_key(page_key: &str, resource_index: usize, cols: u16, rows: u16) -> String {
+        format!("{page_key}:{resource_index}:{cols}x{rows}")
+    }
+
+    pub fn request_onenote_image(
+        &mut self,
+        page_key: String,
+        resource_index: usize,
+        resource: OnenoteResource,
+        thumb_cols: u16,
+        thumb_rows: u16,
+    ) {
+        let key = Self::onenote_image_key(&page_key, resource_index, thumb_cols, thumb_rows);
+        if self.onenote_image_cache.contains_key(&key)
+            || self.onenote_image_pending.contains(&key)
+            || self.onenote_image_errors.contains(&key)
+        {
+            return;
+        }
+        let url = resource.resource_url.trim().to_string();
+        if url.is_empty() {
+            self.onenote_image_errors.insert(key);
+            return;
+        }
+        self.onenote_image_pending.insert(key.clone());
+        let graph = self.graph.clone();
+        let tx = self.ui_tx.clone();
+        let bg = (20, 22, 26);
+
+        tokio::spawn(async move {
+            match graph.download_onenote_resource_bytes(&url).await {
+                Ok(bytes) => {
+                    let decode_res = tokio::task::spawn_blocking(move || {
+                        img_preview::decode_and_render_halfblocks(
+                            &bytes, thumb_cols, thumb_rows, bg,
+                        )
+                    })
+                    .await;
+                    match decode_res {
+                        Ok(Ok(rendered)) => {
+                            let _ = tx.send(UiMsg::OnenoteImageDecoded {
+                                cache_key: key,
+                                rendered,
+                            });
+                        }
+                        Ok(Err(err)) => {
+                            let _ = tx.send(UiMsg::OnenoteImageDecodeFailed {
+                                cache_key: key,
+                                error: err.to_string(),
+                            });
+                        }
+                        Err(err) => {
+                            let _ = tx.send(UiMsg::OnenoteImageDecodeFailed {
+                                cache_key: key,
+                                error: err.to_string(),
+                            });
+                        }
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(UiMsg::OnenoteImageDecodeFailed {
+                        cache_key: key,
+                        error: err.to_string(),
+                    });
+                }
+            }
+        });
+    }
+
+    pub fn download_onenote_attachment(
+        &mut self,
+        ui: &mut UiState,
+        _page_key: &str,
+        resource_index: usize,
+        resource: OnenoteResource,
+    ) {
+        let url = resource.resource_url.trim().to_string();
+        if url.is_empty() {
+            ui.info("이 첨부에는 다운로드 링크가 없습니다");
+            return;
+        }
+        let file_name = resource
+            .file_name
+            .clone()
+            .or_else(|| resource.alt_text.clone())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("onenote_{}.bin", resource_index + 1));
+        let safe_name = file_name.replace(['/', '\\', ':', '|', '*', '?', '"', '<', '>'], "_");
+        let graph = self.graph.clone();
+        let dir = self.download_dir.clone();
+        let tx = self.ui_tx.clone();
+        let task_label = format!("첨부 다운로드: {safe_name}");
+        ui.tasks.begin(task_label.clone());
+
+        tokio::spawn(async move {
+            let write_res: anyhow::Result<PathBuf> = async {
+                let bytes = graph.download_onenote_resource_bytes(&url).await?;
+                tokio::fs::create_dir_all(&dir).await?;
+                let path = dir.join(&safe_name);
+                tokio::fs::write(&path, &bytes).await?;
+                Ok(path)
+            }
+            .await;
+
+            match write_res {
+                Ok(path) => {
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: None,
+                        toast: Some((
+                            format!("저장됨: {}", path.display()),
+                            ToastKind::Success,
+                        )),
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: Some(err.to_string()),
+                        toast: Some((format!("다운로드 실패: {err}"), ToastKind::Error)),
+                    });
+                }
+            }
+        });
+    }
+
+    pub fn create_onenote_notebook(&mut self, ui: &mut UiState, display_name: String) {
+        let name = display_name.trim().to_string();
+        if name.is_empty() {
+            ui.info("필기장 이름을 입력하세요");
+            return;
+        }
+        let scope = self
+            .active_notebook_key
+            .as_deref()
+            .and_then(|key| self.onenote_notebooks.iter().find(|nb| nb.notebook_key == key))
+            .map(|nb| nb.scope.clone())
+            .unwrap_or(OnenoteScope::Me);
+        let graph = self.graph.clone();
+        let storage = self.storage.clone();
+        let sync = self.sync_ctrl.clone();
+        let tx = self.ui_tx.clone();
+        let task_label = "필기장 만들기".to_string();
+        ui.tasks.begin(task_label.clone());
+
+        tokio::spawn(async move {
+            match graph.create_onenote_notebook(&scope, &name).await {
+                Ok(created) => {
+                    let _ = storage.upsert_onenote_notebooks(std::slice::from_ref(&created));
+                    sync.request(SyncCommand::RefreshOneNote);
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: None,
+                        toast: Some((
+                            format!("필기장을 만들었습니다: {}", created.display_name),
+                            ToastKind::Success,
+                        )),
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: Some(err.to_string()),
+                        toast: Some((format!("필기장 만들기 실패: {err}"), ToastKind::Error)),
+                    });
+                }
+            }
+        });
+    }
+
+    pub fn create_onenote_section(
+        &mut self,
+        ui: &mut UiState,
+        notebook_key: String,
+        display_name: String,
+    ) {
+        let name = display_name.trim().to_string();
+        if name.is_empty() {
+            ui.info("섹션 이름을 입력하세요");
+            return;
+        }
+        let (scope, notebook_id) = crate::models::split_onenote_entity_key(&notebook_key);
+        let graph = self.graph.clone();
+        let storage = self.storage.clone();
+        let sync = self.sync_ctrl.clone();
+        let tx = self.ui_tx.clone();
+        let task_label = "섹션 만들기".to_string();
+        ui.tasks.begin(task_label.clone());
+
+        tokio::spawn(async move {
+            match graph
+                .create_onenote_section(&scope, &notebook_id, &name)
+                .await
+            {
+                Ok(created) => {
+                    let _ = storage.upsert_onenote_sections(std::slice::from_ref(&created));
+                    sync.request(SyncCommand::RefreshOneNote);
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: None,
+                        toast: Some((
+                            format!("섹션을 만들었습니다: {}", created.display_name),
+                            ToastKind::Success,
+                        )),
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: Some(err.to_string()),
+                        toast: Some((format!("섹션 만들기 실패: {err}"), ToastKind::Error)),
+                    });
+                }
+            }
+        });
+    }
+
+    pub fn create_onenote_page(
+        &mut self,
+        ui: &mut UiState,
+        section_key: String,
+        title: String,
+        markdown_body: String,
+        inline_images: Vec<InlineImageUpload>,
+        level: Option<i32>,
+    ) {
+        let title = title.trim().to_string();
+        if title.is_empty() {
+            ui.info("페이지 제목을 입력하세요");
+            return;
+        }
+        let (scope, section_id) = crate::models::split_onenote_entity_key(&section_key);
+        let outgoing = OutgoingOnenotePage {
+            title,
+            markdown_body,
+            inline_images,
+            level: level.filter(|l| *l > 0),
+        };
+        let graph = self.graph.clone();
+        let storage = self.storage.clone();
+        let sync = self.sync_ctrl.clone();
+        let tx = self.ui_tx.clone();
+        let task_label = "페이지 만들기".to_string();
+        ui.tasks.begin(task_label.clone());
+
+        tokio::spawn(async move {
+            match graph
+                .create_onenote_page(&scope, &section_id, &outgoing)
+                .await
+            {
+                Ok(created) => {
+                    let _ = storage.upsert_onenote_pages(std::slice::from_ref(&created));
+                    sync.request(SyncCommand::SyncOneNoteSection { section_key });
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: None,
+                        toast: Some(("페이지를 만들었습니다".to_string(), ToastKind::Success)),
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: Some(err.to_string()),
+                        toast: Some((format!("페이지 만들기 실패: {err}"), ToastKind::Error)),
+                    });
+                }
+            }
+        });
+    }
+
+    pub fn append_onenote_markdown(
+        &mut self,
+        ui: &mut UiState,
+        page_key: String,
+        markdown: String,
+        inline_images: Vec<InlineImageUpload>,
+    ) {
+        if markdown.trim().is_empty() && inline_images.is_empty() {
+            ui.info("추가할 Markdown 내용을 입력하세요");
+            return;
+        }
+        let primary_div_id = self
+            .active_page_detail
+            .as_ref()
+            .filter(|d| d.summary.page_key == page_key)
+            .and_then(|d| d.primary_div_id.clone());
+        let (scope, page_id) = crate::models::split_onenote_entity_key(&page_key);
+        let graph = self.graph.clone();
+        let sync = self.sync_ctrl.clone();
+        let tx = self.ui_tx.clone();
+        let task_label = "페이지에 내용 추가".to_string();
+        ui.tasks.begin(task_label.clone());
+
+        tokio::spawn(async move {
+            match graph
+                .append_onenote_page_markdown(
+                    &scope,
+                    &page_id,
+                    primary_div_id.as_deref(),
+                    &markdown,
+                    &inline_images,
+                )
+                .await
+            {
+                Ok(()) => {
+                    sync.request(SyncCommand::SyncOneNotePage {
+                        page_key: page_key.clone(),
+                    });
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: None,
+                        toast: Some(("페이지에 내용을 추가했습니다".to_string(), ToastKind::Success)),
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: Some(err.to_string()),
+                        toast: Some((format!("내용 추가 실패: {err}"), ToastKind::Error)),
+                    });
+                }
+            }
+        });
+    }
+
+    pub fn edit_onenote_block(
+        &mut self,
+        ui: &mut UiState,
+        page_key: String,
+        element_id: String,
+        markdown: String,
+    ) {
+        if element_id.trim().is_empty() {
+            ui.info("수정할 블록 ID가 없습니다");
+            return;
+        }
+        if markdown.trim().is_empty() {
+            ui.info("수정할 블록 Markdown 내용을 입력하세요");
+            return;
+        }
+        let command = parser::onenote::build_replace_block_patch(&element_id, &markdown);
+        let (scope, page_id) = crate::models::split_onenote_entity_key(&page_key);
+        let graph = self.graph.clone();
+        let sync = self.sync_ctrl.clone();
+        let tx = self.ui_tx.clone();
+        let task_label = "블록 수정".to_string();
+        ui.tasks.begin(task_label.clone());
+
+        tokio::spawn(async move {
+            match graph
+                .patch_onenote_page_commands(&scope, &page_id, &[command])
+                .await
+            {
+                Ok(()) => {
+                    sync.request(SyncCommand::SyncOneNotePage {
+                        page_key: page_key.clone(),
+                    });
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: None,
+                        toast: Some(("블록을 수정했습니다".to_string(), ToastKind::Success)),
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: Some(err.to_string()),
+                        toast: Some((format!("블록 수정 실패: {err}"), ToastKind::Error)),
+                    });
+                }
+            }
+        });
+    }
+
+    pub fn search_notes(&mut self, query: String) {
+        let trimmed = query.trim().to_string();
+        if trimmed.is_empty() {
+            self.onenote_search_results.clear();
+            return;
+        }
+        self.onenote_search_results = self
+            .storage
+            .search_onenote_pages(&trimmed, None, 50)
+            .unwrap_or_default();
+    }
+
+    pub fn jump_to_note_search_hit(&mut self, ui: &mut UiState, index: usize) {
+        let Some(hit) = self.onenote_search_results.get(index).cloned() else {
+            return;
+        };
+        let section_key = hit.scope.make_entity_key(&hit.section_id);
+        let notebook_key = self
+            .onenote_sections
+            .iter()
+            .find(|sec| sec.section_key == section_key)
+            .and_then(|sec| sec.notebook_id.clone())
+            .and_then(|nb_id| {
+                self.onenote_notebooks
+                    .iter()
+                    .find(|nb| nb.scope.scope_key() == hit.scope.scope_key() && nb.id == nb_id)
+                    .map(|nb| nb.notebook_key.clone())
+            });
+        ui.persona = Persona::OneNote;
+        ui.active_nav_tab = nav_pane::TAB_NOTES;
+        if let Some(nb_key) = notebook_key {
+            ui.collapsed_notebook_keys.remove(&nb_key);
+            self.active_notebook_key = Some(nb_key);
+        }
+        self.active_section_key = Some(section_key);
+        self.open_onenote_page(ui, hit.page_key);
+    }
+
+    pub fn open_onenote_notebook(&mut self, ui: &mut UiState, notebook_key: String) {
+        ui.collapsed_notebook_keys.remove(&notebook_key);
+        if self.active_notebook_key.as_deref() == Some(notebook_key.as_str()) {
+            return;
+        }
+        self.active_notebook_key = Some(notebook_key);
+        self.active_section_key = None;
+        self.active_page_key = None;
+        self.active_page_detail = None;
+        self.onenote_pages.clear();
+        self.loading_onenote_pages = false;
+        self.loading_onenote_detail = false;
+        ui.onenote_selected_block = 0;
+        ui.onenote_scroll = ScrollState::default();
+    }
+
+    pub fn open_onenote_section(&mut self, ui: &mut UiState, section_key: String) {
+        if let Some(nb_key) = self
+            .onenote_sections
+            .iter()
+            .find(|sec| sec.section_key == section_key)
+            .and_then(|sec| {
+                let nb_id = sec.notebook_id.as_deref()?;
+                let scope_key = sec.scope.scope_key();
+                self.onenote_notebooks
+                    .iter()
+                    .find(|nb| nb.scope.scope_key() == scope_key && nb.id == nb_id)
+                    .map(|nb| nb.notebook_key.clone())
+            })
+        {
+            self.active_notebook_key = Some(nb_key);
+        }
+        self.active_section_key = Some(section_key.clone());
+        self.active_page_key = None;
+        self.active_page_detail = None;
+        self.onenote_pages = self
+            .storage
+            .list_onenote_pages(&section_key)
+            .unwrap_or_default();
+        self.loading_onenote_pages = true;
+        self.loading_onenote_detail = false;
+        ui.onenote_selected_block = 0;
+        ui.onenote_scroll = ScrollState::default();
+        self.sync_ctrl
+            .request(SyncCommand::SyncOneNoteSection { section_key });
+    }
+
+    pub fn open_onenote_page(&mut self, ui: &mut UiState, page_key: String) {
+        self.active_page_detail = self
+            .storage
+            .get_onenote_page_detail(&page_key)
+            .unwrap_or(None);
+        self.active_page_key = Some(page_key.clone());
+        self.loading_onenote_detail = true;
+        ui.onenote_selected_block = 0;
+        ui.onenote_scroll = ScrollState::default();
+        ui.onenote_follow_selection = true;
+        self.sync_ctrl
+            .request(SyncCommand::SyncOneNotePage { page_key });
+    }
+
+    pub fn select_onenote_block(&mut self, ui: &mut UiState, index: usize) {
+        ui.onenote_selected_block = index;
+        ui.onenote_follow_selection = true;
+    }
+
+    pub fn toggle_onenote_todo(&mut self, ui: &mut UiState, index: usize) {
+        let Some(detail) = self.active_page_detail.clone() else {
+            ui.info("페이지를 먼저 열어야 체크리스트를 바꿀 수 있습니다");
+            return;
+        };
+        let Some(block) = detail.blocks.get(index).cloned() else {
+            ui.info("선택한 블록이 없습니다");
+            return;
+        };
+        let Some((command, completed)) = parser::onenote::build_toggle_todo_patch(&block) else {
+            ui.info("이 블록은 체크리스트 항목이 아닙니다");
+            return;
+        };
+        let page_key = detail.summary.page_key.clone();
+        let (scope, page_id) = crate::models::split_onenote_entity_key(&page_key);
+        let graph = self.graph.clone();
+        let sync = self.sync_ctrl.clone();
+        let tx = self.ui_tx.clone();
+        let task_label = "체크리스트 변경".to_string();
+        ui.tasks.begin(task_label.clone());
+        let toast_text = if completed {
+            "완료로 표시했습니다".to_string()
+        } else {
+            "미완료로 되돌렸습니다".to_string()
+        };
+
+        tokio::spawn(async move {
+            match graph
+                .patch_onenote_page_commands(&scope, &page_id, &[command])
+                .await
+            {
+                Ok(()) => {
+                    sync.request(SyncCommand::SyncOneNotePage {
+                        page_key: page_key.clone(),
+                    });
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: None,
+                        toast: Some((toast_text, ToastKind::Success)),
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: Some(err.to_string()),
+                        toast: Some((
+                            format!("체크리스트 변경 실패: {err}"),
+                            ToastKind::Error,
+                        )),
+                    });
+                }
+            }
+        });
+    }
+
+    pub fn toggle_onenote_notebook(&mut self, ui: &mut UiState, notebook_key: String) {
+        if !ui.collapsed_notebook_keys.remove(&notebook_key) {
+            ui.collapsed_notebook_keys.insert(notebook_key);
+        }
+    }
+
+    pub fn open_onenote_create_notebook(&mut self, ui: &mut UiState) {
+        ui.push_overlay(Overlay::OnenoteForm(OnenoteFormOverlay::create_notebook()));
+    }
+
+    pub fn open_onenote_create_section(&mut self, ui: &mut UiState) {
+        let Some(notebook_key) = self.active_notebook_key.clone() else {
+            ui.info("섹션을 만들 필기장을 먼저 선택하세요");
+            return;
+        };
+        let notebook_name = self
+            .onenote_notebooks
+            .iter()
+            .find(|nb| nb.notebook_key == notebook_key)
+            .map(|nb| nb.display_name.clone())
+            .unwrap_or_else(|| notebook_key.clone());
+        ui.push_overlay(Overlay::OnenoteForm(OnenoteFormOverlay::create_section(
+            notebook_key,
+            notebook_name,
+        )));
+    }
+
+    pub fn open_onenote_create_page(&mut self, ui: &mut UiState, subpage: bool) {
+        let Some(section_key) = self.active_section_key.clone() else {
+            ui.info("페이지를 만들 섹션을 먼저 선택하세요");
+            return;
+        };
+        let section_name = self
+            .onenote_sections
+            .iter()
+            .find(|sec| sec.section_key == section_key)
+            .map(|sec| sec.display_name.clone())
+            .unwrap_or_else(|| section_key.clone());
+        let level = if subpage {
+            self.active_page_detail
+                .as_ref()
+                .map(|d| (d.summary.level + 1).clamp(1, 2))
+                .unwrap_or(1)
+        } else {
+            0
+        };
+        ui.push_overlay(Overlay::OnenoteForm(OnenoteFormOverlay::create_page(
+            section_key,
+            section_name,
+            level,
+        )));
+    }
+
+    pub fn delete_active_onenote_page(&mut self, ui: &mut UiState) {
+        let Some(page_key) = self.active_page_key.clone() else {
+            ui.info("삭제할 페이지를 먼저 선택하세요");
+            return;
+        };
+        let (scope, page_id) = crate::models::split_onenote_entity_key(&page_key);
+        let graph = self.graph.clone();
+        let storage = self.storage.clone();
+        let sync = self.sync_ctrl.clone();
+        let tx = self.ui_tx.clone();
+        let task_label = "페이지 삭제".to_string();
+        ui.tasks.begin(task_label.clone());
+
+        self.onenote_pages.retain(|p| p.page_key != page_key);
+        self.active_page_key = None;
+        self.active_page_detail = None;
+        ui.onenote_selected_block = 0;
+        ui.onenote_scroll = ScrollState::default();
+
+        tokio::spawn(async move {
+            match graph.delete_onenote_page(&scope, &page_id).await {
+                Ok(()) => {
+                    let _ = storage.delete_onenote_page(&page_key);
+                    sync.request(SyncCommand::RefreshOneNote);
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: None,
+                        toast: Some(("페이지를 삭제했습니다".to_string(), ToastKind::Success)),
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: Some(err.to_string()),
+                        toast: Some((format!("페이지 삭제 실패: {err}"), ToastKind::Error)),
+                    });
+                }
+            }
+        });
+    }
+
+    pub fn refresh_onenote(&mut self, ui: &mut UiState) {
+        self.loading_onenote_pages = true;
+        self.sync_ctrl.request(SyncCommand::RefreshOneNote);
+        ui.info("OneNote를 새로고침합니다");
+    }
+
+    pub fn open_active_onenote_in_browser(&mut self, ui: &mut UiState) {
+        let url = self
+            .active_page_detail
+            .as_ref()
+            .and_then(|d| d.summary.web_url.clone())
+            .or_else(|| {
+                let key = self.active_page_key.as_deref()?;
+                self.onenote_pages
+                    .iter()
+                    .find(|p| p.page_key == key)
+                    .and_then(|p| p.web_url.clone())
+            });
+        let Some(url) = url else {
+            ui.info("이 페이지는 브라우저 링크가 없습니다");
+            return;
+        };
+        match open::that(&url) {
+            Ok(()) => ui.success("브라우저에서 페이지를 열었습니다"),
+            Err(err) => ui.error(format!("링크 열기 실패: {err}")),
+        }
+    }
+
     pub fn search_mail(&mut self, query: String) {
         self.search_query = query.clone();
         self.mail_search_results.clear();
@@ -2636,6 +3455,32 @@ impl AppState {
                 if ui.active_todo_list_id.as_deref() == list_id.as_deref() {
                     self.todo_tasks = tasks;
                 }
+            }
+            CoreEvent::OnenoteHierarchyUpdated {
+                notebooks,
+                section_groups: _,
+                sections,
+            } => {
+                self.onenote_notebooks = notebooks;
+                self.onenote_sections = sections;
+                if self.active_notebook_key.is_none() {
+                    self.active_notebook_key = self
+                        .onenote_notebooks
+                        .first()
+                        .map(|nb| nb.notebook_key.clone());
+                }
+                self.loading_onenote_pages = false;
+                self.loading_onenote_detail = false;
+            }
+            CoreEvent::OnenotePagesUpdated { section_key, pages } => {
+                if self.active_section_key.as_deref() == Some(section_key.as_str()) {
+                    self.onenote_pages = pages;
+                    self.loading_onenote_pages = false;
+                }
+            }
+            CoreEvent::OnenotePageDetailUpdated(detail) => {
+                self.active_page_detail = Some(*detail);
+                self.loading_onenote_detail = false;
             }
         }
     }
@@ -3045,6 +3890,23 @@ impl AppState {
                         }
                     }
                 }
+            }
+            UiMsg::OnenoteImageDecoded {
+                cache_key,
+                rendered,
+            } => {
+                self.onenote_image_pending.remove(&cache_key);
+                self.onenote_image_errors.remove(&cache_key);
+                if self.onenote_image_cache.len() >= 96 {
+                    if let Some(old) = self.onenote_image_cache.keys().next().cloned() {
+                        self.onenote_image_cache.remove(&old);
+                    }
+                }
+                self.onenote_image_cache.insert(cache_key, rendered);
+            }
+            UiMsg::OnenoteImageDecodeFailed { cache_key, .. } => {
+                self.onenote_image_pending.remove(&cache_key);
+                self.onenote_image_errors.insert(cache_key);
             }
             UiMsg::UpdateChecked(_res) => {}
             UiMsg::TaskDone {

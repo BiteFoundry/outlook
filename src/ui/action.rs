@@ -6,16 +6,21 @@ use chrono::Utc;
 use ratatui::layout::Position;
 
 use crate::config::Persona;
-use crate::models::{ConversationTarget, OutgoingContact, OutgoingEvent};
+use crate::models::{
+    ConversationTarget, InlineImageUpload, OutgoingContact, OutgoingEvent,
+};
 use crate::sync::SyncCommand;
 
 use super::app::{AppState, Focus, NarrowPane, UiState};
 use super::composer::{self, ReplyPreview};
 use super::hitmap::{ButtonId, HitTarget, MessageScope};
-use super::nav_pane::{self, TAB_CALENDAR, TAB_CONTACTS, TAB_COUNT, TAB_MAIL, TAB_TODO};
+use super::nav_pane::{
+    self, TAB_CALENDAR, TAB_CONTACTS, TAB_COUNT, TAB_MAIL, TAB_NOTES, TAB_TODO,
+};
 use super::overlays::context_menu::{ContextMenu, ContextTarget};
 use super::overlays::image_preview::ImagePreviewOverlay;
 use super::overlays::mail_compose::{MailComposeMode, MailComposeOverlay};
+use super::overlays::onenote_form::OnenoteFormOverlay;
 use super::overlays::search::{SearchOverlay, SearchScope};
 use super::overlays::{Overlay, OverlayKind, OverlayOutcome};
 
@@ -256,6 +261,39 @@ pub enum Action {
     SearchContacts(String),
     JumpToMailSearchHit(usize),
     JumpToContactSearchHit(usize),
+
+    // Microsoft OneNote
+    SearchNotes(String),
+    JumpToNoteSearchHit(usize),
+    OnenoteOpenCreateNotebook,
+    OnenoteOpenCreateSection,
+    OnenoteOpenCreatePage { subpage: bool },
+    OnenoteCreateNotebook {
+        display_name: String,
+    },
+    OnenoteCreateSection {
+        notebook_key: String,
+        display_name: String,
+    },
+    OnenoteCreatePage {
+        section_key: String,
+        title: String,
+        markdown_body: String,
+        inline_images: Vec<InlineImageUpload>,
+        level: Option<i32>,
+    },
+    OnenoteAppendMarkdown {
+        page_key: String,
+        markdown: String,
+        inline_images: Vec<InlineImageUpload>,
+    },
+    OnenoteEditBlockSubmit {
+        page_key: String,
+        element_id: String,
+        markdown: String,
+    },
+    OnenoteDeletePageConfirm,
+    OnenoteDownloadAttachment,
 }
 
 /// Dispatches an `Action`, mutating `app` and `ui`.
@@ -950,6 +988,13 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     }
                     ui.info("Outlook 워크스페이스 모드로 전환했습니다");
                 }
+                Persona::OneNote => {
+                    if ui.active_nav_tab != TAB_NOTES {
+                        ui.active_nav_tab = TAB_NOTES;
+                        ui.nav_selected = 0;
+                    }
+                    ui.info("OneNote 워크스페이스 모드로 전환했습니다");
+                }
             }
             ui.set_focus(Focus::Nav);
         }
@@ -1022,6 +1067,19 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     }
                     super::overlays::image_preview::PreviewTarget::Mail { mail_id, attachment } => {
                         app.download_mail_attachment(ui, mail_id, attachment.id, attachment.name);
+                    }
+                    super::overlays::image_preview::PreviewTarget::OneNote {
+                        page_key,
+                        resource_index,
+                        resource,
+                        ..
+                    } => {
+                        app.download_onenote_attachment(
+                            ui,
+                            &page_key,
+                            resource_index,
+                            resource.clone(),
+                        );
                     }
                 }
             }
@@ -1206,6 +1264,61 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 ui.set_focus(Focus::Chat);
             }
         }
+
+        // Microsoft OneNote
+        Action::SearchNotes(query) => {
+            app.search_notes(query);
+        }
+        Action::JumpToNoteSearchHit(idx) => {
+            app.jump_to_note_search_hit(ui, idx);
+        }
+        Action::OnenoteOpenCreateNotebook => {
+            app.open_onenote_create_notebook(ui);
+        }
+        Action::OnenoteOpenCreateSection => {
+            app.open_onenote_create_section(ui);
+        }
+        Action::OnenoteOpenCreatePage { subpage } => {
+            app.open_onenote_create_page(ui, subpage);
+        }
+        Action::OnenoteCreateNotebook { display_name } => {
+            app.create_onenote_notebook(ui, display_name);
+        }
+        Action::OnenoteCreateSection {
+            notebook_key,
+            display_name,
+        } => {
+            app.create_onenote_section(ui, notebook_key, display_name);
+        }
+        Action::OnenoteCreatePage {
+            section_key,
+            title,
+            markdown_body,
+            inline_images,
+            level,
+        } => {
+            app.create_onenote_page(ui, section_key, title, markdown_body, inline_images, level);
+        }
+        Action::OnenoteAppendMarkdown {
+            page_key,
+            markdown,
+            inline_images,
+        } => {
+            app.append_onenote_markdown(ui, page_key, markdown, inline_images);
+        }
+        Action::OnenoteEditBlockSubmit {
+            page_key,
+            element_id,
+            markdown,
+        } => {
+            app.edit_onenote_block(ui, page_key, element_id, markdown);
+        }
+        Action::OnenoteDeletePageConfirm => {
+            app.delete_active_onenote_page(ui);
+        }
+        Action::OnenoteDownloadAttachment => {
+            ui.info("미리보기에서 저장하세요");
+        }
     }
 
     false
@@ -1242,6 +1355,7 @@ fn open_overlay(kind: OverlayKind, app: &mut AppState, ui: &mut UiState) {
         OverlayKind::MailCompose => Overlay::MailCompose(MailComposeOverlay::new()),
         OverlayKind::EventCreate => Overlay::event_create(),
         OverlayKind::ContactCreate => Overlay::contact_create(),
+        OverlayKind::OnenoteForm => Overlay::OnenoteForm(OnenoteFormOverlay::create_notebook()),
         OverlayKind::ImagePreview => {
             open_image_preview(app, ui);
             return;
@@ -1486,6 +1600,9 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
     }
 
     if let Some(hit) = target {
+        if handle_onenote_hit(hit, app, ui) {
+            return false;
+        }
         let act = action_for_target(hit);
         return dispatch(act, app, ui);
     }
@@ -1560,11 +1677,208 @@ fn action_for_target(target: HitTarget) -> Action {
             ButtonId::NewTodo | ButtonId::TodoInputFocus => Action::TodoFocusInput,
             ButtonId::TodoToggle => Action::TodoToggleSelected,
             ButtonId::DeleteTodo => Action::TodoDeleteRequest,
+            // Microsoft OneNote toolbar
+            ButtonId::OnenoteNewNotebook => Action::OnenoteOpenCreateNotebook,
+            ButtonId::OnenoteNewSection => Action::OnenoteOpenCreateSection,
+            ButtonId::OnenoteNewPage => Action::OnenoteOpenCreatePage { subpage: false },
+            ButtonId::OnenoteNewSubpage => Action::OnenoteOpenCreatePage { subpage: true },
+            // These need direct `AppState` access, so `handle_onenote_hit` consumes them first.
+            ButtonId::OnenoteAppendBlock
+            | ButtonId::OnenoteEditBlock
+            | ButtonId::OnenoteEditFullPage
+            | ButtonId::OnenoteToggleTodo
+            | ButtonId::OnenoteOpenWeb
+            | ButtonId::OnenoteRefresh
+            | ButtonId::OnenoteDeletePage => Action::Noop,
         },
         HitTarget::SubjectInput => Action::FocusSubject,
         HitTarget::Composer => Action::OpenComposer,
         HitTarget::OverlayItem { index } => Action::OverlaySelect(index),
+        // OneNote hit targets resolve against `AppState`, so they are handled in
+        // `handle_onenote_hit` before this mapper runs.
+        HitTarget::OnenoteSectionTab(_)
+        | HitTarget::OnenotePage(_)
+        | HitTarget::OnenoteBlock(_)
+        | HitTarget::OnenoteTodoToggle(_)
+        | HitTarget::OnenoteResource { .. } => Action::Noop,
     }
+}
+
+/// Handles OneNote hit targets and toolbar buttons that require direct `AppState` access.
+///
+/// Returns `true` when the target was consumed.
+fn handle_onenote_hit(hit: HitTarget, app: &mut AppState, ui: &mut UiState) -> bool {
+    match hit {
+        HitTarget::OnenoteSectionTab(idx) => {
+            match onenote_section_key_at(app, idx) {
+                Some(section_key) => app.open_onenote_section(ui, section_key),
+                None => ui.info("선택할 OneNote 섹션이 없습니다"),
+            }
+            true
+        }
+        HitTarget::OnenotePage(idx) => {
+            match app.onenote_pages.get(idx).map(|page| page.page_key.clone()) {
+                Some(page_key) => app.open_onenote_page(ui, page_key),
+                None => ui.info("선택할 OneNote 페이지가 없습니다"),
+            }
+            true
+        }
+        HitTarget::OnenoteBlock(idx) => {
+            app.select_onenote_block(ui, idx);
+            true
+        }
+        HitTarget::OnenoteTodoToggle(idx) => {
+            app.toggle_onenote_todo(ui, idx);
+            true
+        }
+        HitTarget::OnenoteResource {
+            resource_index,
+            is_image,
+        } => {
+            if is_image {
+                open_onenote_image_preview(app, ui, Some(resource_index));
+            } else {
+                ui.info("이미지가 아닌 첨부파일입니다 ('d'로 저장)");
+            }
+            true
+        }
+        HitTarget::Button(btn) => handle_onenote_button(btn, app, ui),
+        _ => false,
+    }
+}
+
+/// Handles the OneNote toolbar buttons that cannot be expressed as an `Action`.
+fn handle_onenote_button(btn: ButtonId, app: &mut AppState, ui: &mut UiState) -> bool {
+    match btn {
+        ButtonId::OnenoteAppendBlock => open_onenote_append_form(app, ui),
+        ButtonId::OnenoteEditBlock => open_onenote_edit_block_form(app, ui),
+        ButtonId::OnenoteEditFullPage => open_onenote_edit_page_form(app, ui),
+        ButtonId::OnenoteToggleTodo => {
+            let idx = ui.onenote_selected_block;
+            app.toggle_onenote_todo(ui, idx);
+        }
+        ButtonId::OnenoteOpenWeb => app.open_active_onenote_in_browser(ui),
+        ButtonId::OnenoteRefresh => app.refresh_onenote(ui),
+        ButtonId::OnenoteDeletePage => request_onenote_page_delete(app, ui),
+        _ => return false,
+    }
+    true
+}
+
+/// Resolves a section ribbon index against the sections of the active notebook.
+fn onenote_section_key_at(app: &AppState, idx: usize) -> Option<String> {
+    let active_notebook_key = app.active_notebook_key.as_deref();
+    app.onenote_sections
+        .iter()
+        .filter(|sec| match active_notebook_key {
+            Some(key) => app
+                .onenote_notebooks
+                .iter()
+                .find(|nb| nb.notebook_key == key)
+                .is_none_or(|nb| nav_pane::section_belongs_to_notebook(sec, nb)),
+            None => true,
+        })
+        .nth(idx)
+        .map(|sec| sec.section_key.clone())
+}
+
+fn request_onenote_page_delete(app: &AppState, ui: &mut UiState) {
+    let Some(detail) = app.active_page_detail.as_ref() else {
+        ui.info("삭제할 OneNote 페이지를 먼저 선택하세요");
+        return;
+    };
+    let msg = format!(
+        "OneNote 페이지 '{}' 을(를) 삭제하시겠습니까?",
+        detail.summary.title
+    );
+    ui.push_overlay(Overlay::confirm(
+        msg,
+        Some(Action::OnenoteDeletePageConfirm),
+    ));
+}
+
+/// Opens the append-markdown form for the active page (`a`).
+fn open_onenote_append_form(app: &AppState, ui: &mut UiState) {
+    let Some(detail) = app.active_page_detail.as_ref() else {
+        ui.info("먼저 OneNote 페이지를 선택하세요");
+        return;
+    };
+    let form = OnenoteFormOverlay::append_markdown(
+        detail.summary.page_key.clone(),
+        detail.summary.title.clone(),
+    );
+    ui.push_overlay(Overlay::OnenoteForm(form));
+}
+
+/// Opens the surgical block edit form for the selected block (`e`).
+fn open_onenote_edit_block_form(app: &AppState, ui: &mut UiState) {
+    let Some(detail) = app.active_page_detail.as_ref() else {
+        ui.info("먼저 OneNote 페이지를 선택하세요");
+        return;
+    };
+    let block_index = ui.onenote_selected_block;
+    let Some(block) = detail.blocks.get(block_index) else {
+        ui.info("편집할 OneNote 블록을 선택하세요");
+        return;
+    };
+    let Some(element_id) = block.element_id.clone() else {
+        ui.info("이 블록은 편집할 수 없습니다 (element ID 없음)");
+        return;
+    };
+    let initial_markdown =
+        crate::parser::onenote::onenote_blocks_to_markdown(std::slice::from_ref(block));
+    let form = OnenoteFormOverlay::edit_block(
+        detail.summary.page_key.clone(),
+        detail.summary.title.clone(),
+        element_id,
+        block_index,
+        initial_markdown,
+    );
+    ui.push_overlay(Overlay::OnenoteForm(form));
+}
+
+/// Opens the whole-page markdown edit form (`E`), replacing the page body container.
+fn open_onenote_edit_page_form(app: &AppState, ui: &mut UiState) {
+    let Some(detail) = app.active_page_detail.as_ref() else {
+        ui.info("먼저 OneNote 페이지를 선택하세요");
+        return;
+    };
+    let Some(element_id) = detail.primary_div_id.clone() else {
+        ui.info("페이지 본문 컨테이너를 찾을 수 없어 전체 편집을 열 수 없습니다");
+        return;
+    };
+    let form = OnenoteFormOverlay::edit_block(
+        detail.summary.page_key.clone(),
+        detail.summary.title.clone(),
+        element_id,
+        0,
+        detail.body_markdown.clone(),
+    );
+    ui.push_overlay(Overlay::OnenoteForm(form));
+}
+
+/// Opens the image preview overlay for the active page's resource at `resource_index`.
+fn open_onenote_image_preview(
+    app: &mut AppState,
+    ui: &mut UiState,
+    preferred_res_idx: Option<usize>,
+) {
+    let preview_opt = app
+        .active_page_detail
+        .as_ref()
+        .and_then(|detail| ImagePreviewOverlay::from_onenote_page(detail, preferred_res_idx));
+
+    let Some(preview) = preview_opt else {
+        ui.info("미리볼 수 있는 OneNote 이미지가 없습니다");
+        return;
+    };
+
+    ui.close_overlays_of(OverlayKind::ImagePreview);
+    if let Some(target) = preview.current().cloned() {
+        let (cols, rows) = preview.target_dimensions(ui.term_width, ui.term_height);
+        app.request_preview_image(&target, cols, rows);
+    }
+    ui.push_overlay(Overlay::ImagePreview(preview));
 }
 
 fn open_context_menu_at(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) {

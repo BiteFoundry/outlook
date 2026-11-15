@@ -1,5 +1,5 @@
 //! Full-screen inline terminal image preview modal (`v`).
-//! Supports Teams message attachments and Outlook Mail image attachments,
+//! Supports Teams message attachments, Outlook Mail image attachments, and OneNote page images,
 //! prev/next cycling (`[`/`]`, `←`/`→`), zoom (`+`/`-`), download (`d`), and close (`Esc`/`q`/`v`).
 
 use ratatui::{
@@ -12,7 +12,7 @@ use ratatui::{
 
 use crate::{
     img_preview,
-    models::{AttachmentInfo, MailAttachment, MailMessage, MessageItem},
+    models::{AttachmentInfo, MailAttachment, MailMessage, MessageItem, OnenotePageDetail, OnenoteResource},
     ui::{
         action::Action,
         app::{AppState, UiState},
@@ -31,6 +31,12 @@ pub enum PreviewTarget {
         mail_id: String,
         attachment: MailAttachment,
     },
+    OneNote {
+        page_key: String,
+        resource_id: String,
+        resource_index: usize,
+        resource: OnenoteResource,
+    },
 }
 
 impl PreviewTarget {
@@ -38,6 +44,7 @@ impl PreviewTarget {
         match self {
             PreviewTarget::Teams { msg_id, .. } => msg_id,
             PreviewTarget::Mail { mail_id, .. } => mail_id,
+            PreviewTarget::OneNote { page_key, .. } => page_key,
         }
     }
 
@@ -45,6 +52,7 @@ impl PreviewTarget {
         match self {
             PreviewTarget::Teams { attachment, .. } => &attachment.id,
             PreviewTarget::Mail { attachment, .. } => &attachment.id,
+            PreviewTarget::OneNote { resource_id, .. } => resource_id,
         }
     }
 
@@ -55,6 +63,15 @@ impl PreviewTarget {
                 .clone()
                 .unwrap_or_else(|| format!("image_{}", attachment.id)),
             PreviewTarget::Mail { attachment, .. } => attachment.name.clone(),
+            PreviewTarget::OneNote {
+                resource_index,
+                resource,
+                ..
+            } => resource
+                .file_name
+                .clone()
+                .or_else(|| resource.alt_text.clone())
+                .unwrap_or_else(|| format!("onenote_image_{}.png", resource_index + 1)),
         }
     }
 }
@@ -80,6 +97,38 @@ impl ImagePreviewOverlay {
                 items.push(PreviewTarget::Teams {
                     msg_id: msg.msg_id.clone(),
                     attachment: att.clone(),
+                });
+            }
+        }
+        if items.is_empty() {
+            return None;
+        }
+        Some(Self {
+            items,
+            index: start,
+            zoom_pct: 100,
+            error: None,
+        })
+    }
+
+    pub fn from_onenote_page(
+        detail: &OnenotePageDetail,
+        preferred_res_idx: Option<usize>,
+    ) -> Option<Self> {
+        let mut items = Vec::new();
+        let mut start = 0usize;
+        for (raw_idx, res) in detail.resources.iter().enumerate() {
+            if res.is_image
+                || img_preview::is_image_mime_or_name(&res.mime_type, res.file_name.as_deref())
+            {
+                if preferred_res_idx == Some(raw_idx) {
+                    start = items.len();
+                }
+                items.push(PreviewTarget::OneNote {
+                    page_key: detail.summary.page_key.clone(),
+                    resource_id: format!("res-{raw_idx}"),
+                    resource_index: raw_idx,
+                    resource: res.clone(),
                 });
             }
         }
@@ -185,7 +234,10 @@ impl ImagePreviewOverlay {
                 self.zoom_out();
                 OverlayOutcome::Dispatch(Action::LoadPreviewImage)
             }
-            Action::Input('d') | Action::DownloadLatest | Action::MailDownloadAttachment => {
+            Action::Input('d')
+            | Action::DownloadLatest
+            | Action::MailDownloadAttachment
+            | Action::OnenoteDownloadAttachment => {
                 OverlayOutcome::Dispatch(Action::DownloadPreviewImage)
             }
             _ => OverlayOutcome::Handled,

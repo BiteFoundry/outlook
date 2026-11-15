@@ -1,5 +1,5 @@
 //! Microsoft Graph v1.0 client for Teams Chats, Teams/Channels/Threads, Media, Presence,
-//! and Outlook Mail, Calendar, Contacts, & Microsoft To Do.
+//! Outlook Mail, Calendar, Contacts, Microsoft To Do, & Microsoft OneNote.
 
 pub mod calendar;
 pub mod chats;
@@ -7,6 +7,7 @@ pub mod client;
 pub mod contacts;
 pub mod mail;
 pub mod media;
+pub mod onenote;
 pub mod presence;
 pub mod teams;
 pub mod todo;

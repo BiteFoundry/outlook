@@ -20,29 +20,38 @@ pub const DEFAULT_PUBLIC_CLIENT_ID: &str = "14d82eec-204b-4c2f-b7e8-296a70dab67e
 pub const DEFAULT_TENANT_ID: &str = "common";
 pub const DEFAULT_GITHUB_REPO: &str = "shinick-dev/teams";
 
-/// Entry persona (`teams` vs `outlook`), sharing the exact same Entra OAuth token, Graph client, and SQLite DB.
+/// Entry persona (`teams`, `outlook`, or `onenote`), sharing the exact same Entra OAuth token, Graph client, and SQLite DB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Persona {
     #[default]
     Teams,
     Outlook,
+    OneNote,
 }
 
 impl Persona {
-    /// Detects whether the user invoked `outlook` (via `TEAMS_PERSONA=outlook` or `argv[0]` stem `outlook*`) or `teams`.
+    /// Detects whether the user invoked `onenote`, `outlook`, or `teams` (via `TEAMS_PERSONA` or `argv[0]` stem).
     pub fn detect() -> Self {
         if let Ok(env_val) = std::env::var("TEAMS_PERSONA") {
-            if env_val.trim().eq_ignore_ascii_case("outlook") {
+            let trimmed = env_val.trim();
+            if trimmed.eq_ignore_ascii_case("onenote") || trimmed.eq_ignore_ascii_case("note") {
+                return Self::OneNote;
+            }
+            if trimmed.eq_ignore_ascii_case("outlook") {
                 return Self::Outlook;
             }
-            if env_val.trim().eq_ignore_ascii_case("teams") {
+            if trimmed.eq_ignore_ascii_case("teams") {
                 return Self::Teams;
             }
         }
         if let Some(arg0) = std::env::args_os().next() {
             if let Some(stem) = Path::new(&arg0).file_stem().and_then(|s| s.to_str()) {
-                if stem.to_ascii_lowercase().starts_with("outlook") {
+                let lower = stem.to_ascii_lowercase();
+                if lower.starts_with("onenote") || lower == "note" {
+                    return Self::OneNote;
+                }
+                if lower.starts_with("outlook") {
                     return Self::Outlook;
                 }
             }
@@ -54,6 +63,7 @@ impl Persona {
         match self {
             Self::Teams => "teams",
             Self::Outlook => "outlook",
+            Self::OneNote => "onenote",
         }
     }
 }
@@ -197,6 +207,8 @@ impl AppConfig {
             "Calendars.ReadWrite".to_string(),
             "Contacts.ReadWrite".to_string(),
             "Tasks.ReadWrite".to_string(),
+            "Notes.ReadWrite".to_string(),
+            "Notes.ReadWrite.All".to_string(),
         ]
     }
 

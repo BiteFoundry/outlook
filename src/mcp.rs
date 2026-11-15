@@ -10,6 +10,7 @@
 use std::{io::Write, path::PathBuf};
 
 use anyhow::Result;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -1198,6 +1199,227 @@ async fn call_tool(
             }))
         }
 
+        // -------------------------------------------------------------------
+        // Microsoft OneNote (personal + team/group shared notebooks)
+        // -------------------------------------------------------------------
+        "onenote_list_notebooks" => {
+            let include_teams = args.optional_bool("include_teams")?.unwrap_or(true);
+            let refresh = args.optional_bool("refresh")?.unwrap_or(false);
+            let notebooks =
+                cli::load_onenote_notebooks(storage, graph, include_teams, refresh, false)
+                    .await
+                    .map_err(format_error)?;
+            Ok(json!({ "notebooks": notebooks }))
+        }
+
+        "onenote_create_notebook" => {
+            let name = args.required_str("name")?;
+            let group_id = args.optional_str("group_id")?;
+            let site_id = args.optional_str("site_id")?;
+            let scope =
+                cli::build_onenote_scope_from_args(group_id.as_deref(), site_id.as_deref())
+                    .map_err(format_error)?;
+            let created = graph
+                .create_onenote_notebook(&scope, name.trim())
+                .await
+                .map_err(format_error)?;
+            let _ = storage.upsert_onenote_notebooks(std::slice::from_ref(&created));
+            Ok(json!({ "ok": true, "notebook": created }))
+        }
+
+        "onenote_list_sections" => {
+            let notebook = args.optional_str("notebook")?;
+            let refresh = args.optional_bool("refresh")?.unwrap_or(false);
+            let (nb, sections) =
+                cli::load_onenote_sections(storage, graph, notebook.as_deref(), refresh, false)
+                    .await
+                    .map_err(format_error)?;
+            Ok(json!({ "notebook": nb, "sections": sections }))
+        }
+
+        "onenote_create_section" => {
+            let notebook = args.required_str("notebook")?;
+            let name = args.required_str("name")?;
+            let nb = cli::resolve_onenote_notebook(storage, graph, &notebook, true, false, false)
+                .await
+                .map_err(format_error)?;
+            let mut created = graph
+                .create_onenote_section(&nb.scope, &nb.id, name.trim())
+                .await
+                .map_err(format_error)?;
+            if created.notebook_id.is_none() {
+                created.notebook_id = Some(nb.id.clone());
+            }
+            if created.notebook_name.is_none() {
+                created.notebook_name = Some(nb.display_name.clone());
+            }
+            let _ = storage.upsert_onenote_sections(std::slice::from_ref(&created));
+            Ok(json!({ "ok": true, "notebook": nb, "section": created }))
+        }
+
+        "onenote_list_pages" => {
+            let section = args.required_str("section")?;
+            let limit = bounds(
+                "limit",
+                args.optional_usize("limit")?.unwrap_or(50),
+                1,
+                1_000,
+            )?;
+            let refresh = args.optional_bool("refresh")?.unwrap_or(false);
+            let (sec, pages) =
+                cli::list_onenote_pages_helper(storage, graph, &section, limit, refresh, false)
+                    .await
+                    .map_err(format_error)?;
+            Ok(json!({ "section": sec, "pages": pages }))
+        }
+
+        "onenote_get_page" => {
+            let page = args.required_str("page")?;
+            let offline = args.optional_bool("offline")?.unwrap_or(false);
+            let detail = cli::load_onenote_page_detail(storage, graph, &page, offline)
+                .await
+                .map_err(format_error)?;
+            Ok(json!({ "page": detail }))
+        }
+
+        "onenote_download_resource" => {
+            let page = args.required_str("page")?;
+            let index = args.optional_usize("index")?;
+            let detail = cli::load_onenote_page_detail(storage, graph, &page, false)
+                .await
+                .map_err(format_error)?;
+            let (resolved_idx, res) = cli::select_onenote_resource(&detail, index, false)
+                .map_err(format_error)?;
+            let url = res.fullres_url.as_deref().unwrap_or(&res.resource_url);
+            let bytes = graph
+                .download_onenote_resource_bytes(url)
+                .await
+                .map_err(format_error)?;
+            Ok(json!({
+                "page_key": detail.summary.page_key,
+                "index": resolved_idx,
+                "content_type": res.mime_type,
+                "file_name": res.file_name,
+                "is_image": res.is_image,
+                "size": bytes.len(),
+                "bytes_base64": BASE64_STANDARD.encode(&bytes),
+            }))
+        }
+
+        "onenote_create_page" => {
+            let section = args.required_str("section")?;
+            let title = args.required_str("title")?;
+            let markdown_body = args.optional_text("markdown_body")?.unwrap_or_default();
+            let image_paths: Vec<PathBuf> = args
+                .optional_str_array("image_paths")?
+                .unwrap_or_default()
+                .into_iter()
+                .map(PathBuf::from)
+                .collect();
+            let level = match args.optional_i64("level")? {
+                Some(l) => {
+                    bounds("level", usize::try_from(l).unwrap_or(usize::MAX), 0, 2)?;
+                    Some(l as i32)
+                }
+                None => None,
+            };
+            let (markdown, inline_images) =
+                cli::read_markdown_input_and_images(Some(markdown_body.as_str()), None, &image_paths)
+                    .map_err(format_error)?;
+            let (sec, page) = cli::create_onenote_page_helper(
+                storage,
+                graph,
+                &section,
+                &title,
+                &markdown,
+                inline_images,
+                level,
+            )
+            .await
+            .map_err(format_error)?;
+            Ok(json!({ "ok": true, "section": sec, "page": page }))
+        }
+
+        "onenote_append_page" => {
+            let page = args.required_str("page")?;
+            let markdown_body = args.optional_text("markdown_body")?.unwrap_or_default();
+            let image_paths: Vec<PathBuf> = args
+                .optional_str_array("image_paths")?
+                .unwrap_or_default()
+                .into_iter()
+                .map(PathBuf::from)
+                .collect();
+            let (markdown, inline_images) =
+                cli::read_markdown_input_and_images(Some(markdown_body.as_str()), None, &image_paths)
+                    .map_err(format_error)?;
+            cli::append_onenote_page_helper(storage, graph, &page, &markdown, &inline_images)
+                .await
+                .map_err(format_error)
+        }
+
+        "onenote_update_page" => {
+            let page = args.required_str("page")?;
+            let title = args.optional_str("title")?;
+            let markdown_body = args.optional_text("markdown_body")?;
+            let block_id = args.optional_str("block_id")?;
+            cli::update_onenote_page_helper(
+                storage,
+                graph,
+                &page,
+                title.as_deref(),
+                markdown_body.as_deref(),
+                block_id.as_deref(),
+            )
+            .await
+            .map_err(format_error)
+        }
+
+        "onenote_toggle_todo" => {
+            let page = args.required_str("page")?;
+            let block_id = args.optional_str("block_id")?;
+            let todo_index = args.optional_usize("todo_index")?;
+            cli::toggle_onenote_todo_helper(
+                storage,
+                graph,
+                &page,
+                block_id.as_deref(),
+                todo_index,
+            )
+            .await
+            .map_err(format_error)
+        }
+
+        "onenote_search" => {
+            let query = args.required_str("query")?;
+            let section = args.optional_str("section")?;
+            let limit = bounds(
+                "limit",
+                args.optional_usize("limit")?.unwrap_or(30),
+                1,
+                1_000,
+            )?;
+            let refresh = args.optional_bool("refresh")?.unwrap_or(false);
+            let hits = cli::search_onenote_pages_helper(
+                storage,
+                graph,
+                &query,
+                section.as_deref(),
+                refresh,
+                limit,
+            )
+            .await
+            .map_err(format_error)?;
+            Ok(json!({ "hits": hits }))
+        }
+
+        "onenote_delete_page" => {
+            let page = args.required_str("page")?;
+            args.required_true("confirm")?;
+            cli::delete_onenote_page_helper(storage, graph, &page)
+                .await
+                .map_err(format_error)
+        }
+
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -1334,12 +1556,12 @@ fn initialize_result(message: &Value) -> Value {
             "name": SERVER_NAME,
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Microsoft 365 (Teams + Outlook Mail, Calendar, Contacts, To Do) tools via Microsoft Graph v1.0. Teams targets accept conv_key (chat:... or chan:team:channel), \"Team/Channel\", or a unique conversation title substring. Destructive operations require confirm: true."
+        "instructions": "Microsoft 365 (Teams + Outlook Mail, Calendar, Contacts, To Do + OneNote) tools via Microsoft Graph v1.0. Teams targets accept conv_key (chat:... or chan:team:channel), \"Team/Channel\", or a unique conversation title substring. OneNote sections/pages accept \"Notebook/Section\", names, composite keys (me|id, group:{gid}|id), or raw Graph IDs; onenote_get_page returns block element_ids for onenote_update_page / onenote_toggle_todo. onenote_download_resource is JSON-only and returns resource bytes base64-encoded. Destructive operations require confirm: true."
     })
 }
 
 // ---------------------------------------------------------------------------
-// Tool catalog (36 tools)
+// Tool catalog (49 tools: 36 Teams/Outlook + 13 OneNote)
 // ---------------------------------------------------------------------------
 
 fn tool_catalog() -> Vec<Value> {
@@ -1885,6 +2107,196 @@ fn tool_catalog() -> Vec<Value> {
                 "additionalProperties": false
             }
         }),
+        json!({
+            "name": "onenote_list_notebooks",
+            "description": "List Microsoft OneNote notebooks: personal (/me/onenote) plus joined Teams/M365 group shared notebooks. Each notebook has a stable notebook_key (\"me|id\" or \"group:{gid}|id\").",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "include_teams": { "type": "boolean", "default": true, "description": "Include notebooks shared through joined Teams / M365 groups." },
+                    "refresh": { "type": "boolean", "default": false, "description": "Sync notebooks from Microsoft Graph before returning." }
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "onenote_create_notebook",
+            "description": "Create a OneNote notebook for /me by default, or under a Teams/M365 group (group_id) or SharePoint site (site_id). Irreversible side effect.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "minLength": 1, "description": "Notebook display name." },
+                    "group_id": { "type": "string", "description": "Create under this M365 group / Team instead of /me." },
+                    "site_id": { "type": "string", "description": "Create under this SharePoint site (mutually exclusive with group_id)." }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "onenote_list_sections",
+            "description": "List OneNote sections of one notebook (fuzzy notebook name, notebook_key, or ID) or of all accessible notebooks when omitted.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "notebook": { "type": "string", "description": "Notebook name, \"Owner/Notebook\", notebook_key, or Graph ID." },
+                    "refresh": { "type": "boolean", "default": false }
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "onenote_create_section",
+            "description": "Create a OneNote section inside an existing notebook (fuzzy notebook name, notebook_key, or Graph ID). Irreversible side effect.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "notebook": { "type": "string", "minLength": 1, "description": "Notebook name, \"Owner/Notebook\", notebook_key, or Graph ID." },
+                    "name": { "type": "string", "minLength": 1, "description": "New section display name." }
+                },
+                "required": ["notebook", "name"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "onenote_list_pages",
+            "description": "List pages in a OneNote section. section accepts \"Notebook/Section\", a unique section name, section_key, or Graph ID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "section": { "type": "string", "minLength": 1 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
+                    "refresh": { "type": "boolean", "default": false }
+                },
+                "required": ["section"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "onenote_get_page",
+            "description": "Read a OneNote page (page_key, Graph ID, or title search). Returns body_markdown, body_plain, blocks (with element_id and data-tag such as to-do), resources, and primary_div_id from ?includeIDs=true.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "page": { "type": "string", "minLength": 1 },
+                    "offline": { "type": "boolean", "default": false, "description": "Read from local SQLite cache only." }
+                },
+                "required": ["page"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "onenote_download_resource",
+            "description": "Download an image or file attachment from a OneNote page. Responses are JSON-only: raw bytes are never streamed, instead the tool returns { content_type, file_name, is_image, size, bytes_base64 } with the payload base64-encoded. index defaults to 0.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "page": { "type": "string", "minLength": 1, "description": "page_key, Graph ID, or title search." },
+                    "index": { "type": "integer", "minimum": 0, "description": "Zero-based resource index from onenote_get_page resources (default 0)." }
+                },
+                "required": ["page"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "onenote_create_page",
+            "description": "Create a OneNote page from GitHub-flavored Markdown (tables, task lists \"- [ ]\" become OneNote to-do tags) with optional local inline images. Irreversible side effect.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "section": { "type": "string", "minLength": 1, "description": "\"Notebook/Section\", section name, section_key, or ID." },
+                    "title": { "type": "string", "minLength": 1 },
+                    "markdown_body": { "type": "string" },
+                    "image_paths": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "Local image files embedded inline (png/jpg/gif/webp/bmp)." },
+                    "level": { "type": "integer", "minimum": 0, "maximum": 2, "description": "Page indentation level (0 = root, 1 = subpage, 2 = sub-subpage)." }
+                },
+                // Rule (mirrored by `validate_tool_args`): markdown_body and image_paths are each optional,
+                // but at least one must be non-empty — image-only pages are allowed (same as the CLI).
+                "required": ["section", "title"],
+                "anyOf": [
+                    { "required": ["markdown_body"], "properties": { "markdown_body": { "minLength": 1 } } },
+                    { "required": ["image_paths"], "properties": { "image_paths": { "minItems": 1 } } }
+                ],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "onenote_append_page",
+            "description": "Append Markdown (and optional inline images) to the end of an existing OneNote page via PATCH. Irreversible side effect.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "page": { "type": "string", "minLength": 1 },
+                    "markdown_body": { "type": "string" },
+                    "image_paths": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+                },
+                // Rule (mirrored by `validate_tool_args`): markdown_body and image_paths are each optional,
+                // but at least one must be non-empty — image-only appends are allowed (same as the CLI).
+                "required": ["page"],
+                "anyOf": [
+                    { "required": ["markdown_body"], "properties": { "markdown_body": { "minLength": 1 } } },
+                    { "required": ["image_paths"], "properties": { "image_paths": { "minItems": 1 } } }
+                ],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "onenote_update_page",
+            "description": "Update a OneNote page title and/or body. With block_id (an element_id from onenote_get_page) only that block is replaced with markdown_body; otherwise the whole body is replaced.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "page": { "type": "string", "minLength": 1 },
+                    "title": { "type": "string" },
+                    "markdown_body": { "type": "string" },
+                    "block_id": { "type": "string", "description": "Target element_id (e.g. \"p:{guid}{40}\")." }
+                },
+                "required": ["page"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "onenote_toggle_todo",
+            "description": "Toggle a OneNote to-do checkbox (data-tag to-do <-> to-do:completed) by element block_id or zero-based todo_index.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "page": { "type": "string", "minLength": 1 },
+                    "block_id": { "type": "string" },
+                    "todo_index": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["page"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "onenote_search",
+            "description": "Full-text search cached OneNote pages (SQLite FTS5 trigram + LIKE). Bootstraps the OneNote cache first when empty or refresh=true.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "minLength": 1 },
+                    "section": { "type": "string", "description": "Optional section filter (\"Notebook/Section\", name, key, or ID)." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 30 },
+                    "refresh": { "type": "boolean", "default": false }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "onenote_delete_page",
+            "description": "Delete a OneNote page. Requires confirm: true.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "page": { "type": "string", "minLength": 1 },
+                    "confirm": { "type": "boolean", "const": true }
+                },
+                "required": ["page", "confirm"],
+                "additionalProperties": false
+            }
+        }),
     ]
 }
 
@@ -2160,6 +2572,101 @@ fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             args.required_str("task_id")?;
             args.required_true("confirm")?;
         }
+        "onenote_list_notebooks" => {
+            args.optional_bool("include_teams")?;
+            args.optional_bool("refresh")?;
+        }
+        "onenote_create_notebook" => {
+            args.required_str("name")?;
+            let group_id = args.optional_str("group_id")?;
+            let site_id = args.optional_str("site_id")?;
+            if group_id.is_some() && site_id.is_some() {
+                return Err("group_id and site_id are mutually exclusive".to_string());
+            }
+        }
+        "onenote_list_sections" => {
+            args.optional_str("notebook")?;
+            args.optional_bool("refresh")?;
+        }
+        "onenote_create_section" => {
+            args.required_str("notebook")?;
+            args.required_str("name")?;
+        }
+        "onenote_list_pages" => {
+            args.required_str("section")?;
+            if let Some(limit) = args.optional_usize("limit")? {
+                bounds("limit", limit, 1, 1_000)?;
+            }
+            args.optional_bool("refresh")?;
+        }
+        "onenote_get_page" => {
+            args.required_str("page")?;
+            args.optional_bool("offline")?;
+        }
+        "onenote_download_resource" => {
+            args.required_str("page")?;
+            args.optional_usize("index")?;
+        }
+        "onenote_create_page" => {
+            args.required_str("section")?;
+            args.required_str("title")?;
+            let body = args.optional_text("markdown_body")?;
+            let images = args.optional_str_array("image_paths")?.unwrap_or_default();
+            // Same rule as the JSON schema's `anyOf`: text or images, at least one.
+            if body.is_none() && images.is_empty() {
+                return Err(
+                    "at least one of markdown_body or image_paths must be provided".to_string(),
+                );
+            }
+            if let Some(l) = args.optional_i64("level")? {
+                if !(0..=2).contains(&l) {
+                    return Err("level must be between 0 and 2".to_string());
+                }
+            }
+        }
+        "onenote_append_page" => {
+            args.required_str("page")?;
+            let body = args.optional_text("markdown_body")?;
+            let images = args.optional_str_array("image_paths")?.unwrap_or_default();
+            // Same rule as the JSON schema's `anyOf`: text or images, at least one.
+            if body.is_none() && images.is_empty() {
+                return Err(
+                    "at least one of markdown_body or image_paths must be provided".to_string(),
+                );
+            }
+        }
+        "onenote_update_page" => {
+            args.required_str("page")?;
+            let title = args.optional_str("title")?;
+            let body = args.optional_text("markdown_body")?;
+            let block_id = args.optional_str("block_id")?;
+            if title.is_none() && body.is_none() {
+                return Err("at least one of title or markdown_body must be provided".to_string());
+            }
+            if block_id.is_some() && body.is_none() {
+                return Err("block_id requires markdown_body".to_string());
+            }
+        }
+        "onenote_toggle_todo" => {
+            args.required_str("page")?;
+            let block_id = args.optional_str("block_id")?;
+            let todo_index = args.optional_usize("todo_index")?;
+            if block_id.is_none() && todo_index.is_none() {
+                return Err("one of block_id or todo_index must be provided".to_string());
+            }
+        }
+        "onenote_search" => {
+            args.required_str("query")?;
+            args.optional_str("section")?;
+            if let Some(limit) = args.optional_usize("limit")? {
+                bounds("limit", limit, 1, 1_000)?;
+            }
+            args.optional_bool("refresh")?;
+        }
+        "onenote_delete_page" => {
+            args.required_str("page")?;
+            args.required_true("confirm")?;
+        }
         other => return Err(format!("unknown tool: {other}")),
     }
 
@@ -2214,6 +2721,16 @@ impl<'a> Args<'a> {
             None | Some(Value::Null) => Err(format!("missing required argument: {key}")),
             Some(Value::String(value)) if !value.trim().is_empty() => Ok(value.clone()),
             Some(Value::String(_)) => Err(format!("{key} must not be empty")),
+            Some(_) => Err(format!("{key} must be a string")),
+        }
+    }
+
+    /// Optional Markdown/body text preserved verbatim (no trimming); blank strings become `None`.
+    fn optional_text(&self, key: &str) -> Result<Option<String>, String> {
+        match self.object()?.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
+            Some(Value::String(value)) => Ok(Some(value.clone())),
             Some(_) => Err(format!("{key} must be a string")),
         }
     }
@@ -2431,7 +2948,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_exposes_all_36_tools() {
+    async fn tools_list_exposes_every_cataloged_tool() {
         let (cfg, graph, storage) = test_ctx();
         let resp = handle_rpc_line(
             &cfg,
@@ -2483,6 +3000,19 @@ mod tests {
                 "create_todo_task",
                 "complete_todo_task",
                 "delete_todo_task",
+                "onenote_list_notebooks",
+                "onenote_create_notebook",
+                "onenote_list_sections",
+                "onenote_create_section",
+                "onenote_list_pages",
+                "onenote_get_page",
+                "onenote_download_resource",
+                "onenote_create_page",
+                "onenote_append_page",
+                "onenote_update_page",
+                "onenote_toggle_todo",
+                "onenote_search",
+                "onenote_delete_page",
             ]
         );
 
@@ -2797,5 +3327,215 @@ mod tests {
         let payload: Value =
             serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(payload["hits"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn onenote_tools_are_cataloged_with_unique_names() {
+        let catalog = tool_catalog();
+        let names: Vec<&str> = catalog
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(unique.len(), names.len(), "duplicate tool names: {names:?}");
+        assert_eq!(names.len(), 49);
+
+        let onenote: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| n.starts_with("onenote_"))
+            .collect();
+        assert_eq!(
+            onenote,
+            vec![
+                "onenote_list_notebooks",
+                "onenote_create_notebook",
+                "onenote_list_sections",
+                "onenote_create_section",
+                "onenote_list_pages",
+                "onenote_get_page",
+                "onenote_download_resource",
+                "onenote_create_page",
+                "onenote_append_page",
+                "onenote_update_page",
+                "onenote_toggle_todo",
+                "onenote_search",
+                "onenote_delete_page",
+            ]
+        );
+        for tool in &catalog {
+            assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
+        }
+    }
+
+    #[test]
+    fn onenote_page_tool_schemas_allow_image_only_payloads() {
+        let catalog = tool_catalog();
+        for name in ["onenote_create_page", "onenote_append_page"] {
+            let tool = catalog
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"));
+            let required = tool["inputSchema"]["required"].as_array().unwrap();
+            assert!(
+                !required.iter().any(|v| v == "markdown_body"),
+                "{name} must not require markdown_body (image-only payloads are valid)"
+            );
+            assert_eq!(
+                tool["inputSchema"]["anyOf"].as_array().unwrap().len(),
+                2,
+                "{name} must accept markdown_body or image_paths"
+            );
+        }
+    }
+
+    #[test]
+    fn onenote_tool_argument_validation() {
+        assert!(validate_tool_args("onenote_list_notebooks", &json!({})).is_ok());
+        assert!(validate_tool_args("onenote_list_notebooks", &json!({ "include_teams": "yes" })).is_err());
+        assert!(validate_tool_args("onenote_list_sections", &json!({ "notebook": "업무" })).is_ok());
+        assert!(validate_tool_args("onenote_list_pages", &json!({})).is_err());
+        assert!(validate_tool_args("onenote_list_pages", &json!({ "section": "업무/회의", "limit": 0 })).is_err());
+        assert!(validate_tool_args("onenote_list_pages", &json!({ "section": "업무/회의", "limit": 20 })).is_ok());
+        assert!(validate_tool_args("onenote_get_page", &json!({ "page": "me|1-abc" })).is_ok());
+        assert!(validate_tool_args("onenote_get_page", &json!({})).is_err());
+
+        assert!(validate_tool_args(
+            "onenote_create_page",
+            &json!({ "section": "s", "title": "t", "markdown_body": "# hi" })
+        )
+        .is_ok());
+        assert!(validate_tool_args(
+            "onenote_create_page",
+            &json!({ "section": "s", "title": "t" })
+        )
+        .is_err());
+        assert!(validate_tool_args(
+            "onenote_create_page",
+            &json!({ "section": "s", "title": "t", "markdown_body": "x", "level": 3 })
+        )
+        .is_err());
+        // Image-only pages are accepted (schema `anyOf` + validator agree).
+        assert!(validate_tool_args(
+            "onenote_create_page",
+            &json!({ "section": "s", "title": "t", "image_paths": ["/tmp/a.png"] })
+        )
+        .is_ok());
+
+        assert!(validate_tool_args("onenote_create_notebook", &json!({ "name": "업무" })).is_ok());
+        assert!(validate_tool_args("onenote_create_notebook", &json!({ "name": "  " })).is_err());
+        assert!(validate_tool_args(
+            "onenote_create_notebook",
+            &json!({ "name": "업무", "group_id": "g", "site_id": "s" })
+        )
+        .is_err());
+        assert!(validate_tool_args(
+            "onenote_create_section",
+            &json!({ "notebook": "업무", "name": "회의" })
+        )
+        .is_ok());
+        assert!(validate_tool_args("onenote_create_section", &json!({ "notebook": "업무" })).is_err());
+        assert!(validate_tool_args("onenote_download_resource", &json!({ "page": "p" })).is_ok());
+        assert!(validate_tool_args("onenote_download_resource", &json!({})).is_err());
+
+        assert!(validate_tool_args("onenote_append_page", &json!({ "page": "p" })).is_err());
+        assert!(validate_tool_args("onenote_append_page", &json!({ "page": "p", "markdown_body": "- [ ] 할 일" })).is_ok());
+        assert!(validate_tool_args(
+            "onenote_append_page",
+            &json!({ "page": "p", "image_paths": ["/tmp/a.png"] })
+        )
+        .is_ok());
+
+        assert!(validate_tool_args("onenote_update_page", &json!({ "page": "p" })).is_err());
+        assert!(validate_tool_args("onenote_update_page", &json!({ "page": "p", "block_id": "p:{x}" })).is_err());
+        assert!(validate_tool_args("onenote_update_page", &json!({ "page": "p", "title": "새 제목" })).is_ok());
+        assert!(validate_tool_args(
+            "onenote_update_page",
+            &json!({ "page": "p", "block_id": "p:{x}", "markdown_body": "교체" })
+        )
+        .is_ok());
+
+        assert!(validate_tool_args("onenote_toggle_todo", &json!({ "page": "p" })).is_err());
+        assert!(validate_tool_args("onenote_toggle_todo", &json!({ "page": "p", "todo_index": 0 })).is_ok());
+        assert!(validate_tool_args("onenote_toggle_todo", &json!({ "page": "p", "todo_index": -1 })).is_err());
+
+        assert!(validate_tool_args("onenote_search", &json!({ "query": "회의" })).is_ok());
+        assert!(validate_tool_args("onenote_search", &json!({ "query": " " })).is_err());
+
+        assert!(validate_tool_args("onenote_delete_page", &json!({ "page": "p" })).is_err());
+        assert!(validate_tool_args("onenote_delete_page", &json!({ "page": "p", "confirm": false })).is_err());
+        assert!(validate_tool_args("onenote_delete_page", &json!({ "page": "p", "confirm": true })).is_ok());
+    }
+
+    #[tokio::test]
+    async fn onenote_get_page_offline_reads_cached_detail() {
+        use crate::models::{OnenotePageSummary, OnenoteScope};
+
+        let (cfg, graph, storage) = test_ctx();
+        let summary = OnenotePageSummary {
+            page_key: "me|page-1".to_string(),
+            id: "page-1".to_string(),
+            scope: OnenoteScope::Me,
+            section_id: "sec-1".to_string(),
+            section_name: Some("회의".to_string()),
+            notebook_id: Some("nb-1".to_string()),
+            notebook_name: Some("업무".to_string()),
+            title: "주간 회의록".to_string(),
+            level: 0,
+            order: 0,
+            created_at: None,
+            last_modified_at: Some("2026-11-15T09:00:00Z".to_string()),
+            content_url: None,
+            web_url: None,
+            preview_text: None,
+            has_todo: false,
+        };
+        let xhtml = r#"<html><head><title>주간 회의록</title></head><body><div id="div:{d1}{1}"><p id="p:{a1}{2}">배포 일정 공유</p><p id="p:{a2}{3}" data-tag="to-do">릴리스 노트 작성</p></div></body></html>"#;
+        let detail = parser::onenote::parse_onenote_page_xhtml(summary.clone(), xhtml);
+        storage.upsert_onenote_pages(std::slice::from_ref(&summary)).unwrap();
+        storage.upsert_onenote_page_detail(&detail).unwrap();
+
+        let resp = handle_rpc_line(
+            &cfg,
+            &graph,
+            &storage,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 40,
+                "method": "tools/call",
+                "params": {
+                    "name": "onenote_get_page",
+                    "arguments": { "page": "me|page-1", "offline": true }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], false, "{resp}");
+        let payload: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["page"]["summary"]["page_key"], "me|page-1");
+        assert!(payload["page"]["body_markdown"]
+            .as_str()
+            .unwrap()
+            .contains("배포 일정 공유"));
+
+        // Missing destructive confirmation is rejected before any Graph call.
+        let resp = handle_rpc_line(
+            &cfg,
+            &graph,
+            &storage,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 41,
+                "method": "tools/call",
+                "params": { "name": "onenote_delete_page", "arguments": { "page": "me|page-1" } }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
     }
 }

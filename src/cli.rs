@@ -1,4 +1,4 @@
-//! `teams` / `outlook` dual-persona CLI parser, command dispatcher, and shared domain helpers for CLI/HTTP/MCP.
+//! `teams` / `outlook` / `onenote` tri-persona CLI parser, command dispatcher, and shared domain helpers for CLI/HTTP/MCP.
 
 use std::{
     collections::HashMap,
@@ -18,10 +18,13 @@ use crate::{
     graph::GraphClient,
     img_preview,
     models::{
-        AttachmentInfo, CalendarEvent, ContactItem, ConversationKind, ConversationSummary,
-        ConversationTarget, DownloadedFile, InlineImageUpload, MailAttachment, MailFolder,
-        MailMessage, MentionInfo, MessageItem, OutgoingContact, OutgoingEvent, OutgoingMail,
-        OutgoingTodoTask, QuotedReply, TeamSummary, TodoList,
+        split_onenote_entity_key, AttachmentInfo, CalendarEvent, ContactItem, ConversationKind,
+        ConversationSummary, ConversationTarget, DownloadedFile, InlineImageUpload, MailAttachment,
+        MailFolder, MailMessage, MentionInfo, MessageItem, OnenoteBlock, OnenoteBlockKind,
+        OnenoteNotebook, OnenotePageDetail, OnenotePageSummary, OnenotePatchCommand,
+        OnenoteResource, OnenoteScope, OnenoteSearchHit, OnenoteSection, OnenoteTagKind,
+        OutgoingContact, OutgoingEvent, OutgoingMail, OutgoingOnenotePage, OutgoingTodoTask,
+        QuotedReply, RichSpan, TeamSummary, TodoList,
     },
     parser, resolver,
     serve::{self, ServeOptions},
@@ -35,8 +38,8 @@ const DELETE_JSON_REQUIRES_YES: &str = "--json 모드에서 삭제하려면 --ye
 #[command(
     name = "teams",
     version,
-    about = "Microsoft Teams & Outlook 터미널 클라이언트 (CLI · TUI · HTTP API · MCP)",
-    long_about = "Microsoft Graph v1.0 기반 Microsoft Teams & Outlook 터미널 클라이언트입니다.\n\
+    about = "Microsoft Teams · Outlook · OneNote 터미널 클라이언트 (CLI · TUI · HTTP API · MCP)",
+    long_about = "Microsoft Graph v1.0 기반 Microsoft Teams · Outlook · OneNote 터미널 클라이언트입니다.\n\
                   인자 없이 실행하면 로그인 상태를 확인한 뒤 TUI를 엽니다."
 )]
 pub struct Cli {
@@ -48,13 +51,26 @@ pub struct Cli {
 #[command(
     name = "outlook",
     version,
-    about = "Microsoft Outlook 터미널 클라이언트 (메일 · 캘린더 · 연락처 · To Do · CLI · TUI · HTTP API · MCP)",
+    about = "Microsoft Outlook 터미널 클라이언트 (메일 · 캘린더 · 연락처 · To Do · OneNote · CLI · TUI · HTTP API · MCP)",
     long_about = "Microsoft Graph v1.0 기반 Microsoft Outlook / M365 터미널 클라이언트입니다.\n\
                   인자 없이 실행하면 로그인 상태를 확인한 뒤 Outlook TUI를 엽니다."
 )]
 pub struct OutlookCli {
     #[command(subcommand)]
     pub command: Option<OutlookCommand>,
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "onenote",
+    version,
+    about = "Microsoft OneNote 터미널 클라이언트 (개인/팀 공유 필기장 · 섹션 · 페이지 · CLI · TUI · HTTP API · MCP)",
+    long_about = "Microsoft Graph v1.0 기반 Microsoft OneNote 터미널 클라이언트입니다.\n\
+                  인자 없이 실행하면 로그인 상태를 확인한 뒤 OneNote TUI를 엽니다."
+)]
+pub struct OnenoteCli {
+    #[command(subcommand)]
+    pub command: Option<OnenoteCommand>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -329,6 +345,12 @@ pub enum Command {
         #[command(subcommand)]
         command: TodoCommand,
     },
+    /// Microsoft OneNote 필기장·섹션·페이지 명령 (`teams notes <subcmd>`)
+    #[command(visible_alias = "onenote")]
+    Notes {
+        #[command(subcommand)]
+        command: NotesCommand,
+    },
     /// 메시지 이미지 첨부 또는 로컬 이미지를 터미널에 미리보기 렌더링합니다
     Preview {
         target: Option<String>,
@@ -589,6 +611,12 @@ pub enum OutlookCommand {
     Todo {
         #[command(subcommand)]
         command: TodoCommand,
+    },
+    /// Microsoft OneNote 필기장·섹션·페이지 명령 (`outlook notes <subcmd>`)
+    #[command(visible_alias = "onenote")]
+    Notes {
+        #[command(subcommand)]
+        command: NotesCommand,
     },
     /// GitHub Releases에서 최신 버전을 확인하거나 자가 업데이트합니다
     Update {
@@ -972,6 +1000,403 @@ pub enum TodoCommand {
     },
 }
 
+#[derive(Subcommand, Debug, Clone)]
+pub enum NotesCommand {
+    /// 개인 및 가입된 팀/그룹의 OneNote 필기장 목록을 표시합니다
+    #[command(visible_alias = "ls")]
+    Notebooks {
+        /// 개인(`/me/onenote`) 필기장만 조회합니다
+        #[arg(long = "personal-only")]
+        personal_only: bool,
+        /// 팀/그룹 공유 필기장을 포함합니다 (기본 true)
+        #[arg(
+            long = "include-teams",
+            default_value_t = true,
+            default_missing_value = "true",
+            num_args = 0..=1,
+            require_equals = true
+        )]
+        include_teams: bool,
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        offline: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 새 OneNote 필기장을 생성합니다
+    #[command(name = "create-notebook")]
+    CreateNotebook {
+        name: String,
+        #[arg(long)]
+        group: Option<String>,
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 필기장 내(또는 전체) OneNote 섹션 목록을 표시합니다
+    Sections {
+        notebook: Option<String>,
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        offline: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 지정한 필기장에 새 OneNote 섹션을 생성합니다
+    #[command(name = "create-section")]
+    CreateSection {
+        notebook: String,
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 지정한 섹션(`"필기장/섹션"` 또는 섹션 이름/키)의 페이지 목록을 표시합니다
+    #[command(visible_alias = "list")]
+    Pages {
+        section: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        offline: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// OneNote 페이지 본문, 블록(`element_id`/태그) 및 리소스 상세 정보를 읽습니다
+    #[command(visible_alias = "cat")]
+    Read {
+        page: String,
+        #[arg(long, default_value = "md", value_parser = ["md", "plain", "blocks", "xhtml"])]
+        format: String,
+        #[arg(long = "preview-images")]
+        preview_images: bool,
+        #[arg(long)]
+        offline: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Markdown 본문과 선택적 인라인 이미지로 새 OneNote 페이지를 생성합니다
+    Create {
+        section: String,
+        #[arg(long, required = true)]
+        title: String,
+        markdown_body: Option<String>,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long = "image", value_name = "img_path")]
+        image: Vec<PathBuf>,
+        #[arg(long, value_parser = clap::value_parser!(i32).range(0..=2))]
+        level: Option<i32>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 기존 OneNote 페이지 끝에 Markdown 본문 및 인라인 이미지를 추가(append)합니다
+    Append {
+        page: String,
+        markdown_body: Option<String>,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long = "image", value_name = "img_path")]
+        image: Vec<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// OneNote 페이지의 특정 블록(`--block-id`) 또는 전체 제목/본문을 수정합니다
+    Update {
+        page: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long = "block-id")]
+        block_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// OneNote 페이지의 `to-do` 체크박스 블록을 완료/미완료 토글합니다
+    Check {
+        page: String,
+        #[arg(long = "block-id")]
+        block_id: Option<String>,
+        #[arg(long)]
+        index: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// OneNote 페이지를 삭제합니다
+    Delete {
+        page: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 로컬 SQLite FTS5(`onenote_fts`)에서 OneNote 페이지를 검색합니다
+    Search {
+        query: String,
+        #[arg(long)]
+        section: Option<String>,
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// OneNote 페이지의 이미지 또는 첨부 리소스를 다운로드하거나 터미널에 미리보기합니다
+    Resource {
+        page: String,
+        #[arg(long)]
+        index: Option<usize>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        preview: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum OnenoteCommand {
+    /// Microsoft Entra ID(OAuth 2.0)로 로그인하고 토큰을 저장합니다
+    #[command(visible_alias = "in")]
+    Login {
+        #[arg(long)]
+        client_id: Option<String>,
+        #[arg(long)]
+        tenant_id: Option<String>,
+        #[arg(long)]
+        device_code: bool,
+        #[arg(long)]
+        client_secret: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 저장된 토큰을 삭제합니다
+    #[command(visible_alias = "out")]
+    Logout {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 현재 로그인한 사용자 프로필과 토큰 상태를 표시합니다
+    Whoami {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 설정/DB/키링 경로, 스코프, 캐시 카운트 및 선택적 Graph 연결 진단을 표시합니다
+    Doctor {
+        #[arg(long)]
+        probe: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 개인 및 가입된 팀/그룹의 OneNote 필기장 목록을 표시합니다
+    #[command(visible_alias = "ls")]
+    Notebooks {
+        #[arg(long = "personal-only")]
+        personal_only: bool,
+        #[arg(
+            long = "include-teams",
+            default_value_t = true,
+            default_missing_value = "true",
+            num_args = 0..=1,
+            require_equals = true
+        )]
+        include_teams: bool,
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        offline: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 새 OneNote 필기장을 생성합니다
+    #[command(name = "create-notebook")]
+    CreateNotebook {
+        name: String,
+        #[arg(long)]
+        group: Option<String>,
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 필기장 내(또는 전체) OneNote 섹션 목록을 표시합니다
+    Sections {
+        notebook: Option<String>,
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        offline: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 지정한 필기장에 새 OneNote 섹션을 생성합니다
+    #[command(name = "create-section")]
+    CreateSection {
+        notebook: String,
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 지정한 섹션(`"필기장/섹션"` 또는 섹션 이름/키)의 페이지 목록을 표시합니다
+    #[command(visible_alias = "list")]
+    Pages {
+        section: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        offline: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// OneNote 페이지 본문, 블록(`element_id`/태그) 및 리소스 상세 정보를 읽습니다
+    #[command(visible_alias = "cat")]
+    Read {
+        page: String,
+        #[arg(long, default_value = "md", value_parser = ["md", "plain", "blocks", "xhtml"])]
+        format: String,
+        #[arg(long = "preview-images")]
+        preview_images: bool,
+        #[arg(long)]
+        offline: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Markdown 본문과 선택적 인라인 이미지로 새 OneNote 페이지를 생성합니다
+    Create {
+        section: String,
+        #[arg(long, required = true)]
+        title: String,
+        markdown_body: Option<String>,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long = "image", value_name = "img_path")]
+        image: Vec<PathBuf>,
+        #[arg(long, value_parser = clap::value_parser!(i32).range(0..=2))]
+        level: Option<i32>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 기존 OneNote 페이지 끝에 Markdown 본문 및 인라인 이미지를 추가(append)합니다
+    Append {
+        page: String,
+        markdown_body: Option<String>,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long = "image", value_name = "img_path")]
+        image: Vec<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// OneNote 페이지의 특정 블록(`--block-id`) 또는 전체 제목/본문을 수정합니다
+    Update {
+        page: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long = "block-id")]
+        block_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// OneNote 페이지의 `to-do` 체크박스 블록을 완료/미완료 토글합니다
+    Check {
+        page: String,
+        #[arg(long = "block-id")]
+        block_id: Option<String>,
+        #[arg(long)]
+        index: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// OneNote 페이지를 삭제합니다
+    Delete {
+        page: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 로컬 SQLite FTS5(`onenote_fts`)에서 OneNote 페이지를 검색합니다
+    Search {
+        query: String,
+        #[arg(long)]
+        section: Option<String>,
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// OneNote 페이지의 이미지 또는 첨부 리소스를 다운로드하거나 터미널에 미리보기합니다
+    Resource {
+        page: String,
+        #[arg(long)]
+        index: Option<usize>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        preview: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 로컬 이미지 파일을 터미널에 미리보기 렌더링합니다
+    #[command(name = "preview-file")]
+    PreviewFile {
+        path: PathBuf,
+        #[arg(long)]
+        cols: Option<u16>,
+        #[arg(long)]
+        rows: Option<u16>,
+    },
+    /// GitHub Releases에서 최신 버전을 확인하거나 자가 업데이트합니다
+    /// (`onenote update <page>` 는 페이지 수정이므로 자가 업데이트는 `onenote self-update` / `onenote upgrade`)
+    #[command(name = "self-update", visible_alias = "upgrade")]
+    SelfUpdate {
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 터미널 UI(TUI)를 실행합니다
+    Tui,
+    /// 에이전트용 로컬 HTTP JSON API 서버를 실행합니다
+    #[command(visible_alias = "api")]
+    Serve {
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        #[arg(long, default_value_t = 8788)]
+        port: u16,
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// 에이전트용 stdio MCP(JSON-RPC 2.0) 서버를 실행합니다
+    #[command(visible_alias = "mcp-server")]
+    Mcp,
+}
+
 pub async fn run_from_env() -> Result<()> {
     let mut cfg = AppConfig::load();
     let persona = Persona::detect();
@@ -983,6 +1408,10 @@ pub async fn run_from_env() -> Result<()> {
         Persona::Outlook => {
             let cli = OutlookCli::parse();
             Box::pin(dispatch_outlook_command(&mut cfg, persona, cli.command)).await
+        }
+        Persona::OneNote => {
+            let cli = OnenoteCli::parse();
+            Box::pin(dispatch_onenote_command(&mut cfg, persona, cli.command)).await
         }
     }
 }
@@ -1240,6 +1669,7 @@ async fn dispatch_command(
         Some(Command::Cal { command }) => Box::pin(dispatch_cal_command(cfg, command)).await,
         Some(Command::Contacts { command }) => Box::pin(dispatch_contacts_command(cfg, command)).await,
         Some(Command::Todo { command }) => Box::pin(dispatch_todo_command(cfg, command)).await,
+        Some(Command::Notes { command }) => Box::pin(dispatch_notes_command(cfg, command)).await,
         Some(Command::Preview {
             target,
             msg_id,
@@ -1453,6 +1883,9 @@ async fn dispatch_outlook_command(
             Box::pin(dispatch_contacts_command(cfg, command)).await
         }
         Some(OutlookCommand::Todo { command }) => Box::pin(dispatch_todo_command(cfg, command)).await,
+        Some(OutlookCommand::Notes { command }) => {
+            Box::pin(dispatch_notes_command(cfg, command)).await
+        }
         Some(OutlookCommand::Update {
             check,
             force,
@@ -1689,6 +2122,429 @@ async fn dispatch_todo_command(cfg: &AppConfig, command: TodoCommand) -> Result<
     }
 }
 
+pub async fn dispatch_onenote_command(
+    cfg: &mut AppConfig,
+    persona: Persona,
+    command: Option<OnenoteCommand>,
+) -> Result<()> {
+    match command {
+        None => Box::pin(cmd_tui(cfg, persona)).await,
+        Some(OnenoteCommand::Login {
+            client_id,
+            tenant_id,
+            device_code,
+            client_secret,
+            token,
+            port,
+            json,
+        }) => {
+            Box::pin(cmd_login(
+                cfg,
+                LoginOptions {
+                    client_id,
+                    tenant_id,
+                    device_code,
+                    client_secret,
+                    access_token: token,
+                    port,
+                },
+                json,
+            ))
+            .await
+        }
+        Some(OnenoteCommand::Logout { json }) => Box::pin(cmd_logout(cfg, json)).await,
+        Some(OnenoteCommand::Whoami { json }) => Box::pin(cmd_whoami(cfg, persona, json)).await,
+        Some(OnenoteCommand::Doctor { probe, json }) => {
+            Box::pin(cmd_doctor(cfg, persona, probe, json)).await
+        }
+        Some(OnenoteCommand::Notebooks {
+            personal_only,
+            include_teams,
+            refresh,
+            offline,
+            json,
+        }) => {
+            Box::pin(dispatch_notes_command(
+                cfg,
+                NotesCommand::Notebooks {
+                    personal_only,
+                    include_teams,
+                    refresh,
+                    offline,
+                    json,
+                },
+            ))
+            .await
+        }
+        Some(OnenoteCommand::CreateNotebook {
+            name,
+            group,
+            site,
+            json,
+        }) => {
+            Box::pin(dispatch_notes_command(
+                cfg,
+                NotesCommand::CreateNotebook {
+                    name,
+                    group,
+                    site,
+                    json,
+                },
+            ))
+            .await
+        }
+        Some(OnenoteCommand::Sections {
+            notebook,
+            refresh,
+            offline,
+            json,
+        }) => {
+            Box::pin(dispatch_notes_command(
+                cfg,
+                NotesCommand::Sections {
+                    notebook,
+                    refresh,
+                    offline,
+                    json,
+                },
+            ))
+            .await
+        }
+        Some(OnenoteCommand::CreateSection {
+            notebook,
+            name,
+            json,
+        }) => {
+            Box::pin(dispatch_notes_command(
+                cfg,
+                NotesCommand::CreateSection {
+                    notebook,
+                    name,
+                    json,
+                },
+            ))
+            .await
+        }
+        Some(OnenoteCommand::Pages {
+            section,
+            limit,
+            refresh,
+            offline,
+            json,
+        }) => {
+            Box::pin(dispatch_notes_command(
+                cfg,
+                NotesCommand::Pages {
+                    section,
+                    limit,
+                    refresh,
+                    offline,
+                    json,
+                },
+            ))
+            .await
+        }
+        Some(OnenoteCommand::Read {
+            page,
+            format,
+            preview_images,
+            offline,
+            json,
+        }) => {
+            Box::pin(dispatch_notes_command(
+                cfg,
+                NotesCommand::Read {
+                    page,
+                    format,
+                    preview_images,
+                    offline,
+                    json,
+                },
+            ))
+            .await
+        }
+        Some(OnenoteCommand::Create {
+            section,
+            title,
+            markdown_body,
+            file,
+            image,
+            level,
+            json,
+        }) => {
+            Box::pin(dispatch_notes_command(
+                cfg,
+                NotesCommand::Create {
+                    section,
+                    title,
+                    markdown_body,
+                    file,
+                    image,
+                    level,
+                    json,
+                },
+            ))
+            .await
+        }
+        Some(OnenoteCommand::Append {
+            page,
+            markdown_body,
+            file,
+            image,
+            json,
+        }) => {
+            Box::pin(dispatch_notes_command(
+                cfg,
+                NotesCommand::Append {
+                    page,
+                    markdown_body,
+                    file,
+                    image,
+                    json,
+                },
+            ))
+            .await
+        }
+        Some(OnenoteCommand::Update {
+            page,
+            title,
+            body,
+            file,
+            block_id,
+            json,
+        }) => {
+            Box::pin(dispatch_notes_command(
+                cfg,
+                NotesCommand::Update {
+                    page,
+                    title,
+                    body,
+                    file,
+                    block_id,
+                    json,
+                },
+            ))
+            .await
+        }
+        Some(OnenoteCommand::Check {
+            page,
+            block_id,
+            index,
+            json,
+        }) => {
+            Box::pin(dispatch_notes_command(
+                cfg,
+                NotesCommand::Check {
+                    page,
+                    block_id,
+                    index,
+                    json,
+                },
+            ))
+            .await
+        }
+        Some(OnenoteCommand::Delete { page, yes, json }) => {
+            Box::pin(dispatch_notes_command(
+                cfg,
+                NotesCommand::Delete { page, yes, json },
+            ))
+            .await
+        }
+        Some(OnenoteCommand::Search {
+            query,
+            section,
+            refresh,
+            limit,
+            json,
+        }) => {
+            Box::pin(dispatch_notes_command(
+                cfg,
+                NotesCommand::Search {
+                    query,
+                    section,
+                    refresh,
+                    limit,
+                    json,
+                },
+            ))
+            .await
+        }
+        Some(OnenoteCommand::Resource {
+            page,
+            index,
+            out,
+            preview,
+            json,
+        }) => {
+            Box::pin(dispatch_notes_command(
+                cfg,
+                NotesCommand::Resource {
+                    page,
+                    index,
+                    out,
+                    preview,
+                    json,
+                },
+            ))
+            .await
+        }
+        Some(OnenoteCommand::PreviewFile { path, cols, rows }) => {
+            cmd_preview_local_file(&path, cols, rows)
+        }
+        Some(OnenoteCommand::SelfUpdate {
+            check,
+            force,
+            repo,
+            json,
+        }) => Box::pin(cmd_update(cfg, check, force, repo.as_deref(), json)).await,
+        Some(OnenoteCommand::Tui) => Box::pin(cmd_tui(cfg, persona)).await,
+        Some(OnenoteCommand::Serve { bind, port, token }) => {
+            let (_auth, graph, storage) = Box::pin(open_runtime(cfg, false)).await?;
+            Box::pin(serve::run(
+                cfg.clone(),
+                graph,
+                storage,
+                ServeOptions { bind, port, token },
+            ))
+            .await
+        }
+        Some(OnenoteCommand::Mcp) => {
+            let (_auth, graph, storage) = Box::pin(open_runtime(cfg, false)).await?;
+            Box::pin(crate::mcp::run(cfg.clone(), graph, storage)).await
+        }
+    }
+}
+
+pub async fn dispatch_notes_command(cfg: &AppConfig, command: NotesCommand) -> Result<()> {
+    match command {
+        NotesCommand::Notebooks {
+            personal_only,
+            include_teams,
+            refresh,
+            offline,
+            json,
+        } => {
+            cmd_notes_notebooks(
+                cfg,
+                !personal_only && include_teams,
+                refresh,
+                offline,
+                json,
+            )
+            .await
+        }
+        NotesCommand::CreateNotebook {
+            name,
+            group,
+            site,
+            json,
+        } => cmd_notes_create_notebook(cfg, &name, group.as_deref(), site.as_deref(), json).await,
+        NotesCommand::Sections {
+            notebook,
+            refresh,
+            offline,
+            json,
+        } => cmd_notes_sections(cfg, notebook.as_deref(), refresh, offline, json).await,
+        NotesCommand::CreateSection {
+            notebook,
+            name,
+            json,
+        } => cmd_notes_create_section(cfg, &notebook, &name, json).await,
+        NotesCommand::Pages {
+            section,
+            limit,
+            refresh,
+            offline,
+            json,
+        } => cmd_notes_pages(cfg, &section, limit, refresh, offline, json).await,
+        NotesCommand::Read {
+            page,
+            format,
+            preview_images,
+            offline,
+            json,
+        } => cmd_notes_read(cfg, &page, &format, preview_images, offline, json).await,
+        NotesCommand::Create {
+            section,
+            title,
+            markdown_body,
+            file,
+            image,
+            level,
+            json,
+        } => {
+            cmd_notes_create(
+                cfg,
+                &section,
+                &title,
+                markdown_body.as_deref(),
+                file.as_deref(),
+                &image,
+                level,
+                json,
+            )
+            .await
+        }
+        NotesCommand::Append {
+            page,
+            markdown_body,
+            file,
+            image,
+            json,
+        } => {
+            cmd_notes_append(
+                cfg,
+                &page,
+                markdown_body.as_deref(),
+                file.as_deref(),
+                &image,
+                json,
+            )
+            .await
+        }
+        NotesCommand::Update {
+            page,
+            title,
+            body,
+            file,
+            block_id,
+            json,
+        } => {
+            cmd_notes_update(
+                cfg,
+                &page,
+                title.as_deref(),
+                body.as_deref(),
+                file.as_deref(),
+                block_id.as_deref(),
+                json,
+            )
+            .await
+        }
+        NotesCommand::Check {
+            page,
+            block_id,
+            index,
+            json,
+        } => cmd_notes_check(cfg, &page, block_id.as_deref(), index, json).await,
+        NotesCommand::Delete { page, yes, json } => cmd_notes_delete(cfg, &page, yes, json).await,
+        NotesCommand::Search {
+            query,
+            section,
+            refresh,
+            limit,
+            json,
+        } => cmd_notes_search(cfg, &query, section.as_deref(), refresh, limit, json).await,
+        NotesCommand::Resource {
+            page,
+            index,
+            out,
+            preview,
+            json,
+        } => cmd_notes_resource(cfg, &page, index, out.as_deref(), preview, json).await,
+    }
+}
+
 async fn open_runtime(
     cfg: &AppConfig,
     require_login: bool,
@@ -1728,6 +2584,9 @@ async fn cmd_tui(cfg: &mut AppConfig, persona: Persona) -> Result<()> {
     }
     if persona == Persona::Outlook && storage.list_mail_folders()?.is_empty() {
         let _ = sync::bootstrap_outlook(&graph, &storage).await;
+    }
+    if persona == Persona::OneNote && storage.list_onenote_notebooks()?.is_empty() {
+        let _ = sync::bootstrap_onenote(&graph, &storage).await;
     }
     tui::run_with_persona(cfg.clone(), persona, auth, graph, storage).await
 }
@@ -1901,6 +2760,8 @@ async fn cmd_doctor(
         cached_events,
         cached_contacts,
         cached_todo_lists,
+        cached_onenote_notebooks,
+        cached_onenote_sections,
     ) = if db.exists() {
         if let Ok(storage) = Storage::open(&db) {
             (
@@ -1919,16 +2780,25 @@ async fn cmd_doctor(
                     .map(|v| v.len())
                     .unwrap_or(0),
                 storage.list_todo_lists().map(|v| v.len()).unwrap_or(0),
+                storage
+                    .list_onenote_notebooks()
+                    .map(|v| v.len())
+                    .unwrap_or(0),
+                storage
+                    .list_onenote_sections(None)
+                    .map(|v| v.len())
+                    .unwrap_or(0),
             )
         } else {
-            (0, 0, 0, 0, 0, 0)
+            (0, 0, 0, 0, 0, 0, 0, 0)
         }
     } else {
-        (0, 0, 0, 0, 0, 0)
+        (0, 0, 0, 0, 0, 0, 0, 0)
     };
 
     let mut probe_me: Option<serde_json::Value> = None;
     let mut probe_presence: Option<serde_json::Value> = None;
+    let mut probe_onenote: Option<serde_json::Value> = None;
     let mut probe_error: Option<String> = None;
 
     if probe {
@@ -1946,6 +2816,29 @@ async fn cmd_doctor(
             }
             Err(err) => probe_error = Some(format!("get_me probe 실패: {err:#}")),
         }
+        // Non-fatal OneNote probe (/me/onenote/notebooks?$top=1)
+        probe_onenote = Some(
+            match graph
+                .get_json::<serde_json::Value>("/me/onenote/notebooks?$top=1")
+                .await
+            {
+                Ok(val) => {
+                    let count = val
+                        .get("value")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    json!({
+                        "ok": true,
+                        "sampled_notebooks": count,
+                    })
+                }
+                Err(err) => json!({
+                    "ok": false,
+                    "error": format!("{err:#}"),
+                }),
+            },
+        );
     }
 
     if json_out {
@@ -1977,12 +2870,15 @@ async fn cmd_doctor(
                     "events": cached_events,
                     "contacts": cached_contacts,
                     "todo_lists": cached_todo_lists,
+                    "onenote_notebooks": cached_onenote_notebooks,
+                    "onenote_sections": cached_onenote_sections,
                 },
                 "probe": if probe {
                     Some(json!({
                         "ok": probe_error.is_none(),
                         "me": probe_me,
                         "presence": probe_presence,
+                        "onenote": probe_onenote,
                         "error": probe_error,
                     }))
                 } else {
@@ -2001,7 +2897,7 @@ async fn cmd_doctor(
         println!("drafts.json: {}", drafts.display());
         println!("cache.db: {} (exists={})", db.display(), db.exists());
         println!(
-            "cache_counts: conversations={cached_conversations}, mail_folders={cached_mail_folders}, mails={cached_mails}, events={cached_events}, contacts={cached_contacts}, todo_lists={cached_todo_lists}"
+            "cache_counts: conversations={cached_conversations}, mail_folders={cached_mail_folders}, mails={cached_mails}, events={cached_events}, contacts={cached_contacts}, todo_lists={cached_todo_lists}, onenote_notebooks={cached_onenote_notebooks}, onenote_sections={cached_onenote_sections}"
         );
         println!("download_dir: {}", dl_dir.display());
         println!("github_repo: {}", cfg.github_repo);
@@ -2012,11 +2908,17 @@ async fn cmd_doctor(
         println!("auth_base_url: {}", cfg.auth_base_url);
         println!("keyring_status: {keyring_status}");
         if probe {
+            let onenote_state = probe_onenote
+                .as_ref()
+                .and_then(|v| v.get("ok"))
+                .and_then(|v| v.as_bool())
+                .map(|ok| if ok { "ok" } else { "unavailable" })
+                .unwrap_or("-");
             if let Some(err) = probe_error {
-                println!("probe: 실패 ({err})");
+                println!("probe: 실패 ({err}, onenote={onenote_state})");
             } else {
                 println!(
-                    "probe: 성공 (me={}, presence={})",
+                    "probe: 성공 (me={}, presence={}, onenote={onenote_state})",
                     probe_me
                         .as_ref()
                         .and_then(|v| v.get("display_name"))
@@ -5031,6 +5933,1688 @@ async fn cmd_todo_delete(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Microsoft OneNote commands & shared helpers (reused by `serve.rs` & `mcp.rs`)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn build_onenote_scope_from_args(
+    group_id: Option<&str>,
+    site_id: Option<&str>,
+) -> Result<OnenoteScope> {
+    let g = group_id.map(str::trim).filter(|s| !s.is_empty());
+    let s = site_id.map(str::trim).filter(|s| !s.is_empty());
+    match (g, s) {
+        (Some(_), Some(_)) => bail!("--group 과 --site 는 동시에 지정할 수 없습니다."),
+        (Some(gid), None) => Ok(OnenoteScope::Group {
+            group_id: gid.to_string(),
+            group_name: None,
+        }),
+        (None, Some(sid)) => Ok(OnenoteScope::Site {
+            site_id: sid.to_string(),
+            site_name: None,
+        }),
+        (None, None) => Ok(OnenoteScope::Me),
+    }
+}
+
+pub(crate) fn filter_notebooks_by_scope(
+    items: Vec<OnenoteNotebook>,
+    include_teams: bool,
+) -> Vec<OnenoteNotebook> {
+    if include_teams {
+        items
+    } else {
+        items
+            .into_iter()
+            .filter(|n| n.scope.is_personal())
+            .collect()
+    }
+}
+
+pub(crate) fn resolve_onenote_notebook_from_slice(
+    notebooks: &[OnenoteNotebook],
+    query: &str,
+) -> Result<OnenoteNotebook> {
+    let q = query.trim();
+    if q.is_empty() {
+        bail!("필기장 이름 또는 키가 비어 있습니다.");
+    }
+    if let Some(exact_key) = notebooks
+        .iter()
+        .find(|n| n.notebook_key == q || n.id == q)
+    {
+        return Ok(exact_key.clone());
+    }
+    let q_lower = q.to_lowercase();
+    if let Some((owner_part, name_part)) = q_lower.rsplit_once('/') {
+        let owner_q = owner_part.trim();
+        let name_q = name_part.trim();
+        if !owner_q.is_empty() && !name_q.is_empty() {
+            let exact_pair: Vec<&OnenoteNotebook> = notebooks
+                .iter()
+                .filter(|n| {
+                    n.display_name.to_lowercase() == name_q
+                        && n.scope.owner_label().to_lowercase().contains(owner_q)
+                })
+                .collect();
+            if exact_pair.len() == 1 {
+                return Ok(exact_pair[0].clone());
+            }
+            let sub_pair: Vec<&OnenoteNotebook> = notebooks
+                .iter()
+                .filter(|n| {
+                    n.display_name.to_lowercase().contains(name_q)
+                        && n.scope.owner_label().to_lowercase().contains(owner_q)
+                })
+                .collect();
+            if sub_pair.len() == 1 {
+                return Ok(sub_pair[0].clone());
+            }
+        }
+    }
+
+    let exact_name: Vec<&OnenoteNotebook> = notebooks
+        .iter()
+        .filter(|n| n.display_name.to_lowercase() == q_lower)
+        .collect();
+    if exact_name.len() == 1 {
+        return Ok(exact_name[0].clone());
+    }
+    if exact_name.len() > 1 {
+        let personal: Vec<&&OnenoteNotebook> = exact_name
+            .iter()
+            .filter(|n| n.scope.is_personal())
+            .collect();
+        if personal.len() == 1 {
+            return Ok((*personal[0]).clone());
+        }
+        let candidates: Vec<String> = exact_name
+            .iter()
+            .map(|n| format!("{}/{} ({})", n.scope.owner_label(), n.display_name, n.notebook_key))
+            .collect();
+        bail!(
+            "여러 필기장이 '{q}' 와 일치합니다: {}",
+            candidates.join(", ")
+        );
+    }
+
+    let sub: Vec<&OnenoteNotebook> = notebooks
+        .iter()
+        .filter(|n| {
+            n.display_name.to_lowercase().contains(&q_lower)
+                || format!("{}/{}", n.scope.owner_label(), n.display_name)
+                    .to_lowercase()
+                    .contains(&q_lower)
+        })
+        .collect();
+    match sub.len() {
+        0 => bail!("필기장을 찾을 수 없습니다: {q}"),
+        1 => Ok(sub[0].clone()),
+        _ => {
+            let candidates: Vec<String> = sub
+                .iter()
+                .map(|n| {
+                    format!(
+                        "{}/{} ({})",
+                        n.scope.owner_label(),
+                        n.display_name,
+                        n.notebook_key
+                    )
+                })
+                .collect();
+            bail!(
+                "여러 필기장이 '{q}' 와 일치합니다: {}",
+                candidates.join(", ")
+            );
+        }
+    }
+}
+
+pub(crate) async fn load_onenote_notebooks(
+    storage: &Storage,
+    graph: &GraphClient,
+    include_teams: bool,
+    refresh: bool,
+    offline: bool,
+) -> Result<Vec<OnenoteNotebook>> {
+    let cached = filter_notebooks_by_scope(storage.list_onenote_notebooks()?, include_teams);
+    if !offline && (refresh || cached.is_empty()) {
+        let fetched = if include_teams {
+            graph.list_all_accessible_notebooks(true).await?
+        } else {
+            graph.list_onenote_notebooks(&OnenoteScope::Me).await?
+        };
+        storage.upsert_onenote_notebooks(&fetched)?;
+        let stored = filter_notebooks_by_scope(storage.list_onenote_notebooks()?, include_teams);
+        if stored.is_empty() {
+            Ok(filter_notebooks_by_scope(fetched, include_teams))
+        } else {
+            Ok(stored)
+        }
+    } else {
+        Ok(cached)
+    }
+}
+
+pub(crate) async fn resolve_onenote_notebook(
+    storage: &Storage,
+    graph: &GraphClient,
+    query: &str,
+    include_teams: bool,
+    refresh: bool,
+    offline: bool,
+) -> Result<OnenoteNotebook> {
+    if !refresh {
+        let cached = filter_notebooks_by_scope(storage.list_onenote_notebooks()?, include_teams);
+        if !cached.is_empty() {
+            if let Ok(found) = resolve_onenote_notebook_from_slice(&cached, query) {
+                return Ok(found);
+            }
+        }
+    }
+    if !offline {
+        let fetched = if include_teams {
+            graph.list_all_accessible_notebooks(true).await?
+        } else {
+            graph.list_onenote_notebooks(&OnenoteScope::Me).await?
+        };
+        storage.upsert_onenote_notebooks(&fetched)?;
+        let stored = filter_notebooks_by_scope(storage.list_onenote_notebooks()?, include_teams);
+        let pool = if stored.is_empty() { fetched } else { stored };
+        if let Ok(found) = resolve_onenote_notebook_from_slice(&pool, query) {
+            return Ok(found);
+        }
+    }
+    if query.contains('|') {
+        let (scope, nb_id) = split_onenote_entity_key(query);
+        return Ok(OnenoteNotebook {
+            notebook_key: scope.make_entity_key(&nb_id),
+            id: nb_id.clone(),
+            scope,
+            display_name: nb_id,
+            color: None,
+            is_default: false,
+            is_shared: false,
+            user_role: None,
+            created_at: None,
+            last_modified_at: None,
+            created_by: None,
+            web_url: None,
+        });
+    }
+    bail!("필기장을 찾을 수 없습니다: {}", query.trim())
+}
+
+pub(crate) fn resolve_onenote_section_from_slice(
+    sections: &[OnenoteSection],
+    query: &str,
+) -> Result<OnenoteSection> {
+    let q = query.trim();
+    if q.is_empty() {
+        bail!("섹션 이름 또는 키가 비어 있습니다.");
+    }
+    if let Some(exact_key) = sections
+        .iter()
+        .find(|s| s.section_key == q || s.id == q)
+    {
+        return Ok(exact_key.clone());
+    }
+
+    let q_lower = q.to_lowercase();
+    if let Some((lhs_raw, rhs_raw)) = q_lower.rsplit_once('/') {
+        let lhs = lhs_raw.trim();
+        let rhs = rhs_raw.trim();
+        if !lhs.is_empty() && !rhs.is_empty() {
+            let parent_matches = |s: &OnenoteSection, needle: &str, exact: bool| -> bool {
+                let nb = s.notebook_name.as_deref().unwrap_or_default().to_lowercase();
+                let sg = s
+                    .parent_section_group_name
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_lowercase();
+                let owner = s.scope.owner_label().to_lowercase();
+                let combined = if sg.is_empty() {
+                    nb.clone()
+                } else {
+                    format!("{nb}/{sg}")
+                };
+                if exact {
+                    nb == needle || sg == needle || owner == needle || combined == needle
+                } else {
+                    nb.contains(needle)
+                        || sg.contains(needle)
+                        || owner.contains(needle)
+                        || combined.contains(needle)
+                        || format!("{owner}/{nb}").contains(needle)
+                }
+            };
+
+            let exact_slash: Vec<&OnenoteSection> = sections
+                .iter()
+                .filter(|s| {
+                    s.display_name.to_lowercase() == rhs && parent_matches(s, lhs, true)
+                })
+                .collect();
+            if exact_slash.len() == 1 {
+                return Ok(exact_slash[0].clone());
+            }
+
+            let exact_rhs_sub_lhs: Vec<&OnenoteSection> = sections
+                .iter()
+                .filter(|s| {
+                    s.display_name.to_lowercase() == rhs && parent_matches(s, lhs, false)
+                })
+                .collect();
+            if exact_rhs_sub_lhs.len() == 1 {
+                return Ok(exact_rhs_sub_lhs[0].clone());
+            }
+
+            let sub_slash: Vec<&OnenoteSection> = sections
+                .iter()
+                .filter(|s| {
+                    s.display_name.to_lowercase().contains(rhs) && parent_matches(s, lhs, false)
+                })
+                .collect();
+            match sub_slash.len() {
+                0 => {}
+                1 => return Ok(sub_slash[0].clone()),
+                _ => {
+                    let candidates: Vec<String> = sub_slash
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "{}/{} ({})",
+                                s.notebook_name.as_deref().unwrap_or("-"),
+                                s.display_name,
+                                s.section_key
+                            )
+                        })
+                        .collect();
+                    bail!(
+                        "여러 섹션이 '{q}' 와 일치합니다: {}",
+                        candidates.join(", ")
+                    );
+                }
+            }
+        }
+    }
+
+    let exact_name: Vec<&OnenoteSection> = sections
+        .iter()
+        .filter(|s| s.display_name.to_lowercase() == q_lower)
+        .collect();
+    if exact_name.len() == 1 {
+        return Ok(exact_name[0].clone());
+    }
+    if exact_name.len() > 1 {
+        let candidates: Vec<String> = exact_name
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}/{} ({})",
+                    s.notebook_name.as_deref().unwrap_or("-"),
+                    s.display_name,
+                    s.section_key
+                )
+            })
+            .collect();
+        bail!(
+            "동일한 이름의 섹션이 여러 개 있습니다 ('필기장/섹션' 또는 키를 지정하세요): {}",
+            candidates.join(", ")
+        );
+    }
+
+    let sub: Vec<&OnenoteSection> = sections
+        .iter()
+        .filter(|s| {
+            s.display_name.to_lowercase().contains(&q_lower)
+                || format!(
+                    "{}/{}",
+                    s.notebook_name.as_deref().unwrap_or_default(),
+                    s.display_name
+                )
+                .to_lowercase()
+                .contains(&q_lower)
+        })
+        .collect();
+    match sub.len() {
+        0 => bail!("섹션을 찾을 수 없습니다: {q}"),
+        1 => Ok(sub[0].clone()),
+        _ => {
+            let candidates: Vec<String> = sub
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{}/{} ({})",
+                        s.notebook_name.as_deref().unwrap_or("-"),
+                        s.display_name,
+                        s.section_key
+                    )
+                })
+                .collect();
+            bail!(
+                "여러 섹션이 '{q}' 와 일치합니다: {}",
+                candidates.join(", ")
+            );
+        }
+    }
+}
+
+pub(crate) async fn load_onenote_sections(
+    storage: &Storage,
+    graph: &GraphClient,
+    notebook_query: Option<&str>,
+    refresh: bool,
+    offline: bool,
+) -> Result<(Option<OnenoteNotebook>, Vec<OnenoteSection>)> {
+    if let Some(nb_q) = notebook_query.map(str::trim).filter(|s| !s.is_empty()) {
+        let nb = resolve_onenote_notebook(storage, graph, nb_q, true, refresh, offline).await?;
+        let cached = storage.list_onenote_sections(Some(&nb.notebook_key))?;
+        if !offline && (refresh || cached.is_empty()) {
+            if let Ok(groups) = graph
+                .list_onenote_section_groups(&nb.scope, Some(&nb.id))
+                .await
+            {
+                if !groups.is_empty() {
+                    let _ = storage.upsert_onenote_section_groups(&groups);
+                }
+            }
+            let mut secs = graph.list_onenote_sections(&nb.scope, Some(&nb.id)).await?;
+            for sec in &mut secs {
+                if sec.notebook_id.is_none() {
+                    sec.notebook_id = Some(nb.id.clone());
+                }
+                if sec.notebook_name.is_none() {
+                    sec.notebook_name = Some(nb.display_name.clone());
+                }
+            }
+            storage.upsert_onenote_sections(&secs)?;
+            let stored = storage.list_onenote_sections(Some(&nb.notebook_key))?;
+            Ok((Some(nb), if stored.is_empty() { secs } else { stored }))
+        } else {
+            Ok((Some(nb), cached))
+        }
+    } else {
+        let cached = storage.list_onenote_sections(None)?;
+        if !offline && (refresh || cached.is_empty()) {
+            let notebooks = load_onenote_notebooks(storage, graph, true, refresh, false).await?;
+            let (groups, secs) = graph.list_all_accessible_sections(&notebooks).await?;
+            if !groups.is_empty() {
+                storage.upsert_onenote_section_groups(&groups)?;
+            }
+            storage.upsert_onenote_sections(&secs)?;
+            let stored = storage.list_onenote_sections(None)?;
+            Ok((None, if stored.is_empty() { secs } else { stored }))
+        } else {
+            Ok((None, cached))
+        }
+    }
+}
+
+pub(crate) async fn resolve_onenote_section(
+    storage: &Storage,
+    graph: &GraphClient,
+    query: &str,
+    refresh: bool,
+    offline: bool,
+) -> Result<OnenoteSection> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        bail!("섹션 이름 또는 키가 비어 있습니다.");
+    }
+    if !refresh {
+        let cached = storage.list_onenote_sections(None)?;
+        if !cached.is_empty() {
+            if let Ok(found) = resolve_onenote_section_from_slice(&cached, trimmed) {
+                return Ok(found);
+            }
+        }
+    }
+    if !offline {
+        if let Ok((_, fresh)) = load_onenote_sections(storage, graph, None, true, false).await {
+            if let Ok(found) = resolve_onenote_section_from_slice(&fresh, trimmed) {
+                return Ok(found);
+            }
+        }
+    }
+    if trimmed.contains('|') {
+        let (scope, sec_id) = split_onenote_entity_key(trimmed);
+        return Ok(OnenoteSection {
+            section_key: scope.make_entity_key(&sec_id),
+            id: sec_id.clone(),
+            scope,
+            notebook_id: None,
+            notebook_name: None,
+            parent_section_group_id: None,
+            parent_section_group_name: None,
+            display_name: sec_id,
+            color: None,
+            is_default: false,
+            pages_url: None,
+            created_at: None,
+            last_modified_at: None,
+            web_url: None,
+        });
+    }
+    let cached = storage.list_onenote_sections(None)?;
+    resolve_onenote_section_from_slice(&cached, trimmed)
+}
+
+pub(crate) async fn list_onenote_pages_helper(
+    storage: &Storage,
+    graph: &GraphClient,
+    section_query: &str,
+    limit: usize,
+    refresh: bool,
+    offline: bool,
+) -> Result<(OnenoteSection, Vec<OnenotePageSummary>)> {
+    let limit = clamp_limit(limit);
+    let sec = resolve_onenote_section(storage, graph, section_query, refresh, offline).await?;
+    let cached = storage.list_onenote_pages(&sec.section_key)?;
+    let mut pages = if !offline && (refresh || cached.is_empty()) {
+        let mut fetched = graph
+            .list_onenote_pages(&sec.scope, &sec.id, limit)
+            .await?;
+        for p in &mut fetched {
+            if p.section_id.is_empty() {
+                p.section_id = sec.id.clone();
+            }
+            if p.section_name.is_none() {
+                p.section_name = Some(sec.display_name.clone());
+            }
+            if p.notebook_id.is_none() {
+                p.notebook_id = sec.notebook_id.clone();
+            }
+            if p.notebook_name.is_none() {
+                p.notebook_name = sec.notebook_name.clone();
+            }
+        }
+        storage.upsert_onenote_pages(&fetched)?;
+        let stored = storage.list_onenote_pages(&sec.section_key)?;
+        if stored.is_empty() {
+            fetched
+        } else {
+            stored
+        }
+    } else {
+        cached
+    };
+    pages.truncate(limit);
+    Ok((sec, pages))
+}
+
+fn pick_search_hit_for_title<'a>(
+    hits: &'a [OnenoteSearchHit],
+    query: &str,
+) -> Option<&'a OnenoteSearchHit> {
+    let q_lower = query.trim().to_lowercase();
+    if let Some(exact) = hits.iter().find(|h| h.title.to_lowercase() == q_lower) {
+        return Some(exact);
+    }
+    if hits.len() == 1 {
+        return Some(&hits[0]);
+    }
+    let title_matches: Vec<&OnenoteSearchHit> = hits
+        .iter()
+        .filter(|h| h.title.to_lowercase().contains(&q_lower))
+        .collect();
+    if title_matches.len() == 1 {
+        return Some(title_matches[0]);
+    }
+    None
+}
+
+pub(crate) async fn load_onenote_page_detail(
+    storage: &Storage,
+    graph: &GraphClient,
+    page_query: &str,
+    offline: bool,
+) -> Result<OnenotePageDetail> {
+    let q = page_query.trim();
+    if q.is_empty() {
+        bail!("페이지 ID 또는 검색어가 비어 있습니다.");
+    }
+
+    if offline {
+        if let Some(detail) = storage.get_onenote_page_detail(q)? {
+            return Ok(detail);
+        }
+        let hits = storage.search_onenote_pages(q, None, 10)?;
+        if let Some(hit) = pick_search_hit_for_title(&hits, q) {
+            if let Some(detail) = storage.get_onenote_page_detail(&hit.page_key)? {
+                return Ok(detail);
+            }
+        }
+        bail!("오프라인 캐시에서 OneNote 페이지를 찾을 수 없습니다: {q}");
+    }
+
+    let mut cached_summary = storage.get_onenote_page_summary(q)?;
+    if cached_summary.is_none() && !q.contains('|') {
+        let hits = storage.search_onenote_pages(q, None, 10)?;
+        if let Some(hit) = pick_search_hit_for_title(&hits, q) {
+            cached_summary = storage.get_onenote_page_summary(&hit.page_key)?.or_else(|| {
+                Some(OnenotePageSummary {
+                    page_key: hit.page_key.clone(),
+                    id: hit.page_id.clone(),
+                    scope: hit.scope.clone(),
+                    section_id: hit.section_id.clone(),
+                    section_name: hit.section_name.clone(),
+                    notebook_id: None,
+                    notebook_name: hit.notebook_name.clone(),
+                    title: hit.title.clone(),
+                    level: 0,
+                    order: 0,
+                    created_at: None,
+                    last_modified_at: hit.last_modified_at.clone(),
+                    content_url: None,
+                    web_url: hit.web_url.clone(),
+                    preview_text: Some(hit.snippet.clone()),
+                    has_todo: false,
+                })
+            });
+        }
+    }
+
+    if let Some(summary) = cached_summary {
+        let scope = summary.scope.clone();
+        let id = summary.id.clone();
+        let detail = graph
+            .get_onenote_page_detail(&scope, &id, Some(summary))
+            .await?;
+        storage.upsert_onenote_page_detail(&detail)?;
+        let _ = storage.upsert_onenote_pages(std::slice::from_ref(&detail.summary));
+        return Ok(detail);
+    }
+
+    if q.contains('|') {
+        let (scope, page_id) = split_onenote_entity_key(q);
+        let detail = graph.get_onenote_page_detail(&scope, &page_id, None).await?;
+        storage.upsert_onenote_page_detail(&detail)?;
+        let _ = storage.upsert_onenote_pages(std::slice::from_ref(&detail.summary));
+        return Ok(detail);
+    }
+
+    // Try direct personal page ID first unless query clearly contains whitespace/non-ID chars.
+    let looks_like_id = !q.chars().any(char::is_whitespace) && q.is_ascii();
+    if looks_like_id {
+        if let Ok(detail) = graph
+            .get_onenote_page_detail(&OnenoteScope::Me, q, None)
+            .await
+        {
+            storage.upsert_onenote_page_detail(&detail)?;
+            let _ = storage.upsert_onenote_pages(std::slice::from_ref(&detail.summary));
+            return Ok(detail);
+        }
+    }
+
+    // Bootstrap hierarchy/pages and retry summary + FTS lookup.
+    let _ = sync::bootstrap_onenote(graph, storage).await;
+    if let Some(summary) = storage.get_onenote_page_summary(q)? {
+        let scope = summary.scope.clone();
+        let id = summary.id.clone();
+        let detail = graph
+            .get_onenote_page_detail(&scope, &id, Some(summary))
+            .await?;
+        storage.upsert_onenote_page_detail(&detail)?;
+        let _ = storage.upsert_onenote_pages(std::slice::from_ref(&detail.summary));
+        return Ok(detail);
+    }
+    let hits = storage.search_onenote_pages(q, None, 10)?;
+    if let Some(hit) = pick_search_hit_for_title(&hits, q) {
+        let summary = storage.get_onenote_page_summary(&hit.page_key)?;
+        let detail = graph
+            .get_onenote_page_detail(&hit.scope, &hit.page_id, summary)
+            .await?;
+        storage.upsert_onenote_page_detail(&detail)?;
+        let _ = storage.upsert_onenote_pages(std::slice::from_ref(&detail.summary));
+        return Ok(detail);
+    }
+
+    // Also scan cached page titles across all sections in case FTS didn't index uncached bodies yet.
+    let sections = storage.list_onenote_sections(None)?;
+    let q_lower = q.to_lowercase();
+    let mut title_candidates = Vec::new();
+    for sec in &sections {
+        if let Ok(pages) = storage.list_onenote_pages(&sec.section_key) {
+            for p in pages {
+                if p.id == q
+                    || p.page_key == q
+                    || p.title.to_lowercase() == q_lower
+                    || p.title.to_lowercase().contains(&q_lower)
+                {
+                    title_candidates.push(p);
+                }
+            }
+        }
+    }
+    if let Some(exact) = title_candidates
+        .iter()
+        .find(|p| p.id == q || p.title.to_lowercase() == q_lower)
+        .cloned()
+        .or_else(|| {
+            if title_candidates.len() == 1 {
+                Some(title_candidates[0].clone())
+            } else {
+                None
+            }
+        })
+    {
+        let scope = exact.scope.clone();
+        let id = exact.id.clone();
+        let detail = graph
+            .get_onenote_page_detail(&scope, &id, Some(exact))
+            .await?;
+        storage.upsert_onenote_page_detail(&detail)?;
+        let _ = storage.upsert_onenote_pages(std::slice::from_ref(&detail.summary));
+        return Ok(detail);
+    }
+
+    bail!("OneNote 페이지를 찾을 수 없습니다: {q}")
+}
+
+pub(crate) fn read_markdown_input_and_images(
+    body_arg: Option<&str>,
+    file_arg: Option<&Path>,
+    image_paths: &[PathBuf],
+) -> Result<(String, Vec<InlineImageUpload>)> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(b) = body_arg.filter(|s| !s.is_empty()) {
+        parts.push(b.to_string());
+    }
+    if let Some(path) = file_arg {
+        let from_file = std::fs::read_to_string(path)
+            .with_context(|| format!("Markdown 파일 읽기 실패: {}", path.display()))?;
+        if !from_file.is_empty() {
+            parts.push(from_file);
+        }
+    }
+    let mut markdown = parts.join("\n\n");
+
+    let mut uploads = Vec::with_capacity(image_paths.len());
+    for (idx, img_path) in image_paths.iter().enumerate() {
+        if !img_path.exists() || !img_path.is_file() {
+            bail!("이미지 파일을 찾을 수 없습니다: {}", img_path.display());
+        }
+        let mime_type = image_mime_for_path(img_path).with_context(|| {
+            format!(
+                "지원하지 않는 이미지 형식입니다(png/jpg/jpeg/gif/webp/bmp): {}",
+                img_path.display()
+            )
+        })?;
+        let bytes = std::fs::read(img_path)
+            .with_context(|| format!("이미지 파일 읽기 실패: {}", img_path.display()))?;
+        let file_name = img_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(ToString::to_string);
+        let temp_id = format!("img{}", idx + 1);
+        let marker = format!("name:{temp_id}");
+        if !markdown.contains(&marker) {
+            let alt = file_name.as_deref().unwrap_or("image");
+            if markdown.trim().is_empty() {
+                markdown = format!("![{alt}]({marker})");
+            } else {
+                markdown.push_str(&format!("\n\n![{alt}]({marker})"));
+            }
+        }
+        uploads.push(InlineImageUpload {
+            temp_id,
+            mime_type: mime_type.to_string(),
+            bytes,
+            file_name,
+        });
+    }
+
+    Ok((markdown, uploads))
+}
+
+pub(crate) async fn create_onenote_page_helper(
+    storage: &Storage,
+    graph: &GraphClient,
+    section_query: &str,
+    title: &str,
+    markdown_body: &str,
+    inline_images: Vec<InlineImageUpload>,
+    level: Option<i32>,
+) -> Result<(OnenoteSection, OnenotePageSummary)> {
+    let trimmed_title = title.trim();
+    if trimmed_title.is_empty() {
+        bail!("페이지 제목(--title)이 비어 있습니다.");
+    }
+    if let Some(lv) = level {
+        if !(0..=2).contains(&lv) {
+            bail!("페이지 들여쓰기 level 은 0, 1, 2 중 하나여야 합니다 (입력값: {lv}).");
+        }
+    }
+    let sec = resolve_onenote_section(storage, graph, section_query, false, false).await?;
+    let outgoing = OutgoingOnenotePage {
+        title: trimmed_title.to_string(),
+        markdown_body: markdown_body.to_string(),
+        inline_images,
+        level,
+    };
+    let mut created = graph
+        .create_onenote_page(&sec.scope, &sec.id, &outgoing)
+        .await?;
+    if created.section_id.is_empty() {
+        created.section_id = sec.id.clone();
+    }
+    if created.section_name.is_none() {
+        created.section_name = Some(sec.display_name.clone());
+    }
+    if created.notebook_id.is_none() {
+        created.notebook_id = sec.notebook_id.clone();
+    }
+    if created.notebook_name.is_none() {
+        created.notebook_name = sec.notebook_name.clone();
+    }
+    let _ = storage.upsert_onenote_pages(std::slice::from_ref(&created));
+    Ok((sec, created))
+}
+
+pub(crate) async fn append_onenote_page_helper(
+    storage: &Storage,
+    graph: &GraphClient,
+    page_query: &str,
+    markdown: &str,
+    inline_images: &[InlineImageUpload],
+) -> Result<serde_json::Value> {
+    if markdown.trim().is_empty() && inline_images.is_empty() {
+        bail!("추가할 Markdown 본문 또는 이미지(--file / --image)를 지정하세요.");
+    }
+    let detail = load_onenote_page_detail(storage, graph, page_query, false).await?;
+    graph
+        .append_onenote_page_markdown(
+            &detail.summary.scope,
+            &detail.summary.id,
+            detail.primary_div_id.as_deref(),
+            markdown,
+            inline_images,
+        )
+        .await?;
+
+    let refreshed = graph
+        .get_onenote_page_detail(
+            &detail.summary.scope,
+            &detail.summary.id,
+            Some(detail.summary.clone()),
+        )
+        .await
+        .ok();
+    if let Some(ref d) = refreshed {
+        let _ = storage.upsert_onenote_page_detail(d);
+        let _ = storage.upsert_onenote_pages(std::slice::from_ref(&d.summary));
+    }
+
+    Ok(json!({
+        "ok": true,
+        "page_key": detail.summary.page_key,
+        "page_id": detail.summary.id,
+        "primary_div_id": detail.primary_div_id,
+        "page": refreshed,
+    }))
+}
+
+pub(crate) async fn update_onenote_page_helper(
+    storage: &Storage,
+    graph: &GraphClient,
+    page_query: &str,
+    new_title: Option<&str>,
+    new_markdown: Option<&str>,
+    block_id: Option<&str>,
+) -> Result<serde_json::Value> {
+    let title_opt = new_title.map(str::trim).filter(|s| !s.is_empty());
+    let md_opt = new_markdown.filter(|s| !s.trim().is_empty());
+    let bid_opt = block_id.map(str::trim).filter(|s| !s.is_empty());
+
+    if bid_opt.is_some() && md_opt.is_none() {
+        bail!("block_id 지정 시 교체할 Markdown 본문(--body 또는 --file)이 필요합니다.");
+    }
+    if title_opt.is_none() && md_opt.is_none() {
+        bail!("수정할 제목(--title) 또는 본문(--body / --file) 중 하나 이상을 지정하세요.");
+    }
+
+    let detail = load_onenote_page_detail(storage, graph, page_query, false).await?;
+    let commands: Vec<OnenotePatchCommand> = if let Some(bid) = bid_opt {
+        let mut cmds = vec![parser::onenote::build_replace_block_patch(
+            bid,
+            md_opt.unwrap_or_default(),
+        )];
+        if let Some(t) = title_opt {
+            cmds.push(OnenotePatchCommand {
+                target: "title".to_string(),
+                action: "replace".to_string(),
+                position: None,
+                content: t.to_string(),
+            });
+        }
+        cmds
+    } else if let Some(md) = md_opt {
+        parser::onenote::build_replace_page_body_commands(&detail, title_opt, md)
+    } else {
+        vec![OnenotePatchCommand {
+            target: "title".to_string(),
+            action: "replace".to_string(),
+            position: None,
+            content: title_opt.unwrap_or_default().to_string(),
+        }]
+    };
+
+    if commands.is_empty() {
+        bail!("적용할 OneNote PATCH 명령을 생성할 수 없습니다.");
+    }
+
+    graph
+        .patch_onenote_page_commands(&detail.summary.scope, &detail.summary.id, &commands)
+        .await?;
+
+    let refreshed = graph
+        .get_onenote_page_detail(
+            &detail.summary.scope,
+            &detail.summary.id,
+            Some(detail.summary.clone()),
+        )
+        .await
+        .ok();
+    if let Some(ref d) = refreshed {
+        let _ = storage.upsert_onenote_page_detail(d);
+        let _ = storage.upsert_onenote_pages(std::slice::from_ref(&d.summary));
+    }
+
+    Ok(json!({
+        "ok": true,
+        "page_key": detail.summary.page_key,
+        "page_id": detail.summary.id,
+        "commands_applied": commands.len(),
+        "page": refreshed,
+    }))
+}
+
+pub(crate) async fn toggle_onenote_todo_helper(
+    storage: &Storage,
+    graph: &GraphClient,
+    page_query: &str,
+    block_id: Option<&str>,
+    todo_index: Option<usize>,
+) -> Result<serde_json::Value> {
+    let bid_opt = block_id.map(str::trim).filter(|s| !s.is_empty());
+    if bid_opt.is_none() && todo_index.is_none() {
+        bail!("체크박스 토글을 위해 --block-id <element_id> 또는 --index <todo_index> 를 지정하세요.");
+    }
+
+    let detail = load_onenote_page_detail(storage, graph, page_query, false).await?;
+    let target_block: &OnenoteBlock = if let Some(bid) = bid_opt {
+        let clean = bid.trim_start_matches('#');
+        detail
+            .blocks
+            .iter()
+            .find(|b| {
+                b.element_id
+                    .as_deref()
+                    .is_some_and(|eid| eid.trim_start_matches('#') == clean)
+            })
+            .with_context(|| format!("페이지에서 block_id '{bid}' 를 찾을 수 없습니다."))?
+    } else {
+        let idx = todo_index.unwrap_or(0);
+        let todo_blocks: Vec<&OnenoteBlock> = detail
+            .blocks
+            .iter()
+            .filter(|b| b.tag.as_ref().is_some_and(OnenoteTagKind::is_todo))
+            .collect();
+        if todo_blocks.is_empty() {
+            bail!("이 페이지에는 토글할 OneNote to-do 체크박스가 없습니다.");
+        }
+        todo_blocks.get(idx).copied().with_context(|| {
+            format!(
+                "체크박스 인덱스 {idx} 가 범위를 벗어났습니다 (총 {}개)",
+                todo_blocks.len()
+            )
+        })?
+    };
+
+    let (cmd, completed) = parser::onenote::build_toggle_todo_patch(target_block).context(
+        "선택한 블록은 OneNote to-do 태그가 아니거나 element_id(?includeIDs=true)가 없습니다.",
+    )?;
+
+    graph
+        .patch_onenote_page_commands(
+            &detail.summary.scope,
+            &detail.summary.id,
+            std::slice::from_ref(&cmd),
+        )
+        .await?;
+
+    let refreshed = graph
+        .get_onenote_page_detail(
+            &detail.summary.scope,
+            &detail.summary.id,
+            Some(detail.summary.clone()),
+        )
+        .await
+        .ok();
+    if let Some(ref d) = refreshed {
+        let _ = storage.upsert_onenote_page_detail(d);
+        let _ = storage.upsert_onenote_pages(std::slice::from_ref(&d.summary));
+    }
+
+    Ok(json!({
+        "ok": true,
+        "page_key": detail.summary.page_key,
+        "page_id": detail.summary.id,
+        "element_id": target_block.element_id,
+        "completed": completed,
+        "command": cmd,
+        "page": refreshed,
+    }))
+}
+
+pub(crate) async fn delete_onenote_page_helper(
+    storage: &Storage,
+    graph: &GraphClient,
+    page_query: &str,
+) -> Result<serde_json::Value> {
+    let q = page_query.trim();
+    if q.is_empty() {
+        bail!("삭제할 페이지 ID 또는 검색어가 비어 있습니다.");
+    }
+    let (page_key, scope, page_id) = if let Some(sum) = storage.get_onenote_page_summary(q)? {
+        (sum.page_key, sum.scope, sum.id)
+    } else if !q.contains('|') {
+        let hits = storage.search_onenote_pages(q, None, 5)?;
+        if let Some(hit) = pick_search_hit_for_title(&hits, q) {
+            (hit.page_key.clone(), hit.scope.clone(), hit.page_id.clone())
+        } else {
+            let (s, id) = split_onenote_entity_key(q);
+            (s.make_entity_key(&id), s, id)
+        }
+    } else {
+        let (s, id) = split_onenote_entity_key(q);
+        (s.make_entity_key(&id), s, id)
+    };
+
+    graph.delete_onenote_page(&scope, &page_id).await?;
+    let _ = storage.delete_onenote_page(&page_key);
+    if page_key != page_id {
+        let _ = storage.delete_onenote_page(&page_id);
+    }
+
+    Ok(json!({
+        "ok": true,
+        "page_key": page_key,
+        "page_id": page_id,
+    }))
+}
+
+pub(crate) async fn search_onenote_pages_helper(
+    storage: &Storage,
+    graph: &GraphClient,
+    query: &str,
+    section_query: Option<&str>,
+    refresh: bool,
+    limit: usize,
+) -> Result<Vec<OnenoteSearchHit>> {
+    let q = query.trim();
+    if q.is_empty() {
+        bail!("검색어가 비어 있습니다.");
+    }
+    let limit = clamp_limit(limit);
+
+    if refresh {
+        sync::bootstrap_onenote(graph, storage).await?;
+    }
+
+    let section_filter = match section_query.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(sec_q) => {
+            let sec = match resolve_onenote_section(storage, graph, sec_q, false, true).await {
+                Ok(s) => s,
+                Err(_) => resolve_onenote_section(storage, graph, sec_q, false, false).await?,
+            };
+            Some(sec.section_key)
+        }
+        None => None,
+    };
+
+    let hits = storage.search_onenote_pages(q, section_filter.as_deref(), limit)?;
+    if !hits.is_empty() || refresh {
+        return Ok(hits);
+    }
+
+    if storage.list_onenote_notebooks()?.is_empty() {
+        let _ = sync::bootstrap_onenote(graph, storage).await;
+        return storage.search_onenote_pages(q, section_filter.as_deref(), limit);
+    }
+
+    Ok(hits)
+}
+
+pub(crate) fn select_onenote_resource<'a>(
+    detail: &'a OnenotePageDetail,
+    index: Option<usize>,
+    prefer_image: bool,
+) -> Result<(usize, &'a OnenoteResource)> {
+    if detail.resources.is_empty() {
+        bail!(
+            "이 OneNote 페이지에는 다운로드 가능한 리소스가 없습니다: {}",
+            detail.summary.title
+        );
+    }
+    if let Some(idx) = index {
+        let res = detail.resources.get(idx).with_context(|| {
+            format!(
+                "리소스 인덱스 {idx} 가 범위를 벗어났습니다 (총 {}개)",
+                detail.resources.len()
+            )
+        })?;
+        return Ok((idx, res));
+    }
+    if prefer_image {
+        if let Some((idx, res)) = detail
+            .resources
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.is_image)
+        {
+            return Ok((idx, res));
+        }
+    }
+    Ok((0, &detail.resources[0]))
+}
+
+pub(crate) fn default_resource_filename(res: &OnenoteResource, index: usize) -> String {
+    if let Some(name) = res.file_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let safe: String = name
+            .chars()
+            .map(|c| {
+                if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                    '_'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        if !safe.is_empty() {
+            return safe;
+        }
+    }
+    let ext = match res.mime_type.to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "application/pdf" => "pdf",
+        _ => "bin",
+    };
+    format!("onenote-resource-{index}.{ext}")
+}
+
+fn spans_to_plain(spans: &[RichSpan]) -> String {
+    spans.iter().map(|s| s.text.as_str()).collect()
+}
+
+fn format_onenote_blocks_human(detail: &OnenotePageDetail) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# {} ({})\n",
+        detail.summary.title, detail.summary.page_key
+    ));
+    if let Some(ref div_id) = detail.primary_div_id {
+        out.push_str(&format!("primary_div_id: {div_id}\n"));
+    }
+    for (idx, b) in detail.blocks.iter().enumerate() {
+        let id_badge = b
+            .element_id
+            .as_deref()
+            .map(|id| format!("[id={id}] "))
+            .unwrap_or_default();
+        let tag_badge = match &b.tag {
+            Some(OnenoteTagKind::Todo { completed: true }) => "[x] ".to_string(),
+            Some(OnenoteTagKind::Todo { completed: false }) => "[ ] ".to_string(),
+            Some(other) => format!("[tag={}] ", other.data_tag_value()),
+            None => String::new(),
+        };
+        let summary = match &b.kind {
+            OnenoteBlockKind::Heading { level, spans } => {
+                format!("H{level}: {}", spans_to_plain(spans))
+            }
+            OnenoteBlockKind::Paragraph { spans } => spans_to_plain(spans),
+            OnenoteBlockKind::ListItem {
+                ordered,
+                index,
+                depth,
+                spans,
+            } => {
+                let bullet = if *ordered {
+                    format!("{}.", index.unwrap_or(1))
+                } else {
+                    "-".to_string()
+                };
+                format!(
+                    "{}{} {}",
+                    "  ".repeat(*depth as usize),
+                    bullet,
+                    spans_to_plain(spans)
+                )
+            }
+            OnenoteBlockKind::Quote { spans } => format!("> {}", spans_to_plain(spans)),
+            OnenoteBlockKind::CodeBlock { lang, code } => {
+                format!(
+                    "```{}\n{}\n```",
+                    lang.as_deref().unwrap_or_default(),
+                    code
+                )
+            }
+            OnenoteBlockKind::Table { headers, rows } => {
+                format!("Table ({} cols × {} rows)", headers.len(), rows.len())
+            }
+            OnenoteBlockKind::Image {
+                resource_index,
+                alt,
+                ..
+            } => format!(
+                "Image[#{resource_index}] {}",
+                alt.as_deref().unwrap_or_default()
+            ),
+            OnenoteBlockKind::Attachment {
+                resource_index,
+                name,
+                mime_type,
+                ..
+            } => format!("Attachment[#{resource_index}] {name} ({mime_type})"),
+            OnenoteBlockKind::Divider => "---".to_string(),
+        };
+        out.push_str(&format!("{idx:02}: {id_badge}{tag_badge}{summary}\n"));
+    }
+    out
+}
+
+async fn cmd_notes_notebooks(
+    cfg: &AppConfig,
+    include_teams: bool,
+    refresh: bool,
+    offline: bool,
+    json_out: bool,
+) -> Result<()> {
+    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
+    let notebooks =
+        load_onenote_notebooks(&storage, &graph, include_teams, refresh, offline).await?;
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "notebooks": notebooks }))?
+        );
+    } else if notebooks.is_empty() {
+        println!("표시할 OneNote 필기장이 없습니다.");
+    } else {
+        for nb in &notebooks {
+            let badge = if nb.scope.is_personal() {
+                "개인".to_string()
+            } else {
+                format!("공유:{}", nb.scope.owner_label())
+            };
+            let def = if nb.is_default { " [기본]" } else { "" };
+            println!(
+                "[{}] {}{}  ({})",
+                badge, nb.display_name, def, nb.notebook_key
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_notes_create_notebook(
+    cfg: &AppConfig,
+    name: &str,
+    group: Option<&str>,
+    site: Option<&str>,
+    json_out: bool,
+) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("필기장 이름이 비어 있습니다.");
+    }
+    let scope = build_onenote_scope_from_args(group, site)?;
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let created = graph.create_onenote_notebook(&scope, name.trim()).await?;
+    storage.upsert_onenote_notebooks(std::slice::from_ref(&created))?;
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "notebook": created,
+            }))?
+        );
+    } else {
+        println!(
+            "OneNote 필기장 생성 완료: {} ({})",
+            created.display_name, created.notebook_key
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_notes_sections(
+    cfg: &AppConfig,
+    notebook: Option<&str>,
+    refresh: bool,
+    offline: bool,
+    json_out: bool,
+) -> Result<()> {
+    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
+    let (nb, sections) =
+        load_onenote_sections(&storage, &graph, notebook, refresh, offline).await?;
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "notebook": nb,
+                "sections": sections,
+            }))?
+        );
+    } else if sections.is_empty() {
+        println!("표시할 OneNote 섹션이 없습니다.");
+    } else {
+        for sec in &sections {
+            let nb_label = sec.notebook_name.as_deref().unwrap_or("-");
+            let sg_label = sec
+                .parent_section_group_name
+                .as_deref()
+                .map(|g| format!("{g}/"))
+                .unwrap_or_default();
+            println!(
+                "{}/{}{}  ({})",
+                nb_label, sg_label, sec.display_name, sec.section_key
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_notes_create_section(
+    cfg: &AppConfig,
+    notebook: &str,
+    name: &str,
+    json_out: bool,
+) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("섹션 이름이 비어 있습니다.");
+    }
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let nb = resolve_onenote_notebook(&storage, &graph, notebook, true, false, false).await?;
+    let mut created = graph
+        .create_onenote_section(&nb.scope, &nb.id, name.trim())
+        .await?;
+    if created.notebook_id.is_none() {
+        created.notebook_id = Some(nb.id.clone());
+    }
+    if created.notebook_name.is_none() {
+        created.notebook_name = Some(nb.display_name.clone());
+    }
+    storage.upsert_onenote_sections(std::slice::from_ref(&created))?;
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "notebook": nb,
+                "section": created,
+            }))?
+        );
+    } else {
+        println!(
+            "OneNote 섹션 생성 완료: {}/{} ({})",
+            nb.display_name, created.display_name, created.section_key
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_notes_pages(
+    cfg: &AppConfig,
+    section: &str,
+    limit: usize,
+    refresh: bool,
+    offline: bool,
+    json_out: bool,
+) -> Result<()> {
+    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
+    let (sec, pages) =
+        list_onenote_pages_helper(&storage, &graph, section, limit, refresh, offline).await?;
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "section": sec,
+                "pages": pages,
+            }))?
+        );
+    } else if pages.is_empty() {
+        println!("표시할 OneNote 페이지가 없습니다.");
+    } else {
+        for p in &pages {
+            let indent = "  ".repeat(p.level.clamp(0, 4) as usize);
+            let todo_mark = if p.has_todo { "[todo] " } else { "" };
+            let modified = p.last_modified_at.as_deref().unwrap_or("-");
+            println!(
+                "{indent}{todo_mark}{}  [{}] ({})",
+                p.title, modified, p.page_key
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_notes_read(
+    cfg: &AppConfig,
+    page: &str,
+    format: &str,
+    preview_images: bool,
+    offline: bool,
+    json_out: bool,
+) -> Result<()> {
+    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
+    let detail = load_onenote_page_detail(&storage, &graph, page, offline).await?;
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "format": format,
+                "page": detail,
+            }))?
+        );
+        return Ok(());
+    }
+
+    match format {
+        "xhtml" => println!("{}", detail.raw_xhtml),
+        "plain" => {
+            println!("# {}\n", detail.summary.title);
+            println!("{}", detail.body_plain);
+        }
+        "blocks" => print!("{}", format_onenote_blocks_human(&detail)),
+        _ => {
+            println!("# {}\n", detail.summary.title);
+            println!("{}", detail.body_markdown);
+        }
+    }
+
+    if preview_images && !offline {
+        let (cols, rows) = default_preview_dimensions(None, None);
+        for res in detail.resources.iter().filter(|r| r.is_image) {
+            let url = res.fullres_url.as_deref().unwrap_or(&res.resource_url);
+            if let Ok(bytes) = graph.download_onenote_resource_bytes(url).await {
+                if let Ok(rendered) = img_preview::render_ansi_stdout(&bytes, cols, rows) {
+                    println!();
+                    print!("{rendered}");
+                    if !rendered.ends_with('\n') {
+                        println!();
+                    }
+                }
+            }
+        }
+        io::stdout().flush()?;
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_notes_create(
+    cfg: &AppConfig,
+    section: &str,
+    title: &str,
+    markdown_body: Option<&str>,
+    file: Option<&Path>,
+    image: &[PathBuf],
+    level: Option<i32>,
+    json_out: bool,
+) -> Result<()> {
+    let (md, inline_images) = read_markdown_input_and_images(markdown_body, file, image)?;
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let (sec, created) =
+        create_onenote_page_helper(&storage, &graph, section, title, &md, inline_images, level)
+            .await?;
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "section": sec,
+                "page": created,
+            }))?
+        );
+    } else {
+        println!(
+            "OneNote 페이지 생성 완료: {} ({})",
+            created.title, created.page_key
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_notes_append(
+    cfg: &AppConfig,
+    page: &str,
+    markdown_body: Option<&str>,
+    file: Option<&Path>,
+    image: &[PathBuf],
+    json_out: bool,
+) -> Result<()> {
+    let (md, inline_images) = read_markdown_input_and_images(markdown_body, file, image)?;
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let out = append_onenote_page_helper(&storage, &graph, page, &md, &inline_images).await?;
+
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!(
+            "OneNote 페이지 내용 추가 완료: {}",
+            out["page_key"].as_str().unwrap_or(page)
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_notes_update(
+    cfg: &AppConfig,
+    page: &str,
+    title: Option<&str>,
+    body: Option<&str>,
+    file: Option<&Path>,
+    block_id: Option<&str>,
+    json_out: bool,
+) -> Result<()> {
+    let (md, _) = read_markdown_input_and_images(body, file, &[])?;
+    let md_opt = if body.is_some() || file.is_some() {
+        Some(md.as_str())
+    } else {
+        None
+    };
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let out =
+        update_onenote_page_helper(&storage, &graph, page, title, md_opt, block_id).await?;
+
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!(
+            "OneNote 페이지 수정 완료: {} ({}개 명령 적용)",
+            out["page_key"].as_str().unwrap_or(page),
+            out["commands_applied"].as_u64().unwrap_or(1)
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_notes_check(
+    cfg: &AppConfig,
+    page: &str,
+    block_id: Option<&str>,
+    index: Option<usize>,
+    json_out: bool,
+) -> Result<()> {
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let out = toggle_onenote_todo_helper(&storage, &graph, page, block_id, index).await?;
+
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        let state = if out["completed"].as_bool().unwrap_or(false) {
+            "완료 [x]"
+        } else {
+            "미완료 [ ]"
+        };
+        println!(
+            "OneNote 체크박스 토글 ({state}): {} ({})",
+            out["element_id"].as_str().unwrap_or("-"),
+            out["page_key"].as_str().unwrap_or(page)
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_notes_delete(
+    cfg: &AppConfig,
+    page: &str,
+    yes: bool,
+    json_out: bool,
+) -> Result<()> {
+    if json_out && !yes {
+        bail!("{DELETE_JSON_REQUIRES_YES}");
+    }
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let answer = if yes {
+        None
+    } else {
+        Some(prompt(&format!(
+            "OneNote 페이지 '{page}' 를 삭제합니다. 계속하려면 'yes' 입력: "
+        ))?)
+    };
+    delete_gate(yes, json_out, answer.as_deref())?;
+
+    let out = delete_onenote_page_helper(&storage, &graph, page).await?;
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!(
+            "OneNote 페이지 삭제 완료: {}",
+            out["page_key"].as_str().unwrap_or(page)
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_notes_search(
+    cfg: &AppConfig,
+    query: &str,
+    section: Option<&str>,
+    refresh: bool,
+    limit: usize,
+    json_out: bool,
+) -> Result<()> {
+    let (_auth, graph, storage) = open_runtime(cfg, refresh).await?;
+    let hits =
+        search_onenote_pages_helper(&storage, &graph, query, section, refresh, limit).await?;
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "hits": hits }))?
+        );
+    } else if hits.is_empty() {
+        println!("일치하는 OneNote 페이지가 없습니다.");
+    } else {
+        for h in &hits {
+            let loc = match (&h.notebook_name, &h.section_name) {
+                (Some(nb), Some(sec)) => format!("{nb}/{sec}"),
+                (None, Some(sec)) => sec.clone(),
+                _ => h.section_id.clone(),
+            };
+            println!(
+                "[{}] {}  ({})  {}",
+                loc,
+                h.title,
+                h.page_key,
+                truncate_single_line(&h.snippet, 80)
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_notes_resource(
+    cfg: &AppConfig,
+    page: &str,
+    index: Option<usize>,
+    out: Option<&Path>,
+    preview: bool,
+    json_out: bool,
+) -> Result<()> {
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let detail = load_onenote_page_detail(&storage, &graph, page, false).await?;
+    let (resolved_idx, res) = select_onenote_resource(&detail, index, preview)?;
+    let url = res.fullres_url.as_deref().unwrap_or(&res.resource_url);
+    let bytes = graph.download_onenote_resource_bytes(url).await?;
+
+    if preview && out.is_none() && !json_out {
+        let (cols, rows) = default_preview_dimensions(None, None);
+        let rendered = img_preview::render_ansi_stdout(&bytes, cols, rows)?;
+        print!("{rendered}");
+        if !rendered.ends_with('\n') {
+            println!();
+        }
+        io::stdout().flush()?;
+        return Ok(());
+    }
+
+    let file_name = default_resource_filename(res, resolved_idx);
+    let target_path = match out {
+        Some(p) if p.is_dir() => p.join(&file_name),
+        Some(p) => p.to_path_buf(),
+        None => cfg.resolved_download_dir().join(&file_name),
+    };
+    config::ensure_parent(&target_path)?;
+    std::fs::write(&target_path, &bytes)
+        .with_context(|| format!("OneNote 리소스 저장 실패: {}", target_path.display()))?;
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "page_key": detail.summary.page_key,
+                "index": resolved_idx,
+                "mime_type": res.mime_type,
+                "file_name": file_name,
+                "path": target_path,
+                "bytes_written": bytes.len(),
+            }))?
+        );
+    } else {
+        println!(
+            "OneNote 리소스 다운로드 완료: {} ({} bytes)",
+            target_path.display(),
+            bytes.len()
+        );
+        if preview && res.is_image {
+            let (cols, rows) = default_preview_dimensions(None, None);
+            if let Ok(rendered) = img_preview::render_ansi_stdout(&bytes, cols, rows) {
+                print!("{rendered}");
+                if !rendered.ends_with('\n') {
+                    println!();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn format_unix_ts(ts: i64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
         .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
@@ -5449,5 +8033,181 @@ mod tests {
         delete_gate(false, false, Some("YES")).unwrap();
         assert!(delete_gate(false, false, Some("no")).is_err());
         assert!(delete_gate(false, false, None).is_err());
+    }
+
+    #[test]
+    fn parses_onenote_persona_and_shared_notes_commands() {
+        let cli = OnenoteCli::try_parse_from(["onenote"]).unwrap();
+        assert!(cli.command.is_none());
+
+        let cli = OnenoteCli::try_parse_from(["onenote", "ls", "--personal-only", "--json"]).unwrap();
+        match cli.command.unwrap() {
+            OnenoteCommand::Notebooks {
+                personal_only,
+                include_teams,
+                json,
+                ..
+            } => {
+                assert!(personal_only);
+                assert!(include_teams);
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli = OnenoteCli::try_parse_from([
+            "onenote", "create", "업무/회의", "--title", "주간 회의록", "배포 준비", "--image", "a.png",
+            "--level", "1", "--json",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            OnenoteCommand::Create {
+                section,
+                title,
+                markdown_body,
+                image,
+                level,
+                json,
+                ..
+            } => {
+                assert_eq!(section, "업무/회의");
+                assert_eq!(title, "주간 회의록");
+                assert_eq!(markdown_body.as_deref(), Some("배포 준비"));
+                assert_eq!(image, vec![PathBuf::from("a.png")]);
+                assert_eq!(level, Some(1));
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(OnenoteCli::try_parse_from(["onenote", "create", "s", "--title", "t", "--level", "3"]).is_err());
+
+        let cli = OnenoteCli::try_parse_from(["onenote", "cat", "me|p1", "--format", "blocks"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            OnenoteCommand::Read { ref format, .. } if format == "blocks"
+        ));
+        assert!(OnenoteCli::try_parse_from(["onenote", "read", "p", "--format", "pdf"]).is_err());
+
+        let cli = OnenoteCli::try_parse_from(["onenote", "check", "me|p1", "--index", "2"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            OnenoteCommand::Check { index: Some(2), block_id: None, .. }
+        ));
+
+        // `update <page>` edits a page; self-update is `self-update` / `upgrade`.
+        let cli = OnenoteCli::try_parse_from([
+            "onenote", "update", "me|p1", "--block-id", "p:{a}{1}", "--body", "교체",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            OnenoteCommand::Update { block_id: Some(_), body: Some(_), .. }
+        ));
+        let cli = OnenoteCli::try_parse_from(["onenote", "upgrade", "--check"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            OnenoteCommand::SelfUpdate { check: true, .. }
+        ));
+        let cli = OnenoteCli::try_parse_from(["onenote", "doctor", "--probe"]).unwrap();
+        assert!(matches!(cli.command.unwrap(), OnenoteCommand::Doctor { probe: true, .. }));
+        let cli = OnenoteCli::try_parse_from(["onenote", "api", "--port", "9100"]).unwrap();
+        assert!(matches!(cli.command.unwrap(), OnenoteCommand::Serve { port: 9100, .. }));
+        let cli = OnenoteCli::try_parse_from(["onenote", "mcp"]).unwrap();
+        assert!(matches!(cli.command.unwrap(), OnenoteCommand::Mcp));
+
+        // `teams notes <sub>` and `outlook notes <sub>` share NotesCommand.
+        let cli = Cli::try_parse_from(["teams", "notes", "search", "배포", "--limit", "5", "--refresh"]).unwrap();
+        match cli.command.unwrap() {
+            Command::Notes {
+                command: NotesCommand::Search { query, limit, refresh, .. },
+            } => {
+                assert_eq!(query, "배포");
+                assert_eq!(limit, 5);
+                assert!(refresh);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let cli = OutlookCli::try_parse_from(["outlook", "notes", "pages", "업무/회의", "--offline"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            OutlookCommand::Notes {
+                command: NotesCommand::Pages { offline: true, limit: 50, .. }
+            }
+        ));
+        let cli = Cli::try_parse_from(["teams", "notes", "delete", "me|p1", "--yes", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Notes {
+                command: NotesCommand::Delete { yes: true, json: true, .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn resolves_onenote_notebooks_and_sections_fuzzily() {
+        let nb = |key: &str, id: &str, name: &str, scope: OnenoteScope| OnenoteNotebook {
+            notebook_key: key.to_string(),
+            id: id.to_string(),
+            scope,
+            display_name: name.to_string(),
+            color: None,
+            is_default: false,
+            is_shared: false,
+            user_role: None,
+            created_at: None,
+            last_modified_at: None,
+            created_by: None,
+            web_url: None,
+        };
+        let team = OnenoteScope::Group {
+            group_id: "g1".to_string(),
+            group_name: Some("플랫폼팀".to_string()),
+        };
+        let notebooks = vec![
+            nb("me|nb1", "nb1", "업무", OnenoteScope::Me),
+            nb("group:g1|nb2", "nb2", "업무", team.clone()),
+            nb("me|nb3", "nb3", "개인 일기", OnenoteScope::Me),
+        ];
+        assert_eq!(resolve_onenote_notebook_from_slice(&notebooks, "group:g1|nb2").unwrap().id, "nb2");
+        assert_eq!(resolve_onenote_notebook_from_slice(&notebooks, "nb3").unwrap().id, "nb3");
+        // Duplicate name prefers the personal notebook; owner-qualified picks the team one.
+        assert_eq!(resolve_onenote_notebook_from_slice(&notebooks, "업무").unwrap().id, "nb1");
+        assert_eq!(resolve_onenote_notebook_from_slice(&notebooks, "플랫폼팀/업무").unwrap().id, "nb2");
+        assert_eq!(resolve_onenote_notebook_from_slice(&notebooks, "일기").unwrap().id, "nb3");
+        assert!(resolve_onenote_notebook_from_slice(&notebooks, "없는필기장").is_err());
+        assert_eq!(filter_notebooks_by_scope(notebooks.clone(), false).len(), 2);
+
+        let sec = |key: &str, id: &str, nb_name: &str, name: &str| OnenoteSection {
+            section_key: key.to_string(),
+            id: id.to_string(),
+            scope: OnenoteScope::Me,
+            notebook_id: None,
+            notebook_name: Some(nb_name.to_string()),
+            parent_section_group_id: None,
+            parent_section_group_name: None,
+            display_name: name.to_string(),
+            color: None,
+            is_default: false,
+            pages_url: None,
+            created_at: None,
+            last_modified_at: None,
+            web_url: None,
+        };
+        let sections = vec![
+            sec("me|s1", "s1", "업무", "회의"),
+            sec("me|s2", "s2", "개인 일기", "회의"),
+            sec("me|s3", "s3", "업무", "아이디어"),
+        ];
+        assert_eq!(resolve_onenote_section_from_slice(&sections, "업무/회의").unwrap().id, "s1");
+        assert_eq!(resolve_onenote_section_from_slice(&sections, "me|s2").unwrap().id, "s2");
+        assert_eq!(resolve_onenote_section_from_slice(&sections, "아이디어").unwrap().id, "s3");
+        assert!(resolve_onenote_section_from_slice(&sections, "회의").is_err());
+
+        assert!(build_onenote_scope_from_args(Some("g"), Some("s")).is_err());
+        assert_eq!(build_onenote_scope_from_args(None, None).unwrap(), OnenoteScope::Me);
+        assert_eq!(
+            build_onenote_scope_from_args(Some(" g1 "), None).unwrap().scope_key(),
+            "group:g1"
+        );
     }
 }

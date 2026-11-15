@@ -59,6 +59,11 @@ fn palette_items() -> Vec<PaletteItem> {
             action: Action::SelectNavTab(6),
         },
         PaletteItem {
+            label: "노트(OneNote) 탭으로 이동",
+            shortcut: "Ctrl+8",
+            action: Action::SelectNavTab(7),
+        },
+        PaletteItem {
             label: "Teams 모드로 전환",
             shortcut: "Alt+T",
             action: Action::SwitchPersona(crate::config::Persona::Teams),
@@ -67,6 +72,11 @@ fn palette_items() -> Vec<PaletteItem> {
             label: "Outlook 모드로 전환",
             shortcut: "Alt+O",
             action: Action::SwitchPersona(crate::config::Persona::Outlook),
+        },
+        PaletteItem {
+            label: "OneNote 모드로 전환",
+            shortcut: "Alt+N",
+            action: Action::SwitchPersona(crate::config::Persona::OneNote),
         },
         PaletteItem {
             label: "새 채팅 만들기",
@@ -87,6 +97,26 @@ fn palette_items() -> Vec<PaletteItem> {
             label: "새 연락처 추가",
             shortcut: "n (연락처)",
             action: Action::OpenOverlay(OverlayKind::ContactCreate),
+        },
+        PaletteItem {
+            label: "새 노트 페이지 만들기",
+            shortcut: "n (노트탭)",
+            action: Action::OnenoteOpenCreatePage { subpage: false },
+        },
+        PaletteItem {
+            label: "새 하위 페이지 만들기",
+            shortcut: "N (노트탭)",
+            action: Action::OnenoteOpenCreatePage { subpage: true },
+        },
+        PaletteItem {
+            label: "새 노트 섹션 만들기",
+            shortcut: "S (노트탭)",
+            action: Action::OnenoteOpenCreateSection,
+        },
+        PaletteItem {
+            label: "새 필기장 만들기",
+            shortcut: "B (노트탭)",
+            action: Action::OnenoteOpenCreateNotebook,
         },
         PaletteItem {
             label: "이미지 첨부 크게보기",

@@ -434,6 +434,117 @@ pub struct PatchTodoTaskBody {
     pub completed: bool,
 }
 
+// --- Microsoft OneNote Query & Body DTOs ---
+
+#[derive(Debug, Deserialize)]
+pub struct OnenoteNotebooksQuery {
+    #[serde(default = "default_true")]
+    pub include_teams: bool,
+    #[serde(default)]
+    pub refresh: bool,
+    #[serde(default)]
+    pub offline: bool,
+}
+
+impl Default for OnenoteNotebooksQuery {
+    fn default() -> Self {
+        Self {
+            include_teams: true,
+            refresh: false,
+            offline: false,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateOnenoteNotebookBody {
+    pub name: String,
+    #[serde(default)]
+    pub group_id: Option<String>,
+    #[serde(default)]
+    pub site_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct OnenoteSectionsQuery {
+    #[serde(default)]
+    pub notebook: Option<String>,
+    #[serde(default)]
+    pub refresh: bool,
+    #[serde(default)]
+    pub offline: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateOnenoteSectionBody {
+    pub notebook: String,
+    pub name: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct OnenotePagesQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub refresh: bool,
+    #[serde(default)]
+    pub offline: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateOnenotePageBody {
+    pub title: String,
+    #[serde(default, alias = "markdown_body")]
+    pub markdown: String,
+    #[serde(default)]
+    pub image_paths: Vec<String>,
+    #[serde(default)]
+    pub level: Option<i32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PatchOnenotePageBody {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default, alias = "markdown_body")]
+    pub markdown: Option<String>,
+    #[serde(default)]
+    pub block_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AppendOnenotePageBody {
+    #[serde(default, alias = "markdown_body")]
+    pub markdown: String,
+    #[serde(default)]
+    pub image_paths: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ToggleOnenoteTodoBody {
+    #[serde(default)]
+    pub block_id: Option<String>,
+    #[serde(default)]
+    pub todo_index: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OnenoteSearchQuery {
+    pub q: String,
+    #[serde(default)]
+    pub section: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub refresh: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct OnenoteResourceDownloadBody {
+    #[serde(default)]
+    pub out_dir: Option<String>,
+}
+
 /// Build the `axum::Router` for the local HTTP JSON API.
 pub fn build_router(
     config: AppConfig,
@@ -517,9 +628,46 @@ pub fn build_router(
             "/todo/lists/{list_id}/tasks/{task_id}",
             patch(patch_todo_task).delete(delete_todo_task),
         )
+        // Microsoft OneNote (canonical `/v1/onenote/*` + unversioned `/onenote/*` alias)
+        .nest("/v1/onenote", onenote_routes())
+        .nest("/onenote", onenote_routes())
+        .route("/openapi.json", get(openapi_spec))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+/// OneNote sub-router (mounted under `/v1/onenote` and `/onenote`).
+///
+/// Section/page keys look like `me|1-abc` or `group:{gid}|1-abc`; `axum::extract::Path`
+/// percent-decodes them (`%7C` → `|`, `%3A` → `:`) and raw Graph IDs are accepted too.
+fn onenote_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route(
+            "/notebooks",
+            get(list_onenote_notebooks).post(create_onenote_notebook),
+        )
+        .route(
+            "/sections",
+            get(list_onenote_sections).post(create_onenote_section),
+        )
+        .route(
+            "/sections/{section_key}/pages",
+            get(list_onenote_pages).post(create_onenote_page),
+        )
+        .route(
+            "/pages/{page_key}",
+            get(get_onenote_page)
+                .patch(patch_onenote_page)
+                .delete(delete_onenote_page),
+        )
+        .route("/pages/{page_key}/append", post(append_onenote_page))
+        .route("/pages/{page_key}/toggle-todo", post(toggle_onenote_todo))
+        .route(
+            "/pages/{page_key}/resources/{resource_index}/download",
+            post(download_onenote_resource),
+        )
+        .route("/search", get(search_onenote))
 }
 
 /// Start the HTTP JSON API server and background sync engine until stopped.
@@ -536,6 +684,7 @@ pub async fn run(
         sync::spawn_sync_engine(config.clone(), graph.clone(), storage.clone(), event_tx);
     sync_ctl.request(SyncCommand::RefreshConversations);
     sync_ctl.request(SyncCommand::RefreshOutlook);
+    sync_ctl.request(SyncCommand::RefreshOneNote);
 
     let app = build_router(config, graph, storage, opts.token);
 
@@ -1772,6 +1921,435 @@ async fn delete_todo_task(
     })))
 }
 
+// ---------------------------------------------------------------------------
+// Microsoft OneNote HTTP handlers (thin wrappers over shared `cli::*onenote*` helpers)
+// ---------------------------------------------------------------------------
+
+/// Maps OneNote helper errors to HTTP status codes (404 for unresolved entities, 400 for invalid input).
+fn onenote_api_error(err: anyhow::Error) -> ApiError {
+    let msg = format!("{err:#}");
+    let status = if msg.contains("찾을 수 없습니다") {
+        StatusCode::NOT_FOUND
+    } else if msg.contains("비어 있습니다")
+        || msg.contains("지정하세요")
+        || msg.contains("필요합니다")
+        || msg.contains("범위를 벗어났습니다")
+        || msg.contains("여러 ")
+        || msg.contains("동시에 지정할 수 없습니다")
+        || msg.contains("중 하나여야 합니다")
+        || msg.contains("to-do 태그가 아니거나")
+        || msg.contains("토글할 OneNote to-do")
+        || msg.contains("지원하지 않는 이미지")
+    {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    ApiError::new(status, msg)
+}
+
+fn onenote_image_paths(paths: &[String]) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+async fn list_onenote_notebooks(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<OnenoteNotebooksQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let notebooks = cli::load_onenote_notebooks(
+        &state.storage,
+        &state.graph,
+        query.include_teams,
+        query.refresh,
+        query.offline,
+    )
+    .await
+    .map_err(onenote_api_error)?;
+    Ok(Json(json!({ "notebooks": notebooks })))
+}
+
+async fn create_onenote_notebook(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateOnenoteNotebookBody>,
+) -> Result<Json<Value>, ApiError> {
+    if body.name.trim().is_empty() {
+        return Err(ApiError::bad_request("name must not be empty"));
+    }
+    let scope = cli::build_onenote_scope_from_args(body.group_id.as_deref(), body.site_id.as_deref())
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    let created = state
+        .graph
+        .create_onenote_notebook(&scope, body.name.trim())
+        .await?;
+    let _ = state
+        .storage
+        .upsert_onenote_notebooks(std::slice::from_ref(&created));
+    Ok(Json(json!({ "ok": true, "notebook": created })))
+}
+
+async fn list_onenote_sections(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<OnenoteSectionsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let (notebook, sections) = cli::load_onenote_sections(
+        &state.storage,
+        &state.graph,
+        query.notebook.as_deref(),
+        query.refresh,
+        query.offline,
+    )
+    .await
+    .map_err(onenote_api_error)?;
+    Ok(Json(json!({ "notebook": notebook, "sections": sections })))
+}
+
+async fn create_onenote_section(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateOnenoteSectionBody>,
+) -> Result<Json<Value>, ApiError> {
+    if body.notebook.trim().is_empty() {
+        return Err(ApiError::bad_request("notebook must not be empty"));
+    }
+    if body.name.trim().is_empty() {
+        return Err(ApiError::bad_request("name must not be empty"));
+    }
+    let nb = cli::resolve_onenote_notebook(
+        &state.storage,
+        &state.graph,
+        &body.notebook,
+        true,
+        false,
+        false,
+    )
+    .await
+    .map_err(onenote_api_error)?;
+    let mut created = state
+        .graph
+        .create_onenote_section(&nb.scope, &nb.id, body.name.trim())
+        .await?;
+    if created.notebook_id.is_none() {
+        created.notebook_id = Some(nb.id.clone());
+    }
+    if created.notebook_name.is_none() {
+        created.notebook_name = Some(nb.display_name.clone());
+    }
+    let _ = state
+        .storage
+        .upsert_onenote_sections(std::slice::from_ref(&created));
+    Ok(Json(json!({ "ok": true, "notebook": nb, "section": created })))
+}
+
+async fn list_onenote_pages(
+    State(state): State<Arc<AppState>>,
+    Path(section_key): Path<String>,
+    Query(query): Query<OnenotePagesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let (section, pages) = cli::list_onenote_pages_helper(
+        &state.storage,
+        &state.graph,
+        &section_key,
+        query.limit.unwrap_or(50),
+        query.refresh,
+        query.offline,
+    )
+    .await
+    .map_err(onenote_api_error)?;
+    Ok(Json(json!({ "section": section, "pages": pages })))
+}
+
+async fn create_onenote_page(
+    State(state): State<Arc<AppState>>,
+    Path(section_key): Path<String>,
+    Json(body): Json<CreateOnenotePageBody>,
+) -> Result<Json<Value>, ApiError> {
+    if body.title.trim().is_empty() {
+        return Err(ApiError::bad_request("title must not be empty"));
+    }
+    if let Some(lv) = body.level {
+        if !(0..=2).contains(&lv) {
+            return Err(ApiError::bad_request("level must be 0, 1, or 2"));
+        }
+    }
+    let images = onenote_image_paths(&body.image_paths);
+    let (markdown, inline_images) =
+        cli::read_markdown_input_and_images(Some(body.markdown.as_str()), None, &images)
+            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    let (section, page) = cli::create_onenote_page_helper(
+        &state.storage,
+        &state.graph,
+        &section_key,
+        &body.title,
+        &markdown,
+        inline_images,
+        body.level,
+    )
+    .await
+    .map_err(onenote_api_error)?;
+    Ok(Json(json!({ "ok": true, "section": section, "page": page })))
+}
+
+async fn get_onenote_page(
+    State(state): State<Arc<AppState>>,
+    Path(page_key): Path<String>,
+    Query(query): Query<OfflineQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let detail =
+        cli::load_onenote_page_detail(&state.storage, &state.graph, &page_key, query.offline)
+            .await
+            .map_err(onenote_api_error)?;
+    Ok(Json(json!({ "page": detail })))
+}
+
+async fn patch_onenote_page(
+    State(state): State<Arc<AppState>>,
+    Path(page_key): Path<String>,
+    Json(body): Json<PatchOnenotePageBody>,
+) -> Result<Json<Value>, ApiError> {
+    let has_title = body.title.as_deref().is_some_and(|s| !s.trim().is_empty());
+    let has_md = body.markdown.as_deref().is_some_and(|s| !s.trim().is_empty());
+    if !has_title && !has_md {
+        return Err(ApiError::bad_request(
+            "at least one of title or markdown must be provided",
+        ));
+    }
+    if body.block_id.as_deref().is_some_and(|s| !s.trim().is_empty()) && !has_md {
+        return Err(ApiError::bad_request("block_id requires markdown"));
+    }
+    let out = cli::update_onenote_page_helper(
+        &state.storage,
+        &state.graph,
+        &page_key,
+        body.title.as_deref(),
+        body.markdown.as_deref(),
+        body.block_id.as_deref(),
+    )
+    .await
+    .map_err(onenote_api_error)?;
+    Ok(Json(out))
+}
+
+async fn delete_onenote_page(
+    State(state): State<Arc<AppState>>,
+    Path(page_key): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let out = cli::delete_onenote_page_helper(&state.storage, &state.graph, &page_key)
+        .await
+        .map_err(onenote_api_error)?;
+    Ok(Json(out))
+}
+
+async fn append_onenote_page(
+    State(state): State<Arc<AppState>>,
+    Path(page_key): Path<String>,
+    Json(body): Json<AppendOnenotePageBody>,
+) -> Result<Json<Value>, ApiError> {
+    let images = onenote_image_paths(&body.image_paths);
+    if body.markdown.trim().is_empty() && images.is_empty() {
+        return Err(ApiError::bad_request(
+            "markdown or image_paths must be provided",
+        ));
+    }
+    let (markdown, inline_images) =
+        cli::read_markdown_input_and_images(Some(body.markdown.as_str()), None, &images)
+            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    let out = cli::append_onenote_page_helper(
+        &state.storage,
+        &state.graph,
+        &page_key,
+        &markdown,
+        &inline_images,
+    )
+    .await
+    .map_err(onenote_api_error)?;
+    Ok(Json(out))
+}
+
+async fn toggle_onenote_todo(
+    State(state): State<Arc<AppState>>,
+    Path(page_key): Path<String>,
+    Json(body): Json<ToggleOnenoteTodoBody>,
+) -> Result<Json<Value>, ApiError> {
+    let has_block = body.block_id.as_deref().is_some_and(|s| !s.trim().is_empty());
+    if !has_block && body.todo_index.is_none() {
+        return Err(ApiError::bad_request(
+            "block_id or todo_index must be provided",
+        ));
+    }
+    let out = cli::toggle_onenote_todo_helper(
+        &state.storage,
+        &state.graph,
+        &page_key,
+        body.block_id.as_deref(),
+        body.todo_index,
+    )
+    .await
+    .map_err(onenote_api_error)?;
+    Ok(Json(out))
+}
+
+async fn search_onenote(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<OnenoteSearchQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if query.q.trim().is_empty() {
+        return Err(ApiError::bad_request("q must not be empty"));
+    }
+    let hits = cli::search_onenote_pages_helper(
+        &state.storage,
+        &state.graph,
+        &query.q,
+        query.section.as_deref(),
+        query.refresh,
+        query.limit.unwrap_or(30),
+    )
+    .await
+    .map_err(onenote_api_error)?;
+    Ok(Json(json!({ "hits": hits })))
+}
+
+/// Download one image/file resource of a OneNote page to `out_dir`
+/// (default: the configured download directory) and report where it landed.
+async fn download_onenote_resource(
+    State(state): State<Arc<AppState>>,
+    Path((page_key, resource_index)): Path<(String, usize)>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let parsed: OnenoteResourceDownloadBody = if body.iter().all(u8::is_ascii_whitespace) {
+        OnenoteResourceDownloadBody::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| ApiError::bad_request(format!("invalid JSON body: {e}")))?
+    };
+
+    let detail = cli::load_onenote_page_detail(&state.storage, &state.graph, &page_key, false)
+        .await
+        .map_err(onenote_api_error)?;
+    let (resolved_idx, res) =
+        cli::select_onenote_resource(&detail, Some(resource_index), false)
+            .map_err(onenote_api_error)?;
+    let url = res.fullres_url.as_deref().unwrap_or(&res.resource_url);
+    let bytes = state
+        .graph
+        .download_onenote_resource_bytes(url)
+        .await
+        .map_err(onenote_api_error)?;
+
+    let file_name = cli::default_resource_filename(res, resolved_idx);
+    let dir = parsed
+        .out_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state.config.resolved_download_dir());
+    let target_path = dir.join(&file_name);
+    crate::config::ensure_parent(&target_path)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    std::fs::write(&target_path, &bytes).map_err(|e| {
+        ApiError::bad_request(format!(
+            "OneNote 리소스 저장 실패: {}: {e}",
+            target_path.display()
+        ))
+    })?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "page_key": detail.summary.page_key,
+        "index": resolved_idx,
+        "mime_type": res.mime_type,
+        "file_name": file_name,
+        "path": target_path,
+        "bytes_written": bytes.len(),
+    })))
+}
+
+/// Minimal OpenAPI 3.0 description of every route exposed by `build_router`.
+pub fn openapi_document() -> Value {
+    let ops: &[(&str, &str, &str)] = &[
+        ("/health", "get", "Health check (public)"),
+        ("/conversations", "get", "List chats & channels"),
+        ("/chats", "post", "Create a chat"),
+        ("/teams", "get", "List joined teams"),
+        ("/conversations/{key}/messages", "get post", "Read / send messages"),
+        ("/conversations/{key}/threads/{root_id}", "get", "Read a channel thread"),
+        ("/conversations/{key}/messages/{msg_id}/replies", "post", "Reply to a message"),
+        ("/conversations/{key}/files", "post", "Send a file"),
+        ("/conversations/{key}/messages/{msg_id}/attachments/download", "post", "Download attachment"),
+        ("/conversations/{key}/messages/{msg_id}/reactions", "post", "React to a message"),
+        ("/conversations/{key}/messages/{msg_id}", "patch delete", "Edit / delete a message"),
+        ("/conversations/{key}/read", "post", "Mark conversation read"),
+        ("/conversations/{key}/members", "get", "List members"),
+        ("/search", "get", "Search Teams messages"),
+        ("/presence", "get post", "Get / set presence"),
+        ("/mail/folders", "get", "List mail folders"),
+        ("/mail/messages", "get", "List mail messages"),
+        ("/mail/messages/{id}", "get patch delete", "Read / update / delete mail"),
+        ("/mail/send", "post", "Send mail"),
+        ("/mail/messages/{id}/reply", "post", "Reply to mail"),
+        ("/mail/messages/{id}/forward", "post", "Forward mail"),
+        ("/mail/messages/{id}/move", "post", "Move mail"),
+        ("/mail/messages/{id}/attachments/{att_id}/download", "post", "Download mail attachment"),
+        ("/mail/search", "get", "Search mail"),
+        ("/calendar/events", "get post", "List / create events"),
+        ("/calendar/events/{id}/rsvp", "post", "RSVP to an event"),
+        ("/calendar/events/{id}", "delete", "Delete an event"),
+        ("/contacts", "get post", "List / create contacts"),
+        ("/contacts/{id}", "delete", "Delete a contact"),
+        ("/todo/lists", "get", "List To Do lists"),
+        ("/todo/lists/{list_id}/tasks", "get post", "List / create tasks"),
+        ("/todo/lists/{list_id}/tasks/{task_id}", "patch delete", "Complete / delete a task"),
+        ("/v1/onenote/notebooks", "get post", "List (personal + team/group) / create OneNote notebooks"),
+        ("/v1/onenote/sections", "get post", "List / create OneNote sections"),
+        ("/v1/onenote/sections/{section_key}/pages", "get post", "List / create pages in a section"),
+        ("/v1/onenote/pages/{page_key}", "get patch delete", "Read (blocks, element_id, resources) / update / delete a page"),
+        ("/v1/onenote/pages/{page_key}/append", "post", "Append Markdown (+ images) to a page"),
+        ("/v1/onenote/pages/{page_key}/toggle-todo", "post", "Toggle a to-do checkbox (block_id or todo_index)"),
+        ("/v1/onenote/pages/{page_key}/resources/{resource_index}/download", "post", "Download a page resource (image/attachment) to disk"),
+        ("/onenote/pages/{page_key}/resources/{resource_index}/download", "post", "Download a page resource (image/attachment) to disk (unversioned alias)"),
+        ("/v1/onenote/search", "get", "Search cached OneNote pages (FTS5)"),
+        ("/openapi.json", "get", "This OpenAPI document"),
+    ];
+
+    let mut paths = serde_json::Map::new();
+    for (path, methods, summary) in ops {
+        let mut item = serde_json::Map::new();
+        for m in methods.split_whitespace() {
+            item.insert(
+                m.to_string(),
+                json!({
+                    "summary": summary,
+                    "responses": { "200": { "description": "JSON response" } },
+                }),
+            );
+        }
+        paths.insert((*path).to_string(), Value::Object(item));
+    }
+
+    json!({
+        "openapi": "3.0.3",
+        "info": {
+            "title": "teams-cli local HTTP API (Teams · Outlook · OneNote)",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+        "components": {
+            "securitySchemes": {
+                "bearerAuth": { "type": "http", "scheme": "bearer" }
+            }
+        },
+        "security": [ { "bearerAuth": [] } ],
+        "paths": Value::Object(paths),
+    })
+}
+
+async fn openapi_spec() -> Json<Value> {
+    Json(openapi_document())
+}
+
 fn parse_kind_filter(raw: &str) -> Result<ConversationKind, ApiError> {
     match raw.to_ascii_lowercase().as_str() {
         "oneonone" | "one_on_one" | "1:1" => Ok(ConversationKind::OneOnOne),
@@ -2135,5 +2713,119 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn onenote_routes_validate_input_and_openapi_lists_them() {
+        let base = spawn_test_server(Some("tok-1n".to_string())).await;
+        let client = reqwest::Client::new();
+
+        // Protected by the bearer token like every other route.
+        let res = client
+            .get(format!("{base}/v1/onenote/notebooks?offline=true"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // Offline listing from an empty cache succeeds with an empty array (no Graph call).
+        let res = client
+            .get(format!("{base}/v1/onenote/notebooks?offline=true"))
+            .bearer_auth("tok-1n")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["notebooks"], json!([]));
+
+        // Unversioned alias works too.
+        let res = client
+            .get(format!("{base}/onenote/sections?offline=true"))
+            .bearer_auth("tok-1n")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        for (method, path, payload) in [
+            ("POST", "/v1/onenote/notebooks", json!({ "name": "  " })),
+            ("POST", "/v1/onenote/sections", json!({ "notebook": "업무", "name": "" })),
+            ("POST", "/v1/onenote/sections/me%7Csec-1/pages", json!({ "title": " ", "markdown": "x" })),
+            ("POST", "/v1/onenote/sections/me%7Csec-1/pages", json!({ "title": "t", "markdown": "x", "level": 5 })),
+            ("PATCH", "/v1/onenote/pages/me%7Cpage-1", json!({})),
+            ("PATCH", "/v1/onenote/pages/me%7Cpage-1", json!({ "block_id": "p:{1}" , "title": "t" })),
+            ("POST", "/v1/onenote/pages/me%7Cpage-1/append", json!({ "markdown": "  " })),
+            ("POST", "/v1/onenote/pages/me%7Cpage-1/toggle-todo", json!({})),
+        ] {
+            let req = match method {
+                "POST" => client.post(format!("{base}{path}")),
+                _ => client.patch(format!("{base}{path}")),
+            };
+            let res = req.bearer_auth("tok-1n").json(&payload).send().await.unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{method} {path} {payload}");
+        }
+
+        let res = client
+            .get(format!("{base}/v1/onenote/search?q=%20"))
+            .bearer_auth("tok-1n")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // Offline page read of an uncached page -> 404.
+        let res = client
+            .get(format!("{base}/v1/onenote/pages/missingpage?offline=true"))
+            .bearer_auth("tok-1n")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // Resource download route is protected and rejects malformed bodies before any Graph call.
+        let res = client
+            .post(format!(
+                "{base}/v1/onenote/pages/me%7Cpage-1/resources/0/download"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let res = client
+            .post(format!(
+                "{base}/v1/onenote/pages/me%7Cpage-1/resources/0/download"
+            ))
+            .bearer_auth("tok-1n")
+            .header("content-type", "application/json")
+            .body("{not json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let res = client
+            .get(format!("{base}/openapi.json"))
+            .bearer_auth("tok-1n")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let spec: Value = res.json().await.unwrap();
+        assert_eq!(spec["openapi"], "3.0.3");
+        for p in [
+            "/v1/onenote/notebooks",
+            "/v1/onenote/sections",
+            "/v1/onenote/sections/{section_key}/pages",
+            "/v1/onenote/pages/{page_key}",
+            "/v1/onenote/pages/{page_key}/append",
+            "/v1/onenote/pages/{page_key}/toggle-todo",
+            "/v1/onenote/pages/{page_key}/resources/{resource_index}/download",
+            "/onenote/pages/{page_key}/resources/{resource_index}/download",
+            "/v1/onenote/search",
+        ] {
+            assert!(spec["paths"].get(p).is_some(), "missing {p} in openapi");
+        }
+        assert!(spec["paths"]["/v1/onenote/pages/{page_key}"]["patch"].is_object());
     }
 }

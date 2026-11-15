@@ -265,6 +265,59 @@ impl GraphClient {
         Ok(bytes.to_vec())
     }
 
+    pub async fn get_text(&self, path_or_url: &str) -> Result<String> {
+        let url = self.resolve_url(path_or_url);
+        let resp = self
+            .execute_with_retry(Method::GET, &url, RequestBody::Empty, &[], true)
+            .await?;
+        resp.text().await.context("Graph 텍스트 응답 읽기 실패")
+    }
+
+    pub async fn post_bytes_json<T: DeserializeOwned>(
+        &self,
+        path_or_url: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> Result<T> {
+        let url = self.resolve_url(path_or_url);
+        let resp = self
+            .execute_with_retry(
+                Method::POST,
+                &url,
+                RequestBody::Bytes {
+                    data: bytes,
+                    content_type: Some(content_type.to_string()),
+                },
+                &[],
+                true,
+            )
+            .await?;
+        let resp_bytes = resp.bytes().await.context("Graph POST 응답 바디 읽기 실패")?;
+        serde_json::from_slice(&resp_bytes)
+            .with_context(|| format!("Graph POST JSON 역직렬화 실패 ({url})"))
+    }
+
+    pub async fn patch_bytes_empty(
+        &self,
+        path_or_url: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> Result<()> {
+        let url = self.resolve_url(path_or_url);
+        self.execute_with_retry(
+            Method::PATCH,
+            &url,
+            RequestBody::Bytes {
+                data: bytes,
+                content_type: Some(content_type.to_string()),
+            },
+            &[],
+            true,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Executes `POST /$batch` in chunks of up to 20 sub-requests.
     pub async fn batch(&self, requests: &[BatchSubRequest]) -> Result<Vec<BatchSubResponse>> {
         if requests.is_empty() {
@@ -323,15 +376,16 @@ impl GraphClient {
                 .with_context(|| format!("Graph HTTP 요청 실패 ({method} {url})"))?;
             let status = resp.status();
 
-            if status == StatusCode::UNAUTHORIZED
-                && use_bearer
-                && !unauthorized_retried
-                && self.auth.is_refreshable().await
-            {
+            if status == StatusCode::UNAUTHORIZED && use_bearer && !unauthorized_retried {
                 unauthorized_retried = true;
                 if let Some(failed_tok) = token_used.as_deref() {
-                    self.auth.refresh_for_failed_token(failed_tok).await?;
-                    continue;
+                    if self.auth.is_refreshable().await {
+                        self.auth.refresh_for_failed_token(failed_tok).await?;
+                        continue;
+                    } else if self.auth.refresh_for_failed_token(failed_tok).await.is_ok() {
+                        // External token refresher updated `credentials.json` on disk: retry seamlessly!
+                        continue;
+                    }
                 }
             }
 

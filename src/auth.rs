@@ -104,6 +104,14 @@ impl AuthManager {
         save_stored_tokens(tokens)
     }
 
+    fn load_from_configured_source(&self) -> Result<Option<StoredTokens>> {
+        #[cfg(test)]
+        if let Some(ref path) = self.token_path_override {
+            return load_tokens_from_path(path);
+        }
+        load_stored_tokens()
+    }
+
     pub fn config(&self) -> &AppConfig {
         &self.config
     }
@@ -115,19 +123,51 @@ impl AuthManager {
         self.tokens.read().await.clone()
     }
 
-    /// Returns a valid Bearer access token, refreshing automatically when needed.
+    /// Returns a valid Bearer access token, hot-reloading external `credentials.json` updates
+    /// or refreshing via OAuth `refresh_token` automatically when needed.
     pub async fn valid_access_token(&self) -> Result<String> {
         if let Some(tok) = self.current_tokens().await {
             if !tok.is_expired_soon(90) {
                 return Ok(tok.access_token);
             }
-            if tok.auth_mode != "env_token" && self.can_refresh_token(&tok) {
-                let refreshed = self.refresh_now().await?;
-                return Ok(refreshed.access_token);
+            if tok.auth_mode != "env_token" {
+                if let Some(reloaded) = self
+                    .try_hot_reload_from_disk(&tok.access_token, tok.expires_at)
+                    .await
+                {
+                    if !reloaded.is_expired_soon(30) {
+                        return Ok(reloaded.access_token);
+                    }
+                }
+                if self.can_refresh_token(&tok) {
+                    let refreshed = self.refresh_now().await?;
+                    return Ok(refreshed.access_token);
+                }
             }
             return Ok(tok.access_token);
         }
+        if let Ok(Some(reloaded)) = self.load_from_configured_source() {
+            let mut guard = self.tokens.write().await;
+            *guard = Some(reloaded.clone());
+            return Ok(reloaded.access_token);
+        }
         bail!("로그인이 필요합니다. 먼저 `teams login` 을 실행하세요.")
+    }
+
+    async fn try_hot_reload_from_disk(
+        &self,
+        current_access_token: &str,
+        current_expires_at: i64,
+    ) -> Option<StoredTokens> {
+        let disk_tok = self.load_from_configured_source().ok().flatten()?;
+        if disk_tok.access_token != current_access_token
+            && disk_tok.expires_at >= current_expires_at
+        {
+            let mut guard = self.tokens.write().await;
+            *guard = Some(disk_tok.clone());
+            return Some(disk_tok);
+        }
+        None
     }
 
     /// Returns whether stored tokens can currently be refreshed (refresh token or client secret).
@@ -233,7 +273,7 @@ impl AuthManager {
         self.refresh_locked(&mut guard).await
     }
 
-    /// Refreshes the token only if it still matches `failed_access_token` (prevents thundering herd on 401).
+    /// Refreshes or hot-reloads the token only if it still matches `failed_access_token` (prevents thundering herd on 401).
     pub(crate) async fn refresh_for_failed_token(
         &self,
         failed_access_token: &str,
@@ -245,6 +285,12 @@ impl AuthManager {
         if let Some(current) = guard.as_ref() {
             if current.access_token != failed_access_token && !current.is_expired_soon(30) {
                 return Ok(current.clone());
+            }
+        }
+        if let Ok(Some(disk_tok)) = self.load_from_configured_source() {
+            if disk_tok.access_token != failed_access_token && !disk_tok.is_expired_soon(10) {
+                *guard = Some(disk_tok.clone());
+                return Ok(disk_tok);
             }
         }
         self.refresh_locked(&mut guard).await
@@ -539,10 +585,14 @@ impl AuthManager {
     }
 
     async fn post_token_form(&self, url: &str, params: &[(&str, &str)]) -> Result<TokenResponse> {
-        let res = self
-            .http
-            .post(url)
-            .form(params)
+        let mut req = self.http.post(url).form(params);
+        if let Ok(origin) = std::env::var("TEAMS_TOKEN_ORIGIN") {
+            let trimmed = origin.trim();
+            if !trimmed.is_empty() {
+                req = req.header("Origin", trimmed);
+            }
+        }
+        let res = req
             .send()
             .await
             .context("OAuth 토큰 요청 전송 실패")?;
@@ -582,18 +632,31 @@ impl AuthManager {
 }
 
 pub fn load_stored_tokens() -> Result<Option<StoredTokens>> {
+    let mut keyring_tok: Option<StoredTokens> = None;
     if !keyring_disabled() {
         if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
             if let Ok(secret_json) = entry.get_password() {
                 if !secret_json.trim().is_empty() {
                     if let Ok(parsed) = serde_json::from_str::<StoredTokens>(&secret_json) {
-                        return Ok(Some(parsed));
+                        keyring_tok = Some(parsed);
                     }
                 }
             }
         }
     }
-    load_tokens_from_path(&credential_fallback_path())
+    let file_tok = load_tokens_from_path(&credential_fallback_path())?;
+    match (keyring_tok, file_tok) {
+        (Some(kr), Some(fl)) => {
+            if fl.expires_at > kr.expires_at {
+                Ok(Some(fl))
+            } else {
+                Ok(Some(kr))
+            }
+        }
+        (Some(kr), None) => Ok(Some(kr)),
+        (None, Some(fl)) => Ok(Some(fl)),
+        (None, None) => Ok(None),
+    }
 }
 
 pub fn save_stored_tokens(tokens: &StoredTokens) -> Result<()> {
@@ -1058,8 +1121,12 @@ mod tests {
             auth_mode: "pkce".into(),
         };
         let mgr2 = Arc::new(
-            AuthManager::from_tokens(cfg, expired_tok).with_token_path(cred_path.clone()),
+            AuthManager::from_tokens(cfg, expired_tok.clone()).with_token_path(cred_path.clone()),
         );
+        // Pin the on-disk credential to the same stale token so the hot-reload path
+        // cannot short-circuit the OAuth refresh this test exercises. The assertions
+        // below are unchanged: concurrent callers must coalesce into one token request.
+        save_tokens_to_path(&expired_tok, &cred_path).unwrap();
         let hits_before = hits.load(Ordering::SeqCst);
         let (r1, r2, r3) = tokio::join!(
             mgr2.refresh_for_failed_token("stale-tok"),
@@ -1069,5 +1136,44 @@ mod tests {
         assert_eq!(r1.unwrap().access_token, r2.unwrap().access_token);
         assert_eq!(r3.unwrap().refresh_token.as_deref(), Some("new-rt"));
         assert_eq!(hits.load(Ordering::SeqCst) - hits_before, 1);
+    }
+
+    #[tokio::test]
+    async fn test_hot_reload_external_f12_token_from_disk() {
+        let dir = tempdir().unwrap();
+        let cred_path = dir.path().join("credentials.json");
+        let now = chrono::Utc::now().timestamp();
+
+        let initial = StoredTokens {
+            access_token: "f12-old-token".into(),
+            refresh_token: None,
+            expires_at: now + 20, // within 90s skew -> triggers hot-reload check
+            client_id: "cid".into(),
+            tenant_id: "tid".into(),
+            user_id: Some("u1".into()),
+            user_display_name: Some("Tester".into()),
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        save_tokens_to_path(&initial, &cred_path).unwrap();
+
+        let mgr = AuthManager::from_tokens(AppConfig::default(), initial)
+            .with_token_path(cred_path.clone());
+
+        // External refresher script updates `credentials.json` on disk without restarting TUI
+        let externally_refreshed = StoredTokens {
+            access_token: "f12-fresh-token".into(),
+            refresh_token: None,
+            expires_at: now + 3600,
+            client_id: "cid".into(),
+            tenant_id: "tid".into(),
+            user_id: Some("u1".into()),
+            user_display_name: Some("Tester".into()),
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        save_tokens_to_path(&externally_refreshed, &cred_path).unwrap();
+
+        assert_eq!(mgr.valid_access_token().await.unwrap(), "f12-fresh-token");
     }
 }

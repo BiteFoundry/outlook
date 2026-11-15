@@ -386,7 +386,8 @@ fn draw_top_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState)
 
     let (persona_label, persona_target) = match ui.persona {
         Persona::Teams => (" [Teams] ", Persona::Outlook),
-        Persona::Outlook => (" [Outlook] ", Persona::Teams),
+        Persona::Outlook => (" [Outlook] ", Persona::OneNote),
+        Persona::OneNote => (" [OneNote] ", Persona::Teams),
     };
     let mut x = area.x;
     let badge_w = persona_label.width() as u16;
@@ -591,6 +592,7 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState) 
     let persona_tag = match ui.persona {
         Persona::Teams => "Teams",
         Persona::Outlook => "Outlook",
+        Persona::OneNote => "OneNote",
     };
     let tab_tag = TAB_LABELS.get(ui.active_nav_tab).copied().unwrap_or("채팅");
 

@@ -203,6 +203,84 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
 
         CREATE INDEX IF NOT EXISTS idx_todo_tasks_list_status
             ON todo_tasks(list_id, status);
+
+        CREATE TABLE IF NOT EXISTS onenote_notebooks (
+            notebook_key TEXT PRIMARY KEY,
+            id TEXT NOT NULL,
+            scope_json TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            color TEXT,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            is_shared INTEGER NOT NULL DEFAULT 0,
+            user_role TEXT,
+            created_at TEXT,
+            last_modified_at TEXT,
+            created_by TEXT,
+            web_url TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS onenote_section_groups (
+            section_group_key TEXT PRIMARY KEY,
+            id TEXT NOT NULL,
+            scope_json TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            notebook_id TEXT,
+            parent_section_group_id TEXT,
+            display_name TEXT NOT NULL,
+            created_at TEXT,
+            last_modified_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS onenote_sections (
+            section_key TEXT PRIMARY KEY,
+            id TEXT NOT NULL,
+            scope_json TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            notebook_id TEXT,
+            notebook_name TEXT,
+            parent_section_group_id TEXT,
+            parent_section_group_name TEXT,
+            display_name TEXT NOT NULL,
+            color TEXT,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            pages_url TEXT,
+            created_at TEXT,
+            last_modified_at TEXT,
+            web_url TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_onenote_sections_scope_notebook
+            ON onenote_sections(scope_key, notebook_id);
+
+        CREATE TABLE IF NOT EXISTS onenote_pages (
+            page_key TEXT PRIMARY KEY,
+            id TEXT NOT NULL,
+            scope_json TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            section_key TEXT NOT NULL,
+            section_id TEXT NOT NULL,
+            section_name TEXT,
+            notebook_id TEXT,
+            notebook_name TEXT,
+            title TEXT NOT NULL,
+            level INTEGER NOT NULL DEFAULT 0,
+            page_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT,
+            last_modified_at TEXT,
+            content_url TEXT,
+            web_url TEXT,
+            preview_text TEXT,
+            has_todo INTEGER NOT NULL DEFAULT 0,
+            detail_json TEXT,
+            body_plain TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_onenote_pages_section_order
+            ON onenote_pages(section_key, page_order ASC, last_modified_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_onenote_pages_id
+            ON onenote_pages(id);
         ",
     )
     .context("SQLite 기본 스키마 생성 실패")?;
@@ -257,7 +335,34 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
         ",
     )?;
 
-    Ok(messages_trigram && mail_trigram)
+    let onenote_trigram = ensure_fts5_table(
+        conn,
+        "onenote_fts",
+        "
+        CREATE VIRTUAL TABLE IF NOT EXISTS onenote_fts USING fts5(
+            page_key UNINDEXED,
+            section_key UNINDEXED,
+            title,
+            notebook_name,
+            section_name,
+            body_plain,
+            tokenize='trigram'
+        );
+        ",
+        "
+        CREATE VIRTUAL TABLE IF NOT EXISTS onenote_fts USING fts5(
+            page_key UNINDEXED,
+            section_key UNINDEXED,
+            title,
+            notebook_name,
+            section_name,
+            body_plain,
+            tokenize='unicode61'
+        );
+        ",
+    )?;
+
+    Ok(messages_trigram && mail_trigram && onenote_trigram)
 }
 
 fn ensure_fts5_table(

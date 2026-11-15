@@ -1,6 +1,7 @@
 //! Local SQLite WAL persistence + FTS5 (`trigram` + `LIKE` hybrid) search repository.
 
 pub mod db;
+pub mod onenote;
 pub mod outlook;
 pub mod repo;
 pub mod search;
@@ -15,8 +16,9 @@ use anyhow::Result;
 
 use crate::models::{
     CalendarEvent, ContactItem, ConversationSummary, MailFolder, MailMessage, MailSearchHit,
-    MemberInfo, MessageItem, PresenceStatus, SearchHit, SyncCursor, TeamSummary, ThreadView,
-    TodoList, TodoTask,
+    MemberInfo, MessageItem, OnenoteNotebook, OnenotePageDetail, OnenotePageSummary,
+    OnenoteSearchHit, OnenoteSection, OnenoteSectionGroup, PresenceStatus, SearchHit, SyncCursor,
+    TeamSummary, ThreadView, TodoList, TodoTask,
 };
 
 #[derive(Clone)]
@@ -299,6 +301,89 @@ impl Storage {
     pub fn delete_todo_task(&self, task_id: &str) -> Result<()> {
         let conn = self.lock_conn()?;
         outlook::delete_todo_task(&conn, task_id)
+    }
+
+    // --- Microsoft OneNote ---
+    pub fn upsert_onenote_notebooks(&self, items: &[OnenoteNotebook]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        onenote::upsert_onenote_notebooks(&mut conn, items)
+    }
+
+    pub fn list_onenote_notebooks(&self) -> Result<Vec<OnenoteNotebook>> {
+        let conn = self.lock_conn()?;
+        onenote::list_onenote_notebooks(&conn)
+    }
+
+    pub fn upsert_onenote_section_groups(&self, items: &[OnenoteSectionGroup]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        onenote::upsert_onenote_section_groups(&mut conn, items)
+    }
+
+    pub fn list_onenote_section_groups(&self) -> Result<Vec<OnenoteSectionGroup>> {
+        let conn = self.lock_conn()?;
+        onenote::list_onenote_section_groups(&conn)
+    }
+
+    pub fn upsert_onenote_sections(&self, items: &[OnenoteSection]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        onenote::upsert_onenote_sections(&mut conn, items)
+    }
+
+    pub fn list_onenote_sections(
+        &self,
+        notebook_key_filter: Option<&str>,
+    ) -> Result<Vec<OnenoteSection>> {
+        let conn = self.lock_conn()?;
+        onenote::list_onenote_sections(&conn, notebook_key_filter)
+    }
+
+    pub fn upsert_onenote_pages(&self, items: &[OnenotePageSummary]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        onenote::upsert_onenote_pages(&mut conn, items)
+    }
+
+    pub fn list_onenote_pages(&self, section_key: &str) -> Result<Vec<OnenotePageSummary>> {
+        let conn = self.lock_conn()?;
+        onenote::list_onenote_pages(&conn, section_key)
+    }
+
+    pub fn upsert_onenote_page_detail(&self, detail: &OnenotePageDetail) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        onenote::upsert_onenote_page_detail(&mut conn, detail)
+    }
+
+    pub fn get_onenote_page_detail(&self, page_key_or_id: &str) -> Result<Option<OnenotePageDetail>> {
+        let conn = self.lock_conn()?;
+        onenote::get_onenote_page_detail(&conn, page_key_or_id)
+    }
+
+    pub fn get_onenote_page_summary(
+        &self,
+        page_key_or_id: &str,
+    ) -> Result<Option<OnenotePageSummary>> {
+        let conn = self.lock_conn()?;
+        onenote::get_onenote_page_summary(&conn, page_key_or_id)
+    }
+
+    pub fn delete_onenote_page(&self, page_key_or_id: &str) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        onenote::delete_onenote_page(&mut conn, page_key_or_id)
+    }
+
+    pub fn search_onenote_pages(
+        &self,
+        query: &str,
+        section_key_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<OnenoteSearchHit>> {
+        let conn = self.lock_conn()?;
+        onenote::search_onenote_pages(
+            &conn,
+            query,
+            section_key_filter,
+            limit,
+            self.trigram_enabled,
+        )
     }
 }
 

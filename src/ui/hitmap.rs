@@ -43,6 +43,18 @@ pub enum ButtonId {
     TodoToggle,
     DeleteTodo,
     TodoInputFocus,
+    // Microsoft OneNote toolbar & footer buttons
+    OnenoteNewNotebook,
+    OnenoteNewSection,
+    OnenoteNewPage,
+    OnenoteNewSubpage,
+    OnenoteAppendBlock,
+    OnenoteEditBlock,
+    OnenoteEditFullPage,
+    OnenoteToggleTodo,
+    OnenoteOpenWeb,
+    OnenoteRefresh,
+    OnenoteDeletePage,
 }
 
 /// Identifies which list a message belongs to.
@@ -56,7 +68,7 @@ pub enum MessageScope {
 /// Clickable targets on the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitTarget {
-    /// Navigation tab (`0` = 채팅, `1` = 팀/채널, `2` = 활동, `3` = 메일, `4` = 캘린더, `5` = 연락처, `6` = 할 일).
+    /// Navigation tab (`0` = 채팅, `1` = 팀/채널, `2` = 활동, `3` = 메일, `4` = 캘린더, `5` = 연락처, `6` = 할 일, `7` = 노트).
     NavTab(usize),
     /// A row in the active navigation pane list.
     NavRow(usize),
@@ -84,6 +96,19 @@ pub enum HitTarget {
     Composer,
     /// Item inside the top overlay.
     OverlayItem { index: usize },
+    /// Horizontal section tab in the OneNote ribbon bar (`TAB_NOTES`).
+    OnenoteSectionTab(usize),
+    /// Page item in the OneNote page list sub-column (`TAB_NOTES`).
+    OnenotePage(usize),
+    /// Block row in the OneNote rich note canvas (`TAB_NOTES`).
+    OnenoteBlock(usize),
+    /// Interactive `☐` / `☑` checkbox prefix on a OneNote block (`TAB_NOTES`).
+    OnenoteTodoToggle(usize),
+    /// Inline image or `<object>` file attachment chip in OneNote (`TAB_NOTES`).
+    OnenoteResource {
+        resource_index: usize,
+        is_image: bool,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -225,5 +250,15 @@ mod tests {
         map.add_line(4, 10, 24, HitTarget::OpenThread { msg_index: 3 });
         assert_eq!(map.hit(10, 8), Some(HitTarget::OpenThread { msg_index: 3 }));
         assert_eq!(map.hit(10, 28), None);
+    }
+
+    #[test]
+    fn onenote_todo_checkbox_wins_over_block_line() {
+        let mut map = HitMap::new();
+        map.add_line(10, 5, 40, HitTarget::OnenoteBlock(2));
+        map.add_line(12, 5, 3, HitTarget::OnenoteTodoToggle(2));
+
+        assert_eq!(map.hit(5, 13), Some(HitTarget::OnenoteTodoToggle(2)));
+        assert_eq!(map.hit(5, 20), Some(HitTarget::OnenoteBlock(2)));
     }
 }
