@@ -1,0 +1,702 @@
+//! Teams HTML + attachment parser into `Vec<RichBlock>`, plain text, and GFM Markdown.
+
+use std::collections::HashSet;
+
+use scraper::{ElementRef, Html, Node};
+
+use crate::{
+    models::{AttachmentInfo, MentionInfo, RichBlock, RichSpan, TextStyleFlags},
+    parser::card_in::{is_card_content_type, parse_card_attachment},
+};
+
+pub fn parse_message_blocks(
+    html: &str,
+    attachments: &[AttachmentInfo],
+    mentions: &[MentionInfo],
+) -> Vec<RichBlock> {
+    let mut ctx = ParserContext {
+        attachments,
+        mentions,
+        seen_attachments: HashSet::new(),
+        blocks: Vec::new(),
+        current_spans: Vec::new(),
+        next_image_index: 0,
+    };
+
+    if !html.trim().is_empty() {
+        let fragment = Html::parse_fragment(html);
+        ctx.walk_children(fragment.root_element(), &TextStyleFlags::default());
+        ctx.flush_paragraph();
+    }
+
+    for att in attachments {
+        if !ctx.seen_attachments.contains(&att.id) {
+            ctx.push_attachment_block(att);
+        }
+    }
+
+    ctx.blocks
+}
+
+pub fn blocks_to_plain(blocks: &[RichBlock]) -> String {
+    let mut parts = Vec::new();
+    for block in blocks {
+        match block {
+            RichBlock::Paragraph(spans) => {
+                let s = spans_to_plain(spans);
+                if !s.trim().is_empty() {
+                    parts.push(s.trim().to_string());
+                }
+            }
+            RichBlock::Heading { spans, .. } => {
+                let s = spans_to_plain(spans);
+                if !s.trim().is_empty() {
+                    parts.push(s.trim().to_string());
+                }
+            }
+            RichBlock::Quote(spans) => {
+                let s = spans_to_plain(spans);
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    let quoted = trimmed
+                        .lines()
+                        .map(|l| format!("> {}", l.trim()))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    parts.push(quoted);
+                }
+            }
+            RichBlock::CodeBlock { code, .. } => {
+                let trimmed = code.trim_end();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed.to_string());
+                }
+            }
+            RichBlock::BulletList(items) => {
+                let mut lines = Vec::new();
+                for item in items {
+                    let s = spans_to_plain(item);
+                    if !s.trim().is_empty() {
+                        lines.push(format!("- {}", s.trim()));
+                    }
+                }
+                if !lines.is_empty() {
+                    parts.push(lines.join("\n"));
+                }
+            }
+            RichBlock::Card {
+                title,
+                subtitle,
+                facts,
+                body_lines,
+                actions,
+            } => {
+                let mut lines = Vec::new();
+                if let Some(t) = title.as_deref().filter(|s| !s.is_empty()) {
+                    lines.push(t.to_string());
+                }
+                if let Some(sub) = subtitle.as_deref().filter(|s| !s.is_empty()) {
+                    lines.push(sub.to_string());
+                }
+                for bl in body_lines {
+                    if !bl.is_empty() {
+                        lines.push(bl.clone());
+                    }
+                }
+                for (k, v) in facts {
+                    if k.is_empty() {
+                        lines.push(v.clone());
+                    } else {
+                        lines.push(format!("{k}: {v}"));
+                    }
+                }
+                for (label, target) in actions {
+                    if target.is_empty() {
+                        lines.push(format!("[{label}]"));
+                    } else {
+                        lines.push(format!("[{label}] ({target})"));
+                    }
+                }
+                if !lines.is_empty() {
+                    parts.push(lines.join("\n"));
+                }
+            }
+            RichBlock::AttachmentChip { id, name } => {
+                let label = name.as_deref().unwrap_or(id.as_str());
+                parts.push(format!("[첨부: {label}]"));
+            }
+            RichBlock::InlineImageChip { index, .. } => {
+                parts.push(format!("[이미지 #{}]", index + 1));
+            }
+        }
+    }
+    parts.join("\n")
+}
+
+pub fn blocks_to_markdown(blocks: &[RichBlock]) -> String {
+    let mut parts = Vec::new();
+    for block in blocks {
+        match block {
+            RichBlock::Paragraph(spans) => {
+                let s = spans_to_markdown(spans);
+                if !s.trim().is_empty() {
+                    parts.push(s.trim().to_string());
+                }
+            }
+            RichBlock::Heading { level, spans } => {
+                let s = spans_to_markdown(spans);
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    let hashes = "#".repeat((*level).clamp(1, 6) as usize);
+                    parts.push(format!("{hashes} {trimmed}"));
+                }
+            }
+            RichBlock::Quote(spans) => {
+                let s = spans_to_markdown(spans);
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    let quoted = trimmed
+                        .lines()
+                        .map(|l| format!("> {}", l.trim_end()))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    parts.push(quoted);
+                }
+            }
+            RichBlock::CodeBlock { lang, code } => {
+                let lang_str = lang.as_deref().unwrap_or("");
+                parts.push(format!("```{lang_str}\n{}\n```", code.trim_end_matches('\n')));
+            }
+            RichBlock::BulletList(items) => {
+                let mut lines = Vec::new();
+                for item in items {
+                    let s = spans_to_markdown(item);
+                    if !s.trim().is_empty() {
+                        lines.push(format!("- {}", s.trim()));
+                    }
+                }
+                if !lines.is_empty() {
+                    parts.push(lines.join("\n"));
+                }
+            }
+            RichBlock::Card {
+                title,
+                subtitle,
+                facts,
+                body_lines,
+                actions,
+            } => {
+                let mut lines = Vec::new();
+                if let Some(t) = title.as_deref().filter(|s| !s.is_empty()) {
+                    lines.push(format!("> **{t}**"));
+                }
+                if let Some(sub) = subtitle.as_deref().filter(|s| !s.is_empty()) {
+                    lines.push(format!("> *{sub}*"));
+                }
+                for bl in body_lines {
+                    if !bl.is_empty() {
+                        lines.push(format!("> {bl}"));
+                    }
+                }
+                for (k, v) in facts {
+                    lines.push(format!("> - **{k}**: {v}"));
+                }
+                if !actions.is_empty() {
+                    let btns: Vec<String> = actions
+                        .iter()
+                        .map(|(label, url)| {
+                            if url.starts_with("http://") || url.starts_with("https://") {
+                                format!("[{label}]({url})")
+                            } else {
+                                format!("[{label}]")
+                            }
+                        })
+                        .collect();
+                    lines.push(format!("> {}", btns.join(" · ")));
+                }
+                if !lines.is_empty() {
+                    parts.push(lines.join("\n"));
+                }
+            }
+            RichBlock::AttachmentChip { id, name } => {
+                let label = name.as_deref().unwrap_or(id.as_str());
+                parts.push(format!("[첨부: {label}]"));
+            }
+            RichBlock::InlineImageChip { src, index } => {
+                parts.push(format!("![image-{}]({src})", index + 1));
+            }
+        }
+    }
+    parts.join("\n\n")
+}
+
+struct ParserContext<'a> {
+    attachments: &'a [AttachmentInfo],
+    mentions: &'a [MentionInfo],
+    seen_attachments: HashSet<String>,
+    blocks: Vec<RichBlock>,
+    current_spans: Vec<RichSpan>,
+    next_image_index: usize,
+}
+
+impl<'a> ParserContext<'a> {
+    fn walk_children(&mut self, parent: ElementRef<'_>, style: &TextStyleFlags) {
+        for child in parent.children() {
+            match child.value() {
+                Node::Text(text) => {
+                    self.push_inline_text(text.text.as_ref(), style);
+                }
+                Node::Element(_) => {
+                    if let Some(child_el) = ElementRef::wrap(child) {
+                        self.handle_element(child_el, style);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn handle_element(&mut self, el_ref: ElementRef<'_>, style: &TextStyleFlags) {
+        let el = el_ref.value();
+        let tag = el.name();
+        match tag {
+            "br" => {
+                self.push_raw_span("\n", &TextStyleFlags::default());
+            }
+            "b" | "strong" => {
+                let mut next = style.clone();
+                next.bold = true;
+                self.walk_children(el_ref, &next);
+            }
+            "i" | "em" => {
+                let mut next = style.clone();
+                next.italic = true;
+                self.walk_children(el_ref, &next);
+            }
+            "s" | "strike" | "del" => {
+                let mut next = style.clone();
+                next.strike = true;
+                self.walk_children(el_ref, &next);
+            }
+            "u" => {
+                let mut next = style.clone();
+                next.underline = true;
+                self.walk_children(el_ref, &next);
+            }
+            "code" => {
+                let mut next = style.clone();
+                next.code = true;
+                let raw = collect_raw_text(el_ref);
+                if !raw.is_empty() {
+                    self.push_raw_span(&raw, &next);
+                }
+            }
+            "a" => {
+                let mut next = style.clone();
+                if let Some(href) = el.attr("href").map(str::trim).filter(|s| !s.is_empty()) {
+                    next.link_url = Some(href.to_string());
+                }
+                self.walk_children(el_ref, &next);
+            }
+            "at" => {
+                let mut next = style.clone();
+                next.mention = true;
+                let inner = collect_raw_text(el_ref);
+                let trimmed = inner.trim();
+                let name = if !trimmed.is_empty() {
+                    trimmed.to_string()
+                } else if let Some(id_val) = el.attr("id").and_then(|v| v.parse::<i32>().ok()) {
+                    self.mentions
+                        .iter()
+                        .find(|m| m.id == id_val)
+                        .map(|m| m.display_name.clone())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                if !name.is_empty() {
+                    let display = if name.starts_with('@') {
+                        name
+                    } else {
+                        format!("@{name}")
+                    };
+                    self.push_raw_span(&display, &next);
+                }
+            }
+            "p" | "div" => {
+                self.flush_paragraph();
+                self.walk_children(el_ref, style);
+                self.flush_paragraph();
+            }
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                self.flush_paragraph();
+                let level = tag[1..].parse::<u8>().unwrap_or(1);
+                let spans = self.collect_inline_spans(el_ref, style);
+                if !spans_are_blank(&spans) {
+                    self.blocks.push(RichBlock::Heading {
+                        level,
+                        spans: trim_spans(spans),
+                    });
+                }
+            }
+            "blockquote" => {
+                self.flush_paragraph();
+                let spans = self.collect_quote_spans(el_ref, style);
+                if !spans_are_blank(&spans) {
+                    self.blocks.push(RichBlock::Quote(trim_spans(spans)));
+                }
+            }
+            "pre" => {
+                self.flush_paragraph();
+                let lang = detect_code_lang(el_ref);
+                let code = collect_raw_text(el_ref);
+                let trimmed = code.trim_matches(|c| c == '\r' || c == '\n');
+                if !trimmed.is_empty() {
+                    self.blocks.push(RichBlock::CodeBlock {
+                        lang,
+                        code: trimmed.to_string(),
+                    });
+                }
+            }
+            "ul" | "ol" => {
+                self.flush_paragraph();
+                let mut items = Vec::new();
+                for child in el_ref.children() {
+                    if let Some(child_el) = ElementRef::wrap(child) {
+                        if child_el.value().name() == "li" {
+                            let spans = self.collect_inline_spans(child_el, style);
+                            if !spans_are_blank(&spans) {
+                                items.push(trim_spans(spans));
+                            }
+                        }
+                    }
+                }
+                if !items.is_empty() {
+                    self.blocks.push(RichBlock::BulletList(items));
+                }
+            }
+            "attachment" => {
+                self.flush_paragraph();
+                if let Some(id) = el.attr("id").map(str::trim).filter(|s| !s.is_empty()) {
+                    self.seen_attachments.insert(id.to_string());
+                    if let Some(att) = self.attachments.iter().find(|a| a.id == id) {
+                        self.push_attachment_block(att);
+                    } else {
+                        self.blocks.push(RichBlock::AttachmentChip {
+                            id: id.to_string(),
+                            name: None,
+                        });
+                    }
+                }
+            }
+            "img" => {
+                if let Some(src) = el.attr("src").map(str::trim).filter(|s| !s.is_empty()) {
+                    self.flush_paragraph();
+                    let index = self.next_image_index;
+                    self.next_image_index += 1;
+                    self.blocks.push(RichBlock::InlineImageChip {
+                        src: src.to_string(),
+                        index,
+                    });
+                }
+            }
+            "script" | "style" => {}
+            _ => {
+                self.walk_children(el_ref, style);
+            }
+        }
+    }
+
+    fn collect_inline_spans(
+        &mut self,
+        el_ref: ElementRef<'_>,
+        style: &TextStyleFlags,
+    ) -> Vec<RichSpan> {
+        let saved = std::mem::take(&mut self.current_spans);
+        self.walk_children(el_ref, style);
+        std::mem::replace(&mut self.current_spans, saved)
+    }
+
+    fn collect_quote_spans(
+        &mut self,
+        el_ref: ElementRef<'_>,
+        style: &TextStyleFlags,
+    ) -> Vec<RichSpan> {
+        let saved = std::mem::take(&mut self.current_spans);
+        self.walk_quote_children(el_ref, style);
+        std::mem::replace(&mut self.current_spans, saved)
+    }
+
+    fn walk_quote_children(&mut self, parent: ElementRef<'_>, style: &TextStyleFlags) {
+        let mut first_block = true;
+        for child in parent.children() {
+            match child.value() {
+                Node::Text(text) => {
+                    self.push_inline_text(text.text.as_ref(), style);
+                }
+                Node::Element(el) => {
+                    if el.attr("itemprop") == Some("time") {
+                        continue;
+                    }
+                    let Some(child_el) = ElementRef::wrap(child) else {
+                        continue;
+                    };
+                    match el.name() {
+                        "p" | "div" => {
+                            if !first_block && !self.current_spans.is_empty() {
+                                self.push_raw_span("\n", &TextStyleFlags::default());
+                            }
+                            first_block = false;
+                            self.walk_quote_children(child_el, style);
+                        }
+                        "br" => {
+                            self.push_raw_span("\n", &TextStyleFlags::default());
+                        }
+                        "b" | "strong" => {
+                            let mut next = style.clone();
+                            next.bold = true;
+                            self.walk_quote_children(child_el, &next);
+                        }
+                        "i" | "em" => {
+                            let mut next = style.clone();
+                            next.italic = true;
+                            self.walk_quote_children(child_el, &next);
+                        }
+                        "code" => {
+                            let mut next = style.clone();
+                            next.code = true;
+                            let raw = collect_raw_text(child_el);
+                            if !raw.is_empty() {
+                                self.push_raw_span(&raw, &next);
+                            }
+                        }
+                        _ => {
+                            self.walk_quote_children(child_el, style);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn push_inline_text(&mut self, raw: &str, style: &TextStyleFlags) {
+        let collapsed = collapse_html_whitespace(raw);
+        if collapsed.is_empty() {
+            return;
+        }
+        let to_push = if collapsed == " "
+            && (self.current_spans.is_empty()
+                || self
+                    .current_spans
+                    .last()
+                    .map(|s| s.text.ends_with('\n') || s.text.ends_with(' '))
+                    .unwrap_or(false))
+        {
+            return;
+        } else if self.current_spans.is_empty() {
+            collapsed.trim_start().to_string()
+        } else {
+            collapsed
+        };
+
+        if !to_push.is_empty() {
+            self.push_raw_span(&to_push, style);
+        }
+    }
+
+    fn push_raw_span(&mut self, text: &str, style: &TextStyleFlags) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(last) = self.current_spans.last_mut() {
+            if &last.style == style {
+                last.text.push_str(text);
+                return;
+            }
+        }
+        self.current_spans.push(RichSpan {
+            text: text.to_string(),
+            style: style.clone(),
+        });
+    }
+
+    fn flush_paragraph(&mut self) {
+        let spans = std::mem::take(&mut self.current_spans);
+        if !spans_are_blank(&spans) {
+            self.blocks.push(RichBlock::Paragraph(trim_spans(spans)));
+        }
+    }
+
+    fn push_attachment_block(&mut self, att: &AttachmentInfo) {
+        if is_card_content_type(&att.content_type) {
+            if let Some(card) = parse_card_attachment(att) {
+                self.blocks.push(card);
+                return;
+            }
+        }
+        self.blocks.push(RichBlock::AttachmentChip {
+            id: att.id.clone(),
+            name: att.name.clone(),
+        });
+    }
+}
+
+fn detect_code_lang(pre_el: ElementRef<'_>) -> Option<String> {
+    let el = pre_el.value();
+    if let Some(lang) = el
+        .attr("lang")
+        .or_else(|| el.attr("data-lang"))
+        .and_then(non_empty)
+    {
+        return Some(lang);
+    }
+    if let Some(lang) = lang_from_class(el.attr("class")) {
+        return Some(lang);
+    }
+    for child in pre_el.children() {
+        if let Node::Element(child_el) = child.value() {
+            if child_el.name() == "code" {
+                if let Some(lang) = child_el.attr("lang").and_then(non_empty) {
+                    return Some(lang);
+                }
+                if let Some(lang) = lang_from_class(child_el.attr("class")) {
+                    return Some(lang);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn lang_from_class(class_attr: Option<&str>) -> Option<String> {
+    let classes = class_attr?;
+    for cls in classes.split_whitespace() {
+        if let Some(rest) = cls
+            .strip_prefix("language-")
+            .or_else(|| cls.strip_prefix("lang-"))
+        {
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn non_empty(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+fn collect_raw_text(el_ref: ElementRef<'_>) -> String {
+    let mut out = String::new();
+    collect_raw_text_inner(el_ref, &mut out);
+    out
+}
+
+fn collect_raw_text_inner(el_ref: ElementRef<'_>, out: &mut String) {
+    for child in el_ref.children() {
+        match child.value() {
+            Node::Text(t) => out.push_str(t.text.as_ref()),
+            Node::Element(el) => {
+                if el.name() == "br" {
+                    out.push('\n');
+                } else if let Some(child_el) = ElementRef::wrap(child) {
+                    collect_raw_text_inner(child_el, out);
+                    if matches!(el.name(), "p" | "div") && !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collapse_html_whitespace(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut prev_ws = false;
+    for ch in input.chars() {
+        if ch.is_whitespace() {
+            if !prev_ws {
+                out.push(' ');
+                prev_ws = true;
+            }
+        } else {
+            out.push(ch);
+            prev_ws = false;
+        }
+    }
+    out
+}
+
+fn spans_are_blank(spans: &[RichSpan]) -> bool {
+    spans.iter().all(|s| s.text.trim().is_empty())
+}
+
+fn trim_spans(mut spans: Vec<RichSpan>) -> Vec<RichSpan> {
+    while let Some(first) = spans.first_mut() {
+        let trimmed = first.text.trim_start_matches([' ', '\t', '\n', '\r']);
+        if trimmed.is_empty() {
+            spans.remove(0);
+        } else {
+            first.text = trimmed.to_string();
+            break;
+        }
+    }
+    while let Some(last) = spans.last_mut() {
+        let trimmed = last.text.trim_end_matches([' ', '\t', '\n', '\r']);
+        if trimmed.is_empty() {
+            spans.pop();
+        } else {
+            last.text = trimmed.to_string();
+            break;
+        }
+    }
+    spans
+}
+
+fn spans_to_plain(spans: &[RichSpan]) -> String {
+    spans.iter().map(|s| s.text.as_str()).collect()
+}
+
+fn spans_to_markdown(spans: &[RichSpan]) -> String {
+    let mut out = String::new();
+    for span in spans {
+        if span.text.is_empty() {
+            continue;
+        }
+        let mut formatted = if span.style.code {
+            if span.text.contains('`') {
+                format!("`` {} ``", span.text)
+            } else {
+                format!("`{}`", span.text)
+            }
+        } else {
+            span.text.clone()
+        };
+
+        if span.style.bold && !span.style.code {
+            formatted = format!("**{formatted}**");
+        }
+        if span.style.italic && !span.style.code {
+            formatted = format!("*{formatted}*");
+        }
+        if span.style.strike && !span.style.code {
+            formatted = format!("~~{formatted}~~");
+        }
+        if span.style.underline && !span.style.code {
+            formatted = format!("<u>{formatted}</u>");
+        }
+        if let Some(url) = &span.style.link_url {
+            formatted = format!("[{formatted}]({url})");
+        }
+        out.push_str(&formatted);
+    }
+    out
+}

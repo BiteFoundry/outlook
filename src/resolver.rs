@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 
 use crate::{
     graph::GraphClient,
-    models::ConversationSummary,
+    models::{ConversationKind, ConversationSummary, ConversationTarget},
     storage::Storage,
 };
 
@@ -12,9 +12,10 @@ use crate::{
 ///
 /// Supported query forms:
 /// 1. Exact `conv_key` (`chat:...` or `chan:<team_id>:<channel_id>`)
-/// 2. Raw `chat_id` (`19:...@thread.v2` or `19:...@unq.gbl.spaces`)
+/// 2. Raw `chat_id` (`19:...@thread.v2` or `19:...@unq.gbl.spaces`) or `channel_id`
 /// 3. `"<team substring>/<channel substring>"` for Team Channels
-/// 4. Case-insensitive exact or unique substring match on `title` (or `"team / channel"`)
+/// 4. Case-insensitive exact match on `title`
+/// 5. Case-insensitive unique substring match on `title` (or `"team_name/title"`)
 pub fn resolve_from_slice(
     conversations: &[ConversationSummary],
     query: &str,
@@ -23,10 +24,124 @@ pub fn resolve_from_slice(
     if q.is_empty() {
         bail!("대상 대화방/채널 이름이 비어 있습니다.");
     }
+
+    // Priority 1: Exact conv_key
     if let Some(exact) = conversations.iter().find(|c| c.conv_key == q) {
         return Ok(exact.clone());
     }
-    bail!("대화방/채널을 찾을 수 없습니다: {q}")
+
+    // Priority 2: Exact raw chat_id or channel_id
+    let raw_id_matches: Vec<&ConversationSummary> = conversations
+        .iter()
+        .filter(|c| match &c.target {
+            ConversationTarget::Chat { chat_id } => chat_id == q,
+            ConversationTarget::Channel { channel_id, .. } => channel_id == q,
+        })
+        .collect();
+    if raw_id_matches.len() == 1 {
+        return Ok(raw_id_matches[0].clone());
+    } else if raw_id_matches.len() > 1 {
+        bail!(
+            "대상 ID '{q}'와 일치하는 대화방/채널이 여러 개입니다:\n{}",
+            format_candidates(&raw_id_matches)
+        );
+    }
+
+    // Priority 3: Slash notation "<team_part>/<channel_part>" for Team Channels
+    if let Some((team_raw, chan_raw)) = q.split_once('/') {
+        let team_part = team_raw.trim().to_lowercase();
+        let chan_part = chan_raw.trim().to_lowercase();
+
+        if !team_part.is_empty() || !chan_part.is_empty() {
+            let channels: Vec<&ConversationSummary> = conversations
+                .iter()
+                .filter(|c| c.kind == ConversationKind::Channel)
+                .collect();
+
+            let exact_matches: Vec<&ConversationSummary> = channels
+                .iter()
+                .copied()
+                .filter(|c| {
+                    let tname = c.team_name.as_deref().unwrap_or("").to_lowercase();
+                    let cname = c.title.to_lowercase();
+                    (team_part.is_empty() || tname == team_part)
+                        && (chan_part.is_empty() || cname == chan_part)
+                })
+                .collect();
+
+            if exact_matches.len() == 1 {
+                return Ok(exact_matches[0].clone());
+            } else if exact_matches.len() > 1 {
+                bail!(
+                    "'{q}'와 정확히 일치하는 채널이 여러 개입니다:\n{}",
+                    format_candidates(&exact_matches)
+                );
+            }
+
+            let sub_matches: Vec<&ConversationSummary> = channels
+                .iter()
+                .copied()
+                .filter(|c| {
+                    let tname = c.team_name.as_deref().unwrap_or("").to_lowercase();
+                    let cname = c.title.to_lowercase();
+                    (team_part.is_empty() || tname.contains(&team_part))
+                        && (chan_part.is_empty() || cname.contains(&chan_part))
+                })
+                .collect();
+
+            if sub_matches.len() == 1 {
+                return Ok(sub_matches[0].clone());
+            } else if sub_matches.len() > 1 {
+                bail!(
+                    "'{q}'와 일치하는 채널이 여러 개입니다. 더 구체적으로 지정하세요:\n{}",
+                    format_candidates(&sub_matches)
+                );
+            }
+        }
+    }
+
+    let q_lower = q.to_lowercase();
+
+    // Priority 4: Exact case-insensitive title match across all conversations
+    let exact_title_matches: Vec<&ConversationSummary> = conversations
+        .iter()
+        .filter(|c| c.title.trim().to_lowercase() == q_lower)
+        .collect();
+    if exact_title_matches.len() == 1 {
+        return Ok(exact_title_matches[0].clone());
+    } else if exact_title_matches.len() > 1 {
+        bail!(
+            "제목 '{q}'와 정확히 일치하는 대상이 여러 개입니다. conv_key 또는 '팀이름/채널이름'을 사용하세요:\n{}",
+            format_candidates(&exact_title_matches)
+        );
+    }
+
+    // Priority 5: Unique case-insensitive substring match on title or "team_name/title"
+    let sub_matches: Vec<&ConversationSummary> = conversations
+        .iter()
+        .filter(|c| {
+            let title_lower = c.title.to_lowercase();
+            if title_lower.contains(&q_lower) {
+                return true;
+            }
+            if let Some(team_name) = &c.team_name {
+                let combined = format!("{team_name}/{}", c.title).to_lowercase();
+                if combined.contains(&q_lower) {
+                    return true;
+                }
+            }
+            false
+        })
+        .collect();
+
+    match sub_matches.len() {
+        1 => Ok(sub_matches[0].clone()),
+        n if n > 1 => bail!(
+            "'{q}'와 일치하는 대화방/채널이 {n}개 있습니다. 더 구체적으로 지정하세요:\n{}",
+            format_candidates(&sub_matches)
+        ),
+        _ => bail!("대화방/채널을 찾을 수 없습니다: {q}"),
+    }
 }
 
 /// Resolves against local SQLite cache first, refreshing from Graph once if not found.
@@ -41,8 +156,153 @@ pub async fn resolve_conversation(
     }
     let chats = graph.list_chats(50).await.unwrap_or_default();
     storage.upsert_conversations(&chats)?;
-    let teams = graph.list_joined_teams_with_channels().await.unwrap_or_default();
+    let teams = graph
+        .list_joined_teams_with_channels()
+        .await
+        .unwrap_or_default();
     storage.upsert_teams(&teams)?;
     let refreshed = storage.list_conversations()?;
     resolve_from_slice(&refreshed, query)
+}
+
+fn format_candidates(candidates: &[&ConversationSummary]) -> String {
+    const MAX_LIST: usize = 8;
+    let mut lines: Vec<String> = candidates
+        .iter()
+        .take(MAX_LIST)
+        .map(|c| match c.team_name.as_deref() {
+            Some(team) if c.kind == ConversationKind::Channel && !team.is_empty() => {
+                format!("  - {team}/{} ({})", c.title, c.conv_key)
+            }
+            _ => format!("  - {} ({})", c.title, c.conv_key),
+        })
+        .collect();
+    if candidates.len() > MAX_LIST {
+        lines.push(format!("  ... 외 {}건", candidates.len() - MAX_LIST));
+    }
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_chat(chat_id: &str, title: &str) -> ConversationSummary {
+        let target = ConversationTarget::Chat {
+            chat_id: chat_id.to_string(),
+        };
+        ConversationSummary {
+            conv_key: target.conv_key(),
+            target,
+            kind: ConversationKind::OneOnOne,
+            team_id: None,
+            team_name: None,
+            title: title.to_string(),
+            topic: None,
+            unread_count: 0,
+            last_read_at: None,
+            last_msg_id: None,
+            last_msg_author: None,
+            last_msg_preview: None,
+            last_updated_at: None,
+            pinned: false,
+            peer_user_id: None,
+            web_url: None,
+        }
+    }
+
+    fn make_channel(
+        team_id: &str,
+        team_name: &str,
+        channel_id: &str,
+        title: &str,
+    ) -> ConversationSummary {
+        let target = ConversationTarget::Channel {
+            team_id: team_id.to_string(),
+            channel_id: channel_id.to_string(),
+        };
+        ConversationSummary {
+            conv_key: target.conv_key(),
+            target,
+            kind: ConversationKind::Channel,
+            team_id: Some(team_id.to_string()),
+            team_name: Some(team_name.to_string()),
+            title: title.to_string(),
+            topic: None,
+            unread_count: 0,
+            last_read_at: None,
+            last_msg_id: None,
+            last_msg_author: None,
+            last_msg_preview: None,
+            last_updated_at: None,
+            pinned: false,
+            peer_user_id: None,
+            web_url: None,
+        }
+    }
+
+    #[test]
+    fn test_resolver_priorities_and_slash_notation() {
+        let convs = vec![
+            make_chat("19:hong@unq.gbl.spaces", "홍길동"),
+            make_chat("19:kim@unq.gbl.spaces", "김철수"),
+            make_channel("t1", "개발팀", "19:gen1@thread.tacv2", "일반"),
+            make_channel("t1", "개발팀", "19:dep1@thread.tacv2", "배포"),
+            make_channel("t2", "인프라팀", "19:dep2@thread.tacv2", "배포-알림"),
+            make_channel("t2", "인프라팀", "19:gen2@thread.tacv2", "일반"),
+        ];
+
+        // Priority 1: exact conv_key
+        let r1 = resolve_from_slice(&convs, "chan:t1:19:dep1@thread.tacv2").unwrap();
+        assert_eq!(r1.title, "배포");
+
+        // Priority 2: raw chat_id / channel_id
+        let r2 = resolve_from_slice(&convs, "19:hong@unq.gbl.spaces").unwrap();
+        assert_eq!(r2.title, "홍길동");
+        let r2b = resolve_from_slice(&convs, "19:dep2@thread.tacv2").unwrap();
+        assert_eq!(r2b.title, "배포-알림");
+
+        // Priority 3: slash notation exact & substring
+        let r3 = resolve_from_slice(&convs, "개발팀/배포").unwrap();
+        assert_eq!(r3.conv_key, "chan:t1:19:dep1@thread.tacv2");
+        let r3b = resolve_from_slice(&convs, "인프/알림").unwrap();
+        assert_eq!(r3b.conv_key, "chan:t2:19:dep2@thread.tacv2");
+
+        // Priority 4: exact title match
+        let r4 = resolve_from_slice(&convs, "홍길동").unwrap();
+        assert_eq!(r4.conv_key, "chat:19:hong@unq.gbl.spaces");
+
+        // Priority 5: unique substring match
+        let r5 = resolve_from_slice(&convs, "철수").unwrap();
+        assert_eq!(r5.title, "김철수");
+    }
+
+    #[test]
+    fn test_resolver_ambiguity_error_lists_candidates() {
+        let convs = vec![
+            make_channel("t1", "개발팀", "c1", "일반"),
+            make_channel("t2", "디자인팀", "c2", "일반"),
+            make_channel("t3", "개발2팀", "c3", "배포-일반"),
+        ];
+
+        // Ambiguous exact title
+        let err = resolve_from_slice(&convs, "일반").unwrap_err().to_string();
+        assert!(err.contains("개발팀/일반 (chan:t1:c1)"));
+        assert!(err.contains("디자인팀/일반 (chan:t2:c2)"));
+
+        // Ambiguous slash notation
+        let err2 = resolve_from_slice(&convs, "개발/일반")
+            .unwrap_err()
+            .to_string();
+        assert!(err2.contains("개발팀/일반 (chan:t1:c1)"));
+        assert!(err2.contains("개발2팀/배포-일반 (chan:t3:c3)"));
+    }
+
+    #[test]
+    fn test_resolver_empty_and_not_found() {
+        let convs = vec![make_chat("c1", "홍길동")];
+        assert!(resolve_from_slice(&convs, "   ").is_err());
+        let err = resolve_from_slice(&convs, "없는방").unwrap_err().to_string();
+        assert!(err.contains("찾을 수 없습니다"));
+    }
 }

@@ -1,0 +1,37 @@
+{
+  "name": "@shinick/teams",
+  "version": "0.1.0",
+  "description": "Microsoft Teams terminal client & AI agent toolkit (CLI, TUI, HTTP API, MCP)",
+  "license": "MIT",
+  "bin": {
+    "teams": "bin/teams.js"
+  },
+  "files": [
+    "bin/teams.js",
+    "docs/NPM.md",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "microsoft-teams",
+    "teams",
+    "microsoft-graph",
+    "cli",
+    "tui",
+    "mcp"
+  ],
+  "scripts": {
+    "sync-version": "node scripts/sync-version.mjs",
+    "build:npm": "node scripts/build-npm.mjs"
+  },
+  "optionalDependencies": {
+    "@shinick/teams-win32-x64": "0.1.0",
+    "@shinick/teams-win32-arm64": "0.1.0",
+    "@shinick/teams-darwin-x64": "0.1.0",
+    "@shinick/teams-darwin-arm64": "0.1.0",
+    "@shinick/teams-linux-x64": "0.1.0",
+    "@shinick/teams-linux-arm64": "0.1.0"
+  }
+}

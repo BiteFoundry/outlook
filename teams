@@ -1,0 +1,19 @@
+#!/usr/bin/env sh
+# Unix launcher for teams (analogous to teams.cmd on Windows).
+#
+# Builds the release binary on first use, then execs it so signals and exit
+# codes pass through unchanged. Keep this file LF-terminated and executable
+# (git mode 100755) so it works on macOS/Linux:
+#   chmod +x teams
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+TARGET_DIR=${CARGO_TARGET_DIR:-"$ROOT/target"}
+BIN="$TARGET_DIR/release/teams"
+
+if [ ! -x "$BIN" ]; then
+    echo "[teams] release build not found - building..." >&2
+    cargo build --release --manifest-path "$ROOT/Cargo.toml" >&2
+fi
+
+exec "$BIN" "$@"

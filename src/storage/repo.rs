@@ -1,0 +1,808 @@
+//! Repository CRUD queries for conversations, teams, messages, threads, members, presences, and sync cursors.
+
+use std::collections::{HashMap, HashSet};
+
+use anyhow::Result;
+use rusqlite::{params, Connection, OptionalExtension, Row};
+
+use crate::models::{
+    AttachmentInfo, ChannelSummary, ConversationKind, ConversationSummary, ConversationTarget,
+    MemberInfo, MentionInfo, MessageItem, PresenceStatus, ReactionSummary, SyncCursor, TeamSummary,
+    ThreadView,
+};
+
+pub fn upsert_conversations(conn: &mut Connection, items: &[ConversationSummary]) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "
+            INSERT INTO conversations (
+                conv_key, target_json, kind, team_id, team_name, title, topic,
+                unread_count, last_read_at, last_msg_id, last_msg_author, last_msg_preview,
+                last_updated_at, pinned, peer_user_id, web_url
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16
+            )
+            ON CONFLICT(conv_key) DO UPDATE SET
+                target_json = excluded.target_json,
+                kind = excluded.kind,
+                team_id = COALESCE(excluded.team_id, conversations.team_id),
+                team_name = COALESCE(excluded.team_name, conversations.team_name),
+                title = excluded.title,
+                topic = COALESCE(excluded.topic, conversations.topic),
+                unread_count = excluded.unread_count,
+                last_read_at = COALESCE(excluded.last_read_at, conversations.last_read_at),
+                last_msg_id = COALESCE(excluded.last_msg_id, conversations.last_msg_id),
+                last_msg_author = CASE
+                    WHEN excluded.last_msg_id IS NOT NULL THEN excluded.last_msg_author
+                    ELSE conversations.last_msg_author
+                END,
+                last_msg_preview = CASE
+                    WHEN excluded.last_msg_id IS NOT NULL THEN excluded.last_msg_preview
+                    ELSE conversations.last_msg_preview
+                END,
+                last_updated_at = CASE
+                    WHEN excluded.last_updated_at IS NOT NULL
+                        AND (conversations.last_updated_at IS NULL OR excluded.last_updated_at >= conversations.last_updated_at)
+                    THEN excluded.last_updated_at
+                    ELSE conversations.last_updated_at
+                END,
+                pinned = excluded.pinned,
+                peer_user_id = COALESCE(excluded.peer_user_id, conversations.peer_user_id),
+                web_url = COALESCE(excluded.web_url, conversations.web_url)
+            ",
+        )?;
+
+        for item in items {
+            let target_json = serde_json::to_string(&item.target)?;
+            stmt.execute(params![
+                item.conv_key,
+                target_json,
+                item.kind.as_str(),
+                item.team_id,
+                item.team_name,
+                item.title,
+                item.topic,
+                item.unread_count,
+                item.last_read_at,
+                item.last_msg_id,
+                item.last_msg_author,
+                item.last_msg_preview,
+                item.last_updated_at,
+                if item.pinned { 1i32 } else { 0i32 },
+                item.peer_user_id,
+                item.web_url,
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn upsert_teams(conn: &mut Connection, teams: &[TeamSummary]) -> Result<()> {
+    if teams.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    {
+        let mut team_stmt = tx.prepare(
+            "
+            INSERT INTO teams (team_id, display_name, description, channels_json)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(team_id) DO UPDATE SET
+                display_name = excluded.display_name,
+                description = excluded.description,
+                channels_json = excluded.channels_json
+            ",
+        )?;
+
+        let mut conv_stmt = tx.prepare(
+            "
+            INSERT INTO conversations (
+                conv_key, target_json, kind, team_id, team_name, title, topic,
+                unread_count, last_read_at, last_msg_id, last_msg_author, last_msg_preview,
+                last_updated_at, pinned, peer_user_id, web_url
+            ) VALUES (
+                ?1, ?2, 'channel', ?3, ?4, ?5, ?6,
+                0, NULL, NULL, NULL, NULL,
+                NULL, 0, NULL, ?7
+            )
+            ON CONFLICT(conv_key) DO UPDATE SET
+                target_json = excluded.target_json,
+                kind = 'channel',
+                team_id = excluded.team_id,
+                team_name = excluded.team_name,
+                title = excluded.title,
+                topic = COALESCE(excluded.topic, conversations.topic),
+                web_url = COALESCE(excluded.web_url, conversations.web_url)
+            ",
+        )?;
+
+        for team in teams {
+            let channels_json = serde_json::to_string(&team.channels)?;
+            team_stmt.execute(params![
+                team.id,
+                team.display_name,
+                team.description,
+                channels_json,
+            ])?;
+
+            for ch in &team.channels {
+                let target = ch.target();
+                let conv_key = target.conv_key();
+                let target_json = serde_json::to_string(&target)?;
+                let team_name = if ch.team_name.trim().is_empty() {
+                    team.display_name.as_str()
+                } else {
+                    ch.team_name.as_str()
+                };
+                conv_stmt.execute(params![
+                    conv_key,
+                    target_json,
+                    ch.team_id,
+                    team_name,
+                    ch.display_name,
+                    ch.description,
+                    ch.web_url,
+                ])?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn list_conversations(conn: &Connection) -> Result<Vec<ConversationSummary>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT
+            conv_key, target_json, kind, team_id, team_name, title, topic,
+            unread_count, last_read_at, last_msg_id, last_msg_author, last_msg_preview,
+            last_updated_at, pinned, peer_user_id, web_url
+        FROM conversations
+        ORDER BY pinned DESC, COALESCE(last_updated_at, '') DESC, title ASC
+        ",
+    )?;
+    let rows = stmt.query_map([], map_conversation_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn list_teams(conn: &Connection) -> Result<Vec<TeamSummary>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT team_id, display_name, description, channels_json
+        FROM teams
+        ORDER BY display_name ASC
+        ",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let channels_json: String = row.get(3)?;
+        let channels: Vec<ChannelSummary> =
+            serde_json::from_str(&channels_json).unwrap_or_default();
+        Ok(TeamSummary {
+            id: row.get(0)?,
+            display_name: row.get(1)?,
+            description: row.get(2)?,
+            channels,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn get_conversation(conn: &Connection, conv_key: &str) -> Result<Option<ConversationSummary>> {
+    conn.query_row(
+        "
+        SELECT
+            conv_key, target_json, kind, team_id, team_name, title, topic,
+            unread_count, last_read_at, last_msg_id, last_msg_author, last_msg_preview,
+            last_updated_at, pinned, peer_user_id, web_url
+        FROM conversations
+        WHERE conv_key = ?1
+        ",
+        params![conv_key],
+        map_conversation_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn mark_conversation_read(conn: &Connection, conv_key: &str, read_at: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE conversations SET unread_count = 0, last_read_at = ?1 WHERE conv_key = ?2",
+        params![read_at, conv_key],
+    )?;
+    Ok(())
+}
+
+pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Result<usize> {
+    if messages.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.transaction()?;
+
+    let mut touched_threads: HashSet<(String, String)> = HashSet::new();
+    let mut newest_by_conv: HashMap<String, &MessageItem> = HashMap::new();
+
+    {
+        let mut msg_stmt = tx.prepare(
+            "
+            INSERT INTO messages (
+                msg_key, conv_key, msg_id, parent_msg_id, reply_to_id, reply_to_author, reply_to_preview,
+                subject, author_id, author_name, is_me, created_at, last_modified_at, deleted,
+                importance, message_type, body_html, body_plain, attachments_json, mentions_json,
+                reactions_json, reply_count, web_url
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                ?15, ?16, ?17, ?18, ?19, ?20,
+                ?21, ?22, ?23
+            )
+            ON CONFLICT(msg_key) DO UPDATE SET
+                parent_msg_id = COALESCE(excluded.parent_msg_id, messages.parent_msg_id),
+                reply_to_id = excluded.reply_to_id,
+                reply_to_author = excluded.reply_to_author,
+                reply_to_preview = excluded.reply_to_preview,
+                subject = excluded.subject,
+                author_id = excluded.author_id,
+                author_name = excluded.author_name,
+                is_me = excluded.is_me,
+                created_at = excluded.created_at,
+                last_modified_at = excluded.last_modified_at,
+                deleted = excluded.deleted,
+                importance = excluded.importance,
+                message_type = excluded.message_type,
+                body_html = excluded.body_html,
+                body_plain = excluded.body_plain,
+                attachments_json = excluded.attachments_json,
+                mentions_json = excluded.mentions_json,
+                reactions_json = excluded.reactions_json,
+                reply_count = MAX(messages.reply_count, excluded.reply_count),
+                web_url = COALESCE(excluded.web_url, messages.web_url)
+            ",
+        )?;
+
+        let mut fts_del_stmt = tx.prepare("DELETE FROM messages_fts WHERE msg_key = ?1")?;
+        let mut fts_ins_stmt = tx.prepare(
+            "
+            INSERT INTO messages_fts (msg_key, conv_key, author_name, body_plain, subject)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ",
+        )?;
+
+        for msg in messages {
+            let attachments_json = serde_json::to_string(&msg.attachments)?;
+            let mentions_json = serde_json::to_string(&msg.mentions)?;
+            let reactions_json = serde_json::to_string(&msg.reactions)?;
+            let msg_key = if msg.msg_key.is_empty() {
+                MessageItem::make_msg_key(&msg.conv_key, &msg.msg_id)
+            } else {
+                msg.msg_key.clone()
+            };
+
+            msg_stmt.execute(params![
+                msg_key,
+                msg.conv_key,
+                msg.msg_id,
+                msg.parent_msg_id,
+                msg.reply_to_id,
+                msg.reply_to_author,
+                msg.reply_to_preview,
+                msg.subject,
+                msg.author_id,
+                msg.author_name,
+                if msg.is_me { 1i32 } else { 0i32 },
+                msg.created_at,
+                msg.last_modified_at,
+                if msg.deleted { 1i32 } else { 0i32 },
+                msg.importance,
+                msg.message_type,
+                msg.body_html,
+                msg.body_plain,
+                attachments_json,
+                mentions_json,
+                reactions_json,
+                msg.reply_count as i64,
+                msg.web_url,
+            ])?;
+
+            fts_del_stmt.execute(params![msg_key])?;
+            if !msg.deleted {
+                fts_ins_stmt.execute(params![
+                    msg_key,
+                    msg.conv_key,
+                    msg.author_name,
+                    msg.body_plain,
+                    msg.subject.as_deref().unwrap_or(""),
+                ])?;
+
+                newest_by_conv
+                    .entry(msg.conv_key.clone())
+                    .and_modify(|existing| {
+                        if msg.created_at > existing.created_at
+                            || (msg.created_at == existing.created_at && msg.msg_id > existing.msg_id)
+                        {
+                            *existing = msg;
+                        }
+                    })
+                    .or_insert(msg);
+            }
+
+            if let Some(root_id) = &msg.parent_msg_id {
+                touched_threads.insert((msg.conv_key.clone(), root_id.clone()));
+            }
+        }
+    }
+
+    if !touched_threads.is_empty() {
+        let mut reply_count_stmt = tx.prepare(
+            "
+            UPDATE messages
+            SET reply_count = MAX(
+                reply_count,
+                (SELECT COUNT(*) FROM messages WHERE conv_key = ?1 AND parent_msg_id = ?2 AND deleted = 0)
+            )
+            WHERE conv_key = ?1 AND msg_id = ?2
+            ",
+        )?;
+        for (conv_key, root_id) in touched_threads {
+            reply_count_stmt.execute(params![conv_key, root_id])?;
+        }
+    }
+
+    if !newest_by_conv.is_empty() {
+        let mut conv_update_stmt = tx.prepare(
+            "
+            UPDATE conversations
+            SET
+                last_msg_id = ?1,
+                last_msg_author = ?2,
+                last_msg_preview = ?3,
+                last_updated_at = ?4
+            WHERE conv_key = ?5
+              AND (last_updated_at IS NULL OR last_updated_at < ?4)
+            ",
+        )?;
+        for (conv_key, msg) in newest_by_conv {
+            let preview = build_message_preview(msg);
+            conv_update_stmt.execute(params![
+                msg.msg_id,
+                msg.author_name,
+                preview,
+                msg.created_at,
+                conv_key,
+            ])?;
+        }
+    }
+
+    tx.commit()?;
+    Ok(messages.len())
+}
+
+pub fn list_root_messages(
+    conn: &Connection,
+    conv_key: &str,
+    limit: usize,
+    before_created_at: Option<&str>,
+) -> Result<Vec<MessageItem>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out = if let Some(before) = before_created_at {
+        let mut stmt = conn.prepare(
+            "
+            SELECT
+                msg_key, conv_key, msg_id, parent_msg_id, reply_to_id, reply_to_author, reply_to_preview,
+                subject, author_id, author_name, is_me, created_at, last_modified_at, deleted,
+                importance, message_type, body_html, body_plain, attachments_json, mentions_json,
+                reactions_json, reply_count, web_url
+            FROM messages
+            WHERE conv_key = ?1 AND parent_msg_id IS NULL AND created_at < ?2
+            ORDER BY created_at DESC, msg_id DESC
+            LIMIT ?3
+            ",
+        )?;
+        let rows = stmt.query_map(params![conv_key, before, limit as i64], map_message_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        let mut stmt = conn.prepare(
+            "
+            SELECT
+                msg_key, conv_key, msg_id, parent_msg_id, reply_to_id, reply_to_author, reply_to_preview,
+                subject, author_id, author_name, is_me, created_at, last_modified_at, deleted,
+                importance, message_type, body_html, body_plain, attachments_json, mentions_json,
+                reactions_json, reply_count, web_url
+            FROM messages
+            WHERE conv_key = ?1 AND parent_msg_id IS NULL
+            ORDER BY created_at DESC, msg_id DESC
+            LIMIT ?2
+            ",
+        )?;
+        let rows = stmt.query_map(params![conv_key, limit as i64], map_message_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    out.reverse();
+    Ok(out)
+}
+
+pub fn list_thread_replies(
+    conn: &Connection,
+    conv_key: &str,
+    root_msg_id: &str,
+    limit: usize,
+) -> Result<Vec<MessageItem>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "
+        SELECT
+            msg_key, conv_key, msg_id, parent_msg_id, reply_to_id, reply_to_author, reply_to_preview,
+            subject, author_id, author_name, is_me, created_at, last_modified_at, deleted,
+            importance, message_type, body_html, body_plain, attachments_json, mentions_json,
+            reactions_json, reply_count, web_url
+        FROM messages
+        WHERE conv_key = ?1 AND parent_msg_id = ?2
+        ORDER BY created_at ASC, msg_id ASC
+        LIMIT ?3
+        ",
+    )?;
+    let rows = stmt.query_map(params![conv_key, root_msg_id, limit as i64], map_message_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn get_message(
+    conn: &Connection,
+    conv_key: &str,
+    msg_id: &str,
+) -> Result<Option<MessageItem>> {
+    conn.query_row(
+        "
+        SELECT
+            msg_key, conv_key, msg_id, parent_msg_id, reply_to_id, reply_to_author, reply_to_preview,
+            subject, author_id, author_name, is_me, created_at, last_modified_at, deleted,
+            importance, message_type, body_html, body_plain, attachments_json, mentions_json,
+            reactions_json, reply_count, web_url
+        FROM messages
+        WHERE conv_key = ?1 AND msg_id = ?2
+        ",
+        params![conv_key, msg_id],
+        map_message_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn get_thread(
+    conn: &Connection,
+    conv_key: &str,
+    root_msg_id: &str,
+    limit: usize,
+) -> Result<Option<ThreadView>> {
+    let Some(root) = get_message(conn, conv_key, root_msg_id)? else {
+        return Ok(None);
+    };
+    let replies = list_thread_replies(conn, conv_key, root_msg_id, limit)?;
+    Ok(Some(ThreadView {
+        conv_key: conv_key.to_string(),
+        root,
+        replies,
+    }))
+}
+
+pub fn list_mentions_for_user(
+    conn: &Connection,
+    my_user_id: &str,
+    limit: usize,
+) -> Result<Vec<MessageItem>> {
+    if my_user_id.trim().is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let pattern = format!("%{}%", escape_like(my_user_id));
+    let mut stmt = conn.prepare(
+        "
+        SELECT
+            msg_key, conv_key, msg_id, parent_msg_id, reply_to_id, reply_to_author, reply_to_preview,
+            subject, author_id, author_name, is_me, created_at, last_modified_at, deleted,
+            importance, message_type, body_html, body_plain, attachments_json, mentions_json,
+            reactions_json, reply_count, web_url
+        FROM messages
+        WHERE deleted = 0 AND mentions_json LIKE ?1 ESCAPE '\\'
+        ORDER BY created_at DESC, msg_id DESC
+        ",
+    )?;
+    let rows = stmt.query_map(params![pattern], map_message_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let msg = row?;
+        if msg.mentions.iter().any(|m| m.user_id == my_user_id) {
+            out.push(msg);
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub fn upsert_members(conn: &mut Connection, conv_key: &str, members: &[MemberInfo]) -> Result<()> {
+    if members.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "
+            INSERT INTO members (conv_key, user_id, member_id, display_name, email, roles_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(conv_key, user_id) DO UPDATE SET
+                member_id = COALESCE(excluded.member_id, members.member_id),
+                display_name = excluded.display_name,
+                email = COALESCE(excluded.email, members.email),
+                roles_json = excluded.roles_json
+            ",
+        )?;
+        for m in members {
+            let roles_json = serde_json::to_string(&m.roles)?;
+            stmt.execute(params![
+                conv_key,
+                m.user_id,
+                m.member_id,
+                m.display_name,
+                m.email,
+                roles_json,
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn list_members(conn: &Connection, conv_key: &str) -> Result<Vec<MemberInfo>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT
+            m.user_id, m.member_id, m.display_name, m.email, m.roles_json,
+            p.availability, p.activity
+        FROM members m
+        LEFT JOIN presences p ON m.user_id = p.user_id
+        WHERE m.conv_key = ?1
+        ORDER BY m.display_name ASC
+        ",
+    )?;
+    let rows = stmt.query_map(params![conv_key], |row| {
+        let user_id: String = row.get(0)?;
+        let roles_json: String = row.get(4)?;
+        let roles: Vec<String> = serde_json::from_str(&roles_json).unwrap_or_default();
+        let availability: Option<String> = row.get(5)?;
+        let activity: Option<String> = row.get(6)?;
+        let presence = availability.map(|avail| PresenceStatus {
+            user_id: user_id.clone(),
+            availability: avail,
+            activity: activity.unwrap_or_default(),
+        });
+        Ok(MemberInfo {
+            user_id,
+            member_id: row.get(1)?,
+            display_name: row.get(2)?,
+            email: row.get(3)?,
+            roles,
+            presence,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn upsert_presences(conn: &mut Connection, presences: &[PresenceStatus]) -> Result<()> {
+    if presences.is_empty() {
+        return Ok(());
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "
+            INSERT INTO presences (user_id, availability, activity, updated_at)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(user_id) DO UPDATE SET
+                availability = excluded.availability,
+                activity = excluded.activity,
+                updated_at = excluded.updated_at
+            ",
+        )?;
+        for p in presences {
+            stmt.execute(params![p.user_id, p.availability, p.activity, now])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn get_presences(conn: &Connection) -> Result<HashMap<String, PresenceStatus>> {
+    let mut stmt = conn.prepare("SELECT user_id, availability, activity FROM presences")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(PresenceStatus {
+            user_id: row.get(0)?,
+            availability: row.get(1)?,
+            activity: row.get(2)?,
+        })
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let p = row?;
+        out.insert(p.user_id.clone(), p);
+    }
+    Ok(out)
+}
+
+pub fn get_sync_cursor(conn: &Connection, scope_key: &str) -> Result<Option<SyncCursor>> {
+    conn.query_row(
+        "SELECT scope_key, delta_link, oldest_msg_ts, synced_at FROM sync_cursors WHERE scope_key = ?1",
+        params![scope_key],
+        |row| {
+            Ok(SyncCursor {
+                scope_key: row.get(0)?,
+                delta_link: row.get(1)?,
+                oldest_msg_ts: row.get(2)?,
+                synced_at: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn save_sync_cursor(conn: &Connection, cursor: &SyncCursor) -> Result<()> {
+    conn.execute(
+        "
+        INSERT INTO sync_cursors (scope_key, delta_link, oldest_msg_ts, synced_at)
+        VALUES (?1, ?2, ?3, ?4)
+        ON CONFLICT(scope_key) DO UPDATE SET
+            delta_link = excluded.delta_link,
+            oldest_msg_ts = COALESCE(excluded.oldest_msg_ts, sync_cursors.oldest_msg_ts),
+            synced_at = excluded.synced_at
+        ",
+        params![
+            cursor.scope_key,
+            cursor.delta_link,
+            cursor.oldest_msg_ts,
+            cursor.synced_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn map_conversation_row(row: &Row<'_>) -> rusqlite::Result<ConversationSummary> {
+    let conv_key: String = row.get(0)?;
+    let target_json: String = row.get(1)?;
+    let target: ConversationTarget = serde_json::from_str(&target_json)
+        .ok()
+        .or_else(|| ConversationTarget::from_conv_key(&conv_key))
+        .unwrap_or_else(|| ConversationTarget::Chat {
+            chat_id: conv_key.clone(),
+        });
+    let kind_str: String = row.get(2)?;
+    let pinned_int: i32 = row.get(13)?;
+    Ok(ConversationSummary {
+        conv_key,
+        target,
+        kind: ConversationKind::from_db_str(&kind_str),
+        team_id: row.get(3)?,
+        team_name: row.get(4)?,
+        title: row.get(5)?,
+        topic: row.get(6)?,
+        unread_count: row.get(7)?,
+        last_read_at: row.get(8)?,
+        last_msg_id: row.get(9)?,
+        last_msg_author: row.get(10)?,
+        last_msg_preview: row.get(11)?,
+        last_updated_at: row.get(12)?,
+        pinned: pinned_int != 0,
+        peer_user_id: row.get(14)?,
+        web_url: row.get(15)?,
+    })
+}
+
+fn map_message_row(row: &Row<'_>) -> rusqlite::Result<MessageItem> {
+    let is_me_int: i32 = row.get(10)?;
+    let deleted_int: i32 = row.get(13)?;
+    let attachments_json: String = row.get(18)?;
+    let mentions_json: String = row.get(19)?;
+    let reactions_json: String = row.get(20)?;
+    let reply_count_i64: i64 = row.get(21)?;
+
+    let attachments: Vec<AttachmentInfo> =
+        serde_json::from_str(&attachments_json).unwrap_or_default();
+    let mentions: Vec<MentionInfo> = serde_json::from_str(&mentions_json).unwrap_or_default();
+    let reactions: Vec<ReactionSummary> =
+        serde_json::from_str(&reactions_json).unwrap_or_default();
+
+    Ok(MessageItem {
+        msg_key: row.get(0)?,
+        conv_key: row.get(1)?,
+        msg_id: row.get(2)?,
+        parent_msg_id: row.get(3)?,
+        reply_to_id: row.get(4)?,
+        reply_to_author: row.get(5)?,
+        reply_to_preview: row.get(6)?,
+        subject: row.get(7)?,
+        author_id: row.get(8)?,
+        author_name: row.get(9)?,
+        is_me: is_me_int != 0,
+        created_at: row.get(11)?,
+        last_modified_at: row.get(12)?,
+        deleted: deleted_int != 0,
+        importance: row.get(14)?,
+        message_type: row.get(15)?,
+        body_html: row.get(16)?,
+        body_plain: row.get(17)?,
+        attachments,
+        mentions,
+        reactions,
+        reply_count: reply_count_i64.max(0) as usize,
+        web_url: row.get(22)?,
+    })
+}
+
+fn build_message_preview(msg: &MessageItem) -> String {
+    let single_line: String = msg
+        .body_plain
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let base = if !single_line.is_empty() {
+        single_line
+    } else if let Some(subj) = msg.subject.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        subj.to_string()
+    } else if let Some(att) = msg.attachments.first() {
+        format!(
+            "[첨부: {}]",
+            att.name.as_deref().unwrap_or(att.id.as_str())
+        )
+    } else {
+        String::new()
+    };
+
+    const MAX_CHARS: usize = 120;
+    if base.chars().count() <= MAX_CHARS {
+        base
+    } else {
+        let truncated: String = base.chars().take(MAX_CHARS - 1).collect();
+        format!("{truncated}…")
+    }
+}
+
+pub(crate) fn escape_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}

@@ -1,0 +1,1039 @@
+openapi: 3.1.0
+info:
+  title: teams HTTP JSON API
+  version: 0.1.0
+  description: |
+    Local HTTP/JSON contract exposed by `teams serve` (alias `teams api`).
+
+    Backed by Microsoft Graph v1.0, local SQLite WAL/FTS5 caching, and the
+    background sync engine. Binds to `127.0.0.1:8788` by default. When started
+    with `--token`, every endpoint except `GET /health` requires
+    `Authorization: Bearer <token>`.
+
+    All errors return `{"error": "<message>"}` with an appropriate HTTP status.
+servers:
+  - url: http://127.0.0.1:8788
+    description: Default loopback listener
+security:
+  - bearerAuth: []
+  - {}
+tags:
+  - name: health
+  - name: conversations
+  - name: teams
+  - name: messages
+  - name: threads
+  - name: files
+  - name: search
+  - name: presence
+paths:
+  /health:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      description: Always public, even when `--token` is set.
+      security: []
+      responses:
+        "200":
+          description: Server is up
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /conversations:
+    get:
+      tags: [conversations]
+      summary: List cached chats and channels
+      parameters:
+        - name: refresh
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: kind
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [oneOnOne, group, meeting, channel]
+      responses:
+        "200":
+          description: Conversation list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [conversations]
+                properties:
+                  conversations:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ConversationSummary"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /chats:
+    post:
+      tags: [conversations]
+      summary: Create a 1:1 or group chat
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateChatRequest"
+      responses:
+        "200":
+          description: Chat created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, conversation]
+                properties:
+                  ok:
+                    type: boolean
+                  conversation:
+                    $ref: "#/components/schemas/ConversationSummary"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /teams:
+    get:
+      tags: [teams]
+      summary: List joined Teams and their channels
+      parameters:
+        - name: refresh
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Teams list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [teams]
+                properties:
+                  teams:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TeamSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /conversations/{key}/messages:
+    parameters:
+      - $ref: "#/components/parameters/ConversationKey"
+    get:
+      tags: [messages]
+      summary: Read recent messages from a chat or channel
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - name: offline
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Messages in chronological order
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [conversation, messages]
+                properties:
+                  conversation:
+                    $ref: "#/components/schemas/ConversationSummary"
+                  messages:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/MessageItem"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      tags: [messages]
+      summary: Send a Markdown message
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendMessageRequest"
+      responses:
+        "200":
+          description: Message sent
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SendMessageResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /conversations/{key}/threads/{root_id}:
+    parameters:
+      - $ref: "#/components/parameters/ConversationKey"
+      - name: root_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [threads]
+      summary: Get a channel root post and its thread replies
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - name: offline
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Thread view
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [thread]
+                properties:
+                  thread:
+                    $ref: "#/components/schemas/ThreadView"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /conversations/{key}/messages/{msg_id}/replies:
+    parameters:
+      - $ref: "#/components/parameters/ConversationKey"
+      - $ref: "#/components/parameters/MessageId"
+    post:
+      tags: [messages, threads]
+      summary: Reply to a channel thread or quote-reply a chat message
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReplyRequest"
+      responses:
+        "200":
+          description: Reply sent
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, conversation, reply_to, message]
+                properties:
+                  ok:
+                    type: boolean
+                  conversation:
+                    $ref: "#/components/schemas/ConversationSummary"
+                  reply_to:
+                    type: string
+                  message:
+                    $ref: "#/components/schemas/MessageItem"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /conversations/{key}/files:
+    parameters:
+      - $ref: "#/components/parameters/ConversationKey"
+    post:
+      tags: [files]
+      summary: Upload a local file to OneDrive/SharePoint and post a reference attachment (or inline image)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendFileRequest"
+      responses:
+        "200":
+          description: File uploaded and posted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SendMessageResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /conversations/{key}/messages/{msg_id}/attachments/download:
+    parameters:
+      - $ref: "#/components/parameters/ConversationKey"
+      - $ref: "#/components/parameters/MessageId"
+    post:
+      tags: [files]
+      summary: Download an attachment from a message
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DownloadRequest"
+      responses:
+        "200":
+          description: File downloaded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DownloadResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /conversations/{key}/messages/{msg_id}/reactions:
+    parameters:
+      - $ref: "#/components/parameters/ConversationKey"
+      - $ref: "#/components/parameters/MessageId"
+    post:
+      tags: [messages]
+      summary: Set or unset a reaction on a message
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReactionRequest"
+      responses:
+        "200":
+          description: Reaction updated
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, conv_key, msg_id, reaction, enable]
+                properties:
+                  ok:
+                    type: boolean
+                  conv_key:
+                    type: string
+                  msg_id:
+                    type: string
+                  reaction:
+                    type: string
+                  enable:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /conversations/{key}/messages/{msg_id}:
+    parameters:
+      - $ref: "#/components/parameters/ConversationKey"
+      - $ref: "#/components/parameters/MessageId"
+    patch:
+      tags: [messages]
+      summary: Edit a message sent by the authenticated user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EditMessageRequest"
+      responses:
+        "200":
+          description: Message edited
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageMutationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      tags: [messages]
+      summary: Soft-delete a message sent by the authenticated user
+      parameters:
+        - name: thread_root_id
+          in: query
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                thread_root_id:
+                  type: [string, "null"]
+      responses:
+        "200":
+          description: Message deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageMutationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /conversations/{key}/read:
+    parameters:
+      - $ref: "#/components/parameters/ConversationKey"
+    post:
+      tags: [conversations]
+      summary: Mark a conversation as read
+      responses:
+        "200":
+          description: Marked read
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, conv_key]
+                properties:
+                  ok:
+                    type: boolean
+                  conv_key:
+                    type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /conversations/{key}/members:
+    parameters:
+      - $ref: "#/components/parameters/ConversationKey"
+    get:
+      tags: [conversations]
+      summary: List members of a chat or channel
+      responses:
+        "200":
+          description: Member list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [conv_key, title, members]
+                properties:
+                  conv_key:
+                    type: string
+                  title:
+                    type: string
+                  members:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/MemberInfo"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /search:
+    get:
+      tags: [search]
+      summary: Search cached messages via SQLite FTS5
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+        - $ref: "#/components/parameters/Limit"
+        - name: target
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Search hits
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [query, hits]
+                properties:
+                  query:
+                    type: string
+                  hits:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SearchHit"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /presence:
+    get:
+      tags: [presence]
+      summary: Get presence for self or specified user IDs
+      parameters:
+        - name: user_ids
+          in: query
+          required: false
+          description: Comma-separated Entra user IDs. Omit for current user presence.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Presence response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  presence:
+                    $ref: "#/components/schemas/PresenceStatus"
+                  presences:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PresenceStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      tags: [presence]
+      summary: Set preferred presence for current user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetPresenceRequest"
+      responses:
+        "200":
+          description: Presence updated
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, availability, activity]
+                properties:
+                  ok:
+                    type: boolean
+                  availability:
+                    type: string
+                  activity:
+                    type: string
+                  expiration_mins:
+                    type: [integer, "null"]
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Required when `teams serve --token <secret>` is set.
+  parameters:
+    ConversationKey:
+      name: key
+      in: path
+      required: true
+      description: URL-encoded `conv_key`, raw `chat_id`, `"Team/Channel"`, or fuzzy conversation title.
+      schema:
+        type: string
+    MessageId:
+      name: msg_id
+      in: path
+      required: true
+      schema:
+        type: string
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 50
+  responses:
+    BadRequest:
+      description: Invalid parameters or malformed JSON body
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Target conversation or cached thread not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    InternalError:
+      description: Upstream Graph or SQLite error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+    HealthResponse:
+      type: object
+      required: [ok, version]
+      properties:
+        ok:
+          type: boolean
+        user_id:
+          type: [string, "null"]
+        version:
+          type: string
+    ConversationTarget:
+      type: object
+      required: [target_type]
+      properties:
+        target_type:
+          type: string
+          enum: [chat, channel]
+        chat_id:
+          type: string
+        team_id:
+          type: string
+        channel_id:
+          type: string
+    ConversationSummary:
+      type: object
+      required: [conv_key, target, kind, title, unread_count, pinned]
+      properties:
+        conv_key:
+          type: string
+        target:
+          $ref: "#/components/schemas/ConversationTarget"
+        kind:
+          type: string
+          enum: [oneOnOne, group, meeting, channel]
+        team_id:
+          type: [string, "null"]
+        team_name:
+          type: [string, "null"]
+        title:
+          type: string
+        topic:
+          type: [string, "null"]
+        unread_count:
+          type: integer
+        last_read_at:
+          type: [string, "null"]
+        last_msg_id:
+          type: [string, "null"]
+        last_msg_author:
+          type: [string, "null"]
+        last_msg_preview:
+          type: [string, "null"]
+        last_updated_at:
+          type: [string, "null"]
+        pinned:
+          type: boolean
+        peer_user_id:
+          type: [string, "null"]
+        web_url:
+          type: [string, "null"]
+    ChannelSummary:
+      type: object
+      required: [id, team_id, team_name, display_name, membership_type]
+      properties:
+        id:
+          type: string
+        team_id:
+          type: string
+        team_name:
+          type: string
+        display_name:
+          type: string
+        description:
+          type: [string, "null"]
+        membership_type:
+          type: string
+        web_url:
+          type: [string, "null"]
+    TeamSummary:
+      type: object
+      required: [id, display_name, channels]
+      properties:
+        id:
+          type: string
+        display_name:
+          type: string
+        description:
+          type: [string, "null"]
+        channels:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChannelSummary"
+    AttachmentInfo:
+      type: object
+      required: [id, content_type]
+      properties:
+        id:
+          type: string
+        content_type:
+          type: string
+        content_url:
+          type: [string, "null"]
+        name:
+          type: [string, "null"]
+        content_json:
+          type: [string, "null"]
+        thumbnail_url:
+          type: [string, "null"]
+    MentionInfo:
+      type: object
+      required: [id, user_id, display_name]
+      properties:
+        id:
+          type: integer
+        user_id:
+          type: string
+        display_name:
+          type: string
+    ReactionSummary:
+      type: object
+      required: [reaction_type, count, me_reacted, users]
+      properties:
+        reaction_type:
+          type: string
+        count:
+          type: integer
+        me_reacted:
+          type: boolean
+        users:
+          type: array
+          items:
+            type: string
+    MessageItem:
+      type: object
+      required:
+        [msg_key, conv_key, msg_id, author_name, is_me, created_at, deleted, importance, message_type, body_html, body_plain, attachments, mentions, reactions, reply_count]
+      properties:
+        msg_key:
+          type: string
+        conv_key:
+          type: string
+        msg_id:
+          type: string
+        parent_msg_id:
+          type: [string, "null"]
+        reply_to_id:
+          type: [string, "null"]
+        reply_to_author:
+          type: [string, "null"]
+        reply_to_preview:
+          type: [string, "null"]
+        subject:
+          type: [string, "null"]
+        author_id:
+          type: [string, "null"]
+        author_name:
+          type: string
+        is_me:
+          type: boolean
+        created_at:
+          type: string
+        last_modified_at:
+          type: [string, "null"]
+        deleted:
+          type: boolean
+        importance:
+          type: string
+        message_type:
+          type: string
+        body_html:
+          type: string
+        body_plain:
+          type: string
+        attachments:
+          type: array
+          items:
+            $ref: "#/components/schemas/AttachmentInfo"
+        mentions:
+          type: array
+          items:
+            $ref: "#/components/schemas/MentionInfo"
+        reactions:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReactionSummary"
+        reply_count:
+          type: integer
+        web_url:
+          type: [string, "null"]
+    ThreadView:
+      type: object
+      required: [conv_key, root, replies]
+      properties:
+        conv_key:
+          type: string
+        root:
+          $ref: "#/components/schemas/MessageItem"
+        replies:
+          type: array
+          items:
+            $ref: "#/components/schemas/MessageItem"
+    PresenceStatus:
+      type: object
+      required: [user_id, availability, activity]
+      properties:
+        user_id:
+          type: string
+        availability:
+          type: string
+        activity:
+          type: string
+    MemberInfo:
+      type: object
+      required: [user_id, display_name, roles]
+      properties:
+        user_id:
+          type: string
+        member_id:
+          type: [string, "null"]
+        display_name:
+          type: string
+        email:
+          type: [string, "null"]
+        roles:
+          type: array
+          items:
+            type: string
+        presence:
+          oneOf:
+            - $ref: "#/components/schemas/PresenceStatus"
+            - type: "null"
+    SearchHit:
+      type: object
+      required: [conv_key, conv_title, kind, msg_id, author_name, created_at, snippet]
+      properties:
+        conv_key:
+          type: string
+        conv_title:
+          type: string
+        kind:
+          type: string
+          enum: [oneOnOne, group, meeting, channel]
+        msg_id:
+          type: string
+        parent_msg_id:
+          type: [string, "null"]
+        author_name:
+          type: string
+        created_at:
+          type: string
+        snippet:
+          type: string
+    CreateChatRequest:
+      type: object
+      required: [members]
+      properties:
+        members:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        topic:
+          type: [string, "null"]
+    MentionInput:
+      oneOf:
+        - type: string
+          description: Format `user_id:DisplayName`
+        - type: object
+          required: [user_id, display_name]
+          properties:
+            id:
+              type: [integer, "null"]
+            user_id:
+              type: string
+            display_name:
+              type: string
+    SendMessageRequest:
+      type: object
+      required: [markdown]
+      properties:
+        markdown:
+          type: string
+          minLength: 1
+        subject:
+          type: [string, "null"]
+        mentions:
+          type: array
+          items:
+            $ref: "#/components/schemas/MentionInput"
+        important:
+          type: boolean
+          default: false
+    SendMessageResult:
+      type: object
+      required: [ok, conversation, message]
+      properties:
+        ok:
+          type: boolean
+        conversation:
+          $ref: "#/components/schemas/ConversationSummary"
+        message:
+          $ref: "#/components/schemas/MessageItem"
+    ReplyRequest:
+      type: object
+      required: [markdown]
+      properties:
+        markdown:
+          type: string
+          minLength: 1
+        mentions:
+          type: array
+          items:
+            $ref: "#/components/schemas/MentionInput"
+        important:
+          type: boolean
+          default: false
+    SendFileRequest:
+      type: object
+      required: [path]
+      properties:
+        path:
+          type: string
+          minLength: 1
+        caption:
+          type: [string, "null"]
+        thread_root_id:
+          type: [string, "null"]
+        inline:
+          type: boolean
+          default: false
+    DownloadRequest:
+      type: object
+      properties:
+        index:
+          type: integer
+          minimum: 0
+          default: 0
+        out_dir:
+          type: [string, "null"]
+        thread_root_id:
+          type: [string, "null"]
+    DownloadResult:
+      type: object
+      required: [ok, path, file_name, bytes_written]
+      properties:
+        ok:
+          type: boolean
+        path:
+          type: string
+        file_name:
+          type: string
+        bytes_written:
+          type: integer
+    ReactionRequest:
+      type: object
+      required: [reaction]
+      properties:
+        reaction:
+          type: string
+          description: "`like`, `heart`, `laugh`, `surprised`, `sad`, `angry`, or unicode emoji"
+        enable:
+          type: boolean
+          default: true
+        thread_root_id:
+          type: [string, "null"]
+    EditMessageRequest:
+      type: object
+      required: [markdown]
+      properties:
+        markdown:
+          type: string
+          minLength: 1
+        thread_root_id:
+          type: [string, "null"]
+    MessageMutationResult:
+      type: object
+      required: [ok, conv_key, msg_id]
+      properties:
+        ok:
+          type: boolean
+        conv_key:
+          type: string
+        msg_id:
+          type: string
+    SetPresenceRequest:
+      type: object
+      required: [availability]
+      properties:
+        availability:
+          type: string
+          enum: [Available, Busy, DoNotDisturb, BeRightBack, Away, Reset]
+        activity:
+          type: [string, "null"]
+        expiration_mins:
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 1440
