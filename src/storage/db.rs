@@ -3,6 +3,9 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
+const SCHEMA_USER_VERSION_UNICODE61: i32 = 40;
+const SCHEMA_USER_VERSION_TRIGRAM: i32 = 41;
+
 /// Initializes SQLite PRAGMAs, tables, indexes, and FTS5 virtual table.
 /// Returns `true` if `messages_fts` uses the `trigram` tokenizer, `false` if using `unicode61`.
 pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
@@ -21,12 +24,29 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
         PRAGMA foreign_keys = ON;
         PRAGMA busy_timeout = 5000;
         PRAGMA temp_store = MEMORY;
-        PRAGMA cache_size = -16000;
+        PRAGMA cache_size = -8000;
         ",
     )
     .context("SQLite PRAGMA 설정 실패")?;
     if !is_memory {
         let _ = conn.execute_batch("PRAGMA mmap_size = 67108864;");
+        let user_version: i32 = conn
+            .query_row("PRAGMA user_version;", [], |row| row.get(0))
+            .unwrap_or(0);
+        if user_version == SCHEMA_USER_VERSION_TRIGRAM
+            || user_version == SCHEMA_USER_VERSION_UNICODE61
+        {
+            let intact: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='onenote_fts')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if intact {
+                return Ok(user_version == SCHEMA_USER_VERSION_TRIGRAM);
+            }
+        }
     }
 
     conn.execute_batch(
@@ -379,7 +399,18 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
         ",
     )?;
 
-    Ok(messages_trigram && mail_trigram && onenote_trigram)
+    let all_trigram = messages_trigram && mail_trigram && onenote_trigram;
+    if !is_memory {
+        let version = if all_trigram {
+            SCHEMA_USER_VERSION_TRIGRAM
+        } else {
+            SCHEMA_USER_VERSION_UNICODE61
+        };
+        conn.execute_batch(&format!("PRAGMA user_version = {version};"))
+            .context("SQLite user_version 설정 실패")?;
+    }
+
+    Ok(all_trigram)
 }
 
 /// Configures a read-only WAL reader connection for concurrent UI reads.
@@ -390,12 +421,17 @@ pub fn init_reader_connection(conn: &Connection) -> Result<()> {
         PRAGMA query_only = ON;
         PRAGMA busy_timeout = 5000;
         PRAGMA temp_store = MEMORY;
-        PRAGMA cache_size = -16000;
+        PRAGMA cache_size = -4000;
         ",
     )
     .context("SQLite reader PRAGMA 설정 실패")?;
     let _ = conn.execute_batch("PRAGMA mmap_size = 67108864;");
     Ok(())
+}
+
+/// Releases unused SQLite page-cache memory back to the OS (`PRAGMA shrink_memory`).
+pub fn shrink_connection_memory(conn: &Connection) {
+    let _ = conn.execute_batch("PRAGMA shrink_memory;");
 }
 
 fn ensure_fts5_table(
@@ -421,4 +457,65 @@ fn ensure_fts5_table(
         .map(|s| s.to_ascii_lowercase().contains("trigram"))
         .unwrap_or(true);
     Ok(uses_trigram)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_user_version_fast_path_reopen_and_cache_caps() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("fastpath.db");
+
+        // First open initializes schema and stamps user_version
+        let first_trigram = {
+            let conn = Connection::open(&db_path).unwrap();
+            let trigram = init_connection(&conn, false).unwrap();
+            let ver: i32 = conn
+                .query_row("PRAGMA user_version;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                ver,
+                if trigram {
+                    SCHEMA_USER_VERSION_TRIGRAM
+                } else {
+                    SCHEMA_USER_VERSION_UNICODE61
+                }
+            );
+            let cache_size: i32 = conn
+                .query_row("PRAGMA cache_size;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(cache_size, -8000);
+            trigram
+        };
+
+        // Second open takes user_version fast-path and preserves trigram_enabled
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let second_trigram = init_connection(&conn, false).unwrap();
+            assert_eq!(second_trigram, first_trigram);
+
+            // Force unicode61 user_version stamp and verify fast-path returns false without running DDL
+            conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_USER_VERSION_UNICODE61};"))
+                .unwrap();
+        }
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            assert!(!init_connection(&conn, false).unwrap());
+        }
+
+        // Reader connection uses -4000 cache cap
+        let reader = Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        init_reader_connection(&reader).unwrap();
+        let reader_cache: i32 = reader
+            .query_row("PRAGMA cache_size;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(reader_cache, -4000);
+    }
 }

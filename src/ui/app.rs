@@ -142,7 +142,14 @@ pub enum UiMsg {
     MessageSent {
         conv_key: String,
         parent_msg_id: Option<String>,
+        optimistic_id: Option<String>,
         sent: MessageItem,
+    },
+    MessageSendFailed {
+        conv_key: String,
+        parent_msg_id: Option<String>,
+        optimistic_id: String,
+        text: String,
     },
     MessageDeleted {
         conv_key: String,
@@ -186,11 +193,42 @@ pub enum UiMsg {
     MailDetailLoaded {
         mail: MailMessage,
     },
+    MailDetailFailed {
+        mail_id: String,
+    },
+    MailPrefetchFailed {
+        mail_id: String,
+    },
+    MailReadRollback {
+        mail_id: String,
+        prev_read: bool,
+        folder_prev_unread: Option<(String, i32)>,
+    },
+    MailFlagRollback {
+        mail_id: String,
+        prev_flagged: bool,
+    },
+    MailRemoveRollback {
+        folder_id: String,
+        index: Option<usize>,
+        mail: MailMessage,
+    },
+    OutlookCachedSecondaryLoaded {
+        calendar_events: Vec<CalendarEvent>,
+        contacts: Vec<ContactItem>,
+        todo_lists: Vec<TodoList>,
+        todo_tasks: Vec<TodoTask>,
+        active_todo_list_id: Option<String>,
+    },
     MailUpdated {
         mail: MailMessage,
     },
     MailRemoved {
         mail_id: String,
+    },
+    TodoStatusRollback {
+        task_id: String,
+        prev_status: String,
     },
     CalendarLoaded {
         events: Vec<CalendarEvent>,
@@ -254,6 +292,16 @@ pub enum UiMsg {
         error: String,
     },
     UpdateChecked(UpdateCheckResult),
+    DaemonAttached {
+        pid: Option<u32>,
+        sync_busy: bool,
+    },
+    DaemonDetached,
+    StartLocalBootstrap,
+    ProfileLoaded {
+        me: Option<UserProfile>,
+        presence: Option<PresenceStatus>,
+    },
     TaskDone {
         label: String,
         error: Option<String>,
@@ -456,6 +504,8 @@ pub struct AppState {
     pub loading_thread: bool,
     pub syncing: bool,
     pub sync_summary: String,
+    pub daemon_attached: bool,
+    pub daemon_pid: Option<u32>,
     pub searching: bool,
     pub search_query: String,
     pub search_results: Vec<SearchHit>,
@@ -464,12 +514,17 @@ pub struct AppState {
     pub user_searching: bool,
     pub user_search_results: Vec<UserProfile>,
     pub oldest_reached: bool,
+    // Lazy domain activation flags
+    pub activated_teams: bool,
+    pub activated_outlook: bool,
+    pub activated_onenote: bool,
     // Outlook Unified Workspace state
     pub mail_folders: Vec<MailFolder>,
     pub mails: Vec<MailMessage>,
     pub active_mail_id: Option<String>,
     pub active_mail: Option<MailMessage>,
     pub loading_mail: bool,
+    pub mail_prefetch_pending: HashSet<String>,
     pub calendar_events: Vec<CalendarEvent>,
     pub active_event_id: Option<String>,
     pub contacts: Vec<ContactItem>,
@@ -489,11 +544,14 @@ pub struct AppState {
     pub loading_onenote_pages: bool,
     pub loading_onenote_detail: bool,
     pub onenote_image_cache: HashMap<String, RenderedTerminalImage>,
+    pub onenote_image_cache_order: VecDeque<String>,
+    pub onenote_image_cache_bytes: usize,
     pub onenote_image_pending: HashSet<String>,
     pub onenote_image_errors: HashSet<String>,
-    // Terminal inline image preview cache (bounded LRU-style FIFO)
+    // Terminal inline image preview cache (bounded LRU-style FIFO + 8 MiB byte budget)
     pub image_cache: HashMap<String, RenderedTerminalImage>,
     pub image_cache_order: VecDeque<String>,
+    pub image_cache_bytes: usize,
     pub image_pending: HashSet<String>,
     pub image_errors: HashMap<String, String>,
     pub ui_tx: mpsc::UnboundedSender<UiMsg>,
@@ -555,6 +613,8 @@ impl AppState {
             loading_thread: false,
             syncing: false,
             sync_summary: "준비".to_string(),
+            daemon_attached: false,
+            daemon_pid: None,
             searching: false,
             search_query: String::new(),
             search_results: Vec::new(),
@@ -563,11 +623,15 @@ impl AppState {
             user_searching: false,
             user_search_results: Vec::new(),
             oldest_reached: false,
+            activated_teams: false,
+            activated_outlook: false,
+            activated_onenote: false,
             mail_folders: Vec::new(),
             mails: Vec::new(),
             active_mail_id: None,
             active_mail: None,
             loading_mail: false,
+            mail_prefetch_pending: HashSet::new(),
             calendar_events: Vec::new(),
             active_event_id: None,
             contacts: Vec::new(),
@@ -586,10 +650,13 @@ impl AppState {
             loading_onenote_pages: false,
             loading_onenote_detail: false,
             onenote_image_cache: HashMap::new(),
+            onenote_image_cache_order: VecDeque::new(),
+            onenote_image_cache_bytes: 0,
             onenote_image_pending: HashSet::new(),
             onenote_image_errors: HashSet::new(),
             image_cache: HashMap::new(),
             image_cache_order: VecDeque::new(),
+            image_cache_bytes: 0,
             image_pending: HashSet::new(),
             image_errors: HashMap::new(),
             ui_tx,
@@ -714,7 +781,7 @@ impl AppState {
         ui.composer.reset_after_send();
     }
 
-    pub fn load_cached_initial(&mut self) {
+    fn load_cached_teams(&mut self) {
         if let Ok(convs) = self.storage.list_conversations() {
             self.conversations = convs;
         }
@@ -729,12 +796,19 @@ impl AppState {
                 self.activity_mentions = mentions;
             }
         }
+    }
+
+    fn load_cached_outlook_initial(&mut self) {
         if let Ok(folders) = self.storage.list_mail_folders() {
             self.mail_folders = folders;
         }
-        if let Ok(mails) = self.storage.list_mail_messages(Some("inbox"), 100) {
+        if let Ok(mails) = self.storage.list_mail_summaries(Some("inbox"), 100) {
             self.mails = mails;
         }
+    }
+
+    fn load_cached_outlook_full(&mut self) {
+        self.load_cached_outlook_initial();
         if let Ok(events) = self.storage.list_calendar_events(None, None, 100) {
             self.calendar_events = events;
         }
@@ -749,6 +823,9 @@ impl AppState {
             }
             self.todo_lists = lists;
         }
+    }
+
+    fn load_cached_onenote(&mut self) {
         if let Ok(notebooks) = self.storage.list_onenote_notebooks() {
             self.onenote_notebooks = notebooks;
         }
@@ -782,64 +859,162 @@ impl AppState {
         }
     }
 
-    pub fn spawn_bootstrap(&mut self, ui: &mut UiState) {
-        if ui.active_todo_list_id.is_none() {
-            ui.active_todo_list_id = self.todo_lists.first().map(|l| l.id.clone());
+    pub fn load_cached_initial(&mut self) {
+        self.load_cached_teams();
+        self.load_cached_outlook_full();
+        self.load_cached_onenote();
+    }
+
+    pub fn load_cached_for_persona(&mut self) {
+        match self.persona {
+            Persona::Teams => {
+                self.load_cached_teams();
+                self.activated_teams = true;
+            }
+            Persona::Outlook => {
+                self.load_cached_outlook_initial();
+                self.activated_outlook = true;
+            }
+            Persona::OneNote => {
+                self.load_cached_onenote();
+                self.activated_onenote = true;
+            }
         }
+    }
 
-        let persona = self.persona;
-        let active_section_key = self.active_section_key.clone();
-        let active_page_key = self.active_page_key.clone();
-        let sync_ctrl = self.sync_ctrl.clone();
-        let graph = self.graph.clone();
-        let storage = self.storage.clone();
-        let auth = self.auth.clone();
-        let tx = self.ui_tx.clone();
-        let task_label = "초기 동기화".to_string();
-        ui.tasks.begin(task_label.clone());
-        self.syncing = true;
-        self.sync_summary = "동기화 중...".to_string();
+    fn send_active_domains(&self) {
+        self.sync_ctrl.request(SyncCommand::SetActiveDomains {
+            teams: self.activated_teams,
+            outlook: self.activated_outlook,
+            onenote: self.activated_onenote,
+        });
+    }
 
-        let stagger_delay = std::time::Duration::from_millis(600);
+    pub fn ensure_tab_domain_activated(&mut self, ui: &mut UiState, tab: usize) {
+        const ONENOTE_TAB_LEAVE_MAX_BYTES: usize = 2 * 1024 * 1024;
+        const SHRINK_MEMORY_EVICT_THRESHOLD_BYTES: usize = 1024 * 1024;
 
-        let trigger_onenote = move |sync: &SyncController| {
-            sync.request(SyncCommand::RefreshOneNote);
-            if let Some(sec_key) = active_section_key {
-                sync.request(SyncCommand::SyncOneNoteSection {
-                    section_key: sec_key,
+        if tab != nav_pane::TAB_NOTES
+            && self.onenote_image_cache_bytes > ONENOTE_TAB_LEAVE_MAX_BYTES
+        {
+            let evicted_bytes = self.trim_onenote_image_cache_to(ONENOTE_TAB_LEAVE_MAX_BYTES);
+            if evicted_bytes > SHRINK_MEMORY_EVICT_THRESHOLD_BYTES
+                && tokio::runtime::Handle::try_current().is_ok()
+            {
+                let storage = self.storage.clone();
+                tokio::task::spawn_blocking(move || {
+                    storage.shrink_memory();
                 });
             }
-            if let Some(page_key) = active_page_key {
-                sync.request(SyncCommand::SyncOneNotePage { page_key });
-            }
-        };
-        if persona == Persona::OneNote {
-            trigger_onenote(&sync_ctrl);
-        } else {
-            let onenote_sync = sync_ctrl.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(stagger_delay).await;
-                trigger_onenote(&onenote_sync);
-            });
         }
 
-        let outlook_graph = graph.clone();
-        let outlook_storage = storage.clone();
-        let outlook_tx = tx.clone();
-        let outlook_task_label = if persona == Persona::Outlook {
-            Some(task_label.clone())
-        } else {
-            None
-        };
-        tokio::spawn(async move {
-            if persona != Persona::Outlook {
-                tokio::time::sleep(stagger_delay).await;
+        if tab <= nav_pane::TAB_ACTIVITY {
+            if !self.activated_teams {
+                self.activated_teams = true;
+                self.load_cached_teams();
+                self.send_active_domains();
+                if self.daemon_attached {
+                    self.sync_ctrl.request(SyncCommand::RefreshConversations);
+                } else {
+                    self.spawn_teams_bootstrap(None);
+                }
             }
+        } else if (nav_pane::TAB_MAIL..=nav_pane::TAB_TODO).contains(&tab) {
+            if !self.activated_outlook {
+                self.activated_outlook = true;
+                self.load_cached_outlook_full();
+                if ui.active_todo_list_id.is_none() {
+                    ui.active_todo_list_id = self.todo_lists.first().map(|l| l.id.clone());
+                }
+                self.send_active_domains();
+                if self.daemon_attached {
+                    self.sync_ctrl.request(SyncCommand::RefreshOutlook);
+                } else {
+                    self.spawn_outlook_bootstrap(None);
+                }
+            }
+        } else if tab == nav_pane::TAB_NOTES && !self.activated_onenote {
+            self.activated_onenote = true;
+            self.load_cached_onenote();
+            self.send_active_domains();
+            self.spawn_onenote_bootstrap();
+        }
+    }
+
+    fn spawn_onenote_bootstrap(&self) {
+        self.sync_ctrl.request(SyncCommand::RefreshOneNote);
+        if let Some(sec_key) = self.active_section_key.clone() {
+            self.sync_ctrl.request(SyncCommand::SyncOneNoteSection {
+                section_key: sec_key,
+            });
+        }
+        if let Some(page_key) = self.active_page_key.clone() {
+            self.sync_ctrl
+                .request(SyncCommand::SyncOneNotePage { page_key });
+        }
+    }
+
+    fn spawn_outlook_cached_secondary(&self) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let storage = self.storage.clone();
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            let snapshot = tokio::task::spawn_blocking(move || {
+                let calendar_events = storage
+                    .list_calendar_events(None, None, 100)
+                    .unwrap_or_default();
+                let contacts = storage.list_contacts(None, 200).unwrap_or_default();
+                let todo_lists = storage.list_todo_lists().unwrap_or_default();
+                let active_todo_list_id = todo_lists.first().map(|l| l.id.clone());
+                let todo_tasks = if let Some(ref lid) = active_todo_list_id {
+                    storage.list_todo_tasks(lid, false, 200).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                (
+                    calendar_events,
+                    contacts,
+                    todo_lists,
+                    todo_tasks,
+                    active_todo_list_id,
+                )
+            })
+            .await;
+
+            if let Ok((
+                calendar_events,
+                contacts,
+                todo_lists,
+                todo_tasks,
+                active_todo_list_id,
+            )) = snapshot
+            {
+                let _ = tx.send(UiMsg::OutlookCachedSecondaryLoaded {
+                    calendar_events,
+                    contacts,
+                    todo_lists,
+                    todo_tasks,
+                    active_todo_list_id,
+                });
+            }
+        });
+    }
+
+    fn spawn_outlook_bootstrap(&self, task_label: Option<String>) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let outlook_graph = self.graph.clone();
+        let outlook_storage = self.storage.clone();
+        let outlook_tx = self.ui_tx.clone();
+        tokio::spawn(async move {
             let _ = sync::bootstrap_outlook(&outlook_graph, &outlook_storage).await;
             let snapshot = tokio::task::spawn_blocking(move || {
                 let mail_folders = outlook_storage.list_mail_folders().unwrap_or_default();
                 let mails = outlook_storage
-                    .list_mail_messages(Some("inbox"), 100)
+                    .list_mail_summaries(Some("inbox"), 100)
                     .unwrap_or_default();
                 let calendar_events = outlook_storage
                     .list_calendar_events(None, None, 100)
@@ -886,7 +1061,7 @@ impl AppState {
                     active_todo_list_id,
                 });
             }
-            if let Some(label) = outlook_task_label {
+            if let Some(label) = task_label {
                 let _ = outlook_tx.send(UiMsg::TaskDone {
                     label,
                     error: None,
@@ -894,16 +1069,17 @@ impl AppState {
                 });
             }
         });
+    }
 
-        let teams_task_label = if persona != Persona::Outlook {
-            Some(task_label)
-        } else {
-            None
-        };
+    fn spawn_teams_bootstrap(&self, task_label: Option<String>) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let graph = self.graph.clone();
+        let storage = self.storage.clone();
+        let auth = self.auth.clone();
+        let tx = self.ui_tx.clone();
         tokio::spawn(async move {
-            if persona != Persona::Teams {
-                tokio::time::sleep(stagger_delay).await;
-            }
             let (token_uid, me_res, presence_res, _conv_res) = tokio::join!(
                 async { auth.current_tokens().await.and_then(|t| t.user_id) },
                 graph.get_me(),
@@ -977,7 +1153,7 @@ impl AppState {
                 mentions,
                 presences,
             });
-            if let Some(label) = teams_task_label {
+            if let Some(label) = task_label {
                 let _ = tx.send(UiMsg::TaskDone {
                     label,
                     error: None,
@@ -985,6 +1161,57 @@ impl AppState {
                 });
             }
         });
+    }
+
+    fn spawn_me_profile_if_needed(&self) {
+        if self.my_profile.is_some() || tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let graph = self.graph.clone();
+        let auth = self.auth.clone();
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            let (me_res, presence_res) = tokio::join!(graph.get_me(), graph.get_my_presence());
+            let me = me_res.ok();
+            if let Some(ref u) = me {
+                let _ = auth
+                    .update_identity(u.id.clone(), u.display_name.clone(), u.mail.clone())
+                    .await;
+            }
+            let presence = presence_res.ok();
+            let _ = tx.send(UiMsg::ProfileLoaded { me, presence });
+        });
+    }
+
+    pub fn spawn_bootstrap(&mut self, ui: &mut UiState) {
+        if ui.active_todo_list_id.is_none() {
+            ui.active_todo_list_id = self.todo_lists.first().map(|l| l.id.clone());
+        }
+
+        match self.persona {
+            Persona::Teams => self.activated_teams = true,
+            Persona::Outlook => self.activated_outlook = true,
+            Persona::OneNote => self.activated_onenote = true,
+        }
+        self.send_active_domains();
+
+        let task_label = "초기 동기화".to_string();
+        ui.tasks.begin(task_label.clone());
+        self.syncing = true;
+        self.sync_summary = "동기화 중...".to_string();
+
+        match self.persona {
+            Persona::Teams => {
+                self.spawn_teams_bootstrap(Some(task_label));
+            }
+            Persona::Outlook => {
+                self.spawn_outlook_cached_secondary();
+                self.spawn_outlook_bootstrap(Some(task_label));
+            }
+            Persona::OneNote => {
+                self.spawn_onenote_bootstrap();
+            }
+        }
     }
 
     pub fn select_conversation(&mut self, ui: &mut UiState, target: ConversationTarget) {
@@ -1082,8 +1309,7 @@ impl AppState {
     }
 
     pub fn select_nav_row(&mut self, ui: &mut UiState, idx: usize) {
-        let rows = nav_pane::build_nav_rows(self, ui);
-        let Some(row) = rows.get(idx).cloned() else {
+        let Some(row) = nav_pane::nav_row_at(self, ui, idx) else {
             return;
         };
         ui.nav_selected = idx;
@@ -1300,14 +1526,67 @@ impl AppState {
             subject,
             mentions,
             Vec::new(),
-            inline_images,
+            inline_images.clone(),
             quote.clone(),
         );
+
+        let optimistic_id = if inline_images.is_empty() {
+            let opt_id = format!("optimistic-{}", uuid::Uuid::new_v4());
+            let author_name = self
+                .my_profile
+                .as_ref()
+                .map(|p| p.display_name.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "나".to_string());
+            let optimistic_msg = MessageItem {
+                msg_key: format!("{conv_key}|{opt_id}"),
+                conv_key: conv_key.clone(),
+                msg_id: opt_id.clone(),
+                parent_msg_id: thread_root_id.clone(),
+                reply_to_id: quote.as_ref().map(|q| q.msg_id.clone()),
+                reply_to_author: quote.as_ref().map(|q| q.author_name.clone()),
+                reply_to_preview: quote.as_ref().map(|q| q.preview_plain.clone()),
+                subject: outgoing.subject.clone(),
+                author_id: (!self.my_user_id.is_empty()).then(|| self.my_user_id.clone()),
+                author_name,
+                is_me: true,
+                created_at: Utc::now().to_rfc3339(),
+                last_modified_at: None,
+                deleted: false,
+                importance: "normal".to_string(),
+                message_type: "message".to_string(),
+                body_html: outgoing.body_html.clone(),
+                body_plain: text.clone(),
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+                reactions: Vec::new(),
+                reply_count: 0,
+                web_url: None,
+            };
+            if let Some(ref pid) = thread_root_id {
+                if let Some(thread) = self.active_thread.as_mut() {
+                    if &thread.root.msg_id == pid {
+                        thread.replies.push(optimistic_msg);
+                        ui.thread_scroll.bottom();
+                    }
+                }
+            } else {
+                self.messages.push(optimistic_msg);
+                ui.chat_scroll.bottom();
+            }
+            Some(opt_id)
+        } else {
+            None
+        };
 
         let task_label = "메시지 전송".to_string();
         ui.tasks.begin(task_label.clone());
         self.clear_current_draft(ui);
         ui.show_subject = false;
+
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
 
         let graph = self.graph.clone();
         let storage = self.storage.clone();
@@ -1333,6 +1612,7 @@ impl AppState {
                     let _ = tx.send(UiMsg::MessageSent {
                         conv_key,
                         parent_msg_id: thread_root_id,
+                        optimistic_id,
                         sent,
                     });
                     let _ = tx.send(UiMsg::TaskDone {
@@ -1342,6 +1622,14 @@ impl AppState {
                     });
                 }
                 Err(err) => {
+                    if let Some(opt_id) = optimistic_id {
+                        let _ = tx.send(UiMsg::MessageSendFailed {
+                            conv_key,
+                            parent_msg_id: thread_root_id,
+                            optimistic_id: opt_id,
+                            text,
+                        });
+                    }
                     let msg = format!("전송 실패: {err}");
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
@@ -1698,20 +1986,135 @@ impl AppState {
         format!("{owner_id}:{att_id}:{cols}x{rows}")
     }
 
-    pub fn insert_image_cache(&mut self, cache_key: String, rendered: RenderedTerminalImage) {
-        const MAX_IMAGE_CACHE: usize = 64;
-        self.image_pending.remove(&cache_key);
-        self.image_errors.remove(&cache_key);
-        if self.image_cache.contains_key(&cache_key) {
-            self.image_cache_order.retain(|k| k != &cache_key);
+    fn rendered_image_bytes(rendered: &RenderedTerminalImage) -> usize {
+        rendered.approx_heap_bytes().max(64)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_bounded_image_cache(
+        cache: &mut HashMap<String, RenderedTerminalImage>,
+        order: &mut VecDeque<String>,
+        bytes_total: &mut usize,
+        other_cache: &mut HashMap<String, RenderedTerminalImage>,
+        other_order: &mut VecDeque<String>,
+        other_bytes_total: &mut usize,
+        max_entries: usize,
+        cache_key: String,
+        rendered: RenderedTerminalImage,
+    ) {
+        if let Some(prev) = cache.remove(&cache_key) {
+            *bytes_total = bytes_total.saturating_sub(Self::rendered_image_bytes(&prev));
+            order.retain(|k| k != &cache_key);
         }
-        self.image_cache.insert(cache_key.clone(), rendered);
-        self.image_cache_order.push_back(cache_key);
-        while self.image_cache_order.len() > MAX_IMAGE_CACHE {
-            if let Some(evicted) = self.image_cache_order.pop_front() {
-                self.image_cache.remove(&evicted);
+        let entry_bytes = Self::rendered_image_bytes(&rendered);
+        cache.insert(cache_key.clone(), rendered);
+        order.push_back(cache_key);
+        *bytes_total = bytes_total.saturating_add(entry_bytes);
+
+        while order.len() > max_entries {
+            let Some(evicted) = order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = cache.remove(&evicted) {
+                *bytes_total = bytes_total.saturating_sub(Self::rendered_image_bytes(&removed));
             }
         }
+
+        // Enforce strict 8 MiB combined heap budget across both image caches,
+        // keeping at least the newly inserted image if a single image exceeds budget.
+        while bytes_total.saturating_add(*other_bytes_total) > img_preview::MAX_IMAGE_CACHE_BYTES {
+            if !other_order.is_empty() {
+                if let Some(evicted) = other_order.pop_front() {
+                    if let Some(removed) = other_cache.remove(&evicted) {
+                        *other_bytes_total = other_bytes_total
+                            .saturating_sub(Self::rendered_image_bytes(&removed));
+                    }
+                }
+            } else if order.len() > 1 {
+                if let Some(evicted) = order.pop_front() {
+                    if let Some(removed) = cache.remove(&evicted) {
+                        *bytes_total =
+                            bytes_total.saturating_sub(Self::rendered_image_bytes(&removed));
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn insert_image_cache(&mut self, cache_key: String, rendered: RenderedTerminalImage) {
+        const MAX_IMAGE_CACHE: usize = 32;
+        self.image_pending.remove(&cache_key);
+        self.image_errors.remove(&cache_key);
+        Self::insert_bounded_image_cache(
+            &mut self.image_cache,
+            &mut self.image_cache_order,
+            &mut self.image_cache_bytes,
+            &mut self.onenote_image_cache,
+            &mut self.onenote_image_cache_order,
+            &mut self.onenote_image_cache_bytes,
+            MAX_IMAGE_CACHE,
+            cache_key,
+            rendered,
+        );
+    }
+
+    pub fn insert_onenote_image_cache(
+        &mut self,
+        cache_key: String,
+        rendered: RenderedTerminalImage,
+    ) {
+        const MAX_ONENOTE_IMAGE_CACHE: usize = 24;
+        self.onenote_image_pending.remove(&cache_key);
+        self.onenote_image_errors.remove(&cache_key);
+        Self::insert_bounded_image_cache(
+            &mut self.onenote_image_cache,
+            &mut self.onenote_image_cache_order,
+            &mut self.onenote_image_cache_bytes,
+            &mut self.image_cache,
+            &mut self.image_cache_order,
+            &mut self.image_cache_bytes,
+            MAX_ONENOTE_IMAGE_CACHE,
+            cache_key,
+            rendered,
+        );
+    }
+
+    /// Evicts oldest OneNote cached images until `onenote_image_cache_bytes <= max_bytes`,
+    /// returning total evicted bytes.
+    pub fn trim_onenote_image_cache_to(&mut self, max_bytes: usize) -> usize {
+        let mut evicted_bytes = 0usize;
+        while self.onenote_image_cache_bytes > max_bytes {
+            let Some(evicted) = self.onenote_image_cache_order.pop_front() else {
+                self.onenote_image_cache_bytes = 0;
+                break;
+            };
+            if let Some(removed) = self.onenote_image_cache.remove(&evicted) {
+                let bytes = Self::rendered_image_bytes(&removed);
+                self.onenote_image_cache_bytes =
+                    self.onenote_image_cache_bytes.saturating_sub(bytes);
+                evicted_bytes = evicted_bytes.saturating_add(bytes);
+            }
+        }
+        evicted_bytes
+    }
+
+    pub fn clear_image_cache(&mut self) {
+        self.image_cache.clear();
+        self.image_cache_order.clear();
+        self.image_cache_bytes = 0;
+    }
+
+    pub fn clear_onenote_image_cache(&mut self) {
+        self.onenote_image_cache.clear();
+        self.onenote_image_cache_order.clear();
+        self.onenote_image_cache_bytes = 0;
+    }
+
+    pub fn clear_image_caches(&mut self) {
+        self.clear_image_cache();
+        self.clear_onenote_image_cache();
     }
 
     pub fn request_teams_image(
@@ -2058,13 +2461,21 @@ impl AppState {
         ui.active_mail_folder_name = display_name;
         self.mails = self
             .storage
-            .list_mail_messages(Some(&folder_id), 100)
+            .list_mail_summaries(Some(&folder_id), 100)
             .unwrap_or_default();
-        self.active_mail_id = self.mails.first().map(|m| m.id.clone());
-        self.active_mail = self.mails.first().cloned();
-        ui.mail_scroll = ScrollState::default();
-        ui.mail_attach_index = 0;
+        self.active_mail_id = None;
+        self.active_mail = None;
+        self.loading_mail = false;
+        if let Some(first_id) = self.mails.first().map(|m| m.id.clone()) {
+            self.select_mail(ui, first_id);
+        } else {
+            ui.mail_scroll = ScrollState::default();
+            ui.mail_attach_index = 0;
+        }
 
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
         let graph = self.graph.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
@@ -2077,7 +2488,7 @@ impl AppState {
                 let cached = tokio::task::spawn_blocking(move || {
                     let _ = storage.upsert_mail_messages(&list);
                     storage
-                        .list_mail_messages(Some(&db_folder_id), 100)
+                        .list_mail_summaries(Some(&db_folder_id), 100)
                         .unwrap_or(list)
                 })
                 .await
@@ -2090,14 +2501,60 @@ impl AppState {
         });
     }
 
+    fn spawn_mail_prefetch(&self, mail_id: String) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let graph = self.graph.clone();
+        let storage = self.storage.clone();
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            let db_storage = storage.clone();
+            let db_id = mail_id.clone();
+            let cached = tokio::task::spawn_blocking(move || {
+                db_storage.get_mail_message(&db_id).ok().flatten()
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(mail) = cached {
+                if !mail.body_html.is_empty() && (!mail.has_attachments || !mail.attachments.is_empty()) {
+                    let _ = tx.send(UiMsg::MailDetailLoaded { mail });
+                    return;
+                }
+            }
+            match graph.get_mail_message(&mail_id).await {
+                Ok(mail) => {
+                    let mail_to_store = mail.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = storage.upsert_mail_messages(std::slice::from_ref(&mail_to_store));
+                    })
+                    .await;
+                    let _ = tx.send(UiMsg::MailDetailLoaded { mail });
+                }
+                Err(_) => {
+                    let _ = tx.send(UiMsg::MailPrefetchFailed { mail_id });
+                }
+            }
+        });
+    }
+
     pub fn select_mail(&mut self, ui: &mut UiState, mail_id: String) {
         self.active_mail_id = Some(mail_id.clone());
-        self.active_mail = self
-            .storage
-            .get_mail_message(&mail_id)
-            .ok()
-            .flatten()
-            .or_else(|| self.mails.iter().find(|m| m.id == mail_id).cloned());
+        let in_mem = self.mails.iter().find(|m| m.id == mail_id).cloned();
+        self.active_mail = if in_mem
+            .as_ref()
+            .is_some_and(|m| !m.body_html.is_empty() && (!m.has_attachments || !m.attachments.is_empty()))
+        {
+            in_mem
+        } else {
+            self.storage
+                .get_mail_message(&mail_id)
+                .ok()
+                .flatten()
+                .filter(|m| !m.body_html.is_empty() || !m.body_plain.is_empty())
+                .or(in_mem)
+        };
         ui.mail_scroll = ScrollState::default();
         ui.mail_scroll.top();
         ui.mail_attach_index = 0;
@@ -2106,31 +2563,57 @@ impl AppState {
             .active_mail
             .as_ref()
             .is_none_or(|m| m.body_html.is_empty() || (m.has_attachments && m.attachments.is_empty()));
+        self.loading_mail = needs_detail;
 
-        if needs_detail {
-            self.loading_mail = true;
-            let graph = self.graph.clone();
-            let storage = self.storage.clone();
-            let tx = self.ui_tx.clone();
-            tokio::spawn(async move {
-                match graph.get_mail_message(&mail_id).await {
-                    Ok(mail) => {
-                        let mail_to_store = mail.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            let _ = storage.upsert_mail_messages(std::slice::from_ref(&mail_to_store));
-                        })
-                        .await;
-                        let _ = tx.send(UiMsg::MailDetailLoaded { mail });
+        if tokio::runtime::Handle::try_current().is_ok() {
+            if needs_detail {
+                let graph = self.graph.clone();
+                let storage = self.storage.clone();
+                let tx = self.ui_tx.clone();
+                let req_id = mail_id.clone();
+                tokio::spawn(async move {
+                    match graph.get_mail_message(&req_id).await {
+                        Ok(mail) => {
+                            let mail_to_store = mail.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                let _ = storage.upsert_mail_messages(std::slice::from_ref(&mail_to_store));
+                            })
+                            .await;
+                            let _ = tx.send(UiMsg::MailDetailLoaded { mail });
+                        }
+                        Err(err) => {
+                            let _ = tx.send(UiMsg::MailDetailFailed { mail_id: req_id });
+                            let _ = tx.send(UiMsg::TaskDone {
+                                label: "메일 읽기".to_string(),
+                                error: Some(err.to_string()),
+                                toast: None,
+                            });
+                        }
                     }
-                    Err(err) => {
-                        let _ = tx.send(UiMsg::TaskDone {
-                            label: "메일 읽기".to_string(),
-                            error: Some(err.to_string()),
-                            toast: None,
-                        });
+                });
+            }
+
+            // Prefetch up to 2 neighboring mails (idx - 1, idx + 1) when header-only.
+            if let Some(idx) = self.mails.iter().position(|m| m.id == mail_id) {
+                let mut neighbors = Vec::with_capacity(2);
+                if idx > 0 {
+                    neighbors.push(idx - 1);
+                }
+                if idx + 1 < self.mails.len() {
+                    neighbors.push(idx + 1);
+                }
+                for n_idx in neighbors {
+                    if let Some(neighbor) = self.mails.get(n_idx) {
+                        if neighbor.body_html.is_empty()
+                            && !self.mail_prefetch_pending.contains(&neighbor.id)
+                        {
+                            let n_id = neighbor.id.clone();
+                            self.mail_prefetch_pending.insert(n_id.clone());
+                            self.spawn_mail_prefetch(n_id);
+                        }
                     }
                 }
-            });
+            }
         }
     }
 
@@ -2215,16 +2698,92 @@ impl AppState {
         });
     }
 
+    fn set_mail_read_in_memory(&mut self, mail_id: &str, is_read: bool) {
+        if let Some(m) = self.mails.iter_mut().find(|m| m.id == mail_id) {
+            m.is_read = is_read;
+        }
+        if let Some(m) = self.active_mail.as_mut().filter(|m| m.id == mail_id) {
+            m.is_read = is_read;
+        }
+    }
+
+    fn set_mail_flagged_in_memory(&mut self, mail_id: &str, flagged: bool) {
+        if let Some(m) = self.mails.iter_mut().find(|m| m.id == mail_id) {
+            m.flagged = flagged;
+        }
+        if let Some(m) = self.active_mail.as_mut().filter(|m| m.id == mail_id) {
+            m.flagged = flagged;
+        }
+    }
+
+    fn optimistic_remove_active_mail(
+        &mut self,
+        ui: &mut UiState,
+    ) -> Option<(String, Option<usize>, MailMessage)> {
+        let mail = self.active_mail().cloned()?;
+        let folder_id = ui.active_mail_folder_id.clone();
+        let idx = self.mails.iter().position(|m| m.id == mail.id);
+        if let Some(pos) = idx {
+            self.mails.remove(pos);
+            let next_id = self
+                .mails
+                .get(pos)
+                .or_else(|| self.mails.last())
+                .map(|m| m.id.clone());
+            if let Some(id) = next_id {
+                self.select_mail(ui, id);
+            } else {
+                self.active_mail_id = None;
+                self.active_mail = None;
+                self.loading_mail = false;
+            }
+        } else if self.active_mail_id.as_deref() == Some(&mail.id) {
+            if let Some(id) = self.mails.first().map(|m| m.id.clone()) {
+                self.select_mail(ui, id);
+            } else {
+                self.active_mail_id = None;
+                self.active_mail = None;
+                self.loading_mail = false;
+            }
+        }
+        Some((folder_id, idx, mail))
+    }
+
     pub fn toggle_active_mail_read(&mut self, ui: &mut UiState) {
         let Some(mail) = self.active_mail().cloned() else {
             return;
         };
-        let next_read = !mail.is_read;
+        let prev_read = mail.is_read;
+        let next_read = !prev_read;
+        let target_folder = mail
+            .folder_id
+            .as_deref()
+            .unwrap_or(&ui.active_mail_folder_id);
+        let folder_prev_unread = self
+            .mail_folders
+            .iter_mut()
+            .find(|f| {
+                f.id == target_folder
+                    || f.well_known_name
+                        .as_deref()
+                        .is_some_and(|w| w.eq_ignore_ascii_case(target_folder))
+            })
+            .map(|f| {
+                let prev = f.unread_item_count;
+                let delta = if next_read { -1 } else { 1 };
+                f.unread_item_count = (prev + delta).max(0);
+                (f.id.clone(), prev)
+            });
+        self.set_mail_read_in_memory(&mail.id, next_read);
+
+        let task_label = if next_read { "읽음 표시" } else { "안읽음 표시" }.to_string();
+        ui.tasks.begin(task_label.clone());
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
         let graph = self.graph.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
-        let task_label = if next_read { "읽음 표시" } else { "안읽음 표시" }.to_string();
-        ui.tasks.begin(task_label.clone());
 
         tokio::spawn(async move {
             match graph.set_mail_read(&mail.id, next_read).await {
@@ -2232,7 +2791,6 @@ impl AppState {
                     let mut updated = mail;
                     updated.is_read = next_read;
                     let _ = storage.upsert_mail_messages(std::slice::from_ref(&updated));
-                    let _ = tx.send(UiMsg::MailUpdated { mail: updated });
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label.clone(),
                         error: None,
@@ -2240,6 +2798,11 @@ impl AppState {
                     });
                 }
                 Err(err) => {
+                    let _ = tx.send(UiMsg::MailReadRollback {
+                        mail_id: mail.id,
+                        prev_read,
+                        folder_prev_unread,
+                    });
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: Some(err.to_string()),
@@ -2254,12 +2817,18 @@ impl AppState {
         let Some(mail) = self.active_mail().cloned() else {
             return;
         };
-        let next_flag = !mail.flagged;
+        let prev_flagged = mail.flagged;
+        let next_flag = !prev_flagged;
+        self.set_mail_flagged_in_memory(&mail.id, next_flag);
+
+        let task_label = if next_flag { "중요 표시" } else { "표시 해제" }.to_string();
+        ui.tasks.begin(task_label.clone());
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
         let graph = self.graph.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
-        let task_label = if next_flag { "중요 표시" } else { "표시 해제" }.to_string();
-        ui.tasks.begin(task_label.clone());
 
         tokio::spawn(async move {
             match graph.set_mail_flag(&mail.id, next_flag).await {
@@ -2267,7 +2836,6 @@ impl AppState {
                     let mut updated = mail;
                     updated.flagged = next_flag;
                     let _ = storage.upsert_mail_messages(std::slice::from_ref(&updated));
-                    let _ = tx.send(UiMsg::MailUpdated { mail: updated });
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label.clone(),
                         error: None,
@@ -2275,6 +2843,10 @@ impl AppState {
                     });
                 }
                 Err(err) => {
+                    let _ = tx.send(UiMsg::MailFlagRollback {
+                        mail_id: mail.id,
+                        prev_flagged,
+                    });
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: Some(err.to_string()),
@@ -2286,21 +2858,23 @@ impl AppState {
     }
 
     pub fn archive_active_mail(&mut self, ui: &mut UiState) {
-        let Some(mail) = self.active_mail().cloned() else {
+        let Some((folder_id, index, mail)) = self.optimistic_remove_active_mail(ui) else {
             return;
         };
+        let task_label = "메일 보관".to_string();
+        ui.tasks.begin(task_label.clone());
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
         let graph = self.graph.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
-        let task_label = "메일 보관".to_string();
-        ui.tasks.begin(task_label.clone());
 
         tokio::spawn(async move {
             match graph.move_mail_message(&mail.id, "archive").await {
                 Ok(moved) => {
                     let _ = storage.delete_mail_messages_by_ids(std::slice::from_ref(&mail.id));
                     let _ = storage.upsert_mail_messages(&[moved]);
-                    let _ = tx.send(UiMsg::MailRemoved { mail_id: mail.id });
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: None,
@@ -2308,6 +2882,11 @@ impl AppState {
                     });
                 }
                 Err(err) => {
+                    let _ = tx.send(UiMsg::MailRemoveRollback {
+                        folder_id,
+                        index,
+                        mail,
+                    });
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: Some(err.to_string()),
@@ -2319,20 +2898,22 @@ impl AppState {
     }
 
     pub fn delete_active_mail(&mut self, ui: &mut UiState) {
-        let Some(mail) = self.active_mail().cloned() else {
+        let Some((folder_id, index, mail)) = self.optimistic_remove_active_mail(ui) else {
             return;
         };
+        let task_label = "메일 삭제".to_string();
+        ui.tasks.begin(task_label.clone());
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
         let graph = self.graph.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
-        let task_label = "메일 삭제".to_string();
-        ui.tasks.begin(task_label.clone());
 
         tokio::spawn(async move {
             match graph.delete_mail_message(&mail.id).await {
                 Ok(()) => {
                     let _ = storage.delete_mail_messages_by_ids(std::slice::from_ref(&mail.id));
-                    let _ = tx.send(UiMsg::MailRemoved { mail_id: mail.id });
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: None,
@@ -2340,6 +2921,11 @@ impl AppState {
                     });
                 }
                 Err(err) => {
+                    let _ = tx.send(UiMsg::MailRemoveRollback {
+                        folder_id,
+                        index,
+                        mail,
+                    });
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: Some(err.to_string()),
@@ -2563,6 +3149,7 @@ impl AppState {
         };
         let label = format!("1:1 채팅 시작: {}", contact.display_name);
         ui.active_nav_tab = 0; // TAB_CHATS
+        self.ensure_tab_domain_activated(ui, 0);
         self.create_chat(ui, vec![peer_ref], None);
         ui.info(label);
     }
@@ -2628,12 +3215,24 @@ impl AppState {
         let Some(task) = self.active_todo_task().cloned() else {
             return;
         };
+        let prev_status = task.status.clone();
         let next_completed = !task.is_completed();
+        let next_status = if next_completed {
+            "completed"
+        } else {
+            "notStarted"
+        };
+        if let Some(t) = self.todo_tasks.iter_mut().find(|t| t.id == task.id) {
+            t.status = next_status.to_string();
+        }
+        let task_label = if next_completed { "할 일 완료" } else { "완료 취소" }.to_string();
+        ui.tasks.begin(task_label.clone());
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
         let graph = self.graph.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
-        let task_label = if next_completed { "할 일 완료" } else { "완료 취소" }.to_string();
-        ui.tasks.begin(task_label.clone());
 
         tokio::spawn(async move {
             match graph
@@ -2650,6 +3249,10 @@ impl AppState {
                     });
                 }
                 Err(err) => {
+                    let _ = tx.send(UiMsg::TodoStatusRollback {
+                        task_id: task.id,
+                        prev_status,
+                    });
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: Some(err.to_string()),
@@ -3196,6 +3799,7 @@ impl AppState {
             });
         ui.persona = Persona::OneNote;
         ui.active_nav_tab = nav_pane::TAB_NOTES;
+        self.ensure_tab_domain_activated(ui, nav_pane::TAB_NOTES);
         if let Some(nb_key) = notebook_key {
             ui.collapsed_notebook_keys.remove(&nb_key);
             self.active_notebook_key = Some(nb_key);
@@ -3706,6 +4310,9 @@ impl AppState {
             CoreEvent::SyncStateChanged { busy, summary } => {
                 self.syncing = busy;
                 self.sync_summary = summary;
+                if !busy && self.persona == Persona::OneNote {
+                    ui.tasks.finish("초기 동기화", None);
+                }
             }
             CoreEvent::SyncError(err) => {
                 ui.error(format!("동기화 오류: {err}"));
@@ -3724,13 +4331,21 @@ impl AppState {
             } => {
                 if self.active_conv_key.as_deref() == Some(&conv_key) {
                     if let Ok(msgs) = self.storage.list_root_messages(&conv_key, 80, None) {
-                        self.messages = msgs;
+                        merge_optimistic_messages(&mut self.messages, msgs);
                     }
                     if let Some(root_id) =
                         self.active_thread.as_ref().map(|t| t.root.msg_id.clone())
                     {
-                        if let Ok(Some(thread)) = self.storage.get_thread(&conv_key, &root_id, 100)
+                        if let Ok(Some(mut thread)) =
+                            self.storage.get_thread(&conv_key, &root_id, 100)
                         {
+                            if let Some(existing) = self.active_thread.as_mut() {
+                                merge_optimistic_messages(
+                                    &mut existing.replies,
+                                    std::mem::take(&mut thread.replies),
+                                );
+                                thread.replies = std::mem::take(&mut existing.replies);
+                            }
                             self.active_thread = Some(thread);
                         }
                     }
@@ -3766,7 +4381,14 @@ impl AppState {
                     if let Some(active_id) = self.active_mail_id.clone() {
                         if let Some(updated) = self.mails.iter().find(|m| m.id == active_id).cloned()
                         {
-                            self.active_mail = Some(updated);
+                            let keep_existing_body = self
+                                .active_mail
+                                .as_ref()
+                                .is_some_and(|m| m.id == active_id && !m.body_html.is_empty())
+                                && updated.body_html.is_empty();
+                            if !keep_existing_body {
+                                self.active_mail = Some(updated);
+                            }
                         }
                     }
                 }
@@ -3826,6 +4448,11 @@ impl AppState {
                 }
                 self.loading_onenote_pages = false;
                 self.loading_onenote_detail = false;
+                if self.persona == Persona::OneNote {
+                    self.syncing = false;
+                    self.sync_summary = "최신 상태".to_string();
+                    ui.tasks.finish("초기 동기화", None);
+                }
             }
             CoreEvent::OnenotePagesUpdated { section_key, pages } => {
                 if self.active_section_key.as_deref() == Some(section_key.as_str()) {
@@ -3911,7 +4538,7 @@ impl AppState {
             } => {
                 if self.active_conv_key.as_deref() == Some(&conv_key) {
                     self.loading_messages = false;
-                    self.messages = messages;
+                    merge_optimistic_messages(&mut self.messages, messages);
                     self.members = members;
                 }
             }
@@ -3946,23 +4573,69 @@ impl AppState {
             UiMsg::MessageSent {
                 conv_key,
                 parent_msg_id,
+                optimistic_id,
                 sent,
             } => {
                 if self.active_conv_key.as_deref() == Some(&conv_key) {
                     if let Some(pid) = parent_msg_id {
                         if let Some(thread) = self.active_thread.as_mut() {
-                            if thread.root.msg_id == pid
-                                && !thread.replies.iter().any(|r| r.msg_id == sent.msg_id)
-                            {
-                                thread.replies.push(sent);
+                            if thread.root.msg_id == pid {
+                                if let Some(opt_id) = optimistic_id.as_deref() {
+                                    if let Some(pos) =
+                                        thread.replies.iter().position(|r| r.msg_id == opt_id)
+                                    {
+                                        if thread.replies.iter().any(|r| r.msg_id == sent.msg_id) {
+                                            thread.replies.remove(pos);
+                                        } else {
+                                            thread.replies[pos] = sent;
+                                        }
+                                    } else if !thread.replies.iter().any(|r| r.msg_id == sent.msg_id)
+                                    {
+                                        thread.replies.push(sent);
+                                    }
+                                } else if !thread.replies.iter().any(|r| r.msg_id == sent.msg_id) {
+                                    thread.replies.push(sent);
+                                }
                             }
                         }
                         if let Some(root) = self.messages.iter_mut().find(|m| m.msg_id == pid) {
                             root.reply_count = root.reply_count.saturating_add(1);
                         }
+                    } else if let Some(opt_id) = optimistic_id.as_deref() {
+                        if let Some(pos) = self.messages.iter().position(|m| m.msg_id == opt_id) {
+                            if self.messages.iter().any(|m| m.msg_id == sent.msg_id) {
+                                self.messages.remove(pos);
+                            } else {
+                                self.messages[pos] = sent;
+                            }
+                        } else if !self.messages.iter().any(|m| m.msg_id == sent.msg_id) {
+                            self.messages.push(sent);
+                            ui.chat_scroll.bottom();
+                        }
                     } else if !self.messages.iter().any(|m| m.msg_id == sent.msg_id) {
                         self.messages.push(sent);
                         ui.chat_scroll.bottom();
+                    }
+                }
+            }
+            UiMsg::MessageSendFailed {
+                conv_key,
+                parent_msg_id,
+                optimistic_id,
+                text,
+            } => {
+                if self.active_conv_key.as_deref() == Some(&conv_key) {
+                    if let Some(pid) = parent_msg_id {
+                        if let Some(thread) = self.active_thread.as_mut() {
+                            if thread.root.msg_id == pid {
+                                thread.replies.retain(|r| r.msg_id != optimistic_id);
+                            }
+                        }
+                    } else {
+                        self.messages.retain(|m| m.msg_id != optimistic_id);
+                    }
+                    if ui.composer.text().trim().is_empty() {
+                        ui.composer.load_text(&text);
                     }
                 }
             }
@@ -4079,6 +4752,38 @@ impl AppState {
                     self.presences.insert(uid, status);
                 }
             }
+            UiMsg::OutlookCachedSecondaryLoaded {
+                calendar_events,
+                contacts,
+                todo_lists,
+                todo_tasks,
+                active_todo_list_id,
+            } => {
+                if self.calendar_events.is_empty() {
+                    self.calendar_events = calendar_events;
+                }
+                if self.active_event_id.is_none() {
+                    self.active_event_id = self.calendar_events.first().map(|e| e.id.clone());
+                }
+                if self.contacts.is_empty() {
+                    self.contacts = contacts;
+                }
+                if self.active_contact_id.is_none() {
+                    self.active_contact_id = self.contacts.first().map(|c| c.id.clone());
+                }
+                if self.todo_lists.is_empty() {
+                    self.todo_lists = todo_lists;
+                }
+                if ui.active_todo_list_id.is_none() {
+                    ui.active_todo_list_id = active_todo_list_id;
+                }
+                if self.todo_tasks.is_empty() {
+                    self.todo_tasks = todo_tasks;
+                }
+                if self.active_todo_task_id.is_none() {
+                    self.active_todo_task_id = self.todo_tasks.first().map(|t| t.id.clone());
+                }
+            }
             UiMsg::OutlookBootstrapDone {
                 mail_folders,
                 mails,
@@ -4089,10 +4794,13 @@ impl AppState {
                 active_todo_list_id,
             } => {
                 self.mail_folders = mail_folders;
-                self.mails = mails;
-                if self.active_mail_id.is_none() {
-                    self.active_mail_id = self.mails.first().map(|m| m.id.clone());
-                    self.active_mail = self.mails.first().cloned();
+                if ui.active_mail_folder_id == "inbox" {
+                    self.mails = mails;
+                    if self.active_mail_id.is_none() {
+                        if let Some(first_id) = self.mails.first().map(|m| m.id.clone()) {
+                            self.select_mail(ui, first_id);
+                        }
+                    }
                 }
                 self.calendar_events = calendar_events;
                 if self.active_event_id.is_none() {
@@ -4121,18 +4829,73 @@ impl AppState {
                 if ui.active_mail_folder_id == folder_id {
                     self.mails = mails;
                     if self.active_mail_id.is_none() {
-                        self.active_mail_id = self.mails.first().map(|m| m.id.clone());
-                        self.active_mail = self.mails.first().cloned();
+                        if let Some(first_id) = self.mails.first().map(|m| m.id.clone()) {
+                            self.select_mail(ui, first_id);
+                        }
                     }
                 }
             }
             UiMsg::MailDetailLoaded { mail } => {
+                self.mail_prefetch_pending.remove(&mail.id);
                 if let Some(existing) = self.mails.iter_mut().find(|m| m.id == mail.id) {
                     *existing = mail.clone();
                 }
                 if self.active_mail_id.as_deref() == Some(&mail.id) {
                     self.loading_mail = false;
                     self.active_mail = Some(mail);
+                }
+            }
+            UiMsg::MailDetailFailed { mail_id } => {
+                self.mail_prefetch_pending.remove(&mail_id);
+                if self.active_mail_id.as_deref() == Some(&mail_id) {
+                    self.loading_mail = false;
+                }
+            }
+            UiMsg::MailPrefetchFailed { mail_id } => {
+                self.mail_prefetch_pending.remove(&mail_id);
+            }
+            UiMsg::MailReadRollback {
+                mail_id,
+                prev_read,
+                folder_prev_unread,
+            } => {
+                self.set_mail_read_in_memory(&mail_id, prev_read);
+                if let Some((fid, prev_count)) = folder_prev_unread {
+                    if let Some(folder) = self.mail_folders.iter_mut().find(|f| f.id == fid) {
+                        folder.unread_item_count = prev_count;
+                    }
+                }
+            }
+            UiMsg::MailFlagRollback {
+                mail_id,
+                prev_flagged,
+            } => {
+                self.set_mail_flagged_in_memory(&mail_id, prev_flagged);
+            }
+            UiMsg::MailRemoveRollback {
+                folder_id,
+                index,
+                mail,
+            } => {
+                if ui.active_mail_folder_id == folder_id {
+                    if let Some(pos) = index {
+                        if !self.mails.iter().any(|m| m.id == mail.id) {
+                            let insert_at = pos.min(self.mails.len());
+                            self.mails.insert(insert_at, mail.clone());
+                        }
+                    }
+                    if self.active_mail_id.is_none() {
+                        self.active_mail_id = Some(mail.id.clone());
+                        self.active_mail = Some(mail);
+                    }
+                }
+            }
+            UiMsg::TodoStatusRollback {
+                task_id,
+                prev_status,
+            } => {
+                if let Some(t) = self.todo_tasks.iter_mut().find(|t| t.id == task_id) {
+                    t.status = prev_status;
                 }
             }
             UiMsg::MailUpdated { mail } => {
@@ -4270,20 +5033,67 @@ impl AppState {
                 cache_key,
                 rendered,
             } => {
-                self.onenote_image_pending.remove(&cache_key);
-                self.onenote_image_errors.remove(&cache_key);
-                if self.onenote_image_cache.len() >= 96 {
-                    if let Some(old) = self.onenote_image_cache.keys().next().cloned() {
-                        self.onenote_image_cache.remove(&old);
-                    }
-                }
-                self.onenote_image_cache.insert(cache_key, rendered);
+                self.insert_onenote_image_cache(cache_key, rendered);
             }
             UiMsg::OnenoteImageDecodeFailed { cache_key, .. } => {
                 self.onenote_image_pending.remove(&cache_key);
                 self.onenote_image_errors.insert(cache_key);
             }
             UiMsg::UpdateChecked(_res) => {}
+            UiMsg::DaemonAttached { pid, sync_busy } => {
+                self.daemon_attached = true;
+                self.daemon_pid = pid;
+                self.syncing = sync_busy;
+                self.sync_summary = "데몬 연결됨".to_string();
+                if ui.active_todo_list_id.is_none() {
+                    ui.active_todo_list_id = self.todo_lists.first().map(|l| l.id.clone());
+                }
+                match self.persona {
+                    Persona::Teams => self.activated_teams = true,
+                    Persona::Outlook => self.activated_outlook = true,
+                    Persona::OneNote => self.activated_onenote = true,
+                }
+                self.send_active_domains();
+                self.sync_ctrl.set_focus(
+                    self.active_target.clone(),
+                    self.active_thread.as_ref().map(|t| t.root.msg_id.clone()),
+                );
+                if self.my_profile.is_none() {
+                    self.spawn_me_profile_if_needed();
+                }
+            }
+            UiMsg::DaemonDetached => {
+                self.daemon_attached = false;
+                self.daemon_pid = None;
+                if !self.syncing {
+                    self.sync_summary = "로컬 동기화".to_string();
+                }
+                self.send_active_domains();
+                self.sync_ctrl.set_focus(
+                    self.active_target.clone(),
+                    self.active_thread.as_ref().map(|t| t.root.msg_id.clone()),
+                );
+            }
+            UiMsg::StartLocalBootstrap => {
+                self.daemon_attached = false;
+                self.daemon_pid = None;
+                self.spawn_bootstrap(ui);
+            }
+            UiMsg::ProfileLoaded { me, presence } => {
+                if let Some(u) = me {
+                    self.my_user_id = u.id.clone();
+                    self.my_profile = Some(u);
+                }
+                if let Some(p) = presence {
+                    self.my_presence = Some(p);
+                }
+                if !self.my_user_id.is_empty() && self.activity_mentions.is_empty() {
+                    if let Ok(mentions) = self.storage.list_mentions_for_user(&self.my_user_id, 50)
+                    {
+                        self.activity_mentions = mentions;
+                    }
+                }
+            }
             UiMsg::TaskDone {
                 label,
                 error,
@@ -4325,6 +5135,16 @@ impl AppState {
             ConversationKind::Channel => "채널",
         }
     }
+}
+
+fn merge_optimistic_messages(target: &mut Vec<MessageItem>, mut incoming: Vec<MessageItem>) {
+    let pending: Vec<MessageItem> = target
+        .iter()
+        .filter(|m| m.msg_id.starts_with("optimistic-"))
+        .cloned()
+        .collect();
+    incoming.extend(pending);
+    *target = incoming;
 }
 
 #[cfg(test)]
@@ -4435,5 +5255,417 @@ mod tests {
         assert!(!app.loading_messages);
 
         sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    fn make_test_app_with_persona(persona: Persona) -> (AppState, UiState) {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let sync_ctrl =
+            sync::spawn_sync_engine(cfg.clone(), graph.clone(), storage.clone(), event_tx);
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+        let app =
+            AppState::new_with_persona(cfg.clone(), persona, auth, graph, storage, sync_ctrl, ui_tx);
+        let ui = UiState::from_config_with_persona(&cfg, persona);
+        (app, ui)
+    }
+
+    fn sample_mail(id: &str, is_read: bool, flagged: bool) -> MailMessage {
+        MailMessage {
+            id: id.to_string(),
+            conversation_id: None,
+            folder_id: Some("inbox".to_string()),
+            subject: format!("Subject {id}"),
+            from: None,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            bcc_recipients: vec![],
+            received_at: "2026-11-18T00:00:00Z".to_string(),
+            sent_at: None,
+            is_read,
+            is_draft: false,
+            flagged,
+            importance: "normal".to_string(),
+            has_attachments: false,
+            preview: format!("Preview {id}"),
+            body_html: format!("<p>{id}</p>"),
+            body_plain: id.to_string(),
+            attachments: vec![],
+            web_link: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn persona_outlook_activates_only_outlook_initially_then_teams_on_tab_switch() {
+        let (mut app, mut ui) = make_test_app_with_persona(Persona::Outlook);
+        app.load_cached_for_persona();
+        assert!(!app.activated_teams);
+        assert!(app.activated_outlook);
+        assert!(!app.activated_onenote);
+
+        // Switching to Tab 0 (Teams) lazily activates Teams without activating OneNote.
+        app.ensure_tab_domain_activated(&mut ui, 0);
+        assert!(app.activated_teams);
+        assert!(app.activated_outlook);
+        assert!(!app.activated_onenote);
+
+        // Switching to Tab 7 (OneNote) activates OneNote.
+        app.ensure_tab_domain_activated(&mut ui, nav_pane::TAB_NOTES);
+        assert!(app.activated_onenote);
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn optimistic_mail_read_flag_delete_and_rollback() {
+        let (mut app, mut ui) = make_test_app_with_persona(Persona::Outlook);
+        app.mail_folders = vec![MailFolder {
+            id: "inbox".to_string(),
+            display_name: "Inbox".to_string(),
+            well_known_name: Some("inbox".to_string()),
+            parent_folder_id: None,
+            unread_item_count: 2,
+            total_item_count: 2,
+        }];
+        let m1 = sample_mail("m1", false, false);
+        let m2 = sample_mail("m2", true, false);
+        app.mails = vec![m1.clone(), m2.clone()];
+        app.active_mail_id = Some("m1".to_string());
+        app.active_mail = Some(m1);
+
+        // 1. Optimistic Read toggle + rollback
+        app.toggle_active_mail_read(&mut ui);
+        assert!(app.mails[0].is_read);
+        assert!(app.active_mail.as_ref().unwrap().is_read);
+        assert_eq!(app.mail_folders[0].unread_item_count, 1);
+
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::MailReadRollback {
+                mail_id: "m1".to_string(),
+                prev_read: false,
+                folder_prev_unread: Some(("inbox".to_string(), 2)),
+            },
+        );
+        assert!(!app.mails[0].is_read);
+        assert!(!app.active_mail.as_ref().unwrap().is_read);
+        assert_eq!(app.mail_folders[0].unread_item_count, 2);
+
+        // 2. Optimistic Flag toggle + rollback
+        app.toggle_active_mail_flag(&mut ui);
+        assert!(app.mails[0].flagged);
+        assert!(app.active_mail.as_ref().unwrap().flagged);
+
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::MailFlagRollback {
+                mail_id: "m1".to_string(),
+                prev_flagged: false,
+            },
+        );
+        assert!(!app.mails[0].flagged);
+        assert!(!app.active_mail.as_ref().unwrap().flagged);
+
+        // 3. Optimistic Delete advances active_mail_id to m2 + rollback re-inserts m1 at index 0
+        let m1_snapshot = app.mails[0].clone();
+        app.delete_active_mail(&mut ui);
+        assert_eq!(app.mails.len(), 1);
+        assert_eq!(app.mails[0].id, "m2");
+        assert_eq!(app.active_mail_id.as_deref(), Some("m2"));
+
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::MailRemoveRollback {
+                folder_id: "inbox".to_string(),
+                index: Some(0),
+                mail: m1_snapshot,
+            },
+        );
+        assert_eq!(app.mails.len(), 2);
+        assert_eq!(app.mails[0].id, "m1");
+        assert_eq!(app.mails[1].id, "m2");
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn optimistic_todo_and_message_send_with_rollback() {
+        let (mut app, mut ui) = make_test_app_with_persona(Persona::Teams);
+        app.todo_tasks = vec![TodoTask {
+            id: "t1".to_string(),
+            list_id: "l1".to_string(),
+            title: "Task 1".to_string(),
+            status: "notStarted".to_string(),
+            importance: "normal".to_string(),
+            body_plain: None,
+            due_date_iso: None,
+            reminder_iso: None,
+            completed_at: None,
+            created_at: None,
+            updated_at: None,
+        }];
+        app.active_todo_task_id = Some("t1".to_string());
+        app.toggle_active_todo_completed(&mut ui);
+        assert_eq!(app.todo_tasks[0].status, "completed");
+
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::TodoStatusRollback {
+                task_id: "t1".to_string(),
+                prev_status: "notStarted".to_string(),
+            },
+        );
+        assert_eq!(app.todo_tasks[0].status, "notStarted");
+
+        // Optimistic message send -> replacement -> failure restore
+        app.active_conv_key = Some("chat:c1".to_string());
+        app.active_target = Some(ConversationTarget::Chat {
+            chat_id: "c1".to_string(),
+        });
+        ui.composer.load_text("hello optimistic");
+        app.send_composer(&mut ui);
+        assert_eq!(app.messages.len(), 1);
+        let opt_id = app.messages[0].msg_id.clone();
+        assert!(opt_id.starts_with("optimistic-"));
+        assert!(ui.composer.text().is_empty());
+
+        let mut real_msg = app.messages[0].clone();
+        real_msg.msg_id = "server-1".to_string();
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::MessageSent {
+                conv_key: "chat:c1".to_string(),
+                parent_msg_id: None,
+                optimistic_id: Some(opt_id),
+                sent: real_msg,
+            },
+        );
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].msg_id, "server-1");
+
+        // Failure rollback restores composer text when empty
+        ui.composer.load_text("retry me");
+        app.send_composer(&mut ui);
+        assert_eq!(app.messages.len(), 2);
+        let failed_opt_id = app.messages[1].msg_id.clone();
+        assert!(ui.composer.text().is_empty());
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::MessageSendFailed {
+                conv_key: "chat:c1".to_string(),
+                parent_msg_id: None,
+                optimistic_id: failed_opt_id,
+                text: "retry me".to_string(),
+            },
+        );
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(ui.composer.text(), "retry me");
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn onenote_image_cache_is_bounded_to_24_fifo() {
+        let (mut app, _ui) = make_test_app_with_persona(Persona::OneNote);
+        for i in 0..30 {
+            let key = format!("page:{i}:20x10");
+            let img = RenderedTerminalImage {
+                width_px: 10,
+                height_px: 10,
+                cols: 20,
+                rows: 10,
+                format_label: "PNG".to_string(),
+                lines: vec![],
+            };
+            app.insert_onenote_image_cache(key, img);
+        }
+        assert_eq!(app.onenote_image_cache.len(), 24);
+        assert_eq!(app.onenote_image_cache_order.len(), 24);
+        assert!(!app.onenote_image_cache.contains_key("page:0:20x10"));
+        assert!(!app.onenote_image_cache.contains_key("page:5:20x10"));
+        assert!(app.onenote_image_cache.contains_key("page:6:20x10"));
+        assert!(app.onenote_image_cache.contains_key("page:29:20x10"));
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    fn make_sized_test_image(label_bytes: usize) -> RenderedTerminalImage {
+        RenderedTerminalImage {
+            width_px: 10,
+            height_px: 10,
+            cols: 20,
+            rows: 10,
+            format_label: "X".repeat(label_bytes),
+            lines: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn image_cache_byte_budget_evicts_across_both_caches_and_clear_resets_bytes() {
+        let (mut app, _ui) = make_test_app_with_persona(Persona::Teams);
+        let two_mib = 2 * 1024 * 1024 - 128;
+
+        for i in 0..3 {
+            app.insert_image_cache(format!("msg:{i}:20x10"), make_sized_test_image(two_mib));
+        }
+        assert_eq!(app.image_cache.len(), 3);
+        assert!(app.image_cache_bytes <= img_preview::MAX_IMAGE_CACHE_BYTES);
+
+        // Inserting OneNote images pushes combined cache over 8 MiB -> older entries are evicted
+        // so combined byte usage stays <= MAX_IMAGE_CACHE_BYTES.
+        for i in 0..2 {
+            app.insert_onenote_image_cache(
+                format!("note:{i}:20x10"),
+                make_sized_test_image(two_mib),
+            );
+        }
+        assert!(
+            app.image_cache_bytes + app.onenote_image_cache_bytes
+                <= img_preview::MAX_IMAGE_CACHE_BYTES
+        );
+        assert_eq!(app.onenote_image_cache.len(), 2);
+
+        // Replacing an existing key updates byte counter accurately.
+        let one_mib = 1024 * 1024 - 128;
+        app.insert_onenote_image_cache(
+            "note:1:20x10".to_string(),
+            make_sized_test_image(one_mib),
+        );
+        let expected_onenote_bytes: usize = app
+            .onenote_image_cache
+            .values()
+            .map(AppState::rendered_image_bytes)
+            .sum();
+        assert_eq!(app.onenote_image_cache_bytes, expected_onenote_bytes);
+
+        let expected_teams_bytes: usize = app
+            .image_cache
+            .values()
+            .map(AppState::rendered_image_bytes)
+            .sum();
+        assert_eq!(app.image_cache_bytes, expected_teams_bytes);
+
+        // Single image larger than MAX_IMAGE_CACHE_BYTES still stays cached as the sole entry.
+        let ten_mib = 10 * 1024 * 1024;
+        app.insert_image_cache("oversized:0:20x10".to_string(), make_sized_test_image(ten_mib));
+        assert_eq!(app.image_cache.len(), 1);
+        assert!(app.image_cache.contains_key("oversized:0:20x10"));
+        assert_eq!(app.onenote_image_cache.len(), 0);
+        assert_eq!(app.onenote_image_cache_bytes, 0);
+
+        // Clearing resets maps, orders, and byte counters to zero.
+        app.clear_image_caches();
+        assert!(app.image_cache.is_empty());
+        assert!(app.image_cache_order.is_empty());
+        assert_eq!(app.image_cache_bytes, 0);
+        assert!(app.onenote_image_cache.is_empty());
+        assert!(app.onenote_image_cache_order.is_empty());
+        assert_eq!(app.onenote_image_cache_bytes, 0);
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn leaving_onenote_tab_trims_onenote_image_cache_to_2mib() {
+        let (mut app, mut ui) = make_test_app_with_persona(Persona::OneNote);
+        app.load_cached_for_persona();
+        let one_mib = 1024 * 1024 - 128;
+        for i in 0..4 {
+            app.insert_onenote_image_cache(
+                format!("note:{i}:20x10"),
+                make_sized_test_image(one_mib),
+            );
+        }
+        assert!(app.onenote_image_cache_bytes > 2 * 1024 * 1024);
+
+        // Leaving TAB_NOTES trims OneNote cache down to <= 2 MiB while preserving newest entries.
+        app.ensure_tab_domain_activated(&mut ui, 0);
+        assert!(app.onenote_image_cache_bytes <= 2 * 1024 * 1024);
+        assert!(!app.onenote_image_cache.contains_key("note:0:20x10"));
+        assert!(app.onenote_image_cache.contains_key("note:3:20x10"));
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn daemon_attached_skips_duplicate_bootstrap_and_preserves_domain_and_focus_nudges() {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, focus_rx) = tokio::sync::watch::channel(sync::FocusTarget::default());
+        let (nudge_tx, mut nudge_rx) = mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx, false);
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+
+        let mut app = AppState::new_with_persona(
+            cfg.clone(),
+            Persona::Teams,
+            auth,
+            graph,
+            storage,
+            sync_ctrl,
+            ui_tx,
+        );
+        let mut ui = UiState::from_config_with_persona(&cfg, Persona::Teams);
+        app.my_profile = Some(UserProfile {
+            id: "user-1".to_string(),
+            display_name: "Alice".to_string(),
+            mail: Some("alice@example.com".to_string()),
+            user_principal_name: Some("alice@example.com".to_string()),
+        });
+        app.my_user_id = "user-1".to_string();
+        app.active_target = Some(ConversationTarget::Chat {
+            chat_id: "chat-42".to_string(),
+        });
+
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::DaemonAttached {
+                pid: Some(4242),
+                sync_busy: false,
+            },
+        );
+
+        assert!(app.daemon_attached);
+        assert_eq!(app.daemon_pid, Some(4242));
+        assert!(!app.syncing);
+        assert_eq!(app.sync_summary, "데몬 연결됨");
+        assert!(app.activated_teams);
+        assert!(!app.activated_outlook);
+        assert!(!app.activated_onenote);
+        assert!(ui.tasks.first_running().is_none());
+
+        let cmd = nudge_rx.try_recv().expect("expected SetActiveDomains nudge");
+        assert!(matches!(
+            cmd,
+            SyncCommand::SetActiveDomains {
+                teams: true,
+                outlook: false,
+                onenote: false,
+            }
+        ));
+        assert!(nudge_rx.try_recv().is_err(), "unexpected extra bootstrap command");
+        assert_eq!(
+            focus_rx.borrow().target,
+            Some(ConversationTarget::Chat {
+                chat_id: "chat-42".to_string(),
+            })
+        );
+
+        app.handle_ui_msg(&mut ui, UiMsg::DaemonDetached);
+        assert!(!app.daemon_attached);
+        assert_eq!(app.daemon_pid, None);
+        assert_eq!(app.sync_summary, "로컬 동기화");
+        assert!(matches!(
+            nudge_rx.try_recv().expect("expected re-activated domains on detach"),
+            SyncCommand::SetActiveDomains {
+                teams: true,
+                outlook: false,
+                onenote: false,
+            }
+        ));
     }
 }

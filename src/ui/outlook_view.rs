@@ -18,7 +18,10 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     img_preview::{self, RenderedTerminalImage},
-    models::{CalendarEvent, ContactItem, MailMessage, RichBlock, RichSpan, TodoList, TodoTask},
+    models::{
+        CalendarEvent, ContactItem, MailAttachment, MailMessage, RichBlock, RichSpan, TodoList,
+        TodoTask,
+    },
     parser,
     ui::{
         app::{AppState, Focus, UiState},
@@ -37,6 +40,7 @@ fn compute_mail_sig(
     mail: &MailMessage,
     cached_thumbs_len: usize,
     inline_images: bool,
+    loading_mail: bool,
     theme: &Theme,
     width: usize,
     hyperlinks: bool,
@@ -48,9 +52,11 @@ fn compute_mail_sig(
     h.write_hash(&mail.flagged);
     h.write_hash(&mail.body_html.len());
     h.write_hash(&mail.body_plain.len());
+    h.write_hash(&mail.preview.len());
     h.write_hash(&mail.attachments.len());
     h.write_hash(&cached_thumbs_len);
     h.write_hash(&inline_images);
+    h.write_hash(&(loading_mail && mail.body_html.is_empty() && mail.body_plain.is_empty()));
     h.write_hash(&width.max(16));
     h.write_hash(&hyperlinks);
     hash_theme_sig(&mut h, theme);
@@ -158,8 +164,80 @@ fn draw_mail_pane(
         return;
     }
 
-    let Some(mail) = app.active_mail().cloned() else {
-        let empty = if app.loading_mail {
+    let width = body_area.width as usize;
+    let thumb_cols = width.saturating_sub(4).clamp(16, 40) as u16;
+    let thumb_rows = 10u16;
+    let hyperlinks = chat_view::hyperlinks_enabled();
+    let loading_mail = app.loading_mail;
+
+    let mut missing_images: Vec<(String, MailAttachment)> = Vec::new();
+    let lines: Option<Arc<[RenderedLine]>> = app.active_mail().map(|mail| {
+        // Avoid calling `&mut app` methods until the immutable borrow on `mail` ends.
+        let thumb_count = if ui.inline_images {
+            mail.attachments
+                .iter()
+                .filter(|att| {
+                    img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name))
+                        && app.image_cache.contains_key(&AppState::image_cache_key(
+                            &mail.id,
+                            &att.id,
+                            thumb_cols,
+                            thumb_rows,
+                        ))
+                })
+                .count()
+        } else {
+            0
+        };
+
+        let sig = compute_mail_sig(
+            mail,
+            thumb_count,
+            ui.inline_images,
+            loading_mail,
+            theme,
+            width,
+            hyperlinks,
+        );
+        if let Some(cached) = MAIL_LINES_CACHE.with(|cache| cache.borrow_mut().get(sig)) {
+            cached
+        } else {
+            // Collect cached thumbnails and defer missing image requests until `mail` borrow is dropped.
+            let mut cached_thumbs: Vec<(String, RenderedTerminalImage)> = Vec::new();
+            if ui.inline_images {
+                for att in &mail.attachments {
+                    if img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name)) {
+                        let key =
+                            AppState::image_cache_key(&mail.id, &att.id, thumb_cols, thumb_rows);
+                        if let Some(rendered) = app.image_cache.get(&key) {
+                            cached_thumbs.push((att.id.clone(), rendered.clone()));
+                        } else {
+                            missing_images.push((mail.id.clone(), att.clone()));
+                        }
+                    }
+                }
+            }
+
+            let built: Arc<[RenderedLine]> = Arc::from(build_mail_lines_with_loading(
+                mail,
+                &cached_thumbs,
+                ui.inline_images,
+                loading_mail,
+                theme,
+                width,
+                hyperlinks,
+            ));
+            MAIL_LINES_CACHE.with(|cache| cache.borrow_mut().insert(sig, Arc::clone(&built)));
+            built
+        }
+    });
+
+    for (mail_id, att) in missing_images {
+        app.request_mail_image(mail_id, att, thumb_cols, thumb_rows);
+    }
+
+    let Some(lines) = lines else {
+        let empty = if loading_mail {
             "메일을 불러오는 중…"
         } else {
             "왼쪽 목록에서 메일을 선택하세요 (c: 새 메일)"
@@ -169,59 +247,6 @@ fn draw_mail_pane(
             body_area,
         );
         return;
-    };
-
-    let width = body_area.width as usize;
-    let thumb_cols = width.saturating_sub(4).clamp(16, 40) as u16;
-    let thumb_rows = 10u16;
-    let hyperlinks = chat_view::hyperlinks_enabled();
-
-    let thumb_count = if ui.inline_images {
-        mail.attachments
-            .iter()
-            .filter(|att| {
-                img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name))
-                    && app.image_cache.contains_key(&AppState::image_cache_key(
-                        &mail.id,
-                        &att.id,
-                        thumb_cols,
-                        thumb_rows,
-                    ))
-            })
-            .count()
-    } else {
-        0
-    };
-
-    let sig = compute_mail_sig(&mail, thumb_count, ui.inline_images, theme, width, hyperlinks);
-    let lines = if let Some(cached) = MAIL_LINES_CACHE.with(|cache| cache.borrow_mut().get(sig)) {
-        cached
-    } else {
-        // Request lazy inline image previews for any image attachments if inline_images is enabled.
-        let mut cached_thumbs: Vec<(String, RenderedTerminalImage)> = Vec::new();
-        if ui.inline_images {
-            for att in &mail.attachments {
-                if img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name)) {
-                    let key = AppState::image_cache_key(&mail.id, &att.id, thumb_cols, thumb_rows);
-                    if let Some(rendered) = app.image_cache.get(&key) {
-                        cached_thumbs.push((att.id.clone(), rendered.clone()));
-                    } else {
-                        app.request_mail_image(mail.id.clone(), att.clone(), thumb_cols, thumb_rows);
-                    }
-                }
-            }
-        }
-
-        let built: Arc<[RenderedLine]> = Arc::from(build_mail_lines(
-            &mail,
-            &cached_thumbs,
-            ui.inline_images,
-            theme,
-            width,
-            hyperlinks,
-        ));
-        MAIL_LINES_CACHE.with(|cache| cache.borrow_mut().insert(sig, Arc::clone(&built)));
-        built
     };
 
     let height = body_area.height as usize;
@@ -424,6 +449,26 @@ pub fn build_mail_lines(
     width: usize,
     hyperlinks: bool,
 ) -> Vec<RenderedLine> {
+    build_mail_lines_with_loading(
+        mail,
+        cached_thumbs,
+        inline_images,
+        false,
+        theme,
+        width,
+        hyperlinks,
+    )
+}
+
+pub fn build_mail_lines_with_loading(
+    mail: &MailMessage,
+    cached_thumbs: &[(String, RenderedTerminalImage)],
+    inline_images: bool,
+    loading_mail: bool,
+    theme: &Theme,
+    width: usize,
+    hyperlinks: bool,
+) -> Vec<RenderedLine> {
     let width = width.max(16);
     let mut out = Vec::new();
     let subj = if mail.subject.trim().is_empty() {
@@ -494,6 +539,7 @@ pub fn build_mail_lines(
         theme.muted_style(),
     ))));
 
+    let is_header_only = mail.body_html.trim().is_empty() && mail.body_plain.trim().is_empty();
     let mut blocks = parser::parse_message_blocks(&mail.body_html, &[], &[]);
     if blocks.is_empty() && !mail.body_plain.trim().is_empty() {
         blocks = mail
@@ -508,6 +554,12 @@ pub fn build_mail_lines(
     }
 
     chat_view::render_rich_blocks(&mut out, &blocks, "", false, None, theme, width, hyperlinks);
+    if is_header_only && loading_mail {
+        out.push(RenderedLine::plain(Line::from(Span::styled(
+            "본문을 불러오는 중…",
+            theme.muted_style(),
+        ))));
+    }
 
     if !mail.attachments.is_empty() {
         out.push(RenderedLine::plain(Line::from("")));
@@ -993,5 +1045,46 @@ mod tests {
             .join("\n");
         assert!(joined.contains("회의 참가"));
         assert!(joined.contains("아젠다 확인"));
+    }
+
+    #[test]
+    fn header_only_mail_renders_preview_and_loading_note() {
+        let mail = MailMessage {
+            id: "hdr-1".to_string(),
+            conversation_id: None,
+            folder_id: Some("inbox".to_string()),
+            subject: "헤더만 있는 메일".to_string(),
+            from: None,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            bcc_recipients: vec![],
+            received_at: "2026-11-18T00:00:00Z".to_string(),
+            sent_at: None,
+            is_read: false,
+            is_draft: false,
+            flagged: false,
+            importance: "normal".to_string(),
+            has_attachments: false,
+            preview: "요약 미리보기 텍스트".to_string(),
+            body_html: String::new(),
+            body_plain: String::new(),
+            attachments: vec![],
+            web_link: None,
+        };
+        let lines = build_mail_lines_with_loading(&mail, &[], false, true, &Theme::default(), 60, false);
+        let joined: String = lines
+            .iter()
+            .map(|l| {
+                l.line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("요약 미리보기 텍스트"));
+        assert!(joined.contains("본문을 불러오는 중"));
     }
 }

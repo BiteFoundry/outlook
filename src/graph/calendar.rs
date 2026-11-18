@@ -2,12 +2,12 @@
 
 use std::sync::OnceLock;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use regex::Regex;
 use serde::Deserialize;
 
 use super::{
-    client::GraphListPage,
+    client::{GraphDeltaPage, GraphListPage},
     mail::{normalize_outlook_body, GraphOutlookBody, GraphRecipient},
     GraphClient,
 };
@@ -236,6 +236,50 @@ impl GraphClient {
         }
 
         Ok(events)
+    }
+
+    pub async fn delta_calendar_view(
+        &self,
+        start_iso: &str,
+        end_iso: &str,
+        delta_link: Option<&str>,
+    ) -> Result<(Vec<CalendarEvent>, Vec<String>, Option<String>)> {
+        let initial_url = match delta_link.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(link) => link.to_string(),
+            None => format!(
+                "/me/calendarView/delta?startDateTime={}&endDateTime={}",
+                urlencoding::encode(start_iso.trim()),
+                urlencoding::encode(end_iso.trim()),
+            ),
+        };
+
+        let headers = [("Prefer", "odata.maxpagesize=50")];
+        let mut next_url = Some(initial_url);
+        let mut upserted = Vec::new();
+        let mut removed_ids = Vec::new();
+        let mut new_delta_link = None;
+
+        while let Some(url) = next_url {
+            let page: GraphDeltaPage<serde_json::Value> =
+                self.get_json_with_headers(&url, &headers).await?;
+            for val in page.value {
+                if val.get("@removed").is_some() {
+                    if let Some(id) = val.get("id").and_then(|v| v.as_str()) {
+                        removed_ids.push(id.to_string());
+                    }
+                } else {
+                    let raw: GraphCalendarEvent = serde_json::from_value(val)
+                        .context("Graph 캘린더 delta 항목 역직렬화 실패")?;
+                    upserted.push(CalendarEvent::from(raw));
+                }
+            }
+            if page.delta_link.is_some() {
+                new_delta_link = page.delta_link;
+            }
+            next_url = page.next_link;
+        }
+
+        Ok((upserted, removed_ids, new_delta_link))
     }
 
     pub async fn get_calendar_event(&self, event_id: &str) -> Result<CalendarEvent> {
@@ -572,6 +616,109 @@ mod tests {
                 "ev1:tentativelyAccept:",
                 "ev1:decline:불가",
                 "delete:ev1",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delta_calendar_view_pagination_removed_and_incremental_link() {
+        #[derive(Clone, Default)]
+        struct DeltaState {
+            base_url: Arc<Mutex<String>>,
+            prefer_headers: Arc<Mutex<Vec<String>>>,
+        }
+        let state = DeltaState::default();
+        let state_check = state.clone();
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/calendarView/delta",
+                get(
+                    |State(st): State<DeltaState>,
+                     headers: axum::http::HeaderMap,
+                     Query(params): Query<HashMap<String, String>>| async move {
+                        let prefer = headers
+                            .get("prefer")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        st.prefer_headers.lock().unwrap().push(prefer);
+                        let base = st.base_url.lock().unwrap().clone();
+
+                        if params.get("deltatoken").map(String::as_str) == Some("tok2") {
+                            Json(serde_json::json!({
+                                "value": [
+                                    { "id": "ev-del-2", "@removed": { "reason": "deleted" } }
+                                ],
+                                "@odata.deltaLink": format!("{base}/v1.0/me/calendarView/delta?deltatoken=tok3")
+                            }))
+                        } else if params.get("page").map(String::as_str) == Some("2") {
+                            Json(serde_json::json!({
+                                "value": [
+                                    { "id": "ev-del-1", "@removed": { "reason": "deleted" } },
+                                    {
+                                        "id": "ev-2",
+                                        "subject": "2페이지 일정",
+                                        "start": { "dateTime": "2026-11-16T11:00:00", "timeZone": "UTC" },
+                                        "end": { "dateTime": "2026-11-16T12:00:00", "timeZone": "UTC" }
+                                    }
+                                ],
+                                "@odata.deltaLink": format!("{base}/v1.0/me/calendarView/delta?deltatoken=tok2")
+                            }))
+                        } else {
+                            assert_eq!(params.get("startDateTime").map(String::as_str), Some("2026-11-15T00:00:00Z"));
+                            assert_eq!(params.get("endDateTime").map(String::as_str), Some("2026-11-22T00:00:00Z"));
+                            Json(serde_json::json!({
+                                "value": [
+                                    {
+                                        "id": "ev-1",
+                                        "subject": "초기 일정",
+                                        "start": { "dateTime": "2026-11-15T09:00:00", "timeZone": "UTC" },
+                                        "end": { "dateTime": "2026-11-15T10:00:00", "timeZone": "UTC" }
+                                    }
+                                ],
+                                "@odata.nextLink": format!("{base}/v1.0/me/calendarView/delta?page=2")
+                            }))
+                        }
+                    },
+                ),
+            )
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        *state.base_url.lock().unwrap() = format!("http://{addr}");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = test_graph_client(&format!("http://{addr}/v1.0"));
+        let (up1, rem1, dlink1) = client
+            .delta_calendar_view("2026-11-15T00:00:00Z", "2026-11-22T00:00:00Z", None)
+            .await
+            .unwrap();
+        assert_eq!(up1.len(), 2);
+        assert_eq!(up1[0].id, "ev-1");
+        assert_eq!(up1[1].id, "ev-2");
+        assert_eq!(rem1, vec!["ev-del-1"]);
+        let dlink1 = dlink1.unwrap();
+        assert!(dlink1.contains("deltatoken=tok2"));
+
+        let (up2, rem2, dlink2) = client
+            .delta_calendar_view("2026-11-15T00:00:00Z", "2026-11-22T00:00:00Z", Some(&dlink1))
+            .await
+            .unwrap();
+        assert!(up2.is_empty());
+        assert_eq!(rem2, vec!["ev-del-2"]);
+        assert!(dlink2.unwrap().contains("deltatoken=tok3"));
+
+        let prefers = state_check.prefer_headers.lock().unwrap().clone();
+        assert_eq!(
+            prefers,
+            vec![
+                "odata.maxpagesize=50",
+                "odata.maxpagesize=50",
+                "odata.maxpagesize=50"
             ]
         );
     }

@@ -8,6 +8,11 @@
 //! - Tab 6 (`Ctrl+7`): 할 일 (Microsoft To Do lists & tasks)
 //! - Tab 7 (`Ctrl+8`): 노트 (Microsoft OneNote notebooks, section groups & sections)
 
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -21,6 +26,7 @@ use crate::{
     models::{ConversationKind, OnenoteNotebook, OnenoteSection},
     ui::{
         app::{AppState, Focus, UiState},
+        chat_view::DualHasher,
         hitmap::{ButtonId, HitMap, HitTarget},
     },
 };
@@ -330,7 +336,266 @@ fn push_notebook_tree_rows(
     }
 }
 
+const NAV_CACHE_CAPACITY: usize = 16;
+
+struct NavRowsCache {
+    entries: Vec<((u64, u64), Arc<[NavRow]>)>,
+    max_entries: usize,
+}
+
+impl NavRowsCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(max_entries),
+            max_entries: max_entries.max(1),
+        }
+    }
+
+    fn get(&mut self, key: (u64, u64)) -> Option<Arc<[NavRow]>> {
+        let pos = self.entries.iter().position(|(k, _)| *k == key)?;
+        if pos + 1 < self.entries.len() {
+            let entry = self.entries.remove(pos);
+            self.entries.push(entry);
+        }
+        self.entries.last().map(|(_, val)| Arc::clone(val))
+    }
+
+    fn insert(&mut self, key: (u64, u64), val: Arc<[NavRow]>) {
+        if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key) {
+            self.entries.remove(pos);
+        } else if self.entries.len() >= self.max_entries {
+            self.entries.remove(0);
+        }
+        self.entries.push((key, val));
+    }
+}
+
+thread_local! {
+    static NAV_ROWS_CACHE: RefCell<NavRowsCache> = RefCell::new(NavRowsCache::new(NAV_CACHE_CAPACITY));
+}
+
+#[inline]
+fn write_opt_str(h: &mut DualHasher, s: Option<&str>) {
+    match s {
+        Some(v) => {
+            h.write_hash(&1u8);
+            h.write_str(v);
+        }
+        None => h.write_hash(&0u8),
+    }
+}
+
+/// Computes a 128-bit signature of all inputs that affect `NavRow` output for the active tab.
+fn compute_nav_sig(app: &AppState, ui: &UiState) -> (u64, u64) {
+    let mut h = DualHasher::new(0x4e41_565f_524f_5753);
+    h.write_hash(&ui.active_nav_tab);
+    match ui.active_nav_tab {
+        TAB_CHATS => {
+            let mut count = 0usize;
+            for c in &app.conversations {
+                if c.kind != ConversationKind::Channel {
+                    h.write_str(&c.conv_key);
+                    h.write_str(&c.title);
+                    h.write_hash(&c.kind);
+                    write_opt_str(&mut h, c.peer_user_id.as_deref());
+                    h.write_hash(&c.unread_count);
+                    count += 1;
+                }
+            }
+            h.write_hash(&count);
+        }
+        TAB_TEAMS => {
+            h.write_hash(&app.teams.len());
+            for team in &app.teams {
+                h.write_str(&team.id);
+                h.write_str(&team.display_name);
+                let collapsed = ui.collapsed_team_ids.contains(&team.id);
+                h.write_hash(&collapsed);
+                h.write_hash(&team.channels.len());
+                if !collapsed {
+                    for ch in &team.channels {
+                        h.write_str(&ch.team_id);
+                        h.write_str(&ch.id);
+                        h.write_str(&ch.display_name);
+                        h.write_hash(&(!ch.membership_type.eq_ignore_ascii_case("standard")));
+                    }
+                }
+            }
+            let mut chan_conv_count = 0usize;
+            for c in &app.conversations {
+                if c.kind == ConversationKind::Channel || c.conv_key.starts_with("chan:") {
+                    h.write_str(&c.conv_key);
+                    h.write_hash(&c.unread_count);
+                    chan_conv_count += 1;
+                }
+            }
+            h.write_hash(&chan_conv_count);
+        }
+        TAB_ACTIVITY => {
+            h.write_hash(&app.activity_mentions.len());
+            for m in &app.activity_mentions {
+                h.write_str(&m.conv_key);
+                h.write_str(&m.msg_id);
+                write_opt_str(&mut h, m.parent_msg_id.as_deref());
+                h.write_str(&m.author_name);
+                h.write_str(&m.body_plain);
+                h.write_str(&m.created_at);
+            }
+        }
+        TAB_MAIL => {
+            h.write_str(&ui.active_mail_folder_id);
+            let folder_count = app.mail_folders.len().min(6);
+            h.write_hash(&folder_count);
+            for folder in app.mail_folders.iter().take(6) {
+                h.write_str(&folder.id);
+                h.write_str(&folder.display_name);
+                write_opt_str(&mut h, folder.well_known_name.as_deref());
+                h.write_hash(&folder.unread_item_count);
+            }
+            h.write_hash(&app.mails.len());
+            for mail in &app.mails {
+                h.write_str(&mail.id);
+                h.write_str(&mail.subject);
+                match &mail.from {
+                    Some(from) => {
+                        h.write_hash(&1u8);
+                        write_opt_str(&mut h, from.name.as_deref());
+                        h.write_str(&from.address);
+                    }
+                    None => h.write_hash(&0u8),
+                }
+                h.write_hash(&mail.is_read);
+                h.write_hash(&mail.flagged);
+                h.write_hash(&mail.has_attachments);
+                h.write_str(&mail.received_at);
+            }
+        }
+        TAB_CALENDAR => {
+            h.write_hash(&app.calendar_events.len());
+            for ev in &app.calendar_events {
+                h.write_str(&ev.id);
+                h.write_str(&ev.subject);
+                h.write_str(&ev.start_iso);
+                h.write_str(&ev.end_iso);
+                h.write_hash(&ev.is_all_day);
+                h.write_hash(&(ev.is_online_meeting || ev.online_meeting_url.is_some()));
+                h.write_str(&ev.response_status);
+                h.write_hash(&ev.is_cancelled);
+            }
+        }
+        TAB_CONTACTS => {
+            h.write_hash(&app.contacts.len());
+            for c in &app.contacts {
+                h.write_str(&c.id);
+                h.write_str(&c.display_name);
+                write_opt_str(&mut h, c.primary_email());
+                h.write_str(&c.source);
+            }
+        }
+        TAB_TODO => {
+            let show_chips = app.todo_lists.len() > 1;
+            h.write_hash(&show_chips);
+            if show_chips {
+                write_opt_str(&mut h, ui.active_todo_list_id.as_deref());
+                let list_count = app.todo_lists.len().min(6);
+                h.write_hash(&list_count);
+                for list in app.todo_lists.iter().take(6) {
+                    h.write_str(&list.id);
+                    h.write_str(&list.display_name);
+                }
+            }
+            h.write_hash(&app.todo_tasks.len());
+            for task in &app.todo_tasks {
+                h.write_str(&task.id);
+                h.write_str(&task.list_id);
+                h.write_str(&task.title);
+                h.write_hash(&task.is_completed());
+                h.write_hash(&task.importance.eq_ignore_ascii_case("high"));
+                write_opt_str(&mut h, task.due_date_iso.as_deref());
+            }
+        }
+        TAB_NOTES => {
+            h.write_hash(&app.onenote_notebooks.len());
+            for nb in &app.onenote_notebooks {
+                h.write_str(&nb.notebook_key);
+                h.write_str(&nb.id);
+                h.write_hash(&nb.scope);
+                h.write_str(&nb.display_name);
+                write_opt_str(&mut h, nb.color.as_deref());
+                h.write_hash(&nb.is_shared);
+                h.write_hash(&ui.collapsed_notebook_keys.contains(&nb.notebook_key));
+            }
+            h.write_hash(&app.onenote_sections.len());
+            for sec in &app.onenote_sections {
+                h.write_str(&sec.section_key);
+                h.write_hash(&sec.scope);
+                write_opt_str(&mut h, sec.notebook_id.as_deref());
+                write_opt_str(&mut h, sec.parent_section_group_name.as_deref());
+                h.write_str(&sec.display_name);
+                write_opt_str(&mut h, sec.color.as_deref());
+            }
+        }
+        _ => {}
+    }
+    h.finish()
+}
+
+/// Returns the cached `Arc<[NavRow]>` slice for the active tab, rebuilding only on signature miss.
+pub fn nav_rows_cached(app: &AppState, ui: &UiState) -> Arc<[NavRow]> {
+    let sig = compute_nav_sig(app, ui);
+    if let Some(hit) = NAV_ROWS_CACHE.with(|cache| cache.borrow_mut().get(sig)) {
+        return hit;
+    }
+    let rows: Arc<[NavRow]> = build_nav_rows_uncached(app, ui).into();
+    NAV_ROWS_CACHE.with(|cache| cache.borrow_mut().insert(sig, Arc::clone(&rows)));
+    rows
+}
+
+/// Returns the number of visible rows in the active nav tab without allocating rows on tabs 0..=6.
+pub fn nav_row_count(app: &AppState, ui: &UiState) -> usize {
+    match ui.active_nav_tab {
+        TAB_CHATS => app
+            .conversations
+            .iter()
+            .filter(|c| c.kind != ConversationKind::Channel)
+            .count(),
+        TAB_TEAMS => app
+            .teams
+            .iter()
+            .map(|team| {
+                1 + if ui.collapsed_team_ids.contains(&team.id) {
+                    0
+                } else {
+                    team.channels.len()
+                }
+            })
+            .sum(),
+        TAB_ACTIVITY => app.activity_mentions.len(),
+        TAB_MAIL => app.mail_folders.len().min(6) + app.mails.len(),
+        TAB_CALENDAR => app.calendar_events.len(),
+        TAB_CONTACTS => app.contacts.len(),
+        TAB_TODO => {
+            let list_chips = if app.todo_lists.len() > 1 {
+                app.todo_lists.len().min(6)
+            } else {
+                0
+            };
+            list_chips + app.todo_tasks.len()
+        }
+        TAB_NOTES => nav_rows_cached(app, ui).len(),
+        _ => 0,
+    }
+}
+
+pub fn nav_row_at(app: &AppState, ui: &UiState, index: usize) -> Option<NavRow> {
+    nav_rows_cached(app, ui).get(index).cloned()
+}
+
 pub fn build_nav_rows(app: &AppState, ui: &UiState) -> Vec<NavRow> {
+    nav_rows_cached(app, ui).to_vec()
+}
+
+fn build_nav_rows_uncached(app: &AppState, ui: &UiState) -> Vec<NavRow> {
     match ui.active_nav_tab {
         TAB_CHATS => app
             .conversations
@@ -345,6 +610,15 @@ pub fn build_nav_rows(app: &AppState, ui: &UiState) -> Vec<NavRow> {
             })
             .collect(),
         TAB_TEAMS => {
+            let mut channel_unread: HashMap<&str, i32> =
+                HashMap::with_capacity(app.conversations.len());
+            for c in &app.conversations {
+                if c.kind == ConversationKind::Channel || c.conv_key.starts_with("chan:") {
+                    channel_unread
+                        .entry(c.conv_key.as_str())
+                        .or_insert(c.unread_count);
+                }
+            }
             let mut rows = Vec::new();
             for team in &app.teams {
                 let collapsed = ui.collapsed_team_ids.contains(&team.id);
@@ -357,12 +631,7 @@ pub fn build_nav_rows(app: &AppState, ui: &UiState) -> Vec<NavRow> {
                 if !collapsed {
                     for ch in &team.channels {
                         let conv_key = ch.conv_key();
-                        let unread = app
-                            .conversations
-                            .iter()
-                            .find(|c| c.conv_key == conv_key)
-                            .map(|c| c.unread_count)
-                            .unwrap_or(0);
+                        let unread = channel_unread.get(conv_key.as_str()).copied().unwrap_or(0);
                         let is_private = !ch.membership_type.eq_ignore_ascii_case("standard");
                         rows.push(NavRow::TeamChannel {
                             conv_key,
@@ -554,7 +823,7 @@ pub fn tab_counts(app: &AppState) -> [usize; TAB_COUNT] {
 pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap: &mut HitMap) {
     let theme = &ui.theme;
     let focused = ui.focus == Focus::Nav;
-    let rows = build_nav_rows(app, ui);
+    let rows = nav_rows_cached(app, ui);
     let label = TAB_LABELS.get(ui.active_nav_tab).copied().unwrap_or("채팅");
 
     let count_badge = match ui.active_nav_tab {
@@ -715,6 +984,19 @@ fn draw_footer(frame: &mut Frame, inner: Rect, ui: &UiState, hitmap: &mut HitMap
     );
 }
 
+const MARKER_WIDTH: usize = 2;
+
+const SPACES: &str = "                                                                                                                                ";
+
+#[inline]
+fn spaces_cow(n: usize) -> Cow<'static, str> {
+    if n <= SPACES.len() {
+        Cow::Borrowed(&SPACES[..n])
+    } else {
+        Cow::Owned(" ".repeat(n))
+    }
+}
+
 fn render_nav_row(
     row: &NavRow,
     width: usize,
@@ -724,7 +1006,7 @@ fn render_nav_row(
     ui: &UiState,
 ) -> Line<'static> {
     let theme = &ui.theme;
-    let marker = if selected {
+    let marker: &'static str = if selected {
         "▸ "
     } else if active {
         "• "
@@ -748,32 +1030,30 @@ fn render_nav_row(
             unread,
             ..
         } => {
-            let (prefix_glyph, glyph_color) = match kind {
+            let (prefix_glyph, glyph_color): (Cow<'static, str>, Color) = match kind {
                 ConversationKind::OneOnOne => {
                     let avail = peer_user_id
                         .as_deref()
                         .and_then(|id| app.presences.get(id))
                         .map(|p| p.availability.as_str());
                     let (dot, color) = theme.presence_indicator(avail);
-                    (format!("{dot} "), color)
+                    (Cow::Owned(format!("{dot} ")), color)
                 }
-                ConversationKind::Group => ("[그룹] ".to_string(), theme.accent),
-                ConversationKind::Meeting => ("[회의] ".to_string(), theme.reply),
-                ConversationKind::Channel => ("# ".to_string(), theme.accent),
+                ConversationKind::Group => (Cow::Borrowed("[그룹] "), theme.accent),
+                ConversationKind::Meeting => (Cow::Borrowed("[회의] "), theme.reply),
+                ConversationKind::Channel => (Cow::Borrowed("# "), theme.accent),
             };
             let badge = if *unread > 0 {
                 format!(" ({unread})")
             } else {
                 String::new()
             };
-            let used_fixed = UnicodeWidthStr::width(marker)
-                + UnicodeWidthStr::width(prefix_glyph.as_str())
-                + UnicodeWidthStr::width(badge.as_str());
+            let used_fixed = MARKER_WIDTH
+                + UnicodeWidthStr::width(prefix_glyph.as_ref())
+                + badge.len();
             let name_w = width.saturating_sub(used_fixed).max(4);
-            let name = truncate(title, name_w);
-            let pad = width
-                .saturating_sub(used_fixed + UnicodeWidthStr::width(name.as_str()))
-                .max(0);
+            let (name, name_used) = truncate_with_width(title, name_w);
+            let pad = width.saturating_sub(used_fixed + name_used);
 
             let glyph_style = if selected {
                 theme.selection()
@@ -785,12 +1065,13 @@ fn render_nav_row(
             } else {
                 base_style
             };
-            let mut spans = vec![
-                Span::styled(marker.to_string(), base_style),
-                Span::styled(prefix_glyph, glyph_style),
-                Span::styled(name, name_style),
-                Span::styled(" ".repeat(pad), base_style),
-            ];
+            let mut spans = Vec::with_capacity(5);
+            spans.push(Span::styled(marker, base_style));
+            spans.push(Span::styled(prefix_glyph, glyph_style));
+            spans.push(Span::styled(name, name_style));
+            if pad > 0 {
+                spans.push(Span::styled(spaces_cow(pad), base_style));
+            }
             if !badge.is_empty() {
                 let badge_style = if selected {
                     theme.selection()
@@ -811,9 +1092,7 @@ fn render_nav_row(
         } => {
             let arrow = if *collapsed { "▸ " } else { "▾ " };
             let suffix = format!(" ({channel_count})");
-            let fixed = UnicodeWidthStr::width(marker)
-                + UnicodeWidthStr::width(arrow)
-                + UnicodeWidthStr::width(suffix.as_str());
+            let fixed = MARKER_WIDTH + UnicodeWidthStr::width(arrow) + suffix.len();
             let name = truncate(display_name, width.saturating_sub(fixed).max(4));
             let style = if selected {
                 theme.selection()
@@ -821,7 +1100,7 @@ fn render_nav_row(
                 theme.accent_style().add_modifier(Modifier::BOLD)
             };
             Line::from(vec![
-                Span::styled(marker.to_string(), style),
+                Span::styled(marker, style),
                 Span::styled(arrow, style),
                 Span::styled(name, style),
                 Span::styled(suffix, if selected { style } else { theme.muted_style() }),
@@ -833,30 +1112,39 @@ fn render_nav_row(
             unread,
             ..
         } => {
-            let icon = if *is_private { "  🔒 " } else { "  # " };
+            let (icon, icon_w) = if *is_private {
+                ("  🔒 ", 5usize)
+            } else {
+                ("  # ", 4usize)
+            };
             let badge = if *unread > 0 {
                 format!(" ({unread})")
             } else {
                 String::new()
             };
-            let fixed = UnicodeWidthStr::width(marker)
-                + UnicodeWidthStr::width(icon)
-                + UnicodeWidthStr::width(badge.as_str());
-            let name = truncate(display_name, width.saturating_sub(fixed).max(4));
-            let pad = width
-                .saturating_sub(fixed + UnicodeWidthStr::width(name.as_str()))
-                .max(0);
+            let fixed = MARKER_WIDTH + icon_w + badge.len();
+            let (name, name_used) =
+                truncate_with_width(display_name, width.saturating_sub(fixed).max(4));
+            let pad = width.saturating_sub(fixed + name_used);
             let name_style = if !selected && *unread > 0 {
                 base_style.add_modifier(Modifier::BOLD)
             } else {
                 base_style
             };
-            let mut spans = vec![
-                Span::styled(marker.to_string(), base_style),
-                Span::styled(icon, if selected { base_style } else { theme.muted_style() }),
-                Span::styled(name, name_style),
-                Span::styled(" ".repeat(pad), base_style),
-            ];
+            let mut spans = Vec::with_capacity(5);
+            spans.push(Span::styled(marker, base_style));
+            spans.push(Span::styled(
+                icon,
+                if selected {
+                    base_style
+                } else {
+                    theme.muted_style()
+                },
+            ));
+            spans.push(Span::styled(name, name_style));
+            if pad > 0 {
+                spans.push(Span::styled(spaces_cow(pad), base_style));
+            }
             if !badge.is_empty() {
                 let badge_style = if selected {
                     theme.selection()
@@ -875,9 +1163,9 @@ fn render_nav_row(
             ..
         } => {
             let label = format!("@{author_name}: {preview}");
-            let body = truncate(&label, width.saturating_sub(UnicodeWidthStr::width(marker)));
+            let body = truncate(&label, width.saturating_sub(MARKER_WIDTH));
             Line::from(vec![
-                Span::styled(marker.to_string(), base_style),
+                Span::styled(marker, base_style),
                 Span::styled(body, base_style),
             ])
         }
@@ -893,9 +1181,7 @@ fn render_nav_row(
             } else {
                 String::new()
             };
-            let fixed = UnicodeWidthStr::width(marker)
-                + UnicodeWidthStr::width(icon)
-                + UnicodeWidthStr::width(badge.as_str());
+            let fixed = MARKER_WIDTH + UnicodeWidthStr::width(icon) + badge.len();
             let name = truncate(display_name, width.saturating_sub(fixed).max(4));
             let style = if selected {
                 theme.selection()
@@ -904,11 +1190,10 @@ fn render_nav_row(
             } else {
                 theme.muted_style()
             };
-            let mut spans = vec![
-                Span::styled(marker.to_string(), style),
-                Span::styled(icon, style),
-                Span::styled(name, style),
-            ];
+            let mut spans = Vec::with_capacity(4);
+            spans.push(Span::styled(marker, style));
+            spans.push(Span::styled(icon, style));
+            spans.push(Span::styled(name, style));
             if !badge.is_empty() {
                 spans.push(Span::styled(
                     badge,
@@ -948,7 +1233,7 @@ fn render_nav_row(
                 subject.as_str()
             };
             let combined = format!("{sender_short}: {subj_display}");
-            let fixed = UnicodeWidthStr::width(marker)
+            let fixed = MARKER_WIDTH
                 + UnicodeWidthStr::width(status)
                 + UnicodeWidthStr::width(attach_tag);
             let body = truncate(&combined, width.saturating_sub(fixed).max(4));
@@ -968,11 +1253,10 @@ fn render_nav_row(
             } else {
                 theme.muted_style()
             };
-            let mut spans = vec![
-                Span::styled(marker.to_string(), base_style),
-                Span::styled(status, status_style),
-                Span::styled(body, name_style),
-            ];
+            let mut spans = Vec::with_capacity(4);
+            spans.push(Span::styled(marker, base_style));
+            spans.push(Span::styled(status, status_style));
+            spans.push(Span::styled(body, name_style));
             if !attach_tag.is_empty() {
                 spans.push(Span::styled(
                     attach_tag,
@@ -1005,7 +1289,7 @@ fn render_nav_row(
                 "📅 "
             };
             let text = format!("{when} {subject}");
-            let fixed = UnicodeWidthStr::width(marker) + UnicodeWidthStr::width(icon);
+            let fixed = MARKER_WIDTH + UnicodeWidthStr::width(icon);
             let body = truncate(&text, width.saturating_sub(fixed).max(4));
             let style = if *is_cancelled && !selected {
                 theme.muted_style().add_modifier(Modifier::CROSSED_OUT)
@@ -1013,7 +1297,7 @@ fn render_nav_row(
                 base_style
             };
             Line::from(vec![
-                Span::styled(marker.to_string(), style),
+                Span::styled(marker, style),
                 Span::styled(
                     icon,
                     if selected {
@@ -1032,14 +1316,14 @@ fn render_nav_row(
             ..
         } => {
             let icon = if source == "directory" { "🏢 " } else { "👤 " };
-            let detail = match email {
-                Some(e) if !e.is_empty() => format!("{display_name} ({e})"),
-                _ => display_name.clone(),
+            let detail: Cow<'_, str> = match email {
+                Some(e) if !e.is_empty() => Cow::Owned(format!("{display_name} ({e})")),
+                _ => Cow::Borrowed(display_name.as_str()),
             };
-            let fixed = UnicodeWidthStr::width(marker) + UnicodeWidthStr::width(icon);
+            let fixed = MARKER_WIDTH + UnicodeWidthStr::width(icon);
             let body = truncate(&detail, width.saturating_sub(fixed).max(4));
             Line::from(vec![
-                Span::styled(marker.to_string(), base_style),
+                Span::styled(marker, base_style),
                 Span::styled(
                     icon,
                     if selected {
@@ -1057,7 +1341,7 @@ fn render_nav_row(
             ..
         } => {
             let icon = if *list_active { "▾ 📋 " } else { "▸ 📋 " };
-            let fixed = UnicodeWidthStr::width(marker) + UnicodeWidthStr::width(icon);
+            let fixed = MARKER_WIDTH + UnicodeWidthStr::width(icon);
             let body = truncate(display_name, width.saturating_sub(fixed).max(4));
             let style = if selected {
                 theme.selection()
@@ -1067,7 +1351,7 @@ fn render_nav_row(
                 theme.muted_style()
             };
             Line::from(vec![
-                Span::styled(marker.to_string(), style),
+                Span::styled(marker, style),
                 Span::styled(icon, style),
                 Span::styled(body, style),
             ])
@@ -1080,14 +1364,17 @@ fn render_nav_row(
             ..
         } => {
             let box_icon = if *completed { "[x] " } else { "[ ] " };
-            let star = if *important { "★ " } else { "" };
-            let due = due_date_iso
-                .as_deref()
-                .and_then(|s| s.get(..10))
-                .map(|d| format!(" ({d})"))
-                .unwrap_or_default();
-            let full = format!("{star}{title}{due}");
-            let fixed = UnicodeWidthStr::width(marker) + UnicodeWidthStr::width(box_icon);
+            let due_slice = due_date_iso.as_deref().and_then(|s| s.get(..10));
+            let full: Cow<'_, str> = if !*important && due_slice.is_none() {
+                Cow::Borrowed(title.as_str())
+            } else {
+                let star = if *important { "★ " } else { "" };
+                match due_slice {
+                    Some(d) => Cow::Owned(format!("{star}{title} ({d})")),
+                    None => Cow::Owned(format!("{star}{title}")),
+                }
+            };
+            let fixed = MARKER_WIDTH + 4; // box_icon is 4 ASCII chars
             let body = truncate(&full, width.saturating_sub(fixed).max(4));
             let style = if *completed && !selected {
                 theme.muted_style().add_modifier(Modifier::CROSSED_OUT)
@@ -1097,7 +1384,7 @@ fn render_nav_row(
                 base_style
             };
             Line::from(vec![
-                Span::styled(marker.to_string(), style),
+                Span::styled(marker, style),
                 Span::styled(
                     box_icon,
                     if selected {
@@ -1117,7 +1404,7 @@ fn render_nav_row(
             count,
         } => {
             let suffix = format!(" ({count})");
-            let fixed = UnicodeWidthStr::width(marker) + UnicodeWidthStr::width(suffix.as_str());
+            let fixed = MARKER_WIDTH + suffix.len();
             let body = truncate(label, width.saturating_sub(fixed).max(4));
             let header_style = if selected {
                 theme.selection()
@@ -1129,7 +1416,7 @@ fn render_nav_row(
                 theme.accent_style().add_modifier(Modifier::BOLD)
             };
             Line::from(vec![
-                Span::styled(marker.to_string(), header_style),
+                Span::styled(marker, header_style),
                 Span::styled(body, header_style),
                 Span::styled(
                     suffix,
@@ -1152,15 +1439,15 @@ fn render_nav_row(
             let arrow = if *collapsed { "▸ " } else { "▾ " };
             let bar = "▌";
             let badge_color = onenote_badge_color(color.as_deref(), notebook_key);
-            let full_name = match owner_hint.as_deref() {
-                Some(owner) if !owner.is_empty() => format!("{display_name} · {owner}"),
-                _ => display_name.clone(),
+            let full_name: Cow<'_, str> = match owner_hint.as_deref() {
+                Some(owner) if !owner.is_empty() => Cow::Owned(format!("{display_name} · {owner}")),
+                _ => Cow::Borrowed(display_name.as_str()),
             };
             let suffix = format!(" ({section_count})");
-            let fixed = UnicodeWidthStr::width(marker)
+            let fixed = MARKER_WIDTH
                 + UnicodeWidthStr::width(arrow)
                 + UnicodeWidthStr::width(bar)
-                + UnicodeWidthStr::width(suffix.as_str());
+                + suffix.len();
             let body = truncate(&full_name, width.saturating_sub(fixed).max(4));
             let name_style = if selected {
                 theme.selection()
@@ -1177,7 +1464,7 @@ fn render_nav_row(
                 Style::default().fg(badge_color)
             };
             Line::from(vec![
-                Span::styled(marker.to_string(), name_style),
+                Span::styled(marker, name_style),
                 Span::styled(arrow, name_style),
                 Span::styled(bar, bar_style),
                 Span::styled(body, name_style),
@@ -1193,7 +1480,7 @@ fn render_nav_row(
         }
         NavRow::OnenoteSectionGroup { display_name, .. } => {
             let prefix = "  ▾ 📁 ";
-            let fixed = UnicodeWidthStr::width(marker) + UnicodeWidthStr::width(prefix);
+            let fixed = MARKER_WIDTH + UnicodeWidthStr::width(prefix);
             let body = truncate(display_name, width.saturating_sub(fixed).max(4));
             let style = if selected {
                 theme.selection()
@@ -1201,7 +1488,7 @@ fn render_nav_row(
                 theme.muted_style().add_modifier(Modifier::BOLD)
             };
             Line::from(vec![
-                Span::styled(marker.to_string(), style),
+                Span::styled(marker, style),
                 Span::styled(prefix, style),
                 Span::styled(body, style),
             ])
@@ -1213,16 +1500,17 @@ fn render_nav_row(
             in_section_group,
             ..
         } => {
-            let indent = if *in_section_group { "    " } else { "  " };
+            let (indent, indent_w) = if *in_section_group {
+                ("    ", 4usize)
+            } else {
+                ("  ", 2usize)
+            };
             let bar = "▌";
             let badge_color = onenote_badge_color(color.as_deref(), section_key);
-            let fixed = UnicodeWidthStr::width(marker)
-                + UnicodeWidthStr::width(indent)
-                + UnicodeWidthStr::width(bar);
-            let body = truncate(display_name, width.saturating_sub(fixed).max(4));
-            let pad = width
-                .saturating_sub(fixed + UnicodeWidthStr::width(body.as_str()))
-                .max(0);
+            let fixed = MARKER_WIDTH + indent_w + UnicodeWidthStr::width(bar);
+            let (body, body_used) =
+                truncate_with_width(display_name, width.saturating_sub(fixed).max(4));
+            let pad = width.saturating_sub(fixed + body_used);
             let text_style = if selected {
                 theme.selection()
             } else if active {
@@ -1237,13 +1525,15 @@ fn render_nav_row(
             } else {
                 Style::default().fg(badge_color)
             };
-            Line::from(vec![
-                Span::styled(marker.to_string(), text_style),
-                Span::styled(indent, text_style),
-                Span::styled(bar, bar_style),
-                Span::styled(body, text_style),
-                Span::styled(" ".repeat(pad), text_style),
-            ])
+            let mut spans = Vec::with_capacity(5);
+            spans.push(Span::styled(marker, text_style));
+            spans.push(Span::styled(indent, text_style));
+            spans.push(Span::styled(bar, bar_style));
+            spans.push(Span::styled(body, text_style));
+            if pad > 0 {
+                spans.push(Span::styled(spaces_cow(pad), text_style));
+            }
+            Line::from(spans)
         }
     }
 }
@@ -1280,8 +1570,17 @@ pub fn selection_offset(selected: usize, height: usize, total: usize) -> usize {
     }
 }
 
-fn truncate(text: &str, width: usize) -> String {
-    let mut out = String::new();
+fn truncate_with_width(text: &str, width: usize) -> (String, usize) {
+    if width == 0 {
+        return (String::new(), 0);
+    }
+    if text.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+        if text.len() <= width {
+            return (text.to_string(), text.len());
+        }
+        return (text[..width].to_string(), width);
+    }
+    let mut out = String::with_capacity(text.len().min(width.saturating_mul(3)));
     let mut used = 0usize;
     for ch in text.chars() {
         let w = UnicodeWidthChar::width(ch).unwrap_or(0);
@@ -1291,7 +1590,22 @@ fn truncate(text: &str, width: usize) -> String {
         out.push(ch);
         used += w;
     }
-    out
+    (out, used)
+}
+
+fn truncate(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if text.is_ascii() {
+        if text.len() <= width {
+            return text.to_string();
+        }
+        if text.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+            return text[..width].to_string();
+        }
+    }
+    truncate_with_width(text, width).0
 }
 
 #[cfg(test)]
@@ -1338,5 +1652,492 @@ mod tests {
             format_event_nav_time("2026-11-15T00:00:00Z", true),
             "11-15 종일"
         );
+    }
+
+    #[test]
+    fn truncate_and_spaces_helpers_handle_ascii_and_wide_chars() {
+        assert_eq!(UnicodeWidthStr::width("▸ "), MARKER_WIDTH);
+        assert_eq!(UnicodeWidthStr::width("• "), MARKER_WIDTH);
+        assert_eq!(UnicodeWidthStr::width("  "), MARKER_WIDTH);
+
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello", 5), "hello");
+        assert_eq!(truncate("hello world", 5), "hello");
+        assert_eq!(truncate("hello", 0), "");
+
+        let (s, w) = truncate_with_width("한글ABC", 4);
+        assert_eq!(s, "한글");
+        assert_eq!(w, 4);
+
+        let (s2, w2) = truncate_with_width("한글ABC", 5);
+        assert_eq!(s2, "한글A");
+        assert_eq!(w2, 5);
+
+        assert_eq!(spaces_cow(0).as_ref(), "");
+        assert_eq!(spaces_cow(5).as_ref(), "     ");
+        assert!(matches!(spaces_cow(128), Cow::Borrowed(_)));
+        assert_eq!(spaces_cow(140).len(), 140);
+    }
+
+    fn make_populated_test_state() -> (AppState, UiState, crate::sync::SyncController) {
+        use crate::auth::AuthManager;
+        use crate::config::AppConfig;
+        use crate::graph::GraphClient;
+        use crate::models::{
+            CalendarEvent, ChannelSummary, ContactItem, ConversationSummary, ConversationTarget,
+            EmailRecipient, MailFolder, MailMessage, MessageItem, OnenoteScope, TeamSummary,
+            TodoList, TodoTask,
+        };
+        use crate::storage::Storage;
+        use crate::sync;
+
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sync_ctrl =
+            sync::spawn_sync_engine(cfg.clone(), graph.clone(), storage.clone(), event_tx);
+        let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut app = AppState::new(cfg, auth, graph, storage, sync_ctrl.clone(), ui_tx);
+        let ui = UiState::new();
+
+        app.conversations = vec![
+            ConversationSummary {
+                conv_key: "chat:c1".to_string(),
+                target: ConversationTarget::Chat {
+                    chat_id: "c1".to_string(),
+                },
+                kind: ConversationKind::OneOnOne,
+                team_id: None,
+                team_name: None,
+                title: "Alice".to_string(),
+                topic: None,
+                unread_count: 2,
+                last_read_at: None,
+                last_msg_id: None,
+                last_msg_author: None,
+                last_msg_preview: None,
+                last_updated_at: None,
+                pinned: false,
+                peer_user_id: Some("u1".to_string()),
+                web_url: None,
+            },
+            ConversationSummary {
+                conv_key: "chat:c2".to_string(),
+                target: ConversationTarget::Chat {
+                    chat_id: "c2".to_string(),
+                },
+                kind: ConversationKind::Group,
+                team_id: None,
+                team_name: None,
+                title: "Design Sync".to_string(),
+                topic: None,
+                unread_count: 0,
+                last_read_at: None,
+                last_msg_id: None,
+                last_msg_author: None,
+                last_msg_preview: None,
+                last_updated_at: None,
+                pinned: false,
+                peer_user_id: None,
+                web_url: None,
+            },
+            ConversationSummary {
+                conv_key: "chan:t1:ch1".to_string(),
+                target: ConversationTarget::Channel {
+                    team_id: "t1".to_string(),
+                    channel_id: "ch1".to_string(),
+                },
+                kind: ConversationKind::Channel,
+                team_id: Some("t1".to_string()),
+                team_name: Some("Core".to_string()),
+                title: "General".to_string(),
+                topic: None,
+                unread_count: 5,
+                last_read_at: None,
+                last_msg_id: None,
+                last_msg_author: None,
+                last_msg_preview: None,
+                last_updated_at: None,
+                pinned: false,
+                peer_user_id: None,
+                web_url: None,
+            },
+        ];
+
+        app.teams = vec![
+            TeamSummary {
+                id: "t1".to_string(),
+                display_name: "Core".to_string(),
+                description: None,
+                channels: vec![
+                    ChannelSummary {
+                        id: "ch1".to_string(),
+                        team_id: "t1".to_string(),
+                        team_name: "Core".to_string(),
+                        display_name: "General".to_string(),
+                        description: None,
+                        membership_type: "standard".to_string(),
+                        web_url: None,
+                    },
+                    ChannelSummary {
+                        id: "ch2".to_string(),
+                        team_id: "t1".to_string(),
+                        team_name: "Core".to_string(),
+                        display_name: "Secret".to_string(),
+                        description: None,
+                        membership_type: "private".to_string(),
+                        web_url: None,
+                    },
+                ],
+            },
+            TeamSummary {
+                id: "t2".to_string(),
+                display_name: "Infra".to_string(),
+                description: None,
+                channels: vec![ChannelSummary {
+                    id: "ch3".to_string(),
+                    team_id: "t2".to_string(),
+                    team_name: "Infra".to_string(),
+                    display_name: "Alerts".to_string(),
+                    description: None,
+                    membership_type: "standard".to_string(),
+                    web_url: None,
+                }],
+            },
+        ];
+
+        app.activity_mentions = vec![MessageItem {
+            msg_key: "chan:t1:ch1|m1".to_string(),
+            conv_key: "chan:t1:ch1".to_string(),
+            msg_id: "m1".to_string(),
+            parent_msg_id: None,
+            reply_to_id: None,
+            reply_to_author: None,
+            reply_to_preview: None,
+            subject: None,
+            author_id: None,
+            author_name: "Bob".to_string(),
+            is_me: false,
+            created_at: "2026-11-18T00:00:00Z".to_string(),
+            last_modified_at: None,
+            deleted: false,
+            importance: "normal".to_string(),
+            message_type: "message".to_string(),
+            body_html: String::new(),
+            body_plain: "ping\nline2".to_string(),
+            attachments: Vec::new(),
+            mentions: Vec::new(),
+            reactions: Vec::new(),
+            reply_count: 0,
+            web_url: None,
+        }];
+
+        app.mail_folders = vec![
+            MailFolder {
+                id: "inbox".to_string(),
+                display_name: "받은 편지함".to_string(),
+                well_known_name: Some("inbox".to_string()),
+                parent_folder_id: None,
+                unread_item_count: 1,
+                total_item_count: 10,
+            },
+            MailFolder {
+                id: "sent".to_string(),
+                display_name: "보낸 편지함".to_string(),
+                well_known_name: Some("sentitems".to_string()),
+                parent_folder_id: None,
+                unread_item_count: 0,
+                total_item_count: 3,
+            },
+        ];
+
+        app.mails = vec![MailMessage {
+            id: "mail-1".to_string(),
+            conversation_id: None,
+            folder_id: Some("inbox".to_string()),
+            subject: "Quarterly Review".to_string(),
+            from: Some(EmailRecipient {
+                name: Some("Alice".to_string()),
+                address: "alice@example.com".to_string(),
+            }),
+            to_recipients: Vec::new(),
+            cc_recipients: Vec::new(),
+            bcc_recipients: Vec::new(),
+            received_at: "2026-11-18T01:00:00Z".to_string(),
+            sent_at: None,
+            is_read: false,
+            is_draft: false,
+            flagged: true,
+            importance: "normal".to_string(),
+            has_attachments: true,
+            preview: "Preview".to_string(),
+            body_html: "<p>Initial body</p>".to_string(),
+            body_plain: "Initial body".to_string(),
+            attachments: Vec::new(),
+            web_link: None,
+        }];
+
+        app.calendar_events = vec![CalendarEvent {
+            id: "ev-1".to_string(),
+            subject: "Standup".to_string(),
+            start_iso: "2026-11-18T09:00:00Z".to_string(),
+            end_iso: "2026-11-18T09:30:00Z".to_string(),
+            time_zone: "UTC".to_string(),
+            is_all_day: false,
+            location: None,
+            organizer_name: None,
+            organizer_email: None,
+            attendees: Vec::new(),
+            response_status: "accepted".to_string(),
+            is_online_meeting: true,
+            online_meeting_url: None,
+            body_html: String::new(),
+            body_plain: String::new(),
+            is_cancelled: false,
+            web_link: None,
+        }];
+
+        app.contacts = vec![ContactItem {
+            id: "ct-1".to_string(),
+            display_name: "Charlie".to_string(),
+            given_name: None,
+            surname: None,
+            email_addresses: vec!["charlie@example.com".to_string()],
+            mobile_phone: None,
+            business_phones: Vec::new(),
+            company_name: None,
+            job_title: None,
+            department: None,
+            notes: None,
+            source: "contact".to_string(),
+        }];
+
+        app.todo_lists = vec![
+            TodoList {
+                id: "list-1".to_string(),
+                display_name: "Tasks".to_string(),
+                wellknown_list_name: None,
+                is_owner: true,
+                is_shared: false,
+            },
+            TodoList {
+                id: "list-2".to_string(),
+                display_name: "Work".to_string(),
+                wellknown_list_name: None,
+                is_owner: true,
+                is_shared: false,
+            },
+        ];
+        app.todo_tasks = vec![TodoTask {
+            id: "task-1".to_string(),
+            list_id: "list-1".to_string(),
+            title: "Ship cache".to_string(),
+            status: "notStarted".to_string(),
+            importance: "high".to_string(),
+            body_plain: None,
+            due_date_iso: Some("2026-11-20T00:00:00Z".to_string()),
+            reminder_iso: None,
+            completed_at: None,
+            created_at: None,
+            updated_at: None,
+        }];
+
+        app.onenote_notebooks = vec![
+            OnenoteNotebook {
+                notebook_key: "me|nb1".to_string(),
+                id: "nb1".to_string(),
+                scope: OnenoteScope::Me,
+                display_name: "Personal".to_string(),
+                color: Some("purple".to_string()),
+                is_default: true,
+                is_shared: false,
+                user_role: None,
+                created_at: None,
+                last_modified_at: None,
+                created_by: None,
+                web_url: None,
+            },
+            OnenoteNotebook {
+                notebook_key: "group:g1|nb2".to_string(),
+                id: "nb2".to_string(),
+                scope: OnenoteScope::Group {
+                    group_id: "g1".to_string(),
+                    group_name: Some("Eng".to_string()),
+                },
+                display_name: "Shared".to_string(),
+                color: Some("teal".to_string()),
+                is_default: false,
+                is_shared: true,
+                user_role: None,
+                created_at: None,
+                last_modified_at: None,
+                created_by: None,
+                web_url: None,
+            },
+        ];
+        app.onenote_sections = vec![
+            OnenoteSection {
+                section_key: "me|sec1".to_string(),
+                id: "sec1".to_string(),
+                scope: OnenoteScope::Me,
+                notebook_id: Some("nb1".to_string()),
+                notebook_name: None,
+                parent_section_group_id: Some("sg1".to_string()),
+                parent_section_group_name: Some("Projects".to_string()),
+                display_name: "Alpha".to_string(),
+                color: None,
+                is_default: false,
+                pages_url: None,
+                created_at: None,
+                last_modified_at: None,
+                web_url: None,
+            },
+            OnenoteSection {
+                section_key: "group:g1|sec2".to_string(),
+                id: "sec2".to_string(),
+                scope: OnenoteScope::Group {
+                    group_id: "g1".to_string(),
+                    group_name: Some("Eng".to_string()),
+                },
+                notebook_id: Some("nb2".to_string()),
+                notebook_name: None,
+                parent_section_group_id: None,
+                parent_section_group_name: None,
+                display_name: "Roadmap".to_string(),
+                color: None,
+                is_default: false,
+                pages_url: None,
+                created_at: None,
+                last_modified_at: None,
+                web_url: None,
+            },
+            OnenoteSection {
+                section_key: "me|orphan".to_string(),
+                id: "orphan".to_string(),
+                scope: OnenoteScope::Me,
+                notebook_id: Some("missing-nb".to_string()),
+                notebook_name: None,
+                parent_section_group_id: None,
+                parent_section_group_name: None,
+                display_name: "Orphan".to_string(),
+                color: None,
+                is_default: false,
+                pages_url: None,
+                created_at: None,
+                last_modified_at: None,
+                web_url: None,
+            },
+        ];
+
+        (app, ui, sync_ctrl)
+    }
+
+    #[tokio::test]
+    async fn nav_row_count_and_nav_row_at_match_build_nav_rows_across_all_tabs() {
+        let (mut app, mut ui, sync_ctrl) = make_populated_test_state();
+
+        for tab in 0..TAB_COUNT {
+            ui.active_nav_tab = tab;
+            let expected = build_nav_rows(&app, &ui);
+            assert_eq!(
+                nav_row_count(&app, &ui),
+                expected.len(),
+                "row count mismatch on tab {tab}"
+            );
+            for (idx, exp_row) in expected.iter().enumerate() {
+                assert_eq!(
+                    nav_row_at(&app, &ui, idx).as_ref(),
+                    Some(exp_row),
+                    "nav_row_at mismatch on tab {tab} idx {idx}"
+                );
+            }
+            assert_eq!(nav_row_at(&app, &ui, expected.len()), None);
+        }
+
+        // TAB_TEAMS with collapsed team
+        ui.active_nav_tab = TAB_TEAMS;
+        ui.collapsed_team_ids.insert("t1".to_string());
+        let teams_collapsed = build_nav_rows(&app, &ui);
+        assert_eq!(nav_row_count(&app, &ui), teams_collapsed.len());
+        assert_eq!(teams_collapsed.len(), 3); // t1 header + t2 header + alerts
+
+        // TAB_TODO with single list (no chips rendered)
+        ui.active_nav_tab = TAB_TODO;
+        app.todo_lists.truncate(1);
+        let todo_single = build_nav_rows(&app, &ui);
+        assert_eq!(nav_row_count(&app, &ui), todo_single.len());
+        assert_eq!(todo_single.len(), 1);
+
+        // TAB_NOTES with collapsed notebook
+        ui.active_nav_tab = TAB_NOTES;
+        ui.collapsed_notebook_keys.insert("me|nb1".to_string());
+        let notes_collapsed = build_nav_rows(&app, &ui);
+        assert_eq!(nav_row_count(&app, &ui), notes_collapsed.len());
+
+        sync_ctrl.request(crate::sync::SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn nav_rows_cached_reuses_arc_and_invalidates_on_relevant_mutations() {
+        let (mut app, mut ui, sync_ctrl) = make_populated_test_state();
+
+        // TAB_MAIL: repeated call returns identical Arc pointer
+        ui.active_nav_tab = TAB_MAIL;
+        let p1 = nav_rows_cached(&app, &ui);
+        let p2 = nav_rows_cached(&app, &ui);
+        assert!(Arc::ptr_eq(&p1, &p2));
+
+        // Mutating body_html only must NOT invalidate nav cache
+        app.mails[0].body_html = "<p>Updated HTML body</p>".to_string();
+        let p_body = nav_rows_cached(&app, &ui);
+        assert!(Arc::ptr_eq(&p1, &p_body));
+
+        // Mutating is_read MUST invalidate immediately
+        app.mails[0].is_read = true;
+        let p_read = nav_rows_cached(&app, &ui);
+        assert!(!Arc::ptr_eq(&p1, &p_read));
+        assert!(matches!(
+            p_read.last(),
+            Some(NavRow::MailItem { is_read: true, .. })
+        ));
+
+        // Mutating active_mail_folder_id MUST invalidate immediately
+        ui.active_mail_folder_id = "sent".to_string();
+        let p_folder = nav_rows_cached(&app, &ui);
+        assert!(!Arc::ptr_eq(&p_read, &p_folder));
+
+        // TAB_CHATS: unread_count mutation invalidates
+        ui.active_nav_tab = TAB_CHATS;
+        let c1 = nav_rows_cached(&app, &ui);
+        let c2 = nav_rows_cached(&app, &ui);
+        assert!(Arc::ptr_eq(&c1, &c2));
+        app.conversations[0].unread_count = 9;
+        let c3 = nav_rows_cached(&app, &ui);
+        assert!(!Arc::ptr_eq(&c1, &c3));
+        assert!(matches!(c3.first(), Some(NavRow::Chat { unread: 9, .. })));
+
+        // TAB_TEAMS: channel unread_count & collapsed_team_ids invalidate
+        ui.active_nav_tab = TAB_TEAMS;
+        let t1 = nav_rows_cached(&app, &ui);
+        let t2 = nav_rows_cached(&app, &ui);
+        assert!(Arc::ptr_eq(&t1, &t2));
+
+        app.conversations[2].unread_count = 12;
+        let t3 = nav_rows_cached(&app, &ui);
+        assert!(!Arc::ptr_eq(&t1, &t3));
+        assert!(matches!(
+            t3.get(1),
+            Some(NavRow::TeamChannel { unread: 12, .. })
+        ));
+
+        ui.collapsed_team_ids.insert("t1".to_string());
+        let t4 = nav_rows_cached(&app, &ui);
+        assert!(!Arc::ptr_eq(&t3, &t4));
+        assert_eq!(t4.len(), 3);
+
+        sync_ctrl.request(crate::sync::SyncCommand::Shutdown);
     }
 }

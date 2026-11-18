@@ -303,7 +303,7 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
     ui.term_height = area.height;
     ui.hitmap.clear();
 
-    let row_count = nav_pane::build_nav_rows(app, ui).len();
+    let row_count = nav_pane::nav_row_count(app, ui);
     if row_count == 0 {
         ui.nav_selected = 0;
     } else if ui.nav_selected >= row_count {

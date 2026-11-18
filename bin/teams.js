@@ -68,12 +68,16 @@ if (!binaryPath || !fs.existsSync(binaryPath)) {
 }
 
 // npm does not guarantee the executable bit survives packaging, so make sure
-// the binary is runnable before spawning it.
+// the binary is runnable before spawning it (only chmod when X_OK is missing).
 if (platform !== 'win32') {
   try {
-    fs.chmodSync(binaryPath, 0o755);
+    fs.accessSync(binaryPath, fs.constants.X_OK);
   } catch {
-    // Read-only install; spawn will report EACCES if the bit is missing.
+    try {
+      fs.chmodSync(binaryPath, 0o755);
+    } catch {
+      // Read-only install; spawn will report EACCES if the bit is missing.
+    }
   }
 }
 

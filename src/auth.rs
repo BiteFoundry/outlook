@@ -1086,6 +1086,7 @@ fn keyring_disabled() -> bool {
 /// Checks whether a `DBUS_SESSION_BUS_ADDRESS` value points to a plausible session bus.
 /// Missing/empty addresses or `unix:path=<p>` entries whose socket path does not exist
 /// return `false` so headless Linux/SSH environments skip D-Bus Secret Service immediately.
+#[cfg(any(target_os = "linux", test))]
 fn linux_secret_service_likely_available_with<F>(
     dbus_addr: Option<&str>,
     runtime_failed: bool,

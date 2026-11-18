@@ -2,10 +2,15 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, AtomicU8, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{mpsc, watch},
     time::{self, MissedTickBehavior},
@@ -22,7 +27,159 @@ use crate::{
     storage::Storage,
 };
 
-#[derive(Debug, Clone, Default)]
+const DOMAIN_TEAMS: u8 = 1 << 0;
+const DOMAIN_OUTLOOK: u8 = 1 << 1;
+const DOMAIN_ONENOTE: u8 = 1 << 2;
+
+const IDLE_THRESHOLD_SECS: u64 = 120;
+const DEEP_IDLE_THRESHOLD_SECS: u64 = 600;
+const SLOW_OUTLOOK_TTL: Duration = Duration::from_secs(600);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ActiveDomains {
+    pub teams: bool,
+    pub outlook: bool,
+    pub onenote: bool,
+}
+
+impl Default for ActiveDomains {
+    fn default() -> Self {
+        Self {
+            teams: true,
+            outlook: true,
+            onenote: true,
+        }
+    }
+}
+
+impl ActiveDomains {
+    pub(crate) fn effective(self, background_all_personas: bool) -> Self {
+        if background_all_personas {
+            Self {
+                teams: true,
+                outlook: true,
+                onenote: self.onenote,
+            }
+        } else {
+            self
+        }
+    }
+
+    pub(crate) fn to_bits(self) -> u8 {
+        let mut bits = 0u8;
+        if self.teams {
+            bits |= DOMAIN_TEAMS;
+        }
+        if self.outlook {
+            bits |= DOMAIN_OUTLOOK;
+        }
+        if self.onenote {
+            bits |= DOMAIN_ONENOTE;
+        }
+        bits
+    }
+
+    pub(crate) fn from_bits(bits: u8) -> Self {
+        Self {
+            teams: (bits & DOMAIN_TEAMS) != 0,
+            outlook: (bits & DOMAIN_OUTLOOK) != 0,
+            onenote: (bits & DOMAIN_ONENOTE) != 0,
+        }
+    }
+}
+
+pub(crate) struct SyncSharedState {
+    epoch: Instant,
+    domains_bits: AtomicU8,
+    last_activity_ms: AtomicU64,
+    activity_seq: AtomicU64,
+    background_all_personas: bool,
+}
+
+impl SyncSharedState {
+    pub(crate) fn new(background_all_personas: bool) -> Self {
+        Self::with_epoch(Instant::now(), background_all_personas)
+    }
+
+    pub(crate) fn with_epoch(epoch: Instant, background_all_personas: bool) -> Self {
+        Self {
+            epoch,
+            domains_bits: AtomicU8::new(ActiveDomains::default().to_bits()),
+            last_activity_ms: AtomicU64::new(0),
+            activity_seq: AtomicU64::new(0),
+            background_all_personas,
+        }
+    }
+
+    pub(crate) fn set_active_domains(&self, domains: ActiveDomains) {
+        self.domains_bits
+            .store(domains.to_bits(), Ordering::Release);
+    }
+
+    pub(crate) fn effective_domains(&self) -> ActiveDomains {
+        let raw = ActiveDomains::from_bits(self.domains_bits.load(Ordering::Acquire));
+        raw.effective(self.background_all_personas)
+    }
+
+    pub(crate) fn record_activity(&self, now: Instant) {
+        let ms = now.saturating_duration_since(self.epoch).as_millis() as u64;
+        self.last_activity_ms.store(ms, Ordering::Release);
+        self.activity_seq.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn idle_snapshot(&self, now: Instant) -> (Duration, u64) {
+        let seq = self.activity_seq.load(Ordering::Acquire);
+        let last_ms = self.last_activity_ms.load(Ordering::Acquire);
+        let now_ms = now.saturating_duration_since(self.epoch).as_millis() as u64;
+        (Duration::from_millis(now_ms.saturating_sub(last_ms)), seq)
+    }
+}
+
+pub(crate) fn idle_multiplier(idle_duration: Duration) -> u64 {
+    let secs = idle_duration.as_secs();
+    if secs >= DEEP_IDLE_THRESHOLD_SECS {
+        10
+    } else if secs >= IDLE_THRESHOLD_SECS {
+        4
+    } else {
+        1
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PeriodicBackoffTracker {
+    tick_count: u64,
+    last_activity_seq: u64,
+}
+
+impl PeriodicBackoffTracker {
+    pub(crate) fn on_tick(&mut self, idle_duration: Duration, activity_seq: u64) -> bool {
+        if activity_seq != self.last_activity_seq {
+            self.last_activity_seq = activity_seq;
+            self.tick_count = 0;
+        }
+        let mult = idle_multiplier(idle_duration);
+        if mult <= 1 {
+            self.tick_count = 0;
+            return true;
+        }
+        self.tick_count = self.tick_count.saturating_add(1);
+        self.tick_count % mult == 0
+    }
+}
+
+pub(crate) fn should_refresh_slow_outlook(
+    last_sync: Option<Instant>,
+    now: Instant,
+    ttl: Duration,
+) -> bool {
+    match last_sync {
+        None => true,
+        Some(prev) => now.saturating_duration_since(prev) >= ttl,
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FocusTarget {
     pub target: Option<ConversationTarget>,
     pub thread_root_id: Option<String>,
@@ -32,9 +189,10 @@ pub struct FocusTarget {
 pub struct SyncController {
     focus_tx: watch::Sender<FocusTarget>,
     nudge_tx: mpsc::UnboundedSender<SyncCommand>,
+    shared: Arc<SyncSharedState>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SyncCommand {
     RefreshConversations,
     RefreshOutlook,
@@ -56,11 +214,30 @@ pub enum SyncCommand {
         team_id: String,
         channel_id: String,
     },
+    SetActiveDomains {
+        teams: bool,
+        outlook: bool,
+        onenote: bool,
+    },
+    NotifyUserActivity,
     Shutdown,
 }
 
 impl SyncController {
+    pub fn from_channels(
+        focus_tx: watch::Sender<FocusTarget>,
+        nudge_tx: mpsc::UnboundedSender<SyncCommand>,
+        background_all_personas: bool,
+    ) -> Self {
+        Self {
+            focus_tx,
+            nudge_tx,
+            shared: Arc::new(SyncSharedState::new(background_all_personas)),
+        }
+    }
+
     pub fn set_focus(&self, target: Option<ConversationTarget>, thread_root_id: Option<String>) {
+        self.shared.record_activity(Instant::now());
         let _ = self.focus_tx.send(FocusTarget {
             target,
             thread_root_id,
@@ -73,6 +250,25 @@ impl SyncController {
 
     pub fn send(&self, cmd: SyncCommand) {
         self.request(cmd);
+    }
+
+    pub fn set_active_domains(&self, teams: bool, outlook: bool, onenote: bool) {
+        self.shared.set_active_domains(ActiveDomains {
+            teams,
+            outlook,
+            onenote,
+        });
+        self.shared.record_activity(Instant::now());
+        self.request(SyncCommand::SetActiveDomains {
+            teams,
+            outlook,
+            onenote,
+        });
+    }
+
+    pub fn notify_activity(&self) {
+        self.shared.record_activity(Instant::now());
+        self.request(SyncCommand::NotifyUserActivity);
     }
 }
 
@@ -174,15 +370,18 @@ pub fn spawn_sync_engine(
     let active_ms = config.active_poll_ms.max(250);
     let chat_ms = config.chat_poll_ms.max(500);
     let channel_ms = config.channel_poll_ms.max(1_000);
+    let shared = Arc::new(SyncSharedState::new(config.background_all_personas));
 
     // Lane 1: Fast Interactive Lane (never blocked by Outlook/OneNote/tier-2/tier-3 background polls)
     let fast_graph = graph.clone();
     let fast_storage = storage.clone();
     let fast_event_tx = event_tx.clone();
     let mut fast_shutdown_rx = shutdown_rx.clone();
+    let fast_shared = Arc::clone(&shared);
     tokio::spawn(async move {
         let mut active_tick = time::interval(Duration::from_millis(active_ms));
         active_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut active_backoff = PeriodicBackoffTracker::default();
 
         // Consume initial immediate tick so startup isn't flooded simultaneously before focus/commands arrive.
         active_tick.tick().await;
@@ -208,35 +407,42 @@ pub fn spawn_sync_engine(
                             | SyncCommand::RefreshOutlook
                             | SyncCommand::RefreshOneNote),
                         ) => {
+                            fast_shared.record_activity(Instant::now());
                             let _ = bg_tx.send(cmd);
                         }
                         Some(SyncCommand::SyncMailFolder { folder_id }) => {
+                            fast_shared.record_activity(Instant::now());
                             if let Err(err) = sync_mail_folder(&folder_id, &fast_graph, &fast_storage, &fast_event_tx).await {
                                 let _ = fast_event_tx.send(CoreEvent::SyncError(format!("메일 폴더 동기화 실패: {err}")));
                             }
                         }
                         Some(SyncCommand::SyncTodoList { list_id }) => {
+                            fast_shared.record_activity(Instant::now());
                             if let Err(err) = sync_todo_list(&list_id, &fast_graph, &fast_storage, &fast_event_tx).await {
                                 let _ = fast_event_tx.send(CoreEvent::SyncError(format!("To Do 동기화 실패: {err}")));
                             }
                         }
                         Some(SyncCommand::SyncOneNoteSection { section_key }) => {
+                            fast_shared.record_activity(Instant::now());
                             if let Err(err) = sync_onenote_section(&section_key, &fast_graph, &fast_storage, &fast_event_tx).await {
                                 let _ = fast_event_tx.send(CoreEvent::SyncError(format!("OneNote 섹션 동기화 실패: {err}")));
                             }
                         }
                         Some(SyncCommand::SyncOneNotePage { page_key }) => {
+                            fast_shared.record_activity(Instant::now());
                             if let Err(err) = sync_onenote_page(&page_key, &fast_graph, &fast_storage, &fast_event_tx).await {
                                 let _ = fast_event_tx.send(CoreEvent::SyncError(format!("OneNote 페이지 동기화 실패: {err}")));
                             }
                         }
                         Some(SyncCommand::SyncActiveNow) => {
+                            fast_shared.record_activity(Instant::now());
                             let focus = focus_rx.borrow_and_update().clone();
                             if let Err(err) = sync_active_focus(&focus, &fast_graph, &fast_storage, &fast_event_tx).await {
                                 let _ = fast_event_tx.send(CoreEvent::SyncError(format!("활성 대화 동기화 실패: {err}")));
                             }
                         }
                         Some(SyncCommand::SyncChannelHistory { team_id, channel_id }) => {
+                            fast_shared.record_activity(Instant::now());
                             let _ = fast_event_tx.send(CoreEvent::SyncStateChanged {
                                 busy: true,
                                 summary: "채널 히스토리 동기화 중...".to_string(),
@@ -249,6 +455,17 @@ pub fn spawn_sync_engine(
                                 summary: "동기화 완료".to_string(),
                             });
                         }
+                        Some(SyncCommand::SetActiveDomains { teams, outlook, onenote }) => {
+                            fast_shared.set_active_domains(ActiveDomains {
+                                teams,
+                                outlook,
+                                onenote,
+                            });
+                            fast_shared.record_activity(Instant::now());
+                        }
+                        Some(SyncCommand::NotifyUserActivity) => {
+                            fast_shared.record_activity(Instant::now());
+                        }
                     }
                 }
                 changed = focus_rx.changed() => {
@@ -256,15 +473,21 @@ pub fn spawn_sync_engine(
                         let _ = shutdown_tx.send(true);
                         break;
                     }
+                    fast_shared.record_activity(Instant::now());
                     let focus = focus_rx.borrow_and_update().clone();
                     if let Err(err) = sync_active_focus(&focus, &fast_graph, &fast_storage, &fast_event_tx).await {
                         let _ = fast_event_tx.send(CoreEvent::SyncError(format!("포커스 대화 동기화 실패: {err}")));
                     }
                 }
                 _ = active_tick.tick() => {
-                    let focus = focus_rx.borrow().clone();
-                    if let Err(err) = sync_active_focus(&focus, &fast_graph, &fast_storage, &fast_event_tx).await {
-                        let _ = fast_event_tx.send(CoreEvent::SyncError(format!("활성 폴링 오류: {err}")));
+                    let (idle, seq) = fast_shared.idle_snapshot(Instant::now());
+                    if active_backoff.on_tick(idle, seq) && fast_shared.effective_domains().teams {
+                        let focus = focus_rx.borrow().clone();
+                        if focus.target.is_some() {
+                            if let Err(err) = sync_active_focus(&focus, &fast_graph, &fast_storage, &fast_event_tx).await {
+                                let _ = fast_event_tx.send(CoreEvent::SyncError(format!("활성 폴링 오류: {err}")));
+                            }
+                        }
                     }
                 }
             }
@@ -272,11 +495,16 @@ pub fn spawn_sync_engine(
     });
 
     // Lane 2: Background Poll Lane (tier-2 chat poll, tier-3 presence + Outlook poll, bulk refreshes)
+    let bg_shared = Arc::clone(&shared);
     tokio::spawn(async move {
         let mut chat_tick = time::interval(Duration::from_millis(chat_ms));
         chat_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut channel_tick = time::interval(Duration::from_millis(channel_ms));
         channel_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut chat_backoff = PeriodicBackoffTracker::default();
+        let mut channel_backoff = PeriodicBackoffTracker::default();
+        let mut last_slow_outlook_sync: Option<Instant> = None;
+        let mut was_idle = false;
 
         // Consume initial immediate ticks so startup isn't flooded simultaneously before focus/commands arrive.
         chat_tick.tick().await;
@@ -314,7 +542,7 @@ pub fn spawn_sync_engine(
                                 busy: true,
                                 summary: "Outlook 동기화 중...".to_string(),
                             });
-                            refresh_outlook_best_effort(&graph, &storage, &event_tx).await;
+                            refresh_outlook_full(&graph, &storage, &event_tx, &mut last_slow_outlook_sync).await;
                             let _ = event_tx.send(CoreEvent::SyncStateChanged {
                                 busy: false,
                                 summary: "Outlook 동기화 완료".to_string(),
@@ -337,24 +565,72 @@ pub fn spawn_sync_engine(
                     }
                 }
                 _ = chat_tick.tick() => {
-                    if let Err(err) = poll_chats_tier2(&graph, &storage, &event_tx).await {
-                        let _ = event_tx.send(CoreEvent::SyncError(format!("채팅 폴링 오류: {err}")));
+                    let (idle, seq) = bg_shared.idle_snapshot(Instant::now());
+                    maybe_shrink_on_idle(idle, &mut was_idle, &storage);
+                    if chat_backoff.on_tick(idle, seq) && bg_shared.effective_domains().teams {
+                        if let Err(err) = poll_chats_tier2(&graph, &storage, &event_tx).await {
+                            let _ = event_tx.send(CoreEvent::SyncError(format!("채팅 폴링 오류: {err}")));
+                        }
                     }
                 }
                 _ = channel_tick.tick() => {
-                    let (presence_res, ()) = tokio::join!(
-                        poll_presences_tier3(&graph, &storage, &event_tx),
-                        refresh_outlook_best_effort(&graph, &storage, &event_tx),
-                    );
-                    if let Err(err) = presence_res {
-                        let _ = event_tx.send(CoreEvent::SyncError(format!("상태 폴링 오류: {err}")));
+                    let (idle, seq) = bg_shared.idle_snapshot(Instant::now());
+                    maybe_shrink_on_idle(idle, &mut was_idle, &storage);
+                    if channel_backoff.on_tick(idle, seq) {
+                        let domains = bg_shared.effective_domains();
+                        match (domains.teams, domains.outlook) {
+                            (true, true) => {
+                                let (presence_res, ()) = tokio::join!(
+                                    poll_presences_tier3(&graph, &storage, &event_tx),
+                                    poll_outlook_incremental(
+                                        &graph,
+                                        &storage,
+                                        &event_tx,
+                                        &mut last_slow_outlook_sync,
+                                    ),
+                                );
+                                if let Err(err) = presence_res {
+                                    let _ = event_tx.send(CoreEvent::SyncError(format!("상태 폴링 오류: {err}")));
+                                }
+                            }
+                            (true, false) => {
+                                if let Err(err) = poll_presences_tier3(&graph, &storage, &event_tx).await {
+                                    let _ = event_tx.send(CoreEvent::SyncError(format!("상태 폴링 오류: {err}")));
+                                }
+                            }
+                            (false, true) => {
+                                poll_outlook_incremental(
+                                    &graph,
+                                    &storage,
+                                    &event_tx,
+                                    &mut last_slow_outlook_sync,
+                                )
+                                .await;
+                            }
+                            (false, false) => {}
+                        }
                     }
                 }
             }
         }
     });
 
-    SyncController { focus_tx, nudge_tx }
+    SyncController {
+        focus_tx,
+        nudge_tx,
+        shared,
+    }
+}
+
+fn maybe_shrink_on_idle(idle_duration: Duration, was_idle: &mut bool, storage: &Storage) {
+    if idle_duration >= Duration::from_secs(IDLE_THRESHOLD_SECS) {
+        if !*was_idle {
+            *was_idle = true;
+            storage.shrink_memory();
+        }
+    } else {
+        *was_idle = false;
+    }
 }
 
 async fn sync_active_focus(
@@ -595,44 +871,29 @@ fn pick_default_todo_list(lists: &[crate::models::TodoList]) -> Option<&crate::m
         .or_else(|| lists.first())
 }
 
-async fn refresh_outlook_best_effort(
+async fn refresh_mail_folders_best_effort(
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+) {
+    if let Ok(folders) = graph.list_mail_folders().await {
+        if storage.upsert_mail_folders(&folders).is_ok() {
+            let _ = event_tx.send(CoreEvent::MailFoldersUpdated(folders));
+        }
+    }
+}
+
+async fn refresh_slow_outlook_resources(
     graph: &GraphClient,
     storage: &Storage,
     event_tx: &mpsc::UnboundedSender<CoreEvent>,
 ) {
     let (start_iso, end_iso) = default_calendar_window();
-    let (folders_res, messages_res, events_res, contacts_res, lists_res) = tokio::join!(
-        graph.list_mail_folders(),
-        graph.list_mail_messages("inbox", 40),
+    let (events_res, contacts_res, lists_res) = tokio::join!(
         graph.list_calendar_view(&start_iso, &end_iso, 50),
         graph.list_contacts(100),
         graph.list_todo_lists(),
     );
-
-    if let Ok(folders) = folders_res {
-        if storage.upsert_mail_folders(&folders).is_ok() {
-            let _ = event_tx.send(CoreEvent::MailFoldersUpdated(folders));
-        }
-    }
-
-    if let Ok(messages) = messages_res {
-        let had_initial = storage
-            .list_mail_messages(Some("inbox"), 1)
-            .map(|existing| !existing.is_empty())
-            .unwrap_or(false);
-        let notify_candidate = if had_initial {
-            find_new_unread_mail_candidate("inbox", storage, &messages)
-        } else {
-            None
-        };
-        if storage.upsert_mail_messages(&messages).is_ok() {
-            let _ = event_tx.send(CoreEvent::MailMessagesUpdated {
-                folder_id: "inbox".to_string(),
-                messages,
-                notify_candidate,
-            });
-        }
-    }
 
     if let Ok(events) = events_res {
         if storage.upsert_calendar_events(&events).is_ok() {
@@ -668,8 +929,57 @@ async fn refresh_outlook_best_effort(
     }
 }
 
+async fn refresh_outlook_full(
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    last_slow_outlook_sync: &mut Option<Instant>,
+) {
+    let (_, inbox_res, _) = tokio::join!(
+        refresh_mail_folders_best_effort(graph, storage, event_tx),
+        sync_mail_folder_with_limit("inbox", 40, graph, storage, event_tx),
+        refresh_slow_outlook_resources(graph, storage, event_tx),
+    );
+    let _ = inbox_res;
+    *last_slow_outlook_sync = Some(Instant::now());
+}
+
+async fn poll_outlook_incremental(
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    last_slow_outlook_sync: &mut Option<Instant>,
+) {
+    let now = Instant::now();
+    if should_refresh_slow_outlook(*last_slow_outlook_sync, now, SLOW_OUTLOOK_TTL) {
+        let (_, inbox_res, _) = tokio::join!(
+            refresh_mail_folders_best_effort(graph, storage, event_tx),
+            sync_mail_folder("inbox", graph, storage, event_tx),
+            refresh_slow_outlook_resources(graph, storage, event_tx),
+        );
+        let _ = inbox_res;
+        *last_slow_outlook_sync = Some(Instant::now());
+    } else {
+        let (_, inbox_res) = tokio::join!(
+            refresh_mail_folders_best_effort(graph, storage, event_tx),
+            sync_mail_folder("inbox", graph, storage, event_tx),
+        );
+        let _ = inbox_res;
+    }
+}
+
 async fn sync_mail_folder(
     folder_id: &str,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+) -> Result<()> {
+    sync_mail_folder_with_limit(folder_id, 50, graph, storage, event_tx).await
+}
+
+async fn sync_mail_folder_with_limit(
+    folder_id: &str,
+    fallback_limit: usize,
     graph: &GraphClient,
     storage: &Storage,
     event_tx: &mpsc::UnboundedSender<CoreEvent>,
@@ -678,7 +988,7 @@ async fn sync_mail_folder(
     let prev_cursor = storage.get_sync_cursor(&scope_key)?;
     let had_initial = prev_cursor.is_some()
         || storage
-            .list_mail_messages(Some(folder_id), 1)
+            .list_mail_summaries(Some(folder_id), 1)
             .map(|existing| !existing.is_empty())
             .unwrap_or(false);
 
@@ -712,7 +1022,7 @@ async fn sync_mail_folder(
                 oldest_msg_ts: oldest_ts,
                 synced_at: chrono::Utc::now().to_rfc3339(),
             })?;
-            let messages = storage.list_mail_messages(Some(folder_id), 50)?;
+            let messages = storage.list_mail_summaries(Some(folder_id), 50)?;
             let _ = event_tx.send(CoreEvent::MailMessagesUpdated {
                 folder_id: folder_id.to_string(),
                 messages,
@@ -720,7 +1030,7 @@ async fn sync_mail_folder(
             });
         }
         Err(_) => {
-            let messages = graph.list_mail_messages(folder_id, 50).await?;
+            let messages = graph.list_mail_messages(folder_id, fallback_limit).await?;
             let notify_candidate = if had_initial {
                 find_new_unread_mail_candidate(folder_id, storage, &messages)
             } else {
@@ -738,9 +1048,10 @@ async fn sync_mail_folder(
                 oldest_msg_ts: oldest_ts,
                 synced_at: chrono::Utc::now().to_rfc3339(),
             })?;
+            let summaries = storage.list_mail_summaries(Some(folder_id), 50)?;
             let _ = event_tx.send(CoreEvent::MailMessagesUpdated {
                 folder_id: folder_id.to_string(),
-                messages,
+                messages: summaries,
                 notify_candidate,
             });
         }
@@ -1310,5 +1621,439 @@ mod tests {
             },
         ];
         assert_eq!(pick_default_todo_list(&lists).unwrap().id, "l2");
+    }
+
+    #[test]
+    fn test_idle_backoff_multiplier_and_immediate_activity_reset() {
+        assert_eq!(idle_multiplier(Duration::from_secs(0)), 1);
+        assert_eq!(idle_multiplier(Duration::from_secs(119)), 1);
+        assert_eq!(idle_multiplier(Duration::from_secs(120)), 4);
+        assert_eq!(idle_multiplier(Duration::from_secs(599)), 4);
+        assert_eq!(idle_multiplier(Duration::from_secs(600)), 10);
+        assert_eq!(idle_multiplier(Duration::from_secs(1_800)), 10);
+
+        let epoch = Instant::now();
+        let state = SyncSharedState::with_epoch(epoch, false);
+        let mut tracker = PeriodicBackoffTracker::default();
+
+        // Active (< 120s): every tick runs (1x)
+        let (idle, seq) = state.idle_snapshot(epoch + Duration::from_secs(30));
+        assert!(tracker.on_tick(idle, seq));
+        assert!(tracker.on_tick(idle, seq));
+
+        // Idle (120s .. 600s): 4x — skips 3 out of 4 ticks
+        let (idle_4x, seq_4x) = state.idle_snapshot(epoch + Duration::from_secs(150));
+        let results_4x: Vec<bool> = (0..8)
+            .map(|_| tracker.on_tick(idle_4x, seq_4x))
+            .collect();
+        assert_eq!(
+            results_4x,
+            vec![false, false, false, true, false, false, false, true]
+        );
+
+        // Deep idle (>= 600s): 10x — skips 9 out of 10 ticks
+        let mut deep_tracker = PeriodicBackoffTracker::default();
+        let (idle_10x, seq_10x) = state.idle_snapshot(epoch + Duration::from_secs(600));
+        let results_10x: Vec<bool> = (0..20)
+            .map(|_| deep_tracker.on_tick(idle_10x, seq_10x))
+            .collect();
+        let expected_10x: Vec<bool> = (1..=20).map(|i| i % 10 == 0).collect();
+        assert_eq!(results_10x, expected_10x);
+
+        // User activity arrives at 610s -> immediate reset to 1x active!
+        state.record_activity(epoch + Duration::from_secs(610));
+        let (idle_after, seq_after) = state.idle_snapshot(epoch + Duration::from_secs(611));
+        assert_eq!(idle_multiplier(idle_after), 1);
+        assert!(deep_tracker.on_tick(idle_after, seq_after));
+        assert!(tracker.on_tick(idle_after, seq_after));
+    }
+
+    #[test]
+    fn test_domain_bitmask_gating_and_background_all_personas_override() {
+        let all = ActiveDomains {
+            teams: true,
+            outlook: true,
+            onenote: true,
+        };
+        assert_eq!(ActiveDomains::from_bits(all.to_bits()), all);
+
+        let outlook_only = ActiveDomains {
+            teams: false,
+            outlook: true,
+            onenote: false,
+        };
+        assert_eq!(
+            ActiveDomains::from_bits(outlook_only.to_bits()),
+            outlook_only
+        );
+
+        // Default before SetActiveDomains: all enabled
+        let gated_state = SyncSharedState::new(false);
+        assert_eq!(gated_state.effective_domains(), all);
+
+        // Switching to Outlook-only disables Teams polling when background_all_personas = false
+        gated_state.set_active_domains(outlook_only);
+        assert_eq!(gated_state.effective_domains(), outlook_only);
+
+        // With background_all_personas = true, teams & outlook stay enabled regardless
+        let bg_all_state = SyncSharedState::new(true);
+        bg_all_state.set_active_domains(ActiveDomains {
+            teams: false,
+            outlook: false,
+            onenote: true,
+        });
+        assert_eq!(
+            bg_all_state.effective_domains(),
+            ActiveDomains {
+                teams: true,
+                outlook: true,
+                onenote: true,
+            }
+        );
+    }
+
+    #[test]
+    fn test_should_refresh_slow_outlook_ttl() {
+        let t0 = Instant::now();
+        assert!(should_refresh_slow_outlook(None, t0, SLOW_OUTLOOK_TTL));
+        assert!(!should_refresh_slow_outlook(
+            Some(t0),
+            t0 + Duration::from_secs(599),
+            SLOW_OUTLOOK_TTL
+        ));
+        assert!(should_refresh_slow_outlook(
+            Some(t0),
+            t0 + Duration::from_secs(600),
+            SLOW_OUTLOOK_TTL
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_poll_outlook_incremental_uses_delta_and_slow_resource_ttl() {
+        use std::sync::atomic::AtomicUsize;
+        use axum::{routing::get, Json, Router};
+        use crate::auth::StoredTokens;
+
+        #[derive(Default)]
+        struct Counts {
+            folders: AtomicUsize,
+            delta: AtomicUsize,
+            calendar: AtomicUsize,
+            contacts: AtomicUsize,
+            todo: AtomicUsize,
+        }
+
+        let counts = Arc::new(Counts::default());
+        let c_folders = Arc::clone(&counts);
+        let c_delta = Arc::clone(&counts);
+        let c_cal = Arc::clone(&counts);
+        let c_contacts = Arc::clone(&counts);
+        let c_todo = Arc::clone(&counts);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}/v1.0");
+        let delta_next = format!("{base_url}/me/mailFolders/inbox/messages/delta?$deltatoken=tok2");
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/mailFolders",
+                get(move || {
+                    let c = Arc::clone(&c_folders);
+                    async move {
+                        c.folders.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({ "value": [] }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/inbox/messages/delta",
+                get(move || {
+                    let c = Arc::clone(&c_delta);
+                    let dl = delta_next.clone();
+                    async move {
+                        c.delta.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "value": [],
+                            "@odata.deltaLink": dl
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/calendarView",
+                get(move || {
+                    let c = Arc::clone(&c_cal);
+                    async move {
+                        c.calendar.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({ "value": [] }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/contacts",
+                get(move || {
+                    let c = Arc::clone(&c_contacts);
+                    async move {
+                        c.contacts.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({ "value": [] }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/todo/lists",
+                get(move || {
+                    let c = Arc::clone(&c_todo);
+                    async move {
+                        c.todo.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({ "value": [] }))
+                    }
+                }),
+            );
+
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = AppConfig {
+            graph_base_url: base_url,
+            ..AppConfig::default()
+        };
+        let tokens = StoredTokens {
+            access_token: "test-tok".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: cfg.client_id.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            user_id: Some("u1".to_string()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "pkce".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg, auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut last_slow: Option<Instant> = None;
+
+        // First tick: last_slow is None -> syncs folders + delta + slow resources
+        poll_outlook_incremental(&graph, &storage, &event_tx, &mut last_slow).await;
+        assert!(last_slow.is_some());
+        assert_eq!(counts.folders.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.delta.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.calendar.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.contacts.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.todo.load(Ordering::SeqCst), 1);
+        assert!(storage
+            .get_sync_cursor("mail_delta:inbox")
+            .unwrap()
+            .and_then(|c| c.delta_link)
+            .is_some());
+
+        // Second tick immediately after: only folders + delta run; slow resources skipped!
+        poll_outlook_incremental(&graph, &storage, &event_tx, &mut last_slow).await;
+        assert_eq!(counts.folders.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.delta.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.calendar.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.contacts.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.todo.load(Ordering::SeqCst), 1);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_sync_controller_domain_and_activity_commands_shutdown_cleanly() {
+        let config = AppConfig::default();
+        let auth = AuthManager::new(config.clone()).unwrap();
+        let graph = GraphClient::new(config.clone(), auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        let ctrl = spawn_sync_engine(config, graph, storage, event_tx);
+        ctrl.set_active_domains(false, true, false);
+        ctrl.notify_activity();
+        ctrl.request(SyncCommand::Shutdown);
+
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            while event_rx.recv().await.is_some() {}
+        })
+        .await;
+        assert!(closed.is_ok());
+    }
+
+    #[test]
+    fn test_maybe_shrink_on_idle_transition_state_machine() {
+        let storage = Storage::open_in_memory().unwrap();
+        let mut was_idle = false;
+
+        // Active duration stays false
+        maybe_shrink_on_idle(
+            Duration::from_secs(IDLE_THRESHOLD_SECS - 1),
+            &mut was_idle,
+            &storage,
+        );
+        assert!(!was_idle);
+
+        // Crossing threshold sets was_idle = true and runs shrink_memory
+        maybe_shrink_on_idle(
+            Duration::from_secs(IDLE_THRESHOLD_SECS),
+            &mut was_idle,
+            &storage,
+        );
+        assert!(was_idle);
+
+        // Staying idle keeps was_idle = true
+        maybe_shrink_on_idle(
+            Duration::from_secs(DEEP_IDLE_THRESHOLD_SECS),
+            &mut was_idle,
+            &storage,
+        );
+        assert!(was_idle);
+
+        // Returning to active resets was_idle = false
+        maybe_shrink_on_idle(Duration::from_secs(5), &mut was_idle, &storage);
+        assert!(!was_idle);
+    }
+
+    #[tokio::test]
+    async fn test_sync_mail_folder_emits_summary_only_events_on_delta_and_fallback() {
+        use axum::{http::StatusCode, routing::get, Json, Router};
+        use crate::auth::{AuthManager, StoredTokens};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}/v1.0");
+        let delta_mode = Arc::new(AtomicU64::new(0));
+        let delta_mode_route = Arc::clone(&delta_mode);
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/mailFolders/inbox/messages/delta",
+                get(move || {
+                    let mode = Arc::clone(&delta_mode_route);
+                    async move {
+                        if mode.load(Ordering::SeqCst) == 0 {
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "value": [{
+                                        "id": "m-delta-1",
+                                        "parentFolderId": "inbox",
+                                        "subject": "델타 대용량 메일",
+                                        "receivedDateTime": "2026-11-16T09:00:00Z",
+                                        "isRead": false,
+                                        "isDraft": false,
+                                        "importance": "normal",
+                                        "hasAttachments": false,
+                                        "bodyPreview": "요약 프리뷰",
+                                        "body": {
+                                            "contentType": "html",
+                                            "content": "<html><body><p>대용량 HTML 본문 데이터</p></body></html>"
+                                        }
+                                    }],
+                                    "@odata.deltaLink": "http://example.invalid/delta?token=1"
+                                })),
+                            )
+                        } else {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({ "error": "delta failed" })),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/inbox/messages",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [{
+                            "id": "m-fallback-1",
+                            "parentFolderId": "inbox",
+                            "subject": "폴백 대용량 메일",
+                            "receivedDateTime": "2026-11-16T10:00:00Z",
+                            "isRead": false,
+                            "isDraft": false,
+                            "importance": "normal",
+                            "hasAttachments": false,
+                            "bodyPreview": "폴백 프리뷰",
+                            "body": {
+                                "contentType": "html",
+                                "content": "<html><body><p>폴백 대용량 HTML 본문</p></body></html>"
+                            }
+                        }]
+                    }))
+                }),
+            );
+
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = AppConfig {
+            graph_base_url: base_url,
+            ..AppConfig::default()
+        };
+        let tokens = StoredTokens {
+            access_token: "test-tok".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: cfg.client_id.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            user_id: Some("u1".to_string()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "pkce".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg, auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        // 1) Delta path stores full body in SQLite, emits summary-only CoreEvent
+        sync_mail_folder_with_limit("inbox", 50, &graph, &storage, &event_tx)
+            .await
+            .unwrap();
+        let ev1 = event_rx.recv().await.unwrap();
+        match ev1 {
+            CoreEvent::MailMessagesUpdated {
+                folder_id,
+                messages,
+                ..
+            } => {
+                assert_eq!(folder_id, "inbox");
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].id, "m-delta-1");
+                assert!(messages[0].body_html.is_empty());
+                assert!(messages[0].body_plain.is_empty());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        let stored1 = storage.get_mail_message("m-delta-1").unwrap().unwrap();
+        assert!(stored1.body_html.contains("대용량 HTML 본문 데이터"));
+
+        // 2) Fallback path on delta error also stores full body in SQLite, emits summary-only CoreEvent
+        delta_mode.store(1, Ordering::SeqCst);
+        sync_mail_folder_with_limit("inbox", 50, &graph, &storage, &event_tx)
+            .await
+            .unwrap();
+        let ev2 = event_rx.recv().await.unwrap();
+        match ev2 {
+            CoreEvent::MailMessagesUpdated {
+                folder_id,
+                messages,
+                ..
+            } => {
+                assert_eq!(folder_id, "inbox");
+                assert_eq!(messages.len(), 2);
+                assert!(messages.iter().all(|m| m.body_html.is_empty()));
+                assert!(messages.iter().all(|m| m.body_plain.is_empty()));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        let stored2 = storage.get_mail_message("m-fallback-1").unwrap().unwrap();
+        assert!(stored2.body_html.contains("폴백 대용량 HTML 본문"));
+
+        server.abort();
     }
 }

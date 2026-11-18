@@ -24,7 +24,7 @@ use crate::{
         OnenoteNotebook, OnenotePageDetail, OnenotePageSummary, OnenotePatchCommand,
         OnenoteResource, OnenoteScope, OnenoteSearchHit, OnenoteSection, OnenoteTagKind,
         OutgoingContact, OutgoingEvent, OutgoingMail, OutgoingOnenotePage, OutgoingTodoTask,
-        QuotedReply, RichSpan, TeamSummary, TodoList,
+        QuotedReply, RichSpan, TeamSummary, TodoList, TodoTask,
     },
     parser, resolver,
     serve::{self, ServeOptions},
@@ -43,7 +43,13 @@ const ENV_AFTER_HELP: &str = "\
   TEAMS_ACCESS_TOKEN=<JWT>              직접 Bearer 액세스 토큰 주입 (키링 자동 생략)
   TEAMS_DISABLE_KEYRING=1               OS 키링 비활성화 (credentials.json 파일 전용)
   TEAMS_CLIENT_ID / TEAMS_TENANT_ID     Entra 앱 Client ID / Tenant ID 재정의
-  TEAMS_CONFIG_DIR / TEAMS_DATA_DIR     설정 및 로컬 SQLite 캐시 디렉터리 재정의";
+  TEAMS_CONFIG_DIR / TEAMS_DATA_DIR     설정 및 로컬 SQLite 캐시 디렉터리 재정의
+  TEAMS_CLI_CACHE_SECS=<SECS>           CLI 읽기 명령 로컬 캐시 유효 시간(초) [기본: 0, --cached/--fast 시 캐시 우선]
+  TEAMS_BACKGROUND_ALL=1                TUI 시작 시 비활성 도메인까지 백그라운드 폴링 활성화 [기본: false]
+  TEAMS_AUTO_DAEMON=1                   백그라운드 동기화 데몬 자동 시작/연결 (config.toml: auto_daemon = true) [기본: false]
+
+백그라운드 동기화 데몬 (Background Sync Daemon):
+  teams daemon start | status | stop | restart   (outlook / onenote 동일)";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -134,6 +140,9 @@ pub enum Command {
         limit: usize,
         #[arg(long)]
         refresh: bool,
+        /// 로컬 SQLite 캐시 우선 조회 (네트워크 호출 생략)
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long)]
         json: bool,
     },
@@ -154,6 +163,9 @@ pub enum Command {
     Teams {
         #[arg(long)]
         refresh: bool,
+        /// 로컬 SQLite 캐시 우선 조회 (네트워크 호출 생략)
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long)]
         json: bool,
     },
@@ -162,6 +174,9 @@ pub enum Command {
         team_query: String,
         #[arg(long)]
         refresh: bool,
+        /// 로컬 SQLite 캐시 우선 조회 (네트워크 호출 생략)
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long)]
         json: bool,
     },
@@ -174,6 +189,9 @@ pub enum Command {
         limit: usize,
         #[arg(long)]
         offline: bool,
+        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long)]
         json: bool,
     },
@@ -350,6 +368,9 @@ pub enum Command {
         refresh: bool,
         #[arg(long)]
         offline: bool,
+        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long)]
         json: bool,
     },
@@ -439,6 +460,37 @@ pub enum Command {
     /// 에이전트용 stdio MCP(JSON-RPC 2.0) 서버를 실행합니다
     #[command(visible_alias = "mcp-server")]
     Mcp,
+    /// 백그라운드 동기화 데몬을 제어합니다 (`start` | `stop` | `status` | `restart` | `run`)
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DaemonCommand {
+    /// 백그라운드 동기화 데몬을 시작합니다 (이미 실행 중이면 상태를 반환)
+    Start {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 실행 중인 백그라운드 동기화 데몬을 중지합니다
+    Stop {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 백그라운드 동기화 데몬의 상태를 조회합니다
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 백그라운드 동기화 데몬을 재시작합니다
+    Restart {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 백그라운드 동기화 데몬을 포그라운드에서 실행합니다 (내부 실행용)
+    Run,
 }
 
 #[derive(Subcommand, Debug)]
@@ -483,6 +535,9 @@ pub enum OutlookCommand {
     Folders {
         #[arg(long)]
         refresh: bool,
+        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long)]
         json: bool,
     },
@@ -500,6 +555,9 @@ pub enum OutlookCommand {
         refresh: bool,
         #[arg(long)]
         offline: bool,
+        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long)]
         json: bool,
     },
@@ -509,6 +567,9 @@ pub enum OutlookCommand {
         mail_id: String,
         #[arg(long)]
         offline: bool,
+        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long = "preview-images")]
         preview_images: bool,
         #[arg(long = "no-mark-read")]
@@ -680,6 +741,9 @@ pub enum OutlookCommand {
         limit: usize,
         #[arg(long)]
         refresh: bool,
+        /// 로컬 SQLite 캐시 우선 조회 (네트워크 호출 생략)
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long)]
         json: bool,
     },
@@ -687,6 +751,9 @@ pub enum OutlookCommand {
     Teams {
         #[arg(long)]
         refresh: bool,
+        /// 로컬 SQLite 캐시 우선 조회 (네트워크 호출 생략)
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long)]
         json: bool,
     },
@@ -705,6 +772,11 @@ pub enum OutlookCommand {
     /// 에이전트용 stdio MCP(JSON-RPC 2.0) 서버를 실행합니다
     #[command(visible_alias = "mcp-server")]
     Mcp,
+    /// 백그라운드 동기화 데몬을 제어합니다 (`start` | `stop` | `status` | `restart` | `run`)
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -713,6 +785,9 @@ pub enum MailCommand {
     Folders {
         #[arg(long)]
         refresh: bool,
+        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long)]
         json: bool,
     },
@@ -730,6 +805,9 @@ pub enum MailCommand {
         refresh: bool,
         #[arg(long)]
         offline: bool,
+        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long)]
         json: bool,
     },
@@ -738,6 +816,9 @@ pub enum MailCommand {
         mail_id: String,
         #[arg(long)]
         offline: bool,
+        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long = "preview-images")]
         preview_images: bool,
         #[arg(long = "no-mark-read")]
@@ -850,6 +931,9 @@ pub enum CalCommand {
     Today {
         #[arg(long)]
         offline: bool,
+        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long)]
         json: bool,
     },
@@ -859,6 +943,9 @@ pub enum CalCommand {
         days: i64,
         #[arg(long)]
         offline: bool,
+        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long)]
         json: bool,
     },
@@ -873,6 +960,9 @@ pub enum CalCommand {
         limit: usize,
         #[arg(long)]
         offline: bool,
+        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long)]
         json: bool,
     },
@@ -881,6 +971,9 @@ pub enum CalCommand {
         event_id: String,
         #[arg(long)]
         offline: bool,
+        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long)]
         json: bool,
     },
@@ -947,6 +1040,9 @@ pub enum ContactsCommand {
         refresh: bool,
         #[arg(long)]
         offline: bool,
+        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long)]
         json: bool,
     },
@@ -996,6 +1092,9 @@ pub enum TodoCommand {
         refresh: bool,
         #[arg(long)]
         offline: bool,
+        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long)]
         json: bool,
     },
@@ -1012,6 +1111,9 @@ pub enum TodoCommand {
         refresh: bool,
         #[arg(long)]
         offline: bool,
+        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long)]
         json: bool,
     },
@@ -1461,22 +1563,67 @@ pub enum OnenoteCommand {
         #[command(subcommand)]
         command: MailCommand,
     },
+    /// 백그라운드 동기화 데몬을 제어합니다 (`start` | `stop` | `status` | `restart` | `run`)
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
+}
+
+/// Synchronously handles `--help`, `-h`, `--version`, `-V`, and `help` before Tokio/rustls/Keyring/SQLite init.
+pub fn try_fast_help_or_version() -> Option<Result<()>> {
+    try_fast_help_or_version_from(std::env::args_os(), Persona::detect())
+}
+
+fn try_fast_help_or_version_from<I, S>(args: I, persona: Persona) -> Option<Result<()>>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString> + Clone,
+{
+    let raw: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+    let mut after_bin = raw.iter().skip(1);
+    let first = after_bin.next()?;
+    let has_help_or_version = first.to_str() == Some("help")
+        || std::iter::once(first)
+            .chain(after_bin)
+            .take_while(|arg| arg.to_str() != Some("--"))
+            .any(|arg| matches!(arg.to_str(), Some("--help" | "-h" | "--version" | "-V")));
+
+    if !has_help_or_version {
+        return None;
+    }
+
+    let err = match persona {
+        Persona::Teams => Cli::try_parse_from(&raw).err()?,
+        Persona::Outlook => OutlookCli::try_parse_from(&raw).err()?,
+        Persona::OneNote => OnenoteCli::try_parse_from(&raw).err()?,
+    };
+    if matches!(
+        err.kind(),
+        clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+    ) {
+        let _ = err.print();
+        return Some(Ok(()));
+    }
+    None
 }
 
 pub async fn run_from_env() -> Result<()> {
-    let mut cfg = AppConfig::load();
     let persona = Persona::detect();
     match persona {
         Persona::Teams => {
             let cli = Cli::parse();
+            let mut cfg = AppConfig::load();
             Box::pin(dispatch_command(&mut cfg, persona, cli.command)).await
         }
         Persona::Outlook => {
             let cli = OutlookCli::parse();
+            let mut cfg = AppConfig::load();
             Box::pin(dispatch_outlook_command(&mut cfg, persona, cli.command)).await
         }
         Persona::OneNote => {
             let cli = OnenoteCli::parse();
+            let mut cfg = AppConfig::load();
             Box::pin(dispatch_onenote_command(&mut cfg, persona, cli.command)).await
         }
     }
@@ -1518,26 +1665,33 @@ async fn dispatch_command(
         Some(Command::Chats {
             limit,
             refresh,
+            cached,
             json,
-        }) => Box::pin(cmd_chats(cfg, limit, refresh, json)).await,
+        }) => Box::pin(cmd_chats(cfg, limit, refresh, cached, json)).await,
         Some(Command::NewChat {
             to,
             topic,
             message,
             json,
         }) => Box::pin(cmd_new_chat(cfg, to, topic, message, json)).await,
-        Some(Command::Teams { refresh, json }) => Box::pin(cmd_teams(cfg, refresh, json)).await,
+        Some(Command::Teams {
+            refresh,
+            cached,
+            json,
+        }) => Box::pin(cmd_teams(cfg, refresh, cached, json)).await,
         Some(Command::Channels {
             team_query,
             refresh,
+            cached,
             json,
-        }) => Box::pin(cmd_channels(cfg, &team_query, refresh, json)).await,
+        }) => Box::pin(cmd_channels(cfg, &team_query, refresh, cached, json)).await,
         Some(Command::Read {
             target,
             limit,
             offline,
+            cached,
             json,
-        }) => Box::pin(cmd_read(cfg, &target, limit, offline, json)).await,
+        }) => Box::pin(cmd_read(cfg, &target, limit, offline, cached, json)).await,
         Some(Command::Thread {
             channel_target,
             root_msg_id,
@@ -1731,8 +1885,14 @@ async fn dispatch_command(
             unread,
             refresh,
             offline,
+            cached,
             json,
-        }) => Box::pin(cmd_mail_list(cfg, &folder, limit, unread, refresh, offline, json)).await,
+        }) => {
+            Box::pin(cmd_mail_list(
+                cfg, &folder, limit, unread, refresh, offline, cached, json,
+            ))
+            .await
+        }
         Some(Command::MailSearch {
             query,
             folder,
@@ -1789,6 +1949,7 @@ async fn dispatch_command(
             let (_auth, graph, storage) = Box::pin(open_runtime(cfg, false)).await?;
             Box::pin(crate::mcp::run(cfg.clone(), graph, storage)).await
         }
+        Some(Command::Daemon { command }) => Box::pin(dispatch_daemon_command(cfg, command)).await,
     }
 }
 
@@ -1825,20 +1986,29 @@ async fn dispatch_outlook_command(
         Some(OutlookCommand::Logout { json }) => Box::pin(cmd_logout(cfg, json)).await,
         Some(OutlookCommand::Whoami { json }) => Box::pin(cmd_whoami(cfg, persona, json)).await,
         Some(OutlookCommand::Doctor { probe, json }) => Box::pin(cmd_doctor(cfg, persona, probe, json)).await,
-        Some(OutlookCommand::Folders { refresh, json }) => {
-            Box::pin(cmd_mail_folders(cfg, refresh, json)).await
-        }
+        Some(OutlookCommand::Folders {
+            refresh,
+            cached,
+            json,
+        }) => Box::pin(cmd_mail_folders(cfg, refresh, cached, json)).await,
         Some(OutlookCommand::Inbox {
             folder,
             limit,
             unread,
             refresh,
             offline,
+            cached,
             json,
-        }) => Box::pin(cmd_mail_list(cfg, &folder, limit, unread, refresh, offline, json)).await,
+        }) => {
+            Box::pin(cmd_mail_list(
+                cfg, &folder, limit, unread, refresh, offline, cached, json,
+            ))
+            .await
+        }
         Some(OutlookCommand::Read {
             mail_id,
             offline,
+            cached,
             preview_images,
             no_mark_read,
             json,
@@ -1847,6 +2017,7 @@ async fn dispatch_outlook_command(
                 cfg,
                 &mail_id,
                 offline,
+                cached,
                 preview_images,
                 no_mark_read,
                 json,
@@ -1972,9 +2143,14 @@ async fn dispatch_outlook_command(
         Some(OutlookCommand::Chats {
             limit,
             refresh,
+            cached,
             json,
-        }) => Box::pin(cmd_chats(cfg, limit, refresh, json)).await,
-        Some(OutlookCommand::Teams { refresh, json }) => Box::pin(cmd_teams(cfg, refresh, json)).await,
+        }) => Box::pin(cmd_chats(cfg, limit, refresh, cached, json)).await,
+        Some(OutlookCommand::Teams {
+            refresh,
+            cached,
+            json,
+        }) => Box::pin(cmd_teams(cfg, refresh, cached, json)).await,
         Some(OutlookCommand::Tui) => Box::pin(cmd_tui(cfg, persona)).await,
         Some(OutlookCommand::Serve { bind, port, token }) => {
             let (_auth, graph, storage) = Box::pin(open_runtime(cfg, false)).await?;
@@ -1990,27 +2166,47 @@ async fn dispatch_outlook_command(
             let (_auth, graph, storage) = Box::pin(open_runtime(cfg, false)).await?;
             Box::pin(crate::mcp::run(cfg.clone(), graph, storage)).await
         }
+        Some(OutlookCommand::Daemon { command }) => {
+            Box::pin(dispatch_daemon_command(cfg, command)).await
+        }
     }
 }
 
 async fn dispatch_mail_command(cfg: &AppConfig, command: MailCommand) -> Result<()> {
     match command {
-        MailCommand::Folders { refresh, json } => cmd_mail_folders(cfg, refresh, json).await,
+        MailCommand::Folders {
+            refresh,
+            cached,
+            json,
+        } => cmd_mail_folders(cfg, refresh, cached, json).await,
         MailCommand::List {
             folder,
             limit,
             unread,
             refresh,
             offline,
+            cached,
             json,
-        } => cmd_mail_list(cfg, &folder, limit, unread, refresh, offline, json).await,
+        } => cmd_mail_list(cfg, &folder, limit, unread, refresh, offline, cached, json).await,
         MailCommand::Read {
             mail_id,
             offline,
+            cached,
             preview_images,
             no_mark_read,
             json,
-        } => cmd_mail_read(cfg, &mail_id, offline, preview_images, no_mark_read, json).await,
+        } => {
+            cmd_mail_read(
+                cfg,
+                &mail_id,
+                offline,
+                cached,
+                preview_images,
+                no_mark_read,
+                json,
+            )
+            .await
+        }
         MailCommand::Send {
             to,
             cc,
@@ -2065,24 +2261,31 @@ async fn dispatch_mail_command(cfg: &AppConfig, command: MailCommand) -> Result<
 
 async fn dispatch_cal_command(cfg: &AppConfig, command: CalCommand) -> Result<()> {
     match command {
-        CalCommand::Today { offline, json } => cmd_cal_today(cfg, offline, json).await,
+        CalCommand::Today {
+            offline,
+            cached,
+            json,
+        } => cmd_cal_today(cfg, offline, cached, json).await,
         CalCommand::Week {
             days,
             offline,
+            cached,
             json,
-        } => cmd_cal_week(cfg, days, offline, json).await,
+        } => cmd_cal_week(cfg, days, offline, cached, json).await,
         CalCommand::List {
             start,
             end,
             limit,
             offline,
+            cached,
             json,
-        } => cmd_cal_list(cfg, start.as_deref(), end.as_deref(), limit, offline, json).await,
+        } => cmd_cal_list(cfg, start.as_deref(), end.as_deref(), limit, offline, cached, json).await,
         CalCommand::Show {
             event_id,
             offline,
+            cached,
             json,
-        } => cmd_cal_show(cfg, &event_id, offline, json).await,
+        } => cmd_cal_show(cfg, &event_id, offline, cached, json).await,
         CalCommand::Create {
             subject,
             start,
@@ -2136,8 +2339,9 @@ async fn dispatch_contacts_command(cfg: &AppConfig, command: ContactsCommand) ->
             limit,
             refresh,
             offline,
+            cached,
             json,
-        } => cmd_contacts_list(cfg, limit, refresh, offline, json).await,
+        } => cmd_contacts_list(cfg, limit, refresh, offline, cached, json).await,
         ContactsCommand::Search {
             query,
             limit,
@@ -2166,16 +2370,18 @@ async fn dispatch_todo_command(cfg: &AppConfig, command: TodoCommand) -> Result<
         TodoCommand::Lists {
             refresh,
             offline,
+            cached,
             json,
-        } => cmd_todo_lists(cfg, refresh, offline, json).await,
+        } => cmd_todo_lists(cfg, refresh, offline, cached, json).await,
         TodoCommand::Tasks {
             list,
             all,
             limit,
             refresh,
             offline,
+            cached,
             json,
-        } => cmd_todo_tasks(cfg, &list, all, limit, refresh, offline, json).await,
+        } => cmd_todo_tasks(cfg, &list, all, limit, refresh, offline, cached, json).await,
         TodoCommand::Add {
             title,
             list,
@@ -2495,6 +2701,93 @@ pub async fn dispatch_onenote_command(
         Some(OnenoteCommand::Mail { command }) => {
             Box::pin(dispatch_mail_command(cfg, command)).await
         }
+        Some(OnenoteCommand::Daemon { command }) => {
+            Box::pin(dispatch_daemon_command(cfg, command)).await
+        }
+    }
+}
+
+fn print_daemon_status_text(header: &str, cfg: &AppConfig, status: &crate::daemon::DaemonStatus) {
+    println!(
+        "{header}: running={}, pid={}, transport={}, endpoint={}, attached_clients={}, auto_daemon={}",
+        status.running,
+        status
+            .pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        status.transport.as_deref().unwrap_or("-"),
+        status.endpoint.as_deref().unwrap_or("-"),
+        status.attached_clients,
+        cfg.auto_daemon,
+    );
+    if status.running {
+        println!(
+            "  version={}, uptime_secs={}, sync_busy={}, last_sync_at={}",
+            status.version.as_deref().unwrap_or("-"),
+            status
+                .uptime_secs
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            status.sync_busy,
+            status.last_sync_at.as_deref().unwrap_or("-"),
+        );
+        if !status.sync_summary.trim().is_empty() {
+            println!("  sync_summary: {}", status.sync_summary);
+        }
+    }
+    if let Some(ref err) = status.last_error {
+        println!("  last_error: {err}");
+    }
+}
+
+async fn dispatch_daemon_command(cfg: &AppConfig, command: DaemonCommand) -> Result<()> {
+    match command {
+        DaemonCommand::Start { json } => {
+            let status = crate::daemon::ensure_daemon_started(cfg).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                print_daemon_status_text("daemon started", cfg, &status);
+            }
+            Ok(())
+        }
+        DaemonCommand::Stop { json } => {
+            let stopped = crate::daemon::stop_daemon(cfg).await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": true,
+                        "stopped": stopped,
+                    }))?
+                );
+            } else if stopped {
+                println!("백그라운드 동기화 데몬을 중지했습니다.");
+            } else {
+                println!("실행 중인 백그라운드 동기화 데몬이 없습니다.");
+            }
+            Ok(())
+        }
+        DaemonCommand::Status { json } => {
+            let status = crate::daemon::query_daemon_status(cfg).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                print_daemon_status_text("daemon status", cfg, &status);
+            }
+            Ok(())
+        }
+        DaemonCommand::Restart { json } => {
+            let _ = crate::daemon::stop_daemon(cfg).await?;
+            let status = crate::daemon::ensure_daemon_started(cfg).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                print_daemon_status_text("daemon restarted", cfg, &status);
+            }
+            Ok(())
+        }
+        DaemonCommand::Run => crate::daemon::run_daemon_foreground(cfg.clone()).await,
     }
 }
 
@@ -2647,6 +2940,248 @@ async fn open_runtime(
         graph = graph.with_my_user_id(uid);
     }
     Ok((auth, graph, storage))
+}
+
+fn db_path_in_dir(data_dir: &Path, user_id: Option<&str>) -> PathBuf {
+    let bucket = user_id
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or("default");
+    let sanitized: String = bucket
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    data_dir.join(sanitized).join("cache.db")
+}
+
+fn extract_user_id_from_jwt(raw_token: &str) -> Option<String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let trimmed = raw_token.trim();
+    let token = if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
+        trimmed[7..].trim()
+    } else {
+        trimmed
+    };
+    let payload_b64 = token.split('.').nth(1)?.trim();
+    if payload_b64.is_empty() {
+        return None;
+    }
+    let normalized: String = payload_b64
+        .trim_end_matches('=')
+        .chars()
+        .map(|c| match c {
+            '+' => '-',
+            '/' => '_',
+            _ => c,
+        })
+        .collect();
+    let decoded = URL_SAFE_NO_PAD.decode(&normalized).ok()?;
+    let val: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    val.get("oid")
+        .or_else(|| val.get("sub"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn extract_user_id_from_token_file(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let cleaned = raw.trim_start_matches('\u{feff}').trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    if cleaned.starts_with('{') {
+        let val: serde_json::Value = serde_json::from_str(cleaned).ok()?;
+        for key in ["user_id", "userId"] {
+            if let Some(uid) = val
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return Some(uid.to_string());
+            }
+        }
+        for key in ["access_token", "accessToken", "token"] {
+            if let Some(tok) = val.get(key).and_then(|v| v.as_str()) {
+                if let Some(uid) = extract_user_id_from_jwt(tok) {
+                    return Some(uid);
+                }
+            }
+        }
+        return None;
+    }
+    let first_line = cleaned.lines().map(str::trim).find(|l| !l.is_empty())?;
+    extract_user_id_from_jwt(first_line)
+}
+
+fn find_single_existing_db(data_dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(data_dir).ok()?;
+    let mut found: Option<PathBuf> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let db = path.join("cache.db");
+            if db.is_file() {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(db);
+            }
+        } else if path.is_file() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("cache-") && name.ends_with(".db") {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(path);
+                }
+            }
+        }
+    }
+    found
+}
+
+fn resolve_storage_db_path_fast(
+    cfg: &AppConfig,
+    env_access_token: Option<&str>,
+    data_dir: &Path,
+    cred_path: &Path,
+) -> Option<PathBuf> {
+    if let Some(raw_env) = env_access_token.map(str::trim).filter(|s| !s.is_empty()) {
+        let uid = extract_user_id_from_jwt(raw_env);
+        return Some(db_path_in_dir(data_dir, uid.as_deref()));
+    }
+
+    if let Some(tf) = cfg.resolved_token_file() {
+        if tf.is_file() {
+            let uid = extract_user_id_from_token_file(&tf);
+            return Some(db_path_in_dir(data_dir, uid.as_deref()));
+        }
+    }
+
+    if cred_path.is_file() {
+        if let Some(uid) = extract_user_id_from_token_file(cred_path) {
+            return Some(db_path_in_dir(data_dir, Some(&uid)));
+        }
+    }
+
+    if let Some(single_db) = find_single_existing_db(data_dir) {
+        return Some(single_db);
+    }
+
+    None
+}
+
+fn infer_user_id_fast_with(
+    cfg: &AppConfig,
+    env_access_token: Option<&str>,
+    cred_path: &Path,
+) -> Option<String> {
+    if let Some(raw_env) = env_access_token.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(uid) = extract_user_id_from_jwt(raw_env) {
+            return Some(uid);
+        }
+    }
+    if let Some(tf) = cfg.resolved_token_file() {
+        if tf.is_file() {
+            if let Some(uid) = extract_user_id_from_token_file(&tf) {
+                return Some(uid);
+            }
+        }
+    }
+    if cred_path.is_file() {
+        if let Some(uid) = extract_user_id_from_token_file(cred_path) {
+            return Some(uid);
+        }
+    }
+    None
+}
+
+async fn resolve_daemon_warm(cfg: &AppConfig, refresh: bool, cached: bool) -> bool {
+    if refresh || cached {
+        return false;
+    }
+    let env_tok = std::env::var("TEAMS_ACCESS_TOKEN").ok();
+    let cred_path = config::credential_fallback_path();
+    let inferred_user_id = infer_user_id_fast_with(cfg, env_tok.as_deref(), &cred_path);
+    let daemon_warm = crate::daemon::is_daemon_alive_fast(cfg, inferred_user_id.as_deref());
+    if cfg.auto_daemon && !daemon_warm {
+        let _ = crate::daemon::ensure_daemon_started(cfg).await;
+    }
+    daemon_warm
+}
+
+/// Opens local SQLite `Storage` without touching OS Keyring or initializing `reqwest::Client` TLS roots
+/// whenever `TEAMS_ACCESS_TOKEN`, `TEAMS_TOKEN_FILE`, `credentials.json`, or a single local `cache.db` resolves `user_id`.
+pub(crate) fn open_storage_only(cfg: &AppConfig) -> Result<Storage> {
+    let env_tok = std::env::var("TEAMS_ACCESS_TOKEN").ok();
+    if let Some(path) = resolve_storage_db_path_fast(
+        cfg,
+        env_tok.as_deref(),
+        &config::data_dir(),
+        &config::credential_fallback_path(),
+    ) {
+        return Storage::open(&path);
+    }
+
+    // Fallback to OS keyring / AuthManager only when disk sources and single-DB lookup are ambiguous.
+    let uid = crate::auth::load_stored_tokens()
+        .ok()
+        .flatten()
+        .and_then(|t| t.user_id)
+        .or_else(|| {
+            AuthManager::new(cfg.clone()).ok().and_then(|_auth| None)
+        });
+    Storage::open(&config::db_path(uid.as_deref()))
+}
+
+#[cfg(test)]
+fn parse_cli_cache_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0)
+}
+
+fn cli_cache_ttl_secs(cfg: &AppConfig) -> u64 {
+    if let Ok(raw) = std::env::var("TEAMS_CLI_CACHE_SECS") {
+        if let Ok(parsed) = raw.trim().parse::<u64>() {
+            return parsed;
+        }
+    }
+    cfg.cli_cache_ttl_secs
+}
+
+fn is_cursor_fresh(storage: &Storage, scope_keys: &[&str], ttl_secs: u64) -> bool {
+    if ttl_secs == 0 {
+        return false;
+    }
+    let now = chrono::Utc::now();
+    for key in scope_keys {
+        if let Ok(Some(cursor)) = storage.get_sync_cursor(key) {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&cursor.synced_at) {
+                let age = now.signed_duration_since(dt.with_timezone(&chrono::Utc));
+                if age.num_seconds() >= 0 && (age.num_seconds() as u64) <= ttl_secs {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn record_cli_sync_cursor(storage: &Storage, scope_key: &str) {
+    let cursor = crate::models::SyncCursor {
+        scope_key: scope_key.to_string(),
+        delta_link: None,
+        oldest_msg_ts: None,
+        synced_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let _ = storage.save_sync_cursor(&cursor);
 }
 
 async fn cmd_tui(cfg: &mut AppConfig, persona: Persona) -> Result<()> {
@@ -2979,6 +3514,10 @@ async fn cmd_doctor(
         (0, 0, 0, 0, 0, 0, 0, 0)
     };
 
+    let daemon_status = crate::daemon::query_daemon_status(cfg)
+        .await
+        .unwrap_or_default();
+
     let mut probe_me: Option<serde_json::Value> = None;
     let mut probe_presence: Option<serde_json::Value> = None;
     let mut probe_onenote: Option<serde_json::Value> = None;
@@ -3062,6 +3601,14 @@ async fn cmd_doctor(
                     "onenote_notebooks": cached_onenote_notebooks,
                     "onenote_sections": cached_onenote_sections,
                 },
+                "daemon": {
+                    "running": daemon_status.running,
+                    "pid": daemon_status.pid,
+                    "transport": daemon_status.transport,
+                    "endpoint": daemon_status.endpoint,
+                    "attached_clients": daemon_status.attached_clients,
+                    "auto_daemon": cfg.auto_daemon,
+                },
                 "probe": if probe {
                     Some(json!({
                         "ok": probe_error.is_none(),
@@ -3096,6 +3643,17 @@ async fn cmd_doctor(
         println!("graph_base_url: {}", cfg.graph_base_url);
         println!("auth_base_url: {}", cfg.auth_base_url);
         println!("keyring_status: {keyring_status}");
+        println!(
+            "daemon: running={}, pid={}, endpoint={}, attached_clients={}, auto_daemon={}",
+            daemon_status.running,
+            daemon_status
+                .pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            daemon_status.endpoint.as_deref().unwrap_or("-"),
+            daemon_status.attached_clients,
+            cfg.auto_daemon,
+        );
         println!(
             "token_file: {}",
             token_file
@@ -3158,35 +3716,7 @@ fn describe_keyring_status(tokens: Option<&StoredTokens>, fallback_path: &Path) 
     }
 }
 
-async fn cmd_chats(cfg: &AppConfig, limit: usize, refresh: bool, json_out: bool) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let limit = clamp_limit(limit);
-
-    let cached_chats: Vec<ConversationSummary> = storage
-        .list_conversations()?
-        .into_iter()
-        .filter(|c| !c.kind.is_channel())
-        .collect();
-
-    let mut chats = if refresh || cached_chats.is_empty() {
-        let fetched = graph.list_chats(limit).await?;
-        storage.upsert_conversations(&fetched)?;
-        let stored: Vec<ConversationSummary> = storage
-            .list_conversations()?
-            .into_iter()
-            .filter(|c| !c.kind.is_channel())
-            .collect();
-        if stored.is_empty() {
-            fetched
-        } else {
-            stored
-        }
-    } else {
-        cached_chats
-    };
-
-    chats.truncate(limit);
-
+fn print_chats_output(chats: &[ConversationSummary], json_out: bool) -> Result<()> {
     if json_out {
         println!(
             "{}",
@@ -3195,7 +3725,7 @@ async fn cmd_chats(cfg: &AppConfig, limit: usize, refresh: bool, json_out: bool)
     } else if chats.is_empty() {
         println!("표시할 채팅이 없습니다.");
     } else {
-        for c in &chats {
+        for c in chats {
             let unread = if c.unread_count > 0 {
                 format!(" [unread:{}]", c.unread_count)
             } else {
@@ -3213,6 +3743,62 @@ async fn cmd_chats(cfg: &AppConfig, limit: usize, refresh: bool, json_out: bool)
         }
     }
     Ok(())
+}
+
+async fn cmd_chats(
+    cfg: &AppConfig,
+    limit: usize,
+    refresh: bool,
+    cached: bool,
+    json_out: bool,
+) -> Result<()> {
+    let limit = clamp_limit(limit);
+    let ttl = cli_cache_ttl_secs(cfg);
+    let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
+    if !refresh && (cached || daemon_warm || ttl > 0) {
+        if let Ok(storage) = open_storage_only(cfg) {
+            if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:chats"], ttl) {
+                let mut chats: Vec<ConversationSummary> = storage
+                    .list_conversations()?
+                    .into_iter()
+                    .filter(|c| !c.kind.is_channel())
+                    .collect();
+                if !chats.is_empty() {
+                    chats.truncate(limit);
+                    return print_chats_output(&chats, json_out);
+                }
+            }
+        }
+    }
+
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+
+    let cached_chats: Vec<ConversationSummary> = storage
+        .list_conversations()?
+        .into_iter()
+        .filter(|c| !c.kind.is_channel())
+        .collect();
+
+    let mut chats = if refresh || cached_chats.is_empty() {
+        let fetched = graph.list_chats(limit).await?;
+        storage.upsert_conversations(&fetched)?;
+        record_cli_sync_cursor(&storage, "cli:chats");
+        let stored: Vec<ConversationSummary> = storage
+            .list_conversations()?
+            .into_iter()
+            .filter(|c| !c.kind.is_channel())
+            .collect();
+        if stored.is_empty() {
+            fetched
+        } else {
+            stored
+        }
+    } else {
+        cached_chats
+    };
+
+    chats.truncate(limit);
+    print_chats_output(&chats, json_out)
 }
 
 async fn cmd_new_chat(
@@ -3264,10 +3850,7 @@ async fn cmd_new_chat(
     Ok(())
 }
 
-async fn cmd_teams(cfg: &AppConfig, refresh: bool, json_out: bool) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let teams = load_teams_with_refresh(&graph, &storage, refresh).await?;
-
+fn print_teams_output(teams: &[TeamSummary], json_out: bool) -> Result<()> {
     if json_out {
         println!(
             "{}",
@@ -3276,7 +3859,7 @@ async fn cmd_teams(cfg: &AppConfig, refresh: bool, json_out: bool) -> Result<()>
     } else if teams.is_empty() {
         println!("가입된 팀이 없습니다.");
     } else {
-        for team in &teams {
+        for team in teams {
             println!("{} ({})", team.display_name, team.id);
             for ch in &team.channels {
                 println!(
@@ -3291,22 +3874,11 @@ async fn cmd_teams(cfg: &AppConfig, refresh: bool, json_out: bool) -> Result<()>
     Ok(())
 }
 
-async fn cmd_channels(
-    cfg: &AppConfig,
-    team_query: &str,
-    refresh: bool,
+fn print_channels_output(
+    team: &TeamSummary,
+    channels: &[crate::models::ChannelSummary],
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let teams = load_teams_with_refresh(&graph, &storage, refresh).await?;
-    let team = resolve_team_from_slice(&teams, team_query)?;
-
-    let channels = if refresh {
-        graph.list_team_channels(&team.id, &team.display_name).await?
-    } else {
-        team.channels.clone()
-    };
-
     if json_out {
         println!(
             "{}",
@@ -3317,7 +3889,7 @@ async fn cmd_channels(
         );
     } else {
         println!("# {} ({})", team.display_name, team.id);
-        for ch in &channels {
+        for ch in channels {
             println!(
                 "  {}  [{}]  {}",
                 ch.conv_key(),
@@ -3329,6 +3901,60 @@ async fn cmd_channels(
     Ok(())
 }
 
+async fn cmd_teams(cfg: &AppConfig, refresh: bool, cached: bool, json_out: bool) -> Result<()> {
+    let ttl = cli_cache_ttl_secs(cfg);
+    let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
+    if !refresh && (cached || daemon_warm || ttl > 0) {
+        if let Ok(storage) = open_storage_only(cfg) {
+            if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:teams"], ttl) {
+                let teams = storage.list_teams()?;
+                if !teams.is_empty() {
+                    return print_teams_output(&teams, json_out);
+                }
+            }
+        }
+    }
+
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let teams = load_teams_with_refresh(&graph, &storage, refresh).await?;
+    print_teams_output(&teams, json_out)
+}
+
+async fn cmd_channels(
+    cfg: &AppConfig,
+    team_query: &str,
+    refresh: bool,
+    cached: bool,
+    json_out: bool,
+) -> Result<()> {
+    let ttl = cli_cache_ttl_secs(cfg);
+    let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
+    if !refresh && (cached || daemon_warm || ttl > 0) {
+        if let Ok(storage) = open_storage_only(cfg) {
+            if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:teams"], ttl) {
+                let teams = storage.list_teams()?;
+                if !teams.is_empty() {
+                    if let Ok(team) = resolve_team_from_slice(&teams, team_query) {
+                        return print_channels_output(&team, &team.channels, json_out);
+                    }
+                }
+            }
+        }
+    }
+
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let teams = load_teams_with_refresh(&graph, &storage, refresh).await?;
+    let team = resolve_team_from_slice(&teams, team_query)?;
+
+    let channels = if refresh {
+        graph.list_team_channels(&team.id, &team.display_name).await?
+    } else {
+        team.channels.clone()
+    };
+
+    print_channels_output(&team, &channels, json_out)
+}
+
 async fn load_teams_with_refresh(
     graph: &GraphClient,
     storage: &Storage,
@@ -3338,6 +3964,7 @@ async fn load_teams_with_refresh(
     if refresh || cached.is_empty() {
         let fetched = graph.list_joined_teams_with_channels().await?;
         storage.upsert_teams(&fetched)?;
+        record_cli_sync_cursor(storage, "cli:teams");
         let stored = storage.list_teams()?;
         if stored.is_empty() {
             Ok(fetched)
@@ -3382,32 +4009,11 @@ fn resolve_team_from_slice(teams: &[TeamSummary], query: &str) -> Result<TeamSum
     }
 }
 
-async fn cmd_read(
-    cfg: &AppConfig,
-    target: &str,
-    limit: usize,
-    offline: bool,
+fn print_read_output(
+    conv: &ConversationSummary,
+    messages: &[MessageItem],
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let limit = clamp_limit(limit);
-    let conv = resolve_target(&storage, &graph, target, offline).await?;
-
-    let fetched = if !offline {
-        let msgs = graph.list_messages(&conv.target, limit).await?;
-        storage.upsert_messages(&msgs)?;
-        Some(msgs)
-    } else {
-        None
-    };
-
-    let mut messages = storage.list_root_messages(&conv.conv_key, limit, None)?;
-    if messages.is_empty() {
-        if let Some(f) = fetched {
-            messages = f;
-        }
-    }
-
     if json_out {
         println!(
             "{}",
@@ -3421,12 +4027,67 @@ async fn cmd_read(
         if messages.is_empty() {
             println!("(메시지가 없습니다)");
         } else {
-            for msg in &messages {
+            for msg in messages {
                 print_message_line(msg, "");
             }
         }
     }
     Ok(())
+}
+
+async fn cmd_read(
+    cfg: &AppConfig,
+    target: &str,
+    limit: usize,
+    offline: bool,
+    cached: bool,
+    json_out: bool,
+) -> Result<()> {
+    let limit = clamp_limit(limit);
+    if offline {
+        let storage = open_storage_only(cfg)?;
+        let cached_convs = storage.list_conversations()?;
+        let conv = resolver::resolve_from_slice(&cached_convs, target)?;
+        let messages = storage.list_root_messages(&conv.conv_key, limit, None)?;
+        return print_read_output(&conv, &messages, json_out);
+    }
+
+    let ttl = cli_cache_ttl_secs(cfg);
+    if cached || ttl > 0 {
+        if let Ok(storage) = open_storage_only(cfg) {
+            if let Ok(cached_convs) = storage.list_conversations() {
+                if let Ok(conv) = resolver::resolve_from_slice(&cached_convs, target) {
+                    let cursor_key = format!("cli:read:{}", conv.conv_key);
+                    if cached
+                        || is_cursor_fresh(
+                            &storage,
+                            &[cursor_key.as_str(), conv.conv_key.as_str()],
+                            ttl,
+                        )
+                    {
+                        let messages = storage.list_root_messages(&conv.conv_key, limit, None)?;
+                        if !messages.is_empty() {
+                            return print_read_output(&conv, &messages, json_out);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let conv = resolve_target(&storage, &graph, target, false).await?;
+
+    let msgs = graph.list_messages(&conv.target, limit).await?;
+    storage.upsert_messages(&msgs)?;
+    record_cli_sync_cursor(&storage, &format!("cli:read:{}", conv.conv_key));
+
+    let mut messages = storage.list_root_messages(&conv.conv_key, limit, None)?;
+    if messages.is_empty() {
+        messages = msgs;
+    }
+
+    print_read_output(&conv, &messages, json_out)
 }
 
 async fn cmd_thread(
@@ -3905,11 +4566,14 @@ async fn cmd_search(
     if query.trim().is_empty() {
         bail!("검색어가 비어 있습니다.");
     }
-    let (_auth, graph, storage) = open_runtime(cfg, false).await?;
+    let storage = open_storage_only(cfg)?;
     let limit = clamp_limit(limit);
 
     let conv_key_filter = match target {
-        Some(t) => Some(resolve_target(&storage, &graph, t, true).await?.conv_key),
+        Some(t) => {
+            let cached = storage.list_conversations()?;
+            Some(resolver::resolve_from_slice(&cached, t)?.conv_key)
+        }
         None => None,
     };
 
@@ -4703,6 +5367,23 @@ pub(crate) fn resolve_mail_folder_from_slice(folders: &[MailFolder], query: &str
         .map(|f| f.id.clone())
 }
 
+fn resolve_mail_folder_id_cached(storage: &Storage, folder: &str) -> Result<String> {
+    let q = folder.trim();
+    if q.is_empty() {
+        return Ok("inbox".to_string());
+    }
+    let cached = storage.list_mail_folders()?;
+    if let Some(id) = resolve_mail_folder_from_slice(&cached, q) {
+        return Ok(id);
+    }
+    Ok(match q.to_ascii_lowercase().as_str() {
+        "sent" => "sentitems".to_string(),
+        "trash" | "deleted" => "deleteditems".to_string(),
+        "junk" | "spam" => "junkemail".to_string(),
+        _ => q.to_string(),
+    })
+}
+
 pub(crate) async fn resolve_mail_folder_id(
     storage: &Storage,
     graph: &GraphClient,
@@ -4749,22 +5430,7 @@ async fn load_mail_message(
     Ok(msg)
 }
 
-async fn cmd_mail_folders(cfg: &AppConfig, refresh: bool, json_out: bool) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let cached = storage.list_mail_folders()?;
-    let folders = if refresh || cached.is_empty() {
-        let fetched = graph.list_mail_folders().await?;
-        storage.upsert_mail_folders(&fetched)?;
-        let stored = storage.list_mail_folders()?;
-        if stored.is_empty() {
-            fetched
-        } else {
-            stored
-        }
-    } else {
-        cached
-    };
-
+fn print_mail_folders_output(folders: &[MailFolder], json_out: bool) -> Result<()> {
     if json_out {
         println!(
             "{}",
@@ -4773,7 +5439,7 @@ async fn cmd_mail_folders(cfg: &AppConfig, refresh: bool, json_out: bool) -> Res
     } else if folders.is_empty() {
         println!("메일 폴더가 없습니다.");
     } else {
-        for f in &folders {
+        for f in folders {
             let wk = f
                 .well_known_name
                 .as_deref()
@@ -4788,33 +5454,65 @@ async fn cmd_mail_folders(cfg: &AppConfig, refresh: bool, json_out: bool) -> Res
     Ok(())
 }
 
-async fn cmd_mail_list(
+async fn cmd_mail_folders(
     cfg: &AppConfig,
-    folder: &str,
-    limit: usize,
-    unread_only: bool,
     refresh: bool,
-    offline: bool,
+    cached: bool,
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let limit = clamp_limit(limit);
-    let folder_id = resolve_mail_folder_id(&storage, &graph, folder, offline).await?;
+    let ttl = cli_cache_ttl_secs(cfg);
+    let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
+    if !refresh && (cached || daemon_warm || ttl > 0) {
+        if let Ok(storage) = open_storage_only(cfg) {
+            if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:mail_folders"], ttl) {
+                let folders = storage.list_mail_folders()?;
+                if !folders.is_empty() {
+                    return print_mail_folders_output(&folders, json_out);
+                }
+            }
+        }
+    }
 
-    let cached = storage.list_mail_messages(Some(&folder_id), limit)?;
-    let mut messages = if !offline && (refresh || cached.is_empty()) {
-        let fetched = graph.list_mail_messages(&folder_id, limit).await?;
-        storage.upsert_mail_messages(&fetched)?;
-        let stored = storage.list_mail_messages(Some(&folder_id), limit)?;
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let cached_folders = storage.list_mail_folders()?;
+    let folders = if refresh || cached_folders.is_empty() {
+        let fetched = graph.list_mail_folders().await?;
+        storage.upsert_mail_folders(&fetched)?;
+        record_cli_sync_cursor(&storage, "cli:mail_folders");
+        let stored = storage.list_mail_folders()?;
         if stored.is_empty() {
             fetched
         } else {
             stored
         }
     } else {
-        cached
+        cached_folders
     };
 
+    print_mail_folders_output(&folders, json_out)
+}
+
+fn load_cached_mail_list(
+    storage: &Storage,
+    folder_id: &str,
+    limit: usize,
+    json_out: bool,
+) -> Result<Vec<MailMessage>> {
+    if json_out {
+        storage.list_mail_messages(Some(folder_id), limit)
+    } else {
+        storage.list_mail_summaries(Some(folder_id), limit)
+    }
+}
+
+fn print_mail_list_output(
+    folder: &str,
+    folder_id: &str,
+    mut messages: Vec<MailMessage>,
+    unread_only: bool,
+    limit: usize,
+    json_out: bool,
+) -> Result<()> {
     if unread_only {
         messages.retain(|m| !m.is_read);
     }
@@ -4847,31 +5545,74 @@ async fn cmd_mail_list(
     Ok(())
 }
 
-async fn cmd_mail_read(
+#[allow(clippy::too_many_arguments)]
+async fn cmd_mail_list(
     cfg: &AppConfig,
-    mail_id: &str,
+    folder: &str,
+    limit: usize,
+    unread_only: bool,
+    refresh: bool,
     offline: bool,
-    preview_images: bool,
-    no_mark_read: bool,
+    cached: bool,
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let mut msg = load_mail_message(&storage, &graph, mail_id, offline).await?;
-
-    if !offline && !no_mark_read && !msg.is_read && graph.set_mail_read(&msg.id, true).await.is_ok()
-    {
-        msg.is_read = true;
-        let _ = storage.upsert_mail_messages(std::slice::from_ref(&msg));
+    let limit = clamp_limit(limit);
+    if offline {
+        let storage = open_storage_only(cfg)?;
+        let folder_id = resolve_mail_folder_id_cached(&storage, folder)?;
+        let messages = load_cached_mail_list(&storage, &folder_id, limit, json_out)?;
+        return print_mail_list_output(folder, &folder_id, messages, unread_only, limit, json_out);
     }
 
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({ "message": msg }))?
-        );
-        return Ok(());
+    let ttl = cli_cache_ttl_secs(cfg);
+    let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
+    if !refresh && (cached || daemon_warm || ttl > 0) {
+        if let Ok(storage) = open_storage_only(cfg) {
+            if let Ok(folder_id) = resolve_mail_folder_id_cached(&storage, folder) {
+                let cli_key = format!("cli:mail:{folder_id}");
+                let delta_key = format!("mail_delta:{folder_id}");
+                if cached
+                    || daemon_warm
+                    || is_cursor_fresh(&storage, &[cli_key.as_str(), delta_key.as_str()], ttl)
+                {
+                    let messages = load_cached_mail_list(&storage, &folder_id, limit, json_out)?;
+                    if !messages.is_empty() {
+                        return print_mail_list_output(
+                            folder,
+                            &folder_id,
+                            messages,
+                            unread_only,
+                            limit,
+                            json_out,
+                        );
+                    }
+                }
+            }
+        }
     }
 
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let folder_id = resolve_mail_folder_id(&storage, &graph, folder, false).await?;
+
+    let cached_msgs = load_cached_mail_list(&storage, &folder_id, limit, json_out)?;
+    let messages = if refresh || cached_msgs.is_empty() {
+        let fetched = graph.list_mail_messages(&folder_id, limit).await?;
+        storage.upsert_mail_messages(&fetched)?;
+        record_cli_sync_cursor(&storage, &format!("cli:mail:{folder_id}"));
+        let stored = load_cached_mail_list(&storage, &folder_id, limit, json_out)?;
+        if stored.is_empty() {
+            fetched
+        } else {
+            stored
+        }
+    } else {
+        cached_msgs
+    };
+
+    print_mail_list_output(folder, &folder_id, messages, unread_only, limit, json_out)
+}
+
+fn print_mail_read_text(msg: &MailMessage) {
     println!("제목: {}", msg.subject);
     println!("보낸사람: {}", msg.from_display());
     if !msg.to_recipients.is_empty() {
@@ -4902,6 +5643,69 @@ async fn cmd_mail_read(
         parser::html_and_cards_to_plain(&msg.body_html, &[])
     };
     println!("{body}");
+}
+
+async fn cmd_mail_read(
+    cfg: &AppConfig,
+    mail_id: &str,
+    offline: bool,
+    cached: bool,
+    preview_images: bool,
+    no_mark_read: bool,
+    json_out: bool,
+) -> Result<()> {
+    if offline && !preview_images {
+        let storage = open_storage_only(cfg)?;
+        let msg = storage
+            .get_mail_message(mail_id)?
+            .with_context(|| format!("로컬 캐시에서 메일을 찾을 수 없습니다: {mail_id}"))?;
+        if json_out {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({ "message": msg }))?
+            );
+        } else {
+            print_mail_read_text(&msg);
+        }
+        return Ok(());
+    }
+
+    if !offline && cached && !preview_images {
+        if let Ok(storage) = open_storage_only(cfg) {
+            if let Some(msg) = storage.get_mail_message(mail_id)? {
+                if !msg.body_html.trim().is_empty() || !msg.body_plain.trim().is_empty() {
+                    if json_out {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({ "message": msg }))?
+                        );
+                    } else {
+                        print_mail_read_text(&msg);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
+    let mut msg = load_mail_message(&storage, &graph, mail_id, offline).await?;
+
+    if !offline && !no_mark_read && !msg.is_read && graph.set_mail_read(&msg.id, true).await.is_ok()
+    {
+        msg.is_read = true;
+        let _ = storage.upsert_mail_messages(std::slice::from_ref(&msg));
+    }
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "message": msg }))?
+        );
+        return Ok(());
+    }
+
+    print_mail_read_text(&msg);
 
     if preview_images {
         let (cols, rows) = default_preview_dimensions(None, None);
@@ -5245,20 +6049,25 @@ async fn cmd_mail_search(
     if query.trim().is_empty() {
         bail!("검색어가 비어 있습니다.");
     }
-    let (_auth, graph, storage) = open_runtime(cfg, remote).await?;
     let limit = clamp_limit(limit);
-    let folder_filter = match folder.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(f) => Some(resolve_mail_folder_id(&storage, &graph, f, !remote).await?),
-        None => None,
-    };
-
-    let hits = storage.search_mail_messages(query, folder_filter.as_deref(), limit)?;
-    let remote_messages = if remote {
+    let (hits, remote_messages) = if !remote {
+        let storage = open_storage_only(cfg)?;
+        let folder_filter = match folder.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(f) => Some(resolve_mail_folder_id_cached(&storage, f)?),
+            None => None,
+        };
+        let hits = storage.search_mail_messages(query, folder_filter.as_deref(), limit)?;
+        (hits, Vec::new())
+    } else {
+        let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+        let folder_filter = match folder.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(f) => Some(resolve_mail_folder_id(&storage, &graph, f, false).await?),
+            None => None,
+        };
+        let hits = storage.search_mail_messages(query, folder_filter.as_deref(), limit)?;
         let msgs = graph.search_mail_remote(query, limit).await?;
         let _ = storage.upsert_mail_messages(&msgs);
-        msgs
-    } else {
-        Vec::new()
+        (hits, msgs)
     };
 
     if json_out {
@@ -5372,40 +6181,33 @@ pub(crate) fn normalize_rsvp_response(raw: &str) -> Result<&'static str> {
     }
 }
 
-async fn cmd_cal_today(cfg: &AppConfig, offline: bool, json_out: bool) -> Result<()> {
-    let (start_iso, end_iso) = default_calendar_window(None, None, 1)?;
-    cmd_cal_list(cfg, Some(&start_iso), Some(&end_iso), 50, offline, json_out).await
-}
-
-async fn cmd_cal_week(cfg: &AppConfig, days: i64, offline: bool, json_out: bool) -> Result<()> {
-    let (start_iso, end_iso) = default_calendar_window(None, None, days)?;
-    cmd_cal_list(cfg, Some(&start_iso), Some(&end_iso), 100, offline, json_out).await
-}
-
-async fn cmd_cal_list(
+async fn cmd_cal_today(
     cfg: &AppConfig,
-    start: Option<&str>,
-    end: Option<&str>,
-    limit: usize,
     offline: bool,
+    cached: bool,
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let limit = clamp_limit(limit);
-    let (start_iso, end_iso) = default_calendar_window(start, end, 7)?;
+    let (start_iso, end_iso) = default_calendar_window(None, None, 1)?;
+    cmd_cal_list(cfg, Some(&start_iso), Some(&end_iso), 50, offline, cached, json_out).await
+}
 
-    let events = if offline {
-        storage.list_calendar_events(
-            start.map(|_| start_iso.as_str()),
-            end.map(|_| end_iso.as_str()),
-            limit,
-        )?
-    } else {
-        let fetched = graph.list_calendar_view(&start_iso, &end_iso, limit).await?;
-        let _ = storage.upsert_calendar_events(&fetched);
-        fetched
-    };
+async fn cmd_cal_week(
+    cfg: &AppConfig,
+    days: i64,
+    offline: bool,
+    cached: bool,
+    json_out: bool,
+) -> Result<()> {
+    let (start_iso, end_iso) = default_calendar_window(None, None, days)?;
+    cmd_cal_list(cfg, Some(&start_iso), Some(&end_iso), 100, offline, cached, json_out).await
+}
 
+fn print_cal_events_output(
+    start_iso: &str,
+    end_iso: &str,
+    events: &[CalendarEvent],
+    json_out: bool,
+) -> Result<()> {
     if json_out {
         println!(
             "{}",
@@ -5418,7 +6220,7 @@ async fn cmd_cal_list(
     } else if events.is_empty() {
         println!("표시할 일정이 없습니다.");
     } else {
-        for ev in &events {
+        for ev in events {
             let loc = ev
                 .location
                 .as_deref()
@@ -5433,6 +6235,47 @@ async fn cmd_cal_list(
         }
     }
     Ok(())
+}
+
+async fn cmd_cal_list(
+    cfg: &AppConfig,
+    start: Option<&str>,
+    end: Option<&str>,
+    limit: usize,
+    offline: bool,
+    cached: bool,
+    json_out: bool,
+) -> Result<()> {
+    let limit = clamp_limit(limit);
+    let (start_iso, end_iso) = default_calendar_window(start, end, 7)?;
+    let start_filter = start.map(|_| start_iso.as_str());
+    let end_filter = end.map(|_| end_iso.as_str());
+
+    if offline {
+        let storage = open_storage_only(cfg)?;
+        let events = storage.list_calendar_events(start_filter, end_filter, limit)?;
+        return print_cal_events_output(&start_iso, &end_iso, &events, json_out);
+    }
+
+    let ttl = cli_cache_ttl_secs(cfg);
+    let daemon_warm = resolve_daemon_warm(cfg, false, cached).await;
+    if cached || daemon_warm || ttl > 0 {
+        if let Ok(storage) = open_storage_only(cfg) {
+            if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:cal"], ttl) {
+                let events = storage.list_calendar_events(start_filter, end_filter, limit)?;
+                if !events.is_empty() {
+                    return print_cal_events_output(&start_iso, &end_iso, &events, json_out);
+                }
+            }
+        }
+    }
+
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let events = graph.list_calendar_view(&start_iso, &end_iso, limit).await?;
+    let _ = storage.upsert_calendar_events(&events);
+    record_cli_sync_cursor(&storage, "cli:cal");
+
+    print_cal_events_output(&start_iso, &end_iso, &events, json_out)
 }
 
 async fn load_calendar_event(
@@ -5453,15 +6296,7 @@ async fn load_calendar_event(
     Ok(ev)
 }
 
-async fn cmd_cal_show(
-    cfg: &AppConfig,
-    event_id: &str,
-    offline: bool,
-    json_out: bool,
-) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let ev = load_calendar_event(&storage, &graph, event_id, offline).await?;
-
+fn print_cal_show_output(ev: &CalendarEvent, json_out: bool) -> Result<()> {
     if json_out {
         println!("{}", serde_json::to_string_pretty(&json!({ "event": ev }))?);
     } else {
@@ -5494,6 +6329,40 @@ async fn cmd_cal_show(
         }
     }
     Ok(())
+}
+
+async fn cmd_cal_show(
+    cfg: &AppConfig,
+    event_id: &str,
+    offline: bool,
+    cached: bool,
+    json_out: bool,
+) -> Result<()> {
+    if offline {
+        let storage = open_storage_only(cfg)?;
+        let ev = storage
+            .list_calendar_events(None, None, 10_000)?
+            .into_iter()
+            .find(|e| e.id == event_id)
+            .with_context(|| format!("로컬 캐시에서 일정을 찾을 수 없습니다: {event_id}"))?;
+        return print_cal_show_output(&ev, json_out);
+    }
+
+    if cached {
+        if let Ok(storage) = open_storage_only(cfg) {
+            if let Some(ev) = storage
+                .list_calendar_events(None, None, 10_000)?
+                .into_iter()
+                .find(|e| e.id == event_id)
+            {
+                return print_cal_show_output(&ev, json_out);
+            }
+        }
+    }
+
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let ev = load_calendar_event(&storage, &graph, event_id, false).await?;
+    print_cal_show_output(&ev, json_out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5660,29 +6529,7 @@ async fn cmd_cal_delete(cfg: &AppConfig, event_id: &str, yes: bool, json_out: bo
 // Outlook Contacts commands
 // ---------------------------------------------------------------------------
 
-async fn cmd_contacts_list(
-    cfg: &AppConfig,
-    limit: usize,
-    refresh: bool,
-    offline: bool,
-    json_out: bool,
-) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let limit = clamp_limit(limit);
-    let cached = storage.list_contacts(None, limit)?;
-    let contacts = if !offline && (refresh || cached.is_empty()) {
-        let fetched = graph.list_contacts(limit).await?;
-        storage.upsert_contacts(&fetched)?;
-        let stored = storage.list_contacts(None, limit)?;
-        if stored.is_empty() {
-            fetched
-        } else {
-            stored
-        }
-    } else {
-        cached
-    };
-
+fn print_contacts_output(contacts: &[ContactItem], json_out: bool) -> Result<()> {
     if json_out {
         println!(
             "{}",
@@ -5691,11 +6538,58 @@ async fn cmd_contacts_list(
     } else if contacts.is_empty() {
         println!("표시할 연락처가 없습니다.");
     } else {
-        for c in &contacts {
+        for c in contacts {
             print_contact_line(c);
         }
     }
     Ok(())
+}
+
+async fn cmd_contacts_list(
+    cfg: &AppConfig,
+    limit: usize,
+    refresh: bool,
+    offline: bool,
+    cached: bool,
+    json_out: bool,
+) -> Result<()> {
+    let limit = clamp_limit(limit);
+    if offline {
+        let storage = open_storage_only(cfg)?;
+        let contacts = storage.list_contacts(None, limit)?;
+        return print_contacts_output(&contacts, json_out);
+    }
+
+    let ttl = cli_cache_ttl_secs(cfg);
+    let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
+    if !refresh && (cached || daemon_warm || ttl > 0) {
+        if let Ok(storage) = open_storage_only(cfg) {
+            if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:contacts"], ttl) {
+                let contacts = storage.list_contacts(None, limit)?;
+                if !contacts.is_empty() {
+                    return print_contacts_output(&contacts, json_out);
+                }
+            }
+        }
+    }
+
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let cached_contacts = storage.list_contacts(None, limit)?;
+    let contacts = if refresh || cached_contacts.is_empty() {
+        let fetched = graph.list_contacts(limit).await?;
+        storage.upsert_contacts(&fetched)?;
+        record_cli_sync_cursor(&storage, "cli:contacts");
+        let stored = storage.list_contacts(None, limit)?;
+        if stored.is_empty() {
+            fetched
+        } else {
+            stored
+        }
+    } else {
+        cached_contacts
+    };
+
+    print_contacts_output(&contacts, json_out)
 }
 
 async fn cmd_contacts_search(
@@ -5708,11 +6602,12 @@ async fn cmd_contacts_search(
     if query.trim().is_empty() {
         bail!("검색어가 비어 있습니다.");
     }
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
     let limit = clamp_limit(limit);
     let contacts = if offline {
+        let storage = open_storage_only(cfg)?;
         storage.list_contacts(Some(query), limit)?
     } else {
+        let (_auth, graph, storage) = open_runtime(cfg, true).await?;
         let fetched = graph.search_contacts_and_directory(query, limit).await?;
         let _ = storage.upsert_contacts(&fetched);
         fetched
@@ -5927,27 +6822,20 @@ pub(crate) fn normalize_todo_importance(raw: &str) -> Result<&'static str> {
     }
 }
 
-async fn cmd_todo_lists(
-    cfg: &AppConfig,
-    refresh: bool,
-    offline: bool,
-    json_out: bool,
-) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
+fn resolve_todo_list_id_cached(storage: &Storage, list_query: &str) -> Result<String> {
     let cached = storage.list_todo_lists()?;
-    let lists = if !offline && (refresh || cached.is_empty()) {
-        let fetched = graph.list_todo_lists().await?;
-        storage.upsert_todo_lists(&fetched)?;
-        let stored = storage.list_todo_lists()?;
-        if stored.is_empty() {
-            fetched
-        } else {
-            stored
+    if !cached.is_empty() {
+        if let Ok(found) = resolve_todo_list_from_slice(&cached, list_query) {
+            return Ok(found.id);
         }
-    } else {
-        cached
-    };
+    }
+    if !list_query.trim().is_empty() && !list_query.trim().eq_ignore_ascii_case("default") {
+        return Ok(list_query.trim().to_string());
+    }
+    bail!("기본 To Do 목록을 찾을 수 없습니다.")
+}
 
+fn print_todo_lists_output(lists: &[TodoList], json_out: bool) -> Result<()> {
     if json_out {
         println!(
             "{}",
@@ -5956,7 +6844,7 @@ async fn cmd_todo_lists(
     } else if lists.is_empty() {
         println!("To Do 목록이 없습니다.");
     } else {
-        for l in &lists {
+        for l in lists {
             let wk = l
                 .wellknown_list_name
                 .as_deref()
@@ -5968,35 +6856,7 @@ async fn cmd_todo_lists(
     Ok(())
 }
 
-async fn cmd_todo_tasks(
-    cfg: &AppConfig,
-    list: &str,
-    include_completed: bool,
-    limit: usize,
-    refresh: bool,
-    offline: bool,
-    json_out: bool,
-) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let limit = clamp_limit(limit);
-    let list_id = resolve_todo_list_id(&storage, &graph, list, offline).await?;
-    let cached = storage.list_todo_tasks(&list_id, include_completed, limit)?;
-    let mut tasks = if !offline && (refresh || cached.is_empty()) {
-        let fetched = graph
-            .list_todo_tasks(&list_id, include_completed, limit)
-            .await?;
-        storage.upsert_todo_tasks(&fetched)?;
-        let stored = storage.list_todo_tasks(&list_id, include_completed, limit)?;
-        if stored.is_empty() {
-            fetched
-        } else {
-            stored
-        }
-    } else {
-        cached
-    };
-    tasks.truncate(limit);
-
+fn print_todo_tasks_output(list_id: &str, tasks: &[TodoTask], json_out: bool) -> Result<()> {
     if json_out {
         println!(
             "{}",
@@ -6008,7 +6868,7 @@ async fn cmd_todo_tasks(
     } else if tasks.is_empty() {
         println!("표시할 할 일이 없습니다.");
     } else {
-        for t in &tasks {
+        for t in tasks {
             let check = if t.is_completed() { "x" } else { " " };
             let imp = if t.importance.eq_ignore_ascii_case("high") {
                 "!"
@@ -6024,6 +6884,111 @@ async fn cmd_todo_tasks(
         }
     }
     Ok(())
+}
+
+async fn cmd_todo_lists(
+    cfg: &AppConfig,
+    refresh: bool,
+    offline: bool,
+    cached: bool,
+    json_out: bool,
+) -> Result<()> {
+    if offline {
+        let storage = open_storage_only(cfg)?;
+        let lists = storage.list_todo_lists()?;
+        return print_todo_lists_output(&lists, json_out);
+    }
+
+    let ttl = cli_cache_ttl_secs(cfg);
+    let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
+    if !refresh && (cached || daemon_warm || ttl > 0) {
+        if let Ok(storage) = open_storage_only(cfg) {
+            if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:todo_lists"], ttl) {
+                let lists = storage.list_todo_lists()?;
+                if !lists.is_empty() {
+                    return print_todo_lists_output(&lists, json_out);
+                }
+            }
+        }
+    }
+
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let cached_lists = storage.list_todo_lists()?;
+    let lists = if refresh || cached_lists.is_empty() {
+        let fetched = graph.list_todo_lists().await?;
+        storage.upsert_todo_lists(&fetched)?;
+        record_cli_sync_cursor(&storage, "cli:todo_lists");
+        let stored = storage.list_todo_lists()?;
+        if stored.is_empty() {
+            fetched
+        } else {
+            stored
+        }
+    } else {
+        cached_lists
+    };
+
+    print_todo_lists_output(&lists, json_out)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_todo_tasks(
+    cfg: &AppConfig,
+    list: &str,
+    include_completed: bool,
+    limit: usize,
+    refresh: bool,
+    offline: bool,
+    cached: bool,
+    json_out: bool,
+) -> Result<()> {
+    let limit = clamp_limit(limit);
+    if offline {
+        let storage = open_storage_only(cfg)?;
+        let list_id = resolve_todo_list_id_cached(&storage, list)?;
+        let mut tasks = storage.list_todo_tasks(&list_id, include_completed, limit)?;
+        tasks.truncate(limit);
+        return print_todo_tasks_output(&list_id, &tasks, json_out);
+    }
+
+    let ttl = cli_cache_ttl_secs(cfg);
+    let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
+    if !refresh && (cached || daemon_warm || ttl > 0) {
+        if let Ok(storage) = open_storage_only(cfg) {
+            if let Ok(list_id) = resolve_todo_list_id_cached(&storage, list) {
+                let cursor_key = format!("cli:todo_tasks:{list_id}");
+                if cached || daemon_warm || is_cursor_fresh(&storage, &[cursor_key.as_str()], ttl) {
+                    let mut tasks = storage.list_todo_tasks(&list_id, include_completed, limit)?;
+                    if !tasks.is_empty() {
+                        tasks.truncate(limit);
+                        return print_todo_tasks_output(&list_id, &tasks, json_out);
+                    }
+                }
+            }
+        }
+    }
+
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let list_id = resolve_todo_list_id(&storage, &graph, list, false).await?;
+    let cached_tasks = storage.list_todo_tasks(&list_id, include_completed, limit)?;
+    let mut tasks = if refresh || cached_tasks.is_empty() {
+        let fetched = graph
+            .list_todo_tasks(&list_id, include_completed, limit)
+            .await?;
+        storage.upsert_todo_tasks(&fetched)?;
+        record_cli_sync_cursor(&storage, &format!("cli:todo_tasks:{list_id}"));
+        let stored = storage.list_todo_tasks(&list_id, include_completed, limit)?;
+        if stored.is_empty() {
+            fetched
+        } else {
+            stored
+        }
+    } else {
+        cached_tasks
+    };
+    tasks.truncate(limit);
+
+    print_todo_tasks_output(&list_id, &tasks, json_out)
 }
 
 async fn cmd_todo_add(
@@ -7862,6 +8827,7 @@ mod tests {
             Command::Chats {
                 limit: 20,
                 refresh: true,
+                cached: false,
                 json: true
             }
         ));
@@ -8564,5 +9530,287 @@ mod tests {
             assert!(outlook_help.contains(env_name), "outlook help missing {env_name}");
             assert!(onenote_help.contains(env_name), "onenote help missing {env_name}");
         }
+    }
+
+    #[test]
+    fn parses_cached_and_fast_flags_across_cli_and_outlook() {
+        // Teams persona: --cached and --fast alias
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "chats", "--cached"]).unwrap().command.unwrap(),
+            Command::Chats { cached: true, .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "chats", "--fast"]).unwrap().command.unwrap(),
+            Command::Chats { cached: true, .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "teams", "--fast"]).unwrap().command.unwrap(),
+            Command::Teams { cached: true, .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "channels", "dev", "--cached"]).unwrap().command.unwrap(),
+            Command::Channels { cached: true, .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "read", "c1", "--fast"]).unwrap().command.unwrap(),
+            Command::Read { cached: true, .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "inbox", "--cached"]).unwrap().command.unwrap(),
+            Command::Inbox { cached: true, .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "mail", "list", "--fast"]).unwrap().command.unwrap(),
+            Command::Mail {
+                command: MailCommand::List { cached: true, .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "mail", "folders", "--cached"]).unwrap().command.unwrap(),
+            Command::Mail {
+                command: MailCommand::Folders { cached: true, .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "mail", "read", "m1", "--fast"]).unwrap().command.unwrap(),
+            Command::Mail {
+                command: MailCommand::Read { cached: true, .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "cal", "list", "--cached"]).unwrap().command.unwrap(),
+            Command::Cal {
+                command: CalCommand::List { cached: true, .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "cal", "today", "--fast"]).unwrap().command.unwrap(),
+            Command::Cal {
+                command: CalCommand::Today { cached: true, .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "cal", "week", "--cached"]).unwrap().command.unwrap(),
+            Command::Cal {
+                command: CalCommand::Week { cached: true, .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "cal", "show", "ev1", "--fast"]).unwrap().command.unwrap(),
+            Command::Cal {
+                command: CalCommand::Show { cached: true, .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "todo", "lists", "--cached"]).unwrap().command.unwrap(),
+            Command::Todo {
+                command: TodoCommand::Lists { cached: true, .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "todo", "tasks", "--fast"]).unwrap().command.unwrap(),
+            Command::Todo {
+                command: TodoCommand::Tasks { cached: true, .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "contacts", "list", "--cached"]).unwrap().command.unwrap(),
+            Command::Contacts {
+                command: ContactsCommand::List { cached: true, .. }
+            }
+        ));
+
+        // Outlook persona: --cached and --fast alias
+        assert!(matches!(
+            OutlookCli::try_parse_from(["outlook", "inbox", "--fast"]).unwrap().command.unwrap(),
+            OutlookCommand::Inbox { cached: true, .. }
+        ));
+        assert!(matches!(
+            OutlookCli::try_parse_from(["outlook", "folders", "--cached"]).unwrap().command.unwrap(),
+            OutlookCommand::Folders { cached: true, .. }
+        ));
+        assert!(matches!(
+            OutlookCli::try_parse_from(["outlook", "read", "m1", "--fast"]).unwrap().command.unwrap(),
+            OutlookCommand::Read { cached: true, .. }
+        ));
+        assert!(matches!(
+            OutlookCli::try_parse_from(["outlook", "chats", "--cached"]).unwrap().command.unwrap(),
+            OutlookCommand::Chats { cached: true, .. }
+        ));
+        assert!(matches!(
+            OutlookCli::try_parse_from(["outlook", "teams", "--fast"]).unwrap().command.unwrap(),
+            OutlookCommand::Teams { cached: true, .. }
+        ));
+        assert!(matches!(
+            OutlookCli::try_parse_from(["outlook", "cal", "list", "--fast"]).unwrap().command.unwrap(),
+            OutlookCommand::Cal {
+                command: CalCommand::List { cached: true, .. }
+            }
+        ));
+        assert!(matches!(
+            OutlookCli::try_parse_from(["outlook", "todo", "tasks", "--cached"]).unwrap().command.unwrap(),
+            OutlookCommand::Todo {
+                command: TodoCommand::Tasks { cached: true, .. }
+            }
+        ));
+        assert!(matches!(
+            OutlookCli::try_parse_from(["outlook", "contacts", "list", "--fast"]).unwrap().command.unwrap(),
+            OutlookCommand::Contacts {
+                command: ContactsCommand::List { cached: true, .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn fast_help_version_and_cache_cursor_helpers_work() {
+        assert!(try_fast_help_or_version_from(["teams", "--help"], Persona::Teams).is_some());
+        assert!(try_fast_help_or_version_from(["teams", "-V"], Persona::Teams).is_some());
+        assert!(try_fast_help_or_version_from(["outlook", "inbox", "--help"], Persona::Outlook).is_some());
+        assert!(try_fast_help_or_version_from(["onenote", "help"], Persona::OneNote).is_some());
+        assert!(try_fast_help_or_version_from(["teams", "chats"], Persona::Teams).is_none());
+        assert!(try_fast_help_or_version_from(["teams", "send", "a", "--", "--help"], Persona::Teams).is_none());
+
+        // JWT oid extraction & fast DB path resolution
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"oid":"user-123","sub":"sub-1"}"#);
+        let jwt = format!("Bearer header.{payload}.sig");
+        assert_eq!(extract_user_id_from_jwt(&jwt).as_deref(), Some("user-123"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let cred_path = tmp.path().join("credentials.json");
+        std::fs::create_dir_all(data_dir.join("solo-user")).unwrap();
+        std::fs::write(data_dir.join("solo-user").join("cache.db"), b"").unwrap();
+
+        let cfg = AppConfig::default();
+        // Single DB on disk resolves without credentials.json or keyring
+        assert_eq!(
+            resolve_storage_db_path_fast(&cfg, None, &data_dir, &cred_path).unwrap(),
+            data_dir.join("solo-user").join("cache.db")
+        );
+
+        // Multiple DBs require credentials.json / token / keyring
+        std::fs::create_dir_all(data_dir.join("second-user")).unwrap();
+        std::fs::write(data_dir.join("second-user").join("cache.db"), b"").unwrap();
+        assert!(resolve_storage_db_path_fast(&cfg, None, &data_dir, &cred_path).is_none());
+
+        std::fs::write(&cred_path, r#"{"user_id":"second-user"}"#).unwrap();
+        assert_eq!(
+            resolve_storage_db_path_fast(&cfg, None, &data_dir, &cred_path).unwrap(),
+            data_dir.join("second-user").join("cache.db")
+        );
+
+        // TEAMS_ACCESS_TOKEN overrides credentials.json
+        assert_eq!(
+            resolve_storage_db_path_fast(&cfg, Some(&jwt), &data_dir, &cred_path).unwrap(),
+            data_dir.join("user-123").join("cache.db")
+        );
+
+        // TEAMS_CLI_CACHE_SECS parsing & sync_cursors freshness
+        assert_eq!(parse_cli_cache_secs(None), 0);
+        assert_eq!(parse_cli_cache_secs(Some(" 60 ")), 60);
+        assert_eq!(parse_cli_cache_secs(Some("bad")), 0);
+
+        let storage = Storage::open_in_memory().unwrap();
+        assert!(!is_cursor_fresh(&storage, &["cli:chats"], 60));
+        record_cli_sync_cursor(&storage, "cli:chats");
+        assert!(is_cursor_fresh(&storage, &["cli:chats"], 60));
+        assert!(!is_cursor_fresh(&storage, &["cli:chats"], 0));
+    }
+
+    #[test]
+    fn parses_daemon_subcommands_across_all_personas() {
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "daemon", "start"])
+                .unwrap()
+                .command
+                .unwrap(),
+            Command::Daemon {
+                command: DaemonCommand::Start { json: false }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "daemon", "start", "--json"])
+                .unwrap()
+                .command
+                .unwrap(),
+            Command::Daemon {
+                command: DaemonCommand::Start { json: true }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "daemon", "stop"])
+                .unwrap()
+                .command
+                .unwrap(),
+            Command::Daemon {
+                command: DaemonCommand::Stop { json: false }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "daemon", "status"])
+                .unwrap()
+                .command
+                .unwrap(),
+            Command::Daemon {
+                command: DaemonCommand::Status { json: false }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "daemon", "restart"])
+                .unwrap()
+                .command
+                .unwrap(),
+            Command::Daemon {
+                command: DaemonCommand::Restart { json: false }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "daemon", "run"])
+                .unwrap()
+                .command
+                .unwrap(),
+            Command::Daemon {
+                command: DaemonCommand::Run
+            }
+        ));
+
+        assert!(matches!(
+            OutlookCli::try_parse_from(["outlook", "daemon", "status", "--json"])
+                .unwrap()
+                .command
+                .unwrap(),
+            OutlookCommand::Daemon {
+                command: DaemonCommand::Status { json: true }
+            }
+        ));
+        assert!(matches!(
+            OutlookCli::try_parse_from(["outlook", "daemon", "start"])
+                .unwrap()
+                .command
+                .unwrap(),
+            OutlookCommand::Daemon {
+                command: DaemonCommand::Start { json: false }
+            }
+        ));
+
+        assert!(matches!(
+            OnenoteCli::try_parse_from(["onenote", "daemon", "start"])
+                .unwrap()
+                .command
+                .unwrap(),
+            OnenoteCommand::Daemon {
+                command: DaemonCommand::Start { json: false }
+            }
+        ));
+        assert!(matches!(
+            OnenoteCli::try_parse_from(["onenote", "daemon", "status", "--json"])
+                .unwrap()
+                .command
+                .unwrap(),
+            OnenoteCommand::Daemon {
+                command: DaemonCommand::Status { json: true }
+            }
+        ));
     }
 }

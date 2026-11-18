@@ -105,6 +105,14 @@ pub struct AppConfig {
     pub token_refresh_cmd: String,
     /// Refresh threshold in minutes before token `exp` to trigger `token_refresh_cmd` (`TEAMS_TOKEN_REFRESH_MINS`, default 5).
     pub token_refresh_mins: u64,
+    /// When `false` (default), TUI only background-polls workspaces/domains that have been activated in the session.
+    /// Overrideable via `TEAMS_BACKGROUND_ALL=1|true` or `config.toml` (`background_all_personas = true`).
+    pub background_all_personas: bool,
+    /// CLI local cache TTL in seconds (`TEAMS_CLI_CACHE_SECS`, default `0`).
+    /// Defaults to `0` so CLI invocations fetch fresh unless `TEAMS_CLI_CACHE_SECS`, `cli_cache_ttl_secs`, or `--cached` is used.
+    pub cli_cache_ttl_secs: u64,
+    /// Automatically start and attach to the lightweight background sync daemon (`TEAMS_AUTO_DAEMON=1|true`, default `false`).
+    pub auto_daemon: bool,
 }
 
 impl Default for AppConfig {
@@ -153,6 +161,18 @@ impl Default for AppConfig {
                 .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .unwrap_or(5),
+            background_all_personas: std::env::var("TEAMS_BACKGROUND_ALL")
+                .ok()
+                .and_then(|s| parse_env_bool(&s))
+                .unwrap_or(false),
+            cli_cache_ttl_secs: std::env::var("TEAMS_CLI_CACHE_SECS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0),
+            auto_daemon: std::env::var("TEAMS_AUTO_DAEMON")
+                .ok()
+                .and_then(|s| parse_env_bool(&s))
+                .unwrap_or(false),
         }
     }
 }
@@ -199,6 +219,21 @@ impl AppConfig {
         if let Ok(rmins) = std::env::var("TEAMS_TOKEN_REFRESH_MINS") {
             if let Ok(parsed) = rmins.trim().parse::<u64>() {
                 cfg.token_refresh_mins = parsed;
+            }
+        }
+        if let Ok(bg_all) = std::env::var("TEAMS_BACKGROUND_ALL") {
+            if let Some(parsed) = parse_env_bool(&bg_all) {
+                cfg.background_all_personas = parsed;
+            }
+        }
+        if let Ok(ttl) = std::env::var("TEAMS_CLI_CACHE_SECS") {
+            if let Ok(parsed) = ttl.trim().parse::<u64>() {
+                cfg.cli_cache_ttl_secs = parsed;
+            }
+        }
+        if let Ok(ad) = std::env::var("TEAMS_AUTO_DAEMON") {
+            if let Some(parsed) = parse_env_bool(&ad) {
+                cfg.auto_daemon = parsed;
             }
         }
         cfg
@@ -366,6 +401,14 @@ pub fn save_drafts_to(drafts: &HashMap<String, String>, path: &Path) -> Result<(
     write_atomic(path, &bytes)
 }
 
+fn parse_env_bool(input: &str) -> Option<bool> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 fn expand_tilde(input: &str) -> PathBuf {
     if input == "~" {
         return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
@@ -376,4 +419,127 @@ fn expand_tilde(input: &str) -> PathBuf {
         }
     }
     PathBuf::from(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvVarGuard {
+        fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+            let mut saved = Vec::with_capacity(vars.len());
+            for &(key, val) in vars {
+                saved.push((key, std::env::var(key).ok()));
+                match val {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (key, orig) in self.saved.drain(..) {
+                match orig {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_app_config_toml_parses_background_all_and_cli_cache_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy.toml");
+        fs::write(&legacy_path, "notify = false\nactive_poll_ms = 3000\n").unwrap();
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::set(&[
+            ("TEAMS_BACKGROUND_ALL", None),
+            ("TEAMS_CLI_CACHE_SECS", None),
+        ]);
+
+        let legacy_cfg = AppConfig::load_from(&legacy_path).unwrap();
+        assert!(!legacy_cfg.notify);
+        assert_eq!(legacy_cfg.active_poll_ms, 3000);
+        assert!(!legacy_cfg.background_all_personas);
+        assert_eq!(legacy_cfg.cli_cache_ttl_secs, 0);
+
+        let custom_path = dir.path().join("custom.toml");
+        fs::write(
+            &custom_path,
+            "background_all_personas = true\ncli_cache_ttl_secs = 45\n",
+        )
+        .unwrap();
+        let custom_cfg = AppConfig::load_from(&custom_path).unwrap();
+        assert!(custom_cfg.background_all_personas);
+        assert_eq!(custom_cfg.cli_cache_ttl_secs, 45);
+    }
+
+    #[test]
+    fn test_app_config_env_overrides_background_all_and_cli_cache_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        fs::write(
+            &cfg_path,
+            "background_all_personas = false\ncli_cache_ttl_secs = 15\n",
+        )
+        .unwrap();
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir_str = dir.path().to_string_lossy().into_owned();
+
+        {
+            let _guard = EnvVarGuard::set(&[
+                ("TEAMS_CONFIG_DIR", Some(&dir_str)),
+                ("TEAMS_BACKGROUND_ALL", Some("1")),
+                ("TEAMS_CLI_CACHE_SECS", Some("120")),
+            ]);
+            let cfg = AppConfig::load();
+            assert!(cfg.background_all_personas);
+            assert_eq!(cfg.cli_cache_ttl_secs, 120);
+        }
+
+        {
+            let _guard = EnvVarGuard::set(&[
+                ("TEAMS_CONFIG_DIR", Some(&dir_str)),
+                ("TEAMS_BACKGROUND_ALL", Some("true")),
+                ("TEAMS_CLI_CACHE_SECS", Some("0")),
+            ]);
+            let cfg = AppConfig::load();
+            assert!(cfg.background_all_personas);
+            assert_eq!(cfg.cli_cache_ttl_secs, 0);
+        }
+
+        {
+            let _guard = EnvVarGuard::set(&[
+                ("TEAMS_CONFIG_DIR", Some(&dir_str)),
+                ("TEAMS_BACKGROUND_ALL", None),
+                ("TEAMS_CLI_CACHE_SECS", None),
+            ]);
+            let def = AppConfig::default();
+            assert!(!def.background_all_personas);
+            assert_eq!(def.cli_cache_ttl_secs, 0);
+        }
+    }
+
+    #[test]
+    fn test_parse_env_bool_values() {
+        assert_eq!(parse_env_bool("1"), Some(true));
+        assert_eq!(parse_env_bool(" true "), Some(true));
+        assert_eq!(parse_env_bool("TRUE"), Some(true));
+        assert_eq!(parse_env_bool("0"), Some(false));
+        assert_eq!(parse_env_bool("false"), Some(false));
+        assert_eq!(parse_env_bool("invalid"), None);
+    }
 }

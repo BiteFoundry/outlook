@@ -1,7 +1,7 @@
 //! TUI entry shell: terminal raw mode, mouse capture, keyboard enhancement, event loop, external editor.
 
 use std::io::{self, Stdout};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -17,14 +17,14 @@ use crossterm::terminal::{
 use futures::{FutureExt, StreamExt};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::auth::AuthManager;
 use crate::config::{AppConfig, Persona};
 use crate::graph::GraphClient;
 use crate::models::CoreEvent;
 use crate::storage::Storage;
-use crate::sync::{self, SyncCommand};
+use crate::sync::{self, FocusTarget, SyncCommand, SyncController};
 use crate::ui::{
     self, action,
     action::Action,
@@ -103,10 +103,42 @@ fn install_panic_hook(keyboard_enhanced: bool) {
 }
 
 const MAX_COALESCED_EVENTS: usize = 64;
+const ACTIVITY_THROTTLE: Duration = Duration::from_secs(5);
 
 enum LoopStep {
     Continue,
     Quit,
+}
+
+fn notify_activity_throttled(app: &AppState, last_activity_sent: &mut Option<Instant>) {
+    if last_activity_sent.is_none_or(|t| t.elapsed() >= ACTIVITY_THROTTLE) {
+        app.sync_ctrl.request(SyncCommand::NotifyUserActivity);
+        *last_activity_sent = Some(Instant::now());
+    }
+}
+
+fn draw_frame(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut AppState,
+    ui: &mut UiState,
+) -> Result<()> {
+    let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
+    let mut cursor_pos = None;
+    let draw_res = terminal
+        .draw(|frame| {
+            cursor_pos = ui::draw(frame, app, ui);
+        })
+        .map(|_| ());
+    if draw_res.is_ok() {
+        if let Some((cx, cy)) = cursor_pos {
+            let _ = terminal.show_cursor();
+            let _ = terminal.set_cursor_position((cx, cy));
+        } else {
+            let _ = terminal.hide_cursor();
+        }
+    }
+    let _ = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    Ok(draw_res?)
 }
 
 fn handle_terminal_event(
@@ -114,6 +146,7 @@ fn handle_terminal_event(
     app: &mut AppState,
     ui: &mut UiState,
     dirty: &mut bool,
+    last_activity_sent: &mut Option<Instant>,
 ) -> LoopStep {
     match ev {
         CrosstermEvent::Key(key) => {
@@ -124,6 +157,7 @@ fn handle_terminal_event(
                 &ui.keymap,
                 ui.accepts_text_input(),
             ) {
+                notify_activity_throttled(app, last_activity_sent);
                 *dirty = true;
                 if action::dispatch(act, app, ui) {
                     return LoopStep::Quit;
@@ -132,12 +166,14 @@ fn handle_terminal_event(
         }
         CrosstermEvent::Mouse(mouse) => match mouse.kind {
             MouseEventKind::ScrollUp => {
+                notify_activity_throttled(app, last_activity_sent);
                 *dirty = true;
                 if action::dispatch(Action::ScrollUp, app, ui) {
                     return LoopStep::Quit;
                 }
             }
             MouseEventKind::ScrollDown => {
+                notify_activity_throttled(app, last_activity_sent);
                 *dirty = true;
                 if action::dispatch(Action::ScrollDown, app, ui) {
                     return LoopStep::Quit;
@@ -145,6 +181,7 @@ fn handle_terminal_event(
             }
             _ => {
                 if let Some(act) = event::mouse_to_action(mouse, &ui.hitmap) {
+                    notify_activity_throttled(app, last_activity_sent);
                     *dirty = true;
                     if action::dispatch(act, app, ui) {
                         return LoopStep::Quit;
@@ -153,6 +190,7 @@ fn handle_terminal_event(
             }
         },
         CrosstermEvent::Paste(text) => {
+            notify_activity_throttled(app, last_activity_sent);
             *dirty = true;
             if action::dispatch(Action::Paste(text), app, ui) {
                 return LoopStep::Quit;
@@ -166,6 +204,122 @@ fn handle_terminal_event(
         _ => {}
     }
     LoopStep::Continue
+}
+
+fn spawn_sync_supervisor(
+    config: AppConfig,
+    auth: AuthManager,
+    graph: GraphClient,
+    storage: Storage,
+    core_tx: mpsc::UnboundedSender<CoreEvent>,
+    ui_tx: mpsc::UnboundedSender<UiMsg>,
+    mut proxy_focus_rx: watch::Receiver<FocusTarget>,
+    mut proxy_nudge_rx: mpsc::UnboundedReceiver<SyncCommand>,
+) {
+    tokio::spawn(async move {
+        let expected_user_id = auth
+            .current_tokens()
+            .await
+            .and_then(|t| t.user_id)
+            .filter(|id| !id.is_empty());
+
+        if core_tx.is_closed() {
+            return;
+        }
+
+        if config.auto_daemon {
+            let _ = crate::daemon::ensure_daemon_started(&config).await;
+        }
+
+        if core_tx.is_closed() {
+            return;
+        }
+
+        let mut fell_back_from_daemon = false;
+
+        if let Some(mut conn) =
+            crate::daemon::try_connect_tui(&config, expected_user_id.as_deref()).await
+        {
+            let _ = ui_tx.send(UiMsg::DaemonAttached {
+                pid: conn.status.pid,
+                sync_busy: conn.status.sync_busy,
+            });
+            let initial_focus = proxy_focus_rx.borrow_and_update().clone();
+            if initial_focus.target.is_some() || initial_focus.thread_root_id.is_some() {
+                conn.sync_ctrl
+                    .set_focus(initial_focus.target, initial_focus.thread_root_id);
+            }
+
+            loop {
+                tokio::select! {
+                    ev = conn.events_rx.recv() => {
+                        match ev {
+                            Some(core_ev) => {
+                                if core_tx.send(core_ev).is_err() {
+                                    return;
+                                }
+                            }
+                            None => {
+                                fell_back_from_daemon = true;
+                                break;
+                            }
+                        }
+                    }
+                    cmd = proxy_nudge_rx.recv() => {
+                        match cmd {
+                            None | Some(SyncCommand::Shutdown) => return,
+                            Some(cmd) => conn.sync_ctrl.request(cmd),
+                        }
+                    }
+                    changed = proxy_focus_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        let focus = proxy_focus_rx.borrow_and_update().clone();
+                        conn.sync_ctrl.set_focus(focus.target, focus.thread_root_id);
+                    }
+                }
+            }
+        }
+
+        if core_tx.is_closed() {
+            return;
+        }
+
+        let local_ctrl = sync::spawn_sync_engine(config, graph, storage, core_tx);
+        if fell_back_from_daemon {
+            let _ = ui_tx.send(UiMsg::DaemonDetached);
+        } else {
+            let _ = ui_tx.send(UiMsg::StartLocalBootstrap);
+        }
+
+        let current_focus = proxy_focus_rx.borrow_and_update().clone();
+        if current_focus.target.is_some() || current_focus.thread_root_id.is_some() {
+            local_ctrl.set_focus(current_focus.target, current_focus.thread_root_id);
+        }
+
+        loop {
+            tokio::select! {
+                cmd = proxy_nudge_rx.recv() => {
+                    match cmd {
+                        None | Some(SyncCommand::Shutdown) => {
+                            local_ctrl.request(SyncCommand::Shutdown);
+                            break;
+                        }
+                        Some(cmd) => local_ctrl.request(cmd),
+                    }
+                }
+                changed = proxy_focus_rx.changed() => {
+                    if changed.is_err() {
+                        local_ctrl.request(SyncCommand::Shutdown);
+                        break;
+                    }
+                    let focus = proxy_focus_rx.borrow_and_update().clone();
+                    local_ctrl.set_focus(focus.target, focus.thread_root_id);
+                }
+            }
+        }
+    });
 }
 
 pub async fn run(
@@ -184,30 +338,49 @@ pub async fn run_with_persona(
     graph: GraphClient,
     storage: Storage,
 ) -> Result<()> {
+    // Enter alternate screen and raw mode first so the terminal responds in <5ms.
+    let (guard, mut terminal) = TerminalGuard::enter()?;
+    install_panic_hook(guard.keyboard_enhanced);
+
     let (core_tx, mut core_rx) = mpsc::unbounded_channel::<CoreEvent>();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMsg>();
 
-    let sync_ctrl = sync::spawn_sync_engine(config.clone(), graph.clone(), storage.clone(), core_tx);
+    let (proxy_focus_tx, proxy_focus_rx) = watch::channel(FocusTarget::default());
+    let (proxy_nudge_tx, proxy_nudge_rx) = mpsc::unbounded_channel::<SyncCommand>();
+    let sync_ctrl = SyncController::from_channels(
+        proxy_focus_tx,
+        proxy_nudge_tx,
+        config.background_all_personas,
+    );
 
     let mut ui = UiState::from_config_with_persona(&config, persona);
     let mut app = AppState::new_with_persona(
-        config,
+        config.clone(),
         persona,
+        auth.clone(),
+        graph.clone(),
+        storage.clone(),
+        sync_ctrl.clone(),
+        ui_tx.clone(),
+    );
+    app.load_cached_for_persona();
+    draw_frame(&mut terminal, &mut app, &mut ui)?;
+
+    spawn_sync_supervisor(
+        config,
         auth,
         graph,
         storage,
-        sync_ctrl.clone(),
+        core_tx,
         ui_tx,
+        proxy_focus_rx,
+        proxy_nudge_rx,
     );
-    app.load_cached_initial();
-    app.spawn_bootstrap(&mut ui);
-
-    let (guard, mut terminal) = TerminalGuard::enter()?;
-    install_panic_hook(guard.keyboard_enhanced);
 
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     let mut dirty = true;
+    let mut last_activity_sent: Option<Instant> = None;
 
     loop {
         if ui.editor_requested {
@@ -283,24 +456,8 @@ pub async fn run_with_persona(
         }
 
         if dirty {
-            let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
-            let mut cursor_pos = None;
-            let draw_res = terminal
-                .draw(|frame| {
-                    cursor_pos = ui::draw(frame, &mut app, &mut ui);
-                })
-                .map(|_| ());
-            if draw_res.is_ok() {
-                if let Some((cx, cy)) = cursor_pos {
-                    let _ = terminal.show_cursor();
-                    let _ = terminal.set_cursor_position((cx, cy));
-                } else {
-                    let _ = terminal.hide_cursor();
-                }
-                dirty = false;
-            }
-            let _ = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
-            draw_res?;
+            draw_frame(&mut terminal, &mut app, &mut ui)?;
+            dirty = false;
         }
 
         let mut should_quit = false;
@@ -331,7 +488,7 @@ pub async fn run_with_persona(
                 match maybe_ev {
                     Some(Ok(ev)) => {
                         if matches!(
-                            handle_terminal_event(ev, &mut app, &mut ui, &mut dirty),
+                            handle_terminal_event(ev, &mut app, &mut ui, &mut dirty, &mut last_activity_sent),
                             LoopStep::Quit
                         ) {
                             should_quit = true;
@@ -390,7 +547,7 @@ pub async fn run_with_persona(
                         drained += 1;
                         progressed = true;
                         if matches!(
-                            handle_terminal_event(ev, &mut app, &mut ui, &mut dirty),
+                            handle_terminal_event(ev, &mut app, &mut ui, &mut dirty, &mut last_activity_sent),
                             LoopStep::Quit
                         ) {
                             should_quit = true;

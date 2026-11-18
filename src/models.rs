@@ -319,7 +319,7 @@ pub struct SyncCursor {
 }
 
 /// Asynchronous events pushed from `SyncEngine` to TUI or live subscribers.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CoreEvent {
     ConversationsUpdated(Vec<ConversationSummary>),
     TeamsUpdated(Vec<TeamSummary>),

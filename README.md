@@ -1,4 +1,4 @@
-# teams · outlook · onenote (v0.4.0 Unified Microsoft Teams + Outlook + OneNote Suite)
+# teams · outlook · onenote (v0.5.0 Unified Microsoft Teams + Outlook + OneNote Suite)
 
 **Microsoft Teams**, **Microsoft Outlook(메일 · 캘린더 · 연락처 · Microsoft To Do)**, **Microsoft OneNote(개인 · 팀/그룹 공유 필기장)** 를 **터미널에서** 하나로 통합해 읽고, 검색하고, 답장하고, 파일·이미지·페이지를 주고받을 수 있는 **CLI · TUI · HTTP JSON API · MCP 서버 통합 도구**입니다.
 
@@ -72,10 +72,10 @@ npx --yes -p @shinick/teams onenote --version
 
 ```powershell
 # 방법 C: 소스 클론 없이 프리빌트 단일 실행 파일(teams.exe)만 직접 다운로드
-gh release download v0.4.0 -R shinick-dev/teams --pattern "teams.exe" --dir "$HOME\.local\bin" --clobber
+gh release download v0.5.0 -R shinick-dev/teams --pattern "teams.exe" --dir "$HOME\.local\bin" --clobber
 ```
 
-> GitHub [Releases -> v0.4.0](https://github.com/shinick-dev/teams/releases/tag/v0.4.0)에서 플랫폼별 아카이브(`teams-0.4.0-*.zip` / `.tar.gz`) 또는 `teams.exe`를 내려받아 바로 실행할 수 있습니다.
+> GitHub [Releases -> v0.5.0](https://github.com/shinick-dev/teams/releases/tag/v0.5.0)에서 플랫폼별 아카이브(`teams-0.5.0-*.zip` / `.tar.gz`) 또는 `teams.exe`를 내려받아 바로 실행할 수 있습니다.
 >
 > **Linux 지원 범위**: 프리빌트 Linux 바이너리(`x86_64` / `aarch64`)는 `cargo-zigbuild`로 **GLIBC 2.28** 타깃으로 빌드되어 **AlmaLinux 8 / RHEL 8+ / Rocky Linux 8+ / Ubuntu 20.04+ / Debian 10+** 에서 바로 실행됩니다. 헤드리스 SSH 서버에서는 `teams login --device-code`를 사용할 수 있으며, D-Bus Secret Service가 없는 환경에서는 자동으로 `0600` 권한의 `credentials.json`으로 안전하게 폴백합니다. (CentOS 7 등 GLIBC 2.28 미만 또는 Alpine/musl 환경은 `cargo build --release`로 소스 빌드하세요.)
 
@@ -212,14 +212,15 @@ teams update --force
 | 명령 | 설명 | 주요 사용 예시 |
 | --- | --- | --- |
 | `outlook` | Outlook 페르소나 TUI 실행 (메일·캘린더·연락처·To Do + Teams 전환 가능) | `outlook` |
-| `outlook inbox` | 받은편지함 또는 지정 폴더 메일 목록 조회 | `outlook inbox --limit 30 --json` |
-| `outlook read <mail_id>` | 메일 상세 본문·첨부파일 조회 및 인라인 이미지 미리보기 | `outlook read <mail_id> --preview-images` |
+| `outlook inbox` | 받은편지함 또는 지정 폴더 메일 목록 조회 | `outlook inbox --limit 30 --cached --json` |
+| `outlook read <mail_id>` | 메일 상세 본문·첨부파일 조회 및 인라인 이미지 미리보기 (`--cached` 지원) | `outlook read <mail_id> --preview-images` |
 | `outlook send` | 새 메일 전송 (제목·수신자·Markdown 본문·파일 첨부) | `outlook send --to alice@contoso.com --subject "주간 보고" "첨부 확인 바랍니다." --attach ./report.pdf` |
 | `outlook reply <mail_id>` | 메일 답장 전송 (`--all` 전체 답장) | `outlook reply <mail_id> "확인했습니다. 감사합니다!"` |
-| `outlook cal` | 캘린더 일정 조회(`today`/`week`/`list`), Teams 모임 생성, RSVP | `outlook cal today`, `outlook cal create ...`, `outlook cal rsvp <id> accept` |
-| `outlook contacts` | 개인 연락처 목록, 조직 디렉토리 통합 검색, 연락처 추가/삭제 | `outlook contacts list`, `outlook contacts search "김철수"` |
-| `outlook todo` | Microsoft To Do 목록 조회, 작업 추가, 완료 토글, 삭제 | `outlook todo tasks`, `outlook todo add "배포 점검"`, `outlook todo done <task_id>` |
+| `outlook cal` | 캘린더 일정 조회(`today`/`week`/`list`/`show`, `--cached` 지원), Teams 모임 생성, RSVP | `outlook cal today`, `outlook cal create ...`, `outlook cal rsvp <id> accept` |
+| `outlook contacts` | 개인 연락처 목록(`--cached` 지원), 조직 디렉토리 통합 검색, 연락처 추가/삭제 | `outlook contacts list`, `outlook contacts search "김철수"` |
+| `outlook todo` | Microsoft To Do 목록/작업 조회(`--cached` 지원), 작업 추가, 완료 토글, 삭제 | `outlook todo tasks`, `outlook todo add "배포 점검"`, `outlook todo done <task_id>` |
 | `outlook notes` | OneNote 필기장·섹션·페이지 명령 (`teams notes`와 동일) | `outlook notes notebooks --json`, `outlook notes read "주간 회의록" --format md` |
+| `outlook daemon` | 백그라운드 동기화 데몬 제어 (`start` \| `status` \| `stop` \| `restart`) | `outlook daemon start`, `outlook daemon status --json` |
 | `outlook update` | GitHub Release 최신 버전 확인 및 원클릭 자가 업데이트 | `outlook update --check`, `outlook update` |
 
 ### Outlook 사용 예시
@@ -263,11 +264,11 @@ outlook todo done "<task_id>"
 | `teams whoami` | - | 현재 로그인 사용자 및 토큰 상태 확인 | `--json` |
 | `teams doctor` | - | 설정/DB/키링 경로 및 Graph 연결 진단 | `--probe`, `--json` |
 | `teams update` | - | GitHub Releases 최신 버전 확인 및 자가 업데이트 | `--check`, `--force`, `--json` |
-| `teams chats` | `ls` | 1:1 · 그룹 · 모임 채팅 목록 | `--limit <N>`, `--refresh`, `--json` |
+| `teams chats` | `ls` | 1:1 · 그룹 · 모임 채팅 목록 | `--limit <N>`, `--refresh`, `--cached`/`--fast`, `--json` |
 | `teams new-chat` | - | 새 1:1 또는 그룹 채팅 생성 | `--to <email_or_id>` (반복 가능), `--topic`, `--message`, `--json` |
-| `teams teams` | - | 가입된 팀과 채널 목록 | `--refresh`, `--json` |
-| `teams channels <team>` | - | 특정 팀의 채널 목록 | `--refresh`, `--json` |
-| `teams read <target>` | `cat` | 채팅방 또는 채널 최근 메시지 읽기 | `--limit <N>`, `--offline`, `--json` |
+| `teams teams` | - | 가입된 팀과 채널 목록 | `--refresh`, `--cached`/`--fast`, `--json` |
+| `teams channels <team>` | - | 특정 팀의 채널 목록 | `--refresh`, `--cached`/`--fast`, `--json` |
+| `teams read <target>` | `cat` | 채팅방 또는 채널 최근 메시지 읽기 | `--limit <N>`, `--offline`, `--cached`/`--fast`, `--json` |
 | `teams preview` | - | 메시지 첨부 또는 로컬 이미지 터미널 미리보기 | `--file <path>`, `--attachment <id>`, `--cols`, `--rows` |
 | `teams thread <chan> <root_id>` | - | 팀 채널 루트 게시물 + 스레드 답글 조회 | `--limit <N>`, `--offline`, `--json` |
 | `teams send <target> <md>` | `msg` | Markdown 메시지 전송 | `--subject`, `--mention <user_id:DisplayName>` (반복), `--important`, `--json` |
@@ -285,6 +286,7 @@ outlook todo done "<task_id>"
 | `teams notes <cmd>` | `onenote` | OneNote 필기장·섹션·페이지 명령 (`notebooks`, `sections`, `pages`, `read`, `create`, `append`, `update`, `check`, `delete`, `search`, `resource`) | [OneNote CLI 레퍼런스](#onenote-cli-레퍼런스-onenote) 참고 |
 | `onenote <cmd>` | - | `TEAMS_PERSONA=onenote`로 단일 바이너리를 실행하는 OneNote 페르소나 명령 전체 | `onenote notebooks`, `onenote read <page> --format blocks` 등 |
 | `teams tui` | `chat` | 인터랙티브 TUI 실행 | - |
+| `teams daemon <cmd>` | - | 백그라운드 동기화 데몬 제어 (`start`, `status`, `stop`, `restart`) — 실행 중일 때 CLI 읽기 명령이 로컬 캐시에서 즉시(<5ms) 응답 | `--json` (`start`/`status`/`stop`/`restart`) |
 | `teams serve` | `api` | 에이전트용 로컬 HTTP JSON API 서버 실행 | `--bind <IP>`, `--port <8788>`, `--token <secret>` |
 | `teams mcp` | `mcp-server` | 에이전트용 stdio MCP(JSON-RPC 2.0) 서버 실행 | - |
 
@@ -366,6 +368,7 @@ onenote read "주간 회의록" --format md
 | `onenote create-notebook <name>` | - | 새 필기장 생성 | `--group <id>`, `--site <id>`, `--json` |
 | `onenote create-section <notebook> <name>` | - | 지정한 필기장에 새 섹션 생성 | `--json` |
 | `onenote self-update` | `upgrade` | GitHub Release 최신 버전 확인 및 자가 업데이트 | `--check`, `--force`, `--repo`, `--json` |
+| `onenote daemon <cmd>` | - | 백그라운드 동기화 데몬 제어 (`start`, `status`, `stop`, `restart`) | `--json` |
 | `onenote tui` | - | 인터랙티브 OneNote TUI 실행 | - |
 | `onenote serve` | `api` | 에이전트용 로컬 HTTP JSON API 서버 실행 | `--bind <IP>`, `--port <8788>`, `--token <secret>` |
 | `onenote mcp` | `mcp-server` | 에이전트용 stdio MCP(JSON-RPC 2.0) 서버 실행 | - |
@@ -650,6 +653,9 @@ npx --yes -p @shinick/teams onenote --version
 | `TEAMS_CONFIG_DIR` | `config.toml` · `credentials.json` · `drafts.json` 디렉토리 재정의 |
 | `TEAMS_DATA_DIR` | SQLite 캐시(`cache.db`) 저장 디렉토리 재정의 |
 | `TEAMS_NO_BROWSER` | `1`/`true` 설정 시 로그인 과정에서 브라우저 자동 실행 비활성화 |
+| `TEAMS_CLI_CACHE_SECS` | CLI 읽기 명령의 로컬 SQLite 캐시 유효 시간(초, 기본 `0`). `--cached`(`--fast`) 플래그 사용 시 네트워크 호출 대신 로컬 캐시를 우선 조회 |
+| `TEAMS_BACKGROUND_ALL` | `1`/`true` 설정 시 TUI 시작 때 비활성 페르소나/도메인까지 백그라운드 폴링 활성화 (기본값은 활성 탭만 폴링) |
+| `TEAMS_AUTO_DAEMON` | `1`/`true` 설정(또는 `config.toml`에 `auto_daemon = true`) 시 CLI/TUI가 백그라운드 동기화 데몬(`teams daemon`)을 자동 시작·연결해 읽기 명령을 로컬 캐시에서 즉시 응답 (기본 `false`) |
 
 ## 라이선스
 

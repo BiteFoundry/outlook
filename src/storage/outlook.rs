@@ -18,6 +18,12 @@ const MAIL_SELECT_COLS: &str = "
     m.preview, m.body_html, m.body_plain, m.attachments_json, m.web_link
 ";
 
+const MAIL_SUMMARY_SELECT_COLS: &str = "
+    m.id, m.conversation_id, m.folder_id, m.subject, m.from_json,
+    m.received_at, m.sent_at, m.is_read, m.is_draft, m.flagged,
+    m.importance, m.has_attachments, m.preview, m.web_link
+";
+
 const FOLDER_FILTER_PREDICATE: &str = "
     (
         m.folder_id = ?1
@@ -362,11 +368,16 @@ pub fn upsert_mail_messages(conn: &mut Connection, messages: &[MailMessage]) -> 
     Ok(messages.len())
 }
 
-pub fn list_mail_messages(
+fn query_mail_rows<F>(
     conn: &Connection,
+    select_cols: &str,
     folder_id_or_wellknown: Option<&str>,
     limit: usize,
-) -> Result<Vec<MailMessage>> {
+    mapper: F,
+) -> Result<Vec<MailMessage>>
+where
+    F: FnMut(&Row<'_>) -> rusqlite::Result<MailMessage>,
+{
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -377,7 +388,7 @@ pub fn list_mail_messages(
     if let Some(folder) = filter {
         let sql = format!(
             "
-            SELECT {MAIL_SELECT_COLS}
+            SELECT {select_cols}
             FROM mail_messages m
             WHERE {FOLDER_FILTER_PREDICATE}
             ORDER BY m.received_at DESC, m.id DESC
@@ -385,21 +396,50 @@ pub fn list_mail_messages(
             "
         );
         let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(params![folder, limit as i64], map_mail_message_row)?;
+        let rows = stmt.query_map(params![folder, limit as i64], mapper)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     } else {
         let sql = format!(
             "
-            SELECT {MAIL_SELECT_COLS}
+            SELECT {select_cols}
             FROM mail_messages m
             ORDER BY m.received_at DESC, m.id DESC
             LIMIT ?1
             "
         );
         let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(params![limit as i64], map_mail_message_row)?;
+        let rows = stmt.query_map(params![limit as i64], mapper)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
+}
+
+pub fn list_mail_messages(
+    conn: &Connection,
+    folder_id_or_wellknown: Option<&str>,
+    limit: usize,
+) -> Result<Vec<MailMessage>> {
+    query_mail_rows(
+        conn,
+        MAIL_SELECT_COLS,
+        folder_id_or_wellknown,
+        limit,
+        map_mail_message_row,
+    )
+}
+
+/// Lightweight header-only mail list projection (skips large body/recipient/attachment columns).
+pub fn list_mail_summaries(
+    conn: &Connection,
+    folder_id_or_wellknown: Option<&str>,
+    limit: usize,
+) -> Result<Vec<MailMessage>> {
+    query_mail_rows(
+        conn,
+        MAIL_SUMMARY_SELECT_COLS,
+        folder_id_or_wellknown,
+        limit,
+        map_mail_summary_row,
+    )
 }
 
 pub fn get_mail_message(conn: &Connection, message_id: &str) -> Result<Option<MailMessage>> {
@@ -414,6 +454,119 @@ pub fn get_mail_message(conn: &Connection, message_id: &str) -> Result<Option<Ma
     stmt.query_row(params![message_id], map_mail_message_row)
         .optional()
         .map_err(Into::into)
+}
+
+pub fn set_mail_read_local(conn: &mut Connection, message_id: &str, is_read: bool) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let mut sel = tx.prepare_cached("SELECT folder_id, is_read FROM mail_messages WHERE id = ?1")?;
+        let existing: Option<(Option<String>, i32)> = sel
+            .query_row(params![message_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        if let Some((folder_id, old_is_read_i)) = existing {
+            let old_is_read = old_is_read_i != 0;
+            if old_is_read != is_read {
+                let mut upd_msg =
+                    tx.prepare_cached("UPDATE mail_messages SET is_read = ?2 WHERE id = ?1")?;
+                upd_msg.execute(params![message_id, bool_to_i32(is_read)])?;
+                if let Some(fid) = folder_id {
+                    let delta: i32 = if is_read { -1 } else { 1 };
+                    let mut upd_fld = tx.prepare_cached(
+                        "UPDATE mail_folders SET unread_item_count = MAX(0, unread_item_count + ?2) WHERE id = ?1",
+                    )?;
+                    upd_fld.execute(params![fid, delta])?;
+                }
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn set_mail_flagged_local(conn: &Connection, message_id: &str, flagged: bool) -> Result<()> {
+    let flag_i = bool_to_i32(flagged);
+    let mut stmt = conn.prepare_cached(
+        "UPDATE mail_messages SET flagged = ?2 WHERE id = ?1 AND flagged != ?2",
+    )?;
+    stmt.execute(params![message_id, flag_i])?;
+    Ok(())
+}
+
+pub fn move_mail_folder_local(
+    conn: &mut Connection,
+    message_id: &str,
+    target_folder_id: &str,
+) -> Result<()> {
+    let trimmed = target_folder_id.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let alias = match trimmed.to_ascii_lowercase().as_str() {
+        "trash" => "deleteditems",
+        "sent" => "sentitems",
+        "junk" => "junkemail",
+        _ => trimmed,
+    };
+
+    let tx = conn.transaction()?;
+    {
+        let mut resolve_stmt = tx.prepare_cached(
+            "
+            SELECT id FROM mail_folders
+            WHERE id = ?1
+               OR LOWER(COALESCE(well_known_name, '')) = LOWER(?2)
+               OR LOWER(display_name) = LOWER(?1)
+            LIMIT 1
+            ",
+        )?;
+        let resolved_target: String = resolve_stmt
+            .query_row(params![trimmed, alias], |row| row.get(0))
+            .optional()?
+            .unwrap_or_else(|| trimmed.to_string());
+
+        let mut sel = tx.prepare_cached("SELECT folder_id, is_read FROM mail_messages WHERE id = ?1")?;
+        let existing: Option<(Option<String>, i32)> = sel
+            .query_row(params![message_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+
+        if let Some((old_folder_id, is_read_i)) = existing {
+            if old_folder_id.as_deref() != Some(resolved_target.as_str()) {
+                let mut upd_msg =
+                    tx.prepare_cached("UPDATE mail_messages SET folder_id = ?2 WHERE id = ?1")?;
+                upd_msg.execute(params![message_id, resolved_target])?;
+
+                if let Some(old_fid) = old_folder_id {
+                    let mut dec_old = tx.prepare_cached(
+                        "
+                        UPDATE mail_folders
+                        SET total_item_count = MAX(0, total_item_count - 1),
+                            unread_item_count = CASE
+                                WHEN ?2 = 0 THEN MAX(0, unread_item_count - 1)
+                                ELSE unread_item_count
+                            END
+                        WHERE id = ?1
+                        ",
+                    )?;
+                    dec_old.execute(params![old_fid, is_read_i])?;
+                }
+
+                let mut inc_new = tx.prepare_cached(
+                    "
+                    UPDATE mail_folders
+                    SET total_item_count = total_item_count + 1,
+                        unread_item_count = CASE
+                            WHEN ?2 = 0 THEN unread_item_count + 1
+                            ELSE unread_item_count
+                        END
+                    WHERE id = ?1
+                    ",
+                )?;
+                inc_new.execute(params![resolved_target, is_read_i])?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 pub fn delete_mail_messages_by_ids(conn: &mut Connection, ids: &[String]) -> Result<()> {
@@ -611,6 +764,21 @@ pub fn list_calendar_events(
 pub fn delete_calendar_event(conn: &Connection, event_id: &str) -> Result<()> {
     let mut stmt = conn.prepare_cached("DELETE FROM calendar_events WHERE id = ?1")?;
     stmt.execute(params![event_id])?;
+    Ok(())
+}
+
+pub fn delete_calendar_events_by_ids(conn: &mut Connection, ids: &[String]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare_cached("DELETE FROM calendar_events WHERE id = ?1")?;
+        for id in ids {
+            stmt.execute(params![id])?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1017,6 +1185,39 @@ fn map_mail_message_row(row: &Row<'_>) -> rusqlite::Result<MailMessage> {
         body_plain: row.get(17)?,
         attachments,
         web_link: row.get(19)?,
+    })
+}
+
+fn map_mail_summary_row(row: &Row<'_>) -> rusqlite::Result<MailMessage> {
+    let from_json: Option<String> = row.get(4)?;
+    let is_read_int: i32 = row.get(7)?;
+    let is_draft_int: i32 = row.get(8)?;
+    let flagged_int: i32 = row.get(9)?;
+    let has_att_int: i32 = row.get(11)?;
+
+    let from: Option<EmailRecipient> = from_json.and_then(|s| serde_json::from_str(&s).ok());
+
+    Ok(MailMessage {
+        id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        folder_id: row.get(2)?,
+        subject: row.get(3)?,
+        from,
+        to_recipients: Vec::new(),
+        cc_recipients: Vec::new(),
+        bcc_recipients: Vec::new(),
+        received_at: row.get(5)?,
+        sent_at: row.get(6)?,
+        is_read: is_read_int != 0,
+        is_draft: is_draft_int != 0,
+        flagged: flagged_int != 0,
+        importance: row.get(10)?,
+        has_attachments: has_att_int != 0,
+        preview: row.get(12)?,
+        body_html: String::new(),
+        body_plain: String::new(),
+        attachments: Vec::new(),
+        web_link: row.get(13)?,
     })
 }
 
@@ -1615,5 +1816,202 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn test_list_mail_summaries_header_projection_and_body_preservation() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_mail_folders(&[MailFolder {
+                id: "fld-inbox".to_string(),
+                display_name: "Inbox".to_string(),
+                well_known_name: Some("inbox".to_string()),
+                parent_folder_id: None,
+                unread_item_count: 1,
+                total_item_count: 1,
+            }])
+            .unwrap();
+
+        let mut full = sample_mail(
+            "m-sum-1",
+            "fld-inbox",
+            "프로젝트 보고",
+            "홍길동",
+            "hong@example.com",
+            "2026-11-18T10:00:00Z",
+            "<p>본문 전체에 있는 SecretKeywordFullBody 내용</p>",
+            "본문 전체에 있는 SecretKeywordFullBody 내용",
+        );
+        full.preview = "짧은 미리보기".to_string();
+        full.has_attachments = true;
+        full.attachments = vec![MailAttachment {
+            id: "att-sum".to_string(),
+            name: "spec.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            size: 1024,
+            is_inline: false,
+            content_id: None,
+            content_bytes_b64: None,
+        }];
+        storage.upsert_mail_messages(&[full]).unwrap();
+
+        // list_mail_summaries must return lightweight headers without blobs
+        let summaries = storage.list_mail_summaries(Some("inbox"), 10).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "m-sum-1");
+        assert_eq!(summaries[0].subject, "프로젝트 보고");
+        assert_eq!(summaries[0].preview, "짧은 미리보기");
+        assert!(summaries[0].has_attachments);
+        assert!(summaries[0].body_html.is_empty());
+        assert!(summaries[0].body_plain.is_empty());
+        assert!(summaries[0].to_recipients.is_empty());
+        assert!(summaries[0].attachments.is_empty());
+
+        // Header-only delta update arrives with empty body_html and body_plain == preview
+        let mut header_update = sample_mail(
+            "m-sum-1",
+            "fld-inbox",
+            "프로젝트 보고 (수정)",
+            "홍길동",
+            "hong@example.com",
+            "2026-11-18T10:00:00Z",
+            "",
+            "짧은 미리보기",
+        );
+        header_update.preview = "짧은 미리보기".to_string();
+        header_update.is_read = true;
+        storage.upsert_mail_messages(&[header_update]).unwrap();
+
+        // Full body_html, body_plain, attachments, and mail_fts full-body search must be preserved
+        let full_loaded = storage.get_mail_message("m-sum-1").unwrap().unwrap();
+        assert!(full_loaded.is_read);
+        assert_eq!(
+            full_loaded.body_html,
+            "<p>본문 전체에 있는 SecretKeywordFullBody 내용</p>"
+        );
+        assert_eq!(
+            full_loaded.body_plain,
+            "본문 전체에 있는 SecretKeywordFullBody 내용"
+        );
+        assert_eq!(full_loaded.attachments.len(), 1);
+        assert_eq!(
+            storage
+                .search_mail_messages("SecretKeywordFullBody", Some("inbox"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_optimistic_local_mail_mutations_and_calendar_batch_delete() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_mail_folders(&[
+                MailFolder {
+                    id: "fld-inbox".to_string(),
+                    display_name: "Inbox".to_string(),
+                    well_known_name: Some("inbox".to_string()),
+                    parent_folder_id: None,
+                    unread_item_count: 1,
+                    total_item_count: 1,
+                },
+                MailFolder {
+                    id: "fld-archive".to_string(),
+                    display_name: "Archive".to_string(),
+                    well_known_name: Some("archive".to_string()),
+                    parent_folder_id: None,
+                    unread_item_count: 0,
+                    total_item_count: 0,
+                },
+            ])
+            .unwrap();
+
+        let msg = sample_mail(
+            "m-opt-1",
+            "fld-inbox",
+            "Optimistic test",
+            "Alice",
+            "alice@example.com",
+            "2026-11-18T12:00:00Z",
+            "<p>hello</p>",
+            "hello",
+        );
+        storage.upsert_mail_messages(&[msg]).unwrap();
+
+        // Mark read: unread count 1 -> 0
+        storage.set_mail_read_local("m-opt-1", true).unwrap();
+        assert!(storage.get_mail_message("m-opt-1").unwrap().unwrap().is_read);
+        let folders = storage.list_mail_folders().unwrap();
+        let inbox = folders.iter().find(|f| f.id == "fld-inbox").unwrap();
+        assert_eq!(inbox.unread_item_count, 0);
+
+        // Idempotent mark read again does not underflow or decrement
+        storage.set_mail_read_local("m-opt-1", true).unwrap();
+        let folders = storage.list_mail_folders().unwrap();
+        assert_eq!(
+            folders.iter().find(|f| f.id == "fld-inbox").unwrap().unread_item_count,
+            0
+        );
+
+        // Mark unread: 0 -> 1
+        storage.set_mail_read_local("m-opt-1", false).unwrap();
+        let folders = storage.list_mail_folders().unwrap();
+        assert_eq!(
+            folders.iter().find(|f| f.id == "fld-inbox").unwrap().unread_item_count,
+            1
+        );
+
+        // Flag toggle
+        storage.set_mail_flagged_local("m-opt-1", true).unwrap();
+        assert!(storage.get_mail_message("m-opt-1").unwrap().unwrap().flagged);
+        storage.set_mail_flagged_local("m-opt-1", false).unwrap();
+        assert!(!storage.get_mail_message("m-opt-1").unwrap().unwrap().flagged);
+
+        // Move folder by well-known name adjusts folder_id and counts
+        storage.move_mail_folder_local("m-opt-1", "archive").unwrap();
+        assert_eq!(
+            storage.get_mail_message("m-opt-1").unwrap().unwrap().folder_id.as_deref(),
+            Some("fld-archive")
+        );
+        let folders = storage.list_mail_folders().unwrap();
+        let inbox = folders.iter().find(|f| f.id == "fld-inbox").unwrap();
+        let archive = folders.iter().find(|f| f.id == "fld-archive").unwrap();
+        assert_eq!(inbox.total_item_count, 0);
+        assert_eq!(inbox.unread_item_count, 0);
+        assert_eq!(archive.total_item_count, 1);
+        assert_eq!(archive.unread_item_count, 1);
+
+        // Calendar batch delete
+        let ev1 = CalendarEvent {
+            id: "ev-b1".to_string(),
+            subject: "One".to_string(),
+            start_iso: "2026-11-18T09:00:00Z".to_string(),
+            end_iso: "2026-11-18T10:00:00Z".to_string(),
+            time_zone: "UTC".to_string(),
+            is_all_day: false,
+            location: None,
+            organizer_name: None,
+            organizer_email: None,
+            attendees: Vec::new(),
+            response_status: "accepted".to_string(),
+            is_online_meeting: false,
+            online_meeting_url: None,
+            body_html: String::new(),
+            body_plain: String::new(),
+            is_cancelled: false,
+            web_link: None,
+        };
+        let mut ev2 = ev1.clone();
+        ev2.id = "ev-b2".to_string();
+        let mut ev3 = ev1.clone();
+        ev3.id = "ev-b3".to_string();
+        storage.upsert_calendar_events(&[ev1, ev2, ev3]).unwrap();
+        storage
+            .delete_calendar_events_by_ids(&["ev-b1".to_string(), "ev-b3".to_string()])
+            .unwrap();
+        let remaining = storage.list_calendar_events(None, None, 10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "ev-b2");
     }
 }

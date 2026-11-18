@@ -11,6 +11,9 @@ use ratatui::{
     text::{Line, Span},
 };
 
+/// Upper memory budget (8 MiB) for decoded terminal inline image caches.
+pub const MAX_IMAGE_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct RenderedTerminalImage {
     pub width_px: u32,
@@ -19,6 +22,22 @@ pub struct RenderedTerminalImage {
     pub rows: u16,
     pub format_label: String,
     pub lines: Vec<Line<'static>>,
+}
+
+impl RenderedTerminalImage {
+    /// Approximate heap footprint of this rendered terminal image in bytes.
+    pub fn approx_heap_bytes(&self) -> usize {
+        let mut total = std::mem::size_of::<Self>()
+            + self.format_label.capacity()
+            + self.lines.capacity() * std::mem::size_of::<Line<'static>>();
+        for line in &self.lines {
+            total += line.spans.capacity() * std::mem::size_of::<Span<'static>>();
+            for span in &line.spans {
+                total += span.content.len();
+            }
+        }
+        total
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,5 +387,32 @@ mod tests {
     fn test_decode_rejects_invalid_bytes() {
         assert!(decode_and_render_halfblocks(b"not-an-image", 20, 10, (0, 0, 0)).is_err());
         assert!(render_ansi_stdout(b"not-an-image", 20, 10).is_err());
+    }
+
+    #[test]
+    fn test_approx_heap_bytes_scales_with_dimensions_and_is_nonzero() {
+        let empty = RenderedTerminalImage {
+            width_px: 0,
+            height_px: 0,
+            cols: 0,
+            rows: 0,
+            format_label: String::new(),
+            lines: Vec::new(),
+        };
+        assert_eq!(
+            empty.approx_heap_bytes(),
+            std::mem::size_of::<RenderedTerminalImage>()
+        );
+        assert!(empty.approx_heap_bytes() > 0);
+
+        let png = make_test_png(64, 32);
+        let small = decode_and_render_halfblocks(&png, 8, 4, (0, 0, 0)).unwrap();
+        let large = decode_and_render_halfblocks(&png, 64, 16, (0, 0, 0)).unwrap();
+
+        let small_cells = (small.cols as usize) * (small.rows as usize);
+        let large_cells = (large.cols as usize) * (large.rows as usize);
+        assert!(large_cells > small_cells);
+        assert!(small.approx_heap_bytes() > empty.approx_heap_bytes());
+        assert!(large.approx_heap_bytes() > small.approx_heap_bytes());
     }
 }

@@ -9,7 +9,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
 use super::{
-    client::{parse_retry_after_secs, GraphDeltaPage, GraphListPage},
+    client::{parse_retry_after_secs, BatchSubRequest, GraphDeltaPage, GraphListPage},
     media::{deduplicate_dest_path, sanitize_filename},
     GraphClient,
 };
@@ -21,7 +21,8 @@ const MAIL_SMALL_ATTACHMENT_LIMIT: u64 = 3 * 1024 * 1024; // 3 MiB
 const MAIL_UPLOAD_CHUNK_SIZE: usize = 3_276_800; // 3.2 MiB
 const MAX_THROTTLE_RETRIES: usize = 3;
 
-const MAIL_SELECT_FIELDS: &str = "id,conversationId,parentFolderId,subject,from,toRecipients,ccRecipients,bccRecipients,receivedDateTime,sentDateTime,isRead,isDraft,flag,importance,hasAttachments,bodyPreview,body,webLink";
+const MAIL_HEADER_SELECT_FIELDS: &str = "id,conversationId,parentFolderId,subject,from,toRecipients,ccRecipients,bccRecipients,receivedDateTime,sentDateTime,isRead,isDraft,flag,importance,hasAttachments,bodyPreview,webLink";
+const MAIL_FULL_SELECT_FIELDS: &str = "id,conversationId,parentFolderId,subject,from,toRecipients,ccRecipients,bccRecipients,receivedDateTime,sentDateTime,isRead,isDraft,flag,importance,hasAttachments,bodyPreview,body,webLink";
 
 // ---------------------------------------------------------------------------
 // Shared Graph Outlook Wire DTOs & Request Helpers
@@ -395,7 +396,7 @@ impl GraphClient {
             Some(folder) => format!("/me/mailFolders/{}/messages", urlencoding::encode(&folder)),
         };
         let mut next_url = Some(format!(
-            "{base_path}?$top={top}&$orderby=receivedDateTime desc&$select={MAIL_SELECT_FIELDS}"
+            "{base_path}?$top={top}&$orderby=receivedDateTime desc&$select={MAIL_HEADER_SELECT_FIELDS}"
         ));
         let mut messages = Vec::new();
 
@@ -430,7 +431,7 @@ impl GraphClient {
                         )
                     }
                 };
-                format!("{base_path}?$select={MAIL_SELECT_FIELDS}")
+                format!("{base_path}?$select={MAIL_HEADER_SELECT_FIELDS}")
             }
         };
 
@@ -468,6 +469,53 @@ impl GraphClient {
         );
         let raw: GraphMailMessage = self.get_json(&path).await?;
         Ok(MailMessage::from(raw))
+    }
+
+    /// Fetches full bodies and expanded attachments for multiple messages via `POST /$batch` (chunked by 20).
+    pub async fn batch_get_mail_messages(&self, message_ids: &[String]) -> Result<Vec<MailMessage>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut unique_ids = Vec::new();
+        for id in message_ids {
+            let trimmed = id.trim();
+            if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                unique_ids.push(trimmed.to_string());
+            }
+        }
+        if unique_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let requests: Vec<BatchSubRequest> = unique_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, id)| BatchSubRequest {
+                id: idx.to_string(),
+                method: "GET".to_string(),
+                url: format!(
+                    "/me/messages/{}?$select={MAIL_FULL_SELECT_FIELDS}&$expand=attachments",
+                    urlencoding::encode(id)
+                ),
+                body: None,
+                headers: None,
+            })
+            .collect();
+
+        let responses = self.batch(&requests).await?;
+        let mut by_idx: std::collections::BTreeMap<usize, MailMessage> =
+            std::collections::BTreeMap::new();
+        for resp in responses {
+            let Ok(idx) = resp.id.parse::<usize>() else {
+                continue;
+            };
+            if !(200..300).contains(&resp.status) {
+                continue;
+            }
+            if let Ok(raw) = serde_json::from_value::<GraphMailMessage>(resp.body) {
+                by_idx.insert(idx, MailMessage::from(raw));
+            }
+        }
+
+        Ok(by_idx.into_values().collect())
     }
 
     pub async fn send_mail(&self, mail: &OutgoingMail) -> Result<()> {
@@ -752,7 +800,7 @@ impl GraphClient {
         let search_val = format!("\"{escaped}\"");
         let top = limit.min(100);
         let mut next_url = Some(format!(
-            "/me/messages?$search={}&$top={top}&$select={MAIL_SELECT_FIELDS}",
+            "/me/messages?$search={}&$top={top}&$select={MAIL_HEADER_SELECT_FIELDS}",
             urlencoding::encode(&search_val)
         ));
         let mut messages = Vec::new();
@@ -1422,5 +1470,164 @@ pub(crate) mod tests {
         let hits = client.search_mail_remote("invoice \"2026\"", 10).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "m-hit");
+    }
+
+    #[test]
+    fn test_mail_select_fields_split() {
+        let header_fields: Vec<&str> = MAIL_HEADER_SELECT_FIELDS.split(',').collect();
+        let full_fields: Vec<&str> = MAIL_FULL_SELECT_FIELDS.split(',').collect();
+        assert!(!header_fields.contains(&"body"));
+        assert!(header_fields.contains(&"bodyPreview"));
+        assert!(full_fields.contains(&"body"));
+        assert!(full_fields.contains(&"bodyPreview"));
+    }
+
+    #[tokio::test]
+    async fn test_header_first_list_delta_and_batch_get_mail_messages() {
+        #[derive(Clone, Default)]
+        struct BatchState {
+            list_selects: Arc<Mutex<Vec<String>>>,
+            delta_selects: Arc<Mutex<Vec<String>>>,
+            batch_calls: Arc<Mutex<Vec<Vec<serde_json::Value>>>>,
+        }
+        let st = BatchState::default();
+        let st_check = st.clone();
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/mailFolders/{folder}/messages",
+                get(
+                    |State(s): State<BatchState>, Query(params): Query<HashMap<String, String>>| async move {
+                        s.list_selects
+                            .lock()
+                            .unwrap()
+                            .push(params.get("$select").cloned().unwrap_or_default());
+                        Json(serde_json::json!({
+                            "value": [{
+                                "id": "m-hdr-1",
+                                "subject": "Header Only",
+                                "bodyPreview": "Short preview text"
+                            }]
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/v1.0/me/mailFolders/{folder}/messages/delta",
+                get(
+                    |State(s): State<BatchState>, Query(params): Query<HashMap<String, String>>| async move {
+                        s.delta_selects
+                            .lock()
+                            .unwrap()
+                            .push(params.get("$select").cloned().unwrap_or_default());
+                        Json(serde_json::json!({
+                            "value": [{
+                                "id": "m-hdr-2",
+                                "subject": "Delta Header",
+                                "bodyPreview": "Delta preview"
+                            }],
+                            "@odata.deltaLink": "http://example.invalid/delta?tok=1"
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/v1.0/$batch",
+                post(
+                    |State(s): State<BatchState>, Json(payload): Json<serde_json::Value>| async move {
+                        let reqs = payload["requests"].as_array().cloned().unwrap_or_default();
+                        s.batch_calls.lock().unwrap().push(reqs.clone());
+                        let responses: Vec<serde_json::Value> = reqs
+                            .into_iter()
+                            .map(|r| {
+                                let req_id = r["id"].as_str().unwrap_or_default().to_string();
+                                let url = r["url"].as_str().unwrap_or_default().to_string();
+                                if url.contains("/me/messages/missing-404?") {
+                                    serde_json::json!({
+                                        "id": req_id,
+                                        "status": 404,
+                                        "body": { "error": { "code": "ErrorItemNotFound" } }
+                                    })
+                                } else {
+                                    let msg_id = url
+                                        .trim_start_matches("/me/messages/")
+                                        .split('?')
+                                        .next()
+                                        .unwrap_or_default();
+                                    serde_json::json!({
+                                        "id": req_id,
+                                        "status": 200,
+                                        "body": {
+                                            "id": msg_id,
+                                            "subject": format!("Full {msg_id}"),
+                                            "bodyPreview": "Preview",
+                                            "body": {
+                                                "contentType": "html",
+                                                "content": format!("<p>Body for {msg_id}</p>")
+                                            },
+                                            "attachments": [{
+                                                "id": "att-1",
+                                                "name": "info.txt",
+                                                "contentType": "text/plain",
+                                                "size": 4
+                                            }]
+                                        }
+                                    })
+                                }
+                            })
+                            .collect();
+                        Json(serde_json::json!({ "responses": responses }))
+                    },
+                ),
+            )
+            .with_state(st);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = test_graph_client(&format!("http://{addr}/v1.0"));
+
+        let listed = client.list_mail_messages("inbox", 10).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].body_html, "");
+        assert_eq!(listed[0].body_plain, "Short preview text");
+
+        let (delta_up, _, _) = client.delta_mail_messages("inbox", None).await.unwrap();
+        assert_eq!(delta_up.len(), 1);
+        assert_eq!(delta_up[0].body_html, "");
+        assert_eq!(delta_up[0].body_plain, "Delta preview");
+
+        let list_sels = st_check.list_selects.lock().unwrap().clone();
+        let delta_sels = st_check.delta_selects.lock().unwrap().clone();
+        assert_eq!(list_sels, vec![MAIL_HEADER_SELECT_FIELDS]);
+        assert_eq!(delta_sels, vec![MAIL_HEADER_SELECT_FIELDS]);
+
+        // Empty batch returns empty without HTTP call
+        assert!(client.batch_get_mail_messages(&[]).await.unwrap().is_empty());
+
+        // 22 unique IDs (plus duplicates, blanks, and one 404) -> 2 $batch calls (20 + 2)
+        let mut ids: Vec<String> = (0..21).map(|i| format!("msg-{i}")).collect();
+        ids.push("  msg-0  ".to_string()); // duplicate after trim
+        ids.push("   ".to_string()); // blank
+        ids.push("missing-404".to_string());
+
+        let fetched = client.batch_get_mail_messages(&ids).await.unwrap();
+        assert_eq!(fetched.len(), 21);
+        assert_eq!(fetched[0].id, "msg-0");
+        assert_eq!(fetched[0].body_html, "<p>Body for msg-0</p>");
+        assert_eq!(fetched[0].body_plain, "Body for msg-0");
+        assert_eq!(fetched[0].attachments.len(), 1);
+        assert_eq!(fetched[20].id, "msg-20");
+
+        let calls = st_check.batch_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].len(), 20);
+        assert_eq!(calls[1].len(), 2);
+        let first_url = calls[0][0]["url"].as_str().unwrap();
+        assert!(first_url.contains(&format!("$select={MAIL_FULL_SELECT_FIELDS}")));
+        assert!(first_url.contains("$expand=attachments"));
     }
 }

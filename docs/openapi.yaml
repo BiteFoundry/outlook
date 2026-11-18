@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: teams / outlook / onenote HTTP JSON API
-  version: 0.4.0
+  version: 0.5.0
   description: |
     Local HTTP/JSON contract exposed by `teams serve`, `outlook serve`, or
     `onenote serve` (alias `api`).

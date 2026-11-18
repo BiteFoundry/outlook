@@ -31,11 +31,11 @@ npx outlook inbox
 npx onenote notebooks
 ```
 
-All three commands share the exact same Entra ID login, SQLite FTS5 cache, HTTP API,
-and MCP server:
-- `teams login`, `teams chats`, `teams read <target>`, `teams send <target> <message>`, `teams notes <cmd>`, `teams tui`, `teams serve`, `teams mcp`, `teams update`
-- `outlook`, `outlook inbox`, `outlook read`, `outlook send`, `outlook reply`, `outlook cal`, `outlook contacts`, `outlook todo`, `outlook notes`, `outlook update`
-- `onenote`, `onenote notebooks`, `onenote sections`, `onenote pages`, `onenote read`, `onenote create`, `onenote append`, `onenote update`, `onenote check`, `onenote delete`, `onenote search`, `onenote resource`, `onenote self-update`
+All three commands share the exact same Entra ID login, SQLite FTS5 cache, background sync daemon (`teams daemon start | status | stop | restart`), HTTP API,
+and MCP server (read commands also support `--cached` / `--fast` for instant local cache reads, or run with zero Graph round-trips while the daemon is warm):
+- `teams login`, `teams chats`, `teams read <target>`, `teams send <target> <message>`, `teams notes <cmd>`, `teams daemon <start|status|stop|restart>`, `teams tui`, `teams serve`, `teams mcp`, `teams update`
+- `outlook`, `outlook inbox`, `outlook read`, `outlook send`, `outlook reply`, `outlook cal`, `outlook contacts`, `outlook todo`, `outlook notes`, `outlook daemon <start|status|stop|restart>`, `outlook update`
+- `onenote`, `onenote notebooks`, `onenote sections`, `onenote pages`, `onenote read`, `onenote create`, `onenote append`, `onenote update`, `onenote check`, `onenote delete`, `onenote search`, `onenote resource`, `onenote daemon <start|status|stop|restart>`, `onenote self-update`
 
 ## Supported platforms
 
@@ -102,8 +102,8 @@ version because the root package pins its platform packages exactly.
 Tag the release with a matching `v` prefix:
 
 ```sh
-git tag v0.4.0
-git push origin v0.4.0
+git tag v0.5.0
+git push origin v0.5.0
 ```
 
 ## Publishing
@@ -195,6 +195,9 @@ token_refresh_mins = 5
 | `TEAMS_CONFIG_DIR` | Override config/credentials directory |
 | `TEAMS_DATA_DIR` | Override SQLite cache (`cache.db`) directory |
 | `TEAMS_NO_BROWSER` | Disable automatic browser launch during login (`1` / `true`) |
+| `TEAMS_CLI_CACHE_SECS` | CLI read cache TTL in seconds (default `0`; `--cached` / `--fast` forces cache-first reads) |
+| `TEAMS_BACKGROUND_ALL` | Poll inactive personas/domains in background on TUI startup (`1` / `true`, default `false`) |
+| `TEAMS_AUTO_DAEMON` | Auto-start/attach to the background sync daemon (`1` / `true`, or `config.toml`: `auto_daemon = true`, default `false`) |
 
 ## Troubleshooting
 

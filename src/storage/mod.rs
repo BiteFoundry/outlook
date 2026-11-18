@@ -106,6 +106,20 @@ impl Storage {
         self.trigram_enabled
     }
 
+    /// Releases unused SQLite page-cache memory back to the OS (`PRAGMA shrink_memory`).
+    pub fn shrink_memory(&self) {
+        if let Ok(conn) = self.conn.lock() {
+            db::shrink_connection_memory(&conn);
+        }
+        if let Some(pool) = &self.readers {
+            if let Ok(guard) = pool.lock() {
+                for c in guard.iter() {
+                    db::shrink_connection_memory(c);
+                }
+            }
+        }
+    }
+
     fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>> {
         self.conn
             .lock()
@@ -289,9 +303,34 @@ impl Storage {
         outlook::list_mail_messages(&conn, folder_id_or_wellknown, limit)
     }
 
+    /// Lightweight header-only projection for TUI/CLI folder lists (skips reading large HTML/plain/attachment blobs).
+    pub fn list_mail_summaries(
+        &self,
+        folder_id_or_wellknown: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MailMessage>> {
+        let conn = self.read_conn()?;
+        outlook::list_mail_summaries(&conn, folder_id_or_wellknown, limit)
+    }
+
     pub fn get_mail_message(&self, message_id: &str) -> Result<Option<MailMessage>> {
         let conn = self.read_conn()?;
         outlook::get_mail_message(&conn, message_id)
+    }
+
+    pub fn set_mail_read_local(&self, message_id: &str, is_read: bool) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        outlook::set_mail_read_local(&mut conn, message_id, is_read)
+    }
+
+    pub fn set_mail_flagged_local(&self, message_id: &str, flagged: bool) -> Result<()> {
+        let conn = self.lock_conn()?;
+        outlook::set_mail_flagged_local(&conn, message_id, flagged)
+    }
+
+    pub fn move_mail_folder_local(&self, message_id: &str, target_folder_id: &str) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        outlook::move_mail_folder_local(&mut conn, message_id, target_folder_id)
     }
 
     pub fn delete_mail_messages_by_ids(&self, ids: &[String]) -> Result<()> {
@@ -327,6 +366,11 @@ impl Storage {
     pub fn delete_calendar_event(&self, event_id: &str) -> Result<()> {
         let conn = self.lock_conn()?;
         outlook::delete_calendar_event(&conn, event_id)
+    }
+
+    pub fn delete_calendar_events_by_ids(&self, ids: &[String]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        outlook::delete_calendar_events_by_ids(&mut conn, ids)
     }
 
     pub fn upsert_contacts(&self, contacts: &[ContactItem]) -> Result<()> {
@@ -969,5 +1013,54 @@ mod tests {
         storage.upsert_messages(&[m1]).unwrap();
         assert!(storage.get_message(&conv_key, "m1").unwrap().unwrap().deleted);
         assert!(storage.search_messages("PostgreSQL", None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_shrink_memory_in_memory_and_file_backed_with_reader_pool() {
+        // 1) In-memory Storage (writer connection only)
+        let mem = Storage::open_in_memory().unwrap();
+        let chat = sample_chat("c-mem-shrink", "메모리 축소", false, None);
+        mem.upsert_conversations(&[chat]).unwrap();
+        mem.shrink_memory();
+        assert_eq!(mem.list_conversations().unwrap().len(), 1);
+
+        // 2) File-backed WAL Storage with active pooled reader connections
+        let dir = tempfile::tempdir().unwrap();
+        let db_file = dir.path().join("shrink.db");
+        let wal = Storage::open(&db_file).unwrap();
+        let wal_chat = sample_chat("c-wal-shrink", "WAL 축소", false, None);
+        let conv_key = wal_chat.conv_key.clone();
+        wal.upsert_conversations(&[wal_chat]).unwrap();
+        let msg = sample_msg(
+            &conv_key,
+            "m1",
+            None,
+            "홍길동",
+            "SQLite shrink_memory 테스트 본문",
+            None,
+            "2026-11-15T12:00:00Z",
+        );
+        wal.upsert_messages(&[msg]).unwrap();
+
+        // Populate pooled reader connections before calling shrink_memory
+        assert_eq!(wal.list_conversations().unwrap().len(), 1);
+        assert_eq!(wal.list_root_messages(&conv_key, 10, None).unwrap().len(), 1);
+        let pooled_count = wal.readers.as_ref().unwrap().lock().unwrap().len();
+        assert!(pooled_count >= 1);
+
+        wal.shrink_memory();
+
+        // Both writer and pooled readers continue operating cleanly afterwards
+        let msg2 = sample_msg(
+            &conv_key,
+            "m2",
+            None,
+            "김철수",
+            "shrink_memory 이후 후속 읽기/쓰기 확인",
+            None,
+            "2026-11-15T12:05:00Z",
+        );
+        wal.upsert_messages(&[msg2]).unwrap();
+        assert_eq!(wal.list_root_messages(&conv_key, 10, None).unwrap().len(), 2);
     }
 }

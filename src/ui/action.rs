@@ -472,18 +472,19 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             } else {
                 ui.persona = Persona::Teams;
             }
+            app.ensure_tab_domain_activated(ui, ui.active_nav_tab);
         }
         Action::SelectNavRow(idx) => {
             app.select_nav_row(ui, idx);
         }
         Action::NavFirst => {
-            let len = nav_pane::build_nav_rows(app, ui).len();
+            let len = nav_pane::nav_row_count(app, ui);
             if len > 0 {
                 ui.nav_selected = 0;
             }
         }
         Action::NavLast => {
-            let len = nav_pane::build_nav_rows(app, ui).len();
+            let len = nav_pane::nav_row_count(app, ui);
             if len > 0 {
                 ui.nav_selected = len - 1;
             }
@@ -1026,6 +1027,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     ui.info("OneNote 워크스페이스 모드로 전환했습니다");
                 }
             }
+            app.ensure_tab_domain_activated(ui, ui.active_nav_tab);
             ui.set_focus(Focus::Nav);
         }
         Action::ToggleInlineImages => {
@@ -1252,6 +1254,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::TodoFocusInput => {
             ui.active_nav_tab = TAB_TODO;
+            app.ensure_tab_domain_activated(ui, TAB_TODO);
             ui.narrow_pane = NarrowPane::Chat;
             ui.set_focus(Focus::Chat);
             ui.todo_input_active = true;
@@ -1277,6 +1280,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             if let Some(hit) = app.mail_search_results.get(idx).cloned() {
                 ui.active_nav_tab = TAB_MAIL;
                 ui.persona = Persona::Outlook;
+                app.ensure_tab_domain_activated(ui, TAB_MAIL);
                 app.select_mail(ui, hit.id);
                 ui.narrow_pane = NarrowPane::Chat;
                 ui.set_focus(Focus::Chat);
@@ -1286,6 +1290,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             if let Some(contact) = app.contact_search_results.get(idx).cloned() {
                 ui.active_nav_tab = TAB_CONTACTS;
                 ui.persona = Persona::Outlook;
+                app.ensure_tab_domain_activated(ui, TAB_CONTACTS);
                 if !app.contacts.iter().any(|c| c.id == contact.id) {
                     app.contacts.insert(0, contact.clone());
                 }
@@ -1534,7 +1539,7 @@ fn selected_message_scope_and_index(
 fn move_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
     match ui.focus() {
         Focus::Nav => {
-            let len = nav_pane::build_nav_rows(app, ui).len();
+            let len = nav_pane::nav_row_count(app, ui);
             if len == 0 {
                 return;
             }

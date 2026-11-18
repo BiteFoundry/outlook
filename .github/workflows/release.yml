@@ -184,6 +184,7 @@ jobs:
           test -f bin/teams.js
           test -f bin/outlook.js
           test -f bin/onenote.js
+          test -f scripts/postinstall.mjs
           test -f dist/teams-win32-x64/bin/teams.exe
           test -f dist/teams-win32-arm64/bin/teams.exe
           test -f dist/teams-darwin-x64/bin/teams
