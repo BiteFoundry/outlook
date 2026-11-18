@@ -43,7 +43,7 @@
 - **Minimal-Chrome Responsive TUI (`ratatui`)**: 3-tier responsive layout (`Wide >= 120`, `Medium 80..119`, `Narrow < 80`), **Composer-First** input workflow, Cozy 5-minute author grouping and Compact gutter density (`Ctrl+D`), `─── N unread messages ───` divider, unified `Ctrl+K` Omni-Switcher, and colorblind-safe multi-depth themes (`NO_COLOR`, `Ansi16`, `Ansi256`, Truecolor Dark/Light).
 - **Deep History Pagination (`@odata.nextLink`)**: Persists Microsoft Graph `$skiptoken` cursors in SQLite `sync_cursors` with deterministic timestamp tie-breaking, automatic recovery on expired tokens, CLI `teams read --before` / `teams sync --depth`, and seamless TUI scroll-up backfill.
 - **Local SQLite WAL + FTS5 Cache & Daemon**: Stores chats, channels, threads, and messages locally in `cache.db` for instant hybrid trigram + `LIKE` offline search (`teams search`) and sub-5ms CLI reads when `teams daemon` is running.
-- **Inline Terminal Image Preview (`v` / `teams preview`)**: Multi-protocol high-resolution rendering for PNG, JPEG, GIF, and WebP attachments with automatic terminal detection & routing across **Windows, Linux, and macOS** (**Kitty Graphics Protocol**, **iTerm2 `OSC 1337`**, **Sixel `DCS q`**, and **24-bit Unicode Half-Blocks (`▀`)** fallback).
+- **Inline Terminal Image Preview (`v` / `Alt+v` / click / `teams preview`)**: Multi-protocol high-resolution rendering for PNG, JPEG, GIF, WebP, and pasted `hostedContents` inline screenshots with automatic viewport thumbnails, terminal detection & routing across **Windows, Linux, and macOS** (**Kitty Graphics Protocol**, **iTerm2 `OSC 1337`**, **Sixel `DCS q`**, and **24-bit Unicode Half-Blocks (`▀`)** fallback).
 - **Automatic JWT Scope Diagnostics**: `teams whoami`, `teams doctor`, and `403 Forbidden` handlers inspect JWT `scp`/`roles` claims to flag restricted tokens (such as `Chat.ReadBasic`-only tokens that cannot read message bodies).
 - **AI Agent Automation (`teams serve` & `teams mcp`)**: Local Axum HTTP JSON API (`127.0.0.1:8788`, optional `--token` Bearer auth) and newline-delimited stdio JSON-RPC 2.0 MCP server exposing 17 Microsoft Teams tools.
 - **Cross-Platform & AlmaLinux 8 Ready**: Single static binary (bundled SQLite + `rustls`, zero OpenSSL dev dependencies). Prebuilt Linux binaries target **GLIBC 2.28** (`AlmaLinux 8`, `RHEL 8+`, `Rocky Linux 8+`, `Ubuntu 20.04+`, `Debian 10+`).
@@ -271,7 +271,7 @@ Additional composer, message, and history controls:
 | | `Esc` | Cancel reply/mention popup or return focus to message stream |
 | **Message Stream** | `t` / `Enter` | Open thread drawer for selected channel post |
 | | `r` | Quote-reply / reply to selected message |
-| | `v` | Open inline terminal image preview (`+`/`-`/`0`/scroll zoom, `p` cycle protocol, `[`/`]` prev/next, `d` save) |
+| | `v` / `Alt+v` | Open inline terminal image preview (`Alt+v` works directly from Composer too; `+`/`-`/`0`/scroll zoom, `p` cycle protocol, `[`/`]` prev/next, `d` save) |
 | | `e` / `+` / `=` | Open reaction picker (`like`, `heart`, `laugh`, `surprised`, `sad`, `angry`) |
 | | `d` / `[` / `]` | Download attachment / cycle attachments |
 | | `y` | Copy selected message body |
@@ -286,12 +286,12 @@ Additional composer, message, and history controls:
 
 - Scrolling to the top of any chat or channel (`PgUp`, `Up`, or mouse wheel up) automatically fetches older pages via `@odata.nextLink` while anchoring your scroll position. Press `o` to fetch one page on demand or `H` for a 150+ message deep backfill.
 - Scrolling to the bottom of the **Chats** list automatically pages beyond the initial 50 conversations.
-- Pressing `v` on a message with an image attachment opens a high-resolution inline preview with automatic terminal detection and routing across **Windows, Linux, and macOS**:
+- Pressing `v` (or `Alt+v` directly from the Composer, or left-clicking an `[IMG ...]` chip or inline thumbnail) on a message with an image attachment or pasted `hostedContents` screenshot opens a high-resolution inline preview with automatic terminal detection and routing across **Windows, Linux, and macOS**:
   - **Kitty Graphics Protocol** (Kitty, Ghostty)
   - **iTerm2 Inline Images (`OSC 1337`)** (WezTerm on Windows/Linux/macOS, iTerm2 on macOS, Rio, Mintty)
   - **Sixel (`DCS q`)** (Windows Terminal v1.22+, foot, Contour, mlterm)
   - **24-bit Unicode Half-Blocks (`▀`)** universal fallback (tmux/SSH/legacy consoles and fast-scrolling inline chat thumbnails)
-- **TUI Image Preview Controls**: `v` to open, `+` / `-` / `0` or mouse wheel to zoom, `p` to cycle protocol live (`auto` / `kitty` / `iterm2` / `sixel` / `halfblock`), `[` / `]` for previous/next attachment, and `d` to save to disk.
+- **TUI Image Preview Controls**: `v` / `Alt+v` or click `[IMG ...]` / thumbnail to open, `+` / `-` / `0` or mouse wheel to zoom, `p` to cycle protocol live (`auto` / `kitty` / `iterm2` / `sixel` / `halfblock`), `[` / `]` for previous/next attachment, and `d` to save to disk.
 - Configure the default globally via `image_protocol = "auto"` in `config.toml`, `TEAMS_IMAGE_PROTOCOL`, or per-command via `teams preview --protocol <PROTOCOL>` (and inspect detected capabilities with `teams doctor`).
 
 ---

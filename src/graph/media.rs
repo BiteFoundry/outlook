@@ -292,14 +292,15 @@ impl GraphClient {
             .unwrap_or_else(|| format!("attachment_{}", attachment.id));
 
         let safe_name = sanitize_filename(&raw_name);
-        let dest_path = deduplicate_dest_path(dest_dir, &safe_name);
-        let final_name = dest_path
+        let mut dest_path = deduplicate_dest_path(dest_dir, &safe_name);
+        let mut final_name = dest_path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(&safe_name)
             .to_string();
 
         let is_hosted = content_url.contains("/hostedContents/")
+            || content_url.starts_with("hostedContents/")
             || attachment.content_type.eq_ignore_ascii_case("hostedContent");
         let fallback_bearer = should_send_bearer(&self.config.graph_base_url, content_url);
 
@@ -318,6 +319,16 @@ impl GraphClient {
                 }
             }
         };
+
+        if is_hosted {
+            if let Some((new_path, new_name)) =
+                maybe_refine_hosted_image_extension(&dest_path, dest_dir, &safe_name, &final_name)
+                    .await
+            {
+                dest_path = new_path;
+                final_name = new_name;
+            }
+        }
 
         Ok(DownloadedFile {
             path: dest_path,
@@ -350,6 +361,7 @@ impl GraphClient {
             .or_else(|| filename_from_url(content_url))
             .unwrap_or_else(|| format!("attachment_{}", attachment.id));
         let is_hosted = content_url.contains("/hostedContents/")
+            || content_url.starts_with("hostedContents/")
             || attachment.content_type.eq_ignore_ascii_case("hostedContent");
         let fallback_bearer = should_send_bearer(&self.config.graph_base_url, content_url);
         let bytes = if is_hosted {
@@ -380,8 +392,11 @@ impl GraphClient {
 
 pub(crate) fn should_send_bearer(graph_base_url: &str, target_url: &str) -> bool {
     let trimmed = target_url.trim();
-    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+    if trimmed.starts_with('/') && !trimmed.starts_with("//") {
         return true;
+    }
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return !trimmed.starts_with("//") && !trimmed.contains("://") && !trimmed.is_empty();
     }
     let Ok(target) = url::Url::parse(trimmed) else {
         return false;
@@ -513,6 +528,65 @@ pub(crate) fn deduplicate_dest_path(dest_dir: &Path, safe_name: &str) -> PathBuf
     dest_dir.join(format!("{stem}_{}", Uuid::new_v4()))
 }
 
+async fn maybe_refine_hosted_image_extension(
+    dest_path: &Path,
+    dest_dir: &Path,
+    safe_name: &str,
+    final_name: &str,
+) -> Option<(PathBuf, String)> {
+    let cur_ext = Path::new(safe_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let is_generic = cur_ext.is_empty()
+        || safe_name.starts_with("inline-image-")
+        || safe_name.starts_with("attachment_");
+    if !is_generic {
+        return None;
+    }
+
+    let mut header = [0u8; 16];
+    let n = {
+        let mut f = tokio::fs::File::open(dest_path).await.ok()?;
+        let mut read = 0usize;
+        while read < header.len() {
+            let chunk = f.read(&mut header[read..]).await.ok()?;
+            if chunk == 0 {
+                break;
+            }
+            read += chunk;
+        }
+        read
+    };
+    if n < 3 {
+        return None;
+    }
+
+    let detected_ext = match image::guess_format(&header[..n]).ok()? {
+        image::ImageFormat::Png => "png",
+        image::ImageFormat::Jpeg => "jpg",
+        image::ImageFormat::Gif => "gif",
+        image::ImageFormat::WebP => "webp",
+        _ => return None,
+    };
+
+    if cur_ext.eq_ignore_ascii_case(detected_ext)
+        || (cur_ext.eq_ignore_ascii_case("jpeg") && detected_ext == "jpg")
+    {
+        return None;
+    }
+
+    let candidate_path = Path::new(final_name).with_extension(detected_ext);
+    let candidate_name = candidate_path.file_name()?.to_str()?;
+    let target_path = deduplicate_dest_path(dest_dir, candidate_name);
+    tokio::fs::rename(dest_path, &target_path).await.ok()?;
+    let target_name = target_path
+        .file_name()
+        .and_then(|s| s.to_str())?
+        .to_string();
+    Some((target_path, target_name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,9 +645,15 @@ mod tests {
     fn test_should_send_bearer_origin_guard() {
         let base = "https://graph.microsoft.com/v1.0";
         assert!(should_send_bearer(base, "/me/drive/items/1/content"));
+        assert!(should_send_bearer(
+            base,
+            "/chats/c1/messages/m1/hostedContents/1/$value"
+        ));
         assert!(should_send_bearer(base, "https://graph.microsoft.com/v1.0/shares/123"));
         assert!(should_send_bearer(base, "https://cdn.microsoft.com/file.bin"));
         assert!(!should_send_bearer(base, "https://evil.example.com/steal"));
+        assert!(!should_send_bearer(base, "https://evil.example.com/x.png"));
+        assert!(!should_send_bearer(base, "//evil.example.com/x.png"));
         assert!(!should_send_bearer(base, "https://contoso.sharepoint.com/sites/a/doc.pdf"));
         assert!(!should_send_bearer(base, "http://graph.microsoft.com/v1.0/me"));
 
@@ -723,5 +803,75 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("exceeds in-memory limit"));
+    }
+
+    #[tokio::test]
+    async fn test_download_hosted_image_sends_bearer_and_sniffs_jpeg_extension() {
+        use axum::{
+            http::{header, HeaderMap, StatusCode},
+            routing::get,
+            Router,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let saw_auth = Arc::new(Mutex::new(Option::<String>::None));
+        let saw_auth_clone = saw_auth.clone();
+        // Minimal JPEG header + dummy bytes
+        let jpeg_bytes = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01];
+        let jpeg_clone = jpeg_bytes.clone();
+
+        let app = Router::new().route(
+            "/v1.0/chats/c1/messages/m1/hostedContents/1/$value",
+            get(move |headers: HeaderMap| {
+                let saw = saw_auth_clone.clone();
+                let payload = jpeg_clone.clone();
+                async move {
+                    *saw.lock().unwrap() = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    (StatusCode::OK, payload)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tok = crate::auth::StoredTokens {
+            access_token: "hosted-secret-token".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("u1".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = crate::auth::AuthManager::from_tokens(cfg.clone(), tok);
+        let client = GraphClient::new(cfg, auth).unwrap();
+
+        let dir = tempdir().unwrap();
+        let att = AttachmentInfo {
+            id: "hosted:1".into(),
+            content_type: "hostedContent".into(),
+            content_url: Some("/chats/c1/messages/m1/hostedContents/1/$value".into()),
+            name: Some("inline-image-1.png".into()),
+            content_json: None,
+            thumbnail_url: None,
+        };
+        let dl = client.download_attachment(&att, dir.path()).await.unwrap();
+        assert_eq!(dl.file_name, "inline-image-1.jpg");
+        assert!(dl.path.ends_with("inline-image-1.jpg"));
+        assert_eq!(std::fs::read(&dl.path).unwrap(), jpeg_bytes);
+        assert_eq!(
+            saw_auth.lock().unwrap().as_deref(),
+            Some("Bearer hosted-secret-token")
+        );
     }
 }

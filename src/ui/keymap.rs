@@ -298,6 +298,7 @@ impl Keymap {
         map.bind(any, Char('2'), M::CONTROL, Action::SelectNavTab(1));
         map.bind(any, Char('3'), M::CONTROL, Action::SelectNavTab(2));
         map.bind(any, Char('v'), M::NONE, Action::OpenImagePreview);
+        map.bind(any, Char('v'), M::ALT, Action::OpenImagePreview);
 
         // Overlays & Teams actions
         map.bind(
@@ -573,6 +574,13 @@ mod tests {
                 key(KeyCode::Char('X'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)
             ),
             Some(Action::ClearPendingImages)
+        );
+        assert_eq!(
+            map.resolve(
+                Focus::Composer,
+                key(KeyCode::Char('v'), KeyModifiers::ALT)
+            ),
+            Some(Action::OpenImagePreview)
         );
     }
 }

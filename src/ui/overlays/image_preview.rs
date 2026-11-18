@@ -65,7 +65,7 @@ impl ImagePreviewOverlay {
     pub fn from_teams_message(msg: &MessageItem, preferred_att_idx: Option<usize>) -> Option<Self> {
         let mut items = Vec::new();
         let mut start = 0usize;
-        for (raw_idx, att) in msg.attachments.iter().enumerate() {
+        for (raw_idx, att) in msg.effective_attachments().iter().enumerate() {
             if img_preview::is_image_mime_or_name(&att.content_type, att.name.as_deref()) {
                 if preferred_att_idx == Some(raw_idx) {
                     start = items.len();
@@ -616,5 +616,20 @@ mod tests {
         assert_eq!(unskipped_border, 1);
 
         app.sync_ctrl.request(crate::sync::SyncCommand::Shutdown);
+    }
+
+    #[test]
+    fn from_teams_message_extracts_inline_hosted_content_screenshot() {
+        let mut msg = teams_msg_with_attachments();
+        msg.msg_id = "m1".to_string();
+        msg.attachments.clear();
+        msg.body_html =
+            "<p>Look:</p><img src=\"https://graph.microsoft.com/v1.0/chats/c1/messages/m1/hostedContents/1/$value\">"
+                .to_string();
+
+        let overlay = ImagePreviewOverlay::from_teams_message(&msg, None)
+            .expect("inline hostedContents img must produce preview overlay");
+        assert_eq!(overlay.items.len(), 1);
+        assert_eq!(overlay.current().unwrap().att_id(), "hosted:1");
     }
 }

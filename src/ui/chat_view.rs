@@ -187,6 +187,33 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut AppState, ui: &mut UiState,
     let offset = ui.chat_scroll.offset(height);
     ui.chat_scroll.offset = offset;
 
+    if ui.inline_images {
+        let width = (message_area.width as usize).max(12);
+        let thumb_cols = width.saturating_sub(4).clamp(16, 40) as u16;
+        let thumb_rows = 10u16;
+        let vis_start = offset.saturating_sub(20);
+        let vis_end = offset.saturating_add(height).saturating_add(20);
+        let mut to_fetch = Vec::new();
+        for (msg_idx, &(r_start, r_end)) in cached.ranges.iter().enumerate() {
+            if r_end > vis_start && r_start < vis_end {
+                if let Some(msg) = app.messages.get(msg_idx) {
+                    let eff = msg.effective_attachments();
+                    for att in eff.iter() {
+                        if img_preview::is_image_mime_or_name(
+                            &att.content_type,
+                            att.name.as_deref(),
+                        ) {
+                            to_fetch.push((msg.msg_id.clone(), att.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        for (msg_id, att) in to_fetch {
+            app.request_teams_image(msg_id, att, thumb_cols, thumb_rows);
+        }
+    }
+
     let is_channel = app
         .active_conversation()
         .is_some_and(|c| c.kind == ConversationKind::Channel)
@@ -683,8 +710,9 @@ pub(crate) fn hash_message_sig(h: &mut DualHasher, msg: &MessageItem) {
         h.write_str(&m.user_id);
         h.write_str(&m.display_name);
     }
-    h.write_hash(&msg.attachments.len());
-    for att in &msg.attachments {
+    let eff_attachments = msg.effective_attachments();
+    h.write_hash(&eff_attachments.len());
+    for att in eff_attachments.iter() {
         h.write_str(&att.id);
         match &att.name {
             Some(name) => {
@@ -857,24 +885,6 @@ pub(crate) fn build_stream_cached(
 
     let thumb_cols = width.saturating_sub(4).clamp(16, 40) as u16;
     let thumb_rows = 10u16;
-    if ui.inline_images {
-        let len = app.messages.len();
-        let start = len.saturating_sub(15);
-        let to_fetch: Vec<(String, AttachmentInfo)> = app.messages[start..]
-            .iter()
-            .flat_map(|m| {
-                m.attachments
-                    .iter()
-                    .filter(|att| {
-                        img_preview::is_image_mime_or_name(&att.content_type, att.name.as_deref())
-                    })
-                    .map(move |att| (m.msg_id.clone(), att.clone()))
-            })
-            .collect();
-        for (msg_id, att) in to_fetch {
-            app.request_teams_image(msg_id, att, thumb_cols, thumb_rows);
-        }
-    }
 
     let mut view = ChatRender::from_app(app, ui);
     view.selected_index = None;
@@ -1684,8 +1694,10 @@ fn render_message_body_and_attachments(
     msg: &MessageItem,
     bctx: &BodyBlockCtx<'_>,
 ) -> bool {
+    let eff_attachments = msg.effective_attachments();
+    let attachments = eff_attachments.as_ref();
     let parsed_blocks =
-        parser::parse_message_blocks_arc(&msg.body_html, &msg.attachments, &msg.mentions);
+        parser::parse_message_blocks_arc(&msg.body_html, attachments, &msg.mentions);
     let fallback_blocks;
     let blocks: &[RichBlock] = if parsed_blocks.is_empty() && !msg.body_plain.trim().is_empty() {
         fallback_blocks = [RichBlock::Paragraph(vec![RichSpan::plain(&msg.body_plain)])];
@@ -1702,14 +1714,14 @@ fn render_message_body_and_attachments(
         match block {
             RichBlock::AttachmentChip { id, name } => {
                 ended_with_text = false;
-                let attach_idx = resolve_attachment_index(&msg.attachments, Some(id.as_str()), None)
+                let attach_idx = resolve_attachment_index(attachments, Some(id.as_str()), None)
                     .unwrap_or(0);
                 emitted_attach_indices.push(attach_idx);
                 let display_name = name
                     .as_deref()
-                    .or_else(|| msg.attachments.get(attach_idx).and_then(|a| a.name.as_deref()))
+                    .or_else(|| attachments.get(attach_idx).and_then(|a| a.name.as_deref()))
                     .unwrap_or("attachment");
-                let is_img = msg.attachments.get(attach_idx).is_some_and(|a| {
+                let is_img = attachments.get(attach_idx).is_some_and(|a| {
                     img_preview::is_image_mime_or_name(&a.content_type, a.name.as_deref())
                 });
                 let tag = if is_img { "IMG " } else { "FILE " };
@@ -1738,8 +1750,7 @@ fn render_message_body_and_attachments(
                         },
                     )],
                 ));
-                if let (Some(cache), Some(att)) = (bctx.image_cache, msg.attachments.get(attach_idx))
-                {
+                if let (Some(cache), Some(att)) = (bctx.image_cache, attachments.get(attach_idx)) {
                     if is_img && !emitted_thumb_ids.contains(&att.id) {
                         emitted_thumb_ids.push(att.id.clone());
                         emit_inline_thumb(
@@ -1751,16 +1762,17 @@ fn render_message_body_and_attachments(
                             bctx.indent,
                             bctx.width,
                             bctx.theme,
-                            bctx.target,
+                            bctx.scope,
+                            bctx.msg_index,
+                            attach_idx,
                         );
                     }
                 }
             }
             RichBlock::InlineImageChip { src, index } => {
                 ended_with_text = false;
-                let attach_idx =
-                    resolve_attachment_index(&msg.attachments, None, Some(src.as_str()))
-                        .unwrap_or(*index);
+                let attach_idx = resolve_attachment_index(attachments, None, Some(src.as_str()))
+                    .unwrap_or(*index);
                 emitted_attach_indices.push(attach_idx);
                 let chip = format!("[IMG #{}]", index + 1);
                 let max_chip_w = bctx.width.saturating_sub(bctx.indent_col as usize);
@@ -1784,8 +1796,7 @@ fn render_message_body_and_attachments(
                         },
                     )],
                 ));
-                if let (Some(cache), Some(att)) = (bctx.image_cache, msg.attachments.get(attach_idx))
-                {
+                if let (Some(cache), Some(att)) = (bctx.image_cache, attachments.get(attach_idx)) {
                     if !emitted_thumb_ids.contains(&att.id) {
                         emitted_thumb_ids.push(att.id.clone());
                         emit_inline_thumb(
@@ -1797,7 +1808,9 @@ fn render_message_body_and_attachments(
                             bctx.indent,
                             bctx.width,
                             bctx.theme,
-                            bctx.target,
+                            bctx.scope,
+                            bctx.msg_index,
+                            attach_idx,
                         );
                     }
                 }
@@ -1826,7 +1839,7 @@ fn render_message_body_and_attachments(
     }
 
     // Emit any remaining file/reference attachments not already emitted by parser blocks
-    for (idx, att) in msg.attachments.iter().enumerate() {
+    for (idx, att) in attachments.iter().enumerate() {
         if emitted_attach_indices.contains(&idx) {
             continue;
         }
@@ -1878,7 +1891,9 @@ fn render_message_body_and_attachments(
                     bctx.indent,
                     bctx.width,
                     bctx.theme,
-                    bctx.target,
+                    bctx.scope,
+                    bctx.msg_index,
+                    idx,
                 );
             }
         }
@@ -1897,10 +1912,17 @@ fn emit_inline_thumb(
     indent: &str,
     width: usize,
     theme: &Theme,
-    target: HitTarget,
+    scope: MessageScope,
+    msg_index: usize,
+    attach_idx: usize,
 ) {
     let key = AppState::image_cache_key(msg_id, &att.id, thumb_dims.0, thumb_dims.1);
     if let Some(rendered) = cache.get(&key) {
+        let target = HitTarget::Attachment {
+            scope,
+            msg_index,
+            attach_index: attach_idx,
+        };
         for thumb_line in &rendered.lines {
             let mut full = Vec::new();
             if !indent.is_empty() {
@@ -1910,7 +1932,7 @@ fn emit_inline_thumb(
             out.push(RenderedLine::clickable(Line::from(full), target));
         }
         let meta = format!(
-            "↳ {}x{} ({}) · press v to preview",
+            "↳ {}x{} ({}) · click or Alt+v for HD preview",
             rendered.width_px, rendered.height_px, rendered.format_label
         );
         let max_w = width.saturating_sub(UnicodeWidthStr::width(indent));
@@ -2391,6 +2413,21 @@ fn render_rich_blocks_inner(
     }
 }
 
+fn extract_hosted_content_id(src: &str) -> Option<&str> {
+    let idx = src.find("hostedContents/")?;
+    if idx > 0 && src.as_bytes()[idx - 1] != b'/' {
+        return None;
+    }
+    let rest = &src[idx + "hostedContents/".len()..];
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let seg = &rest[..end];
+    if seg.is_empty() {
+        None
+    } else {
+        Some(seg)
+    }
+}
+
 fn resolve_attachment_index(
     attachments: &[AttachmentInfo],
     id: Option<&str>,
@@ -2407,6 +2444,18 @@ fn resolve_attachment_index(
             .position(|a| a.content_url.as_deref() == Some(src))
         {
             return Some(pos);
+        }
+        if let Some(seg) = extract_hosted_content_id(src) {
+            let hosted_id = format!("hosted:{seg}");
+            if let Some(pos) = attachments.iter().position(|a| {
+                a.id == hosted_id
+                    || a.content_url
+                        .as_deref()
+                        .and_then(extract_hosted_content_id)
+                        == Some(seg)
+            }) {
+                return Some(pos);
+            }
         }
     }
     None
@@ -3084,5 +3133,115 @@ mod tests {
         let more_text: String = more.line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(more_text.contains("o / H"));
         assert_eq!(more.target, Some(HitTarget::LoadOlderMessages));
+    }
+
+    #[test]
+    fn resolve_attachment_index_matches_hosted_content_segment_accurately() {
+        let attachments = vec![
+            AttachmentInfo {
+                id: "hosted:10".into(),
+                content_type: "image/png".into(),
+                content_url: Some("/chats/c1/messages/m1/hostedContents/10/$value".into()),
+                name: Some("image10.png".into()),
+                content_json: None,
+                thumbnail_url: None,
+            },
+            AttachmentInfo {
+                id: "hosted:1".into(),
+                content_type: "image/png".into(),
+                content_url: Some("/chats/c1/messages/m1/hostedContents/1/$value".into()),
+                name: Some("image1.png".into()),
+                content_json: None,
+                thumbnail_url: None,
+            },
+        ];
+
+        assert_eq!(
+            resolve_attachment_index(&attachments, None, Some("../hostedContents/1/$value")),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_attachment_index(
+                &attachments,
+                None,
+                Some("https://graph.microsoft.com/v1.0/chats/c1/messages/m1/hostedContents/1/$value")
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_attachment_index(&attachments, None, Some("../hostedContents/10/$value")),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn inline_hosted_content_renders_clickable_thumb_and_caption() {
+        let mut msg = sample_msg("m1", None, 0);
+        msg.conv_key = "chat:c1".into();
+        msg.msg_key = "chat:c1|m1".into();
+        msg.attachments.clear();
+        msg.reactions.clear();
+        msg.body_html =
+            "<p>Look:</p><img src=\"https://graph.microsoft.com/v1.0/chats/c1/messages/m1/hostedContents/1/$value\">"
+                .into();
+        msg.body_plain = "Look:".into();
+
+        let thumb_dims = (24u16, 10u16);
+        let cache_key = AppState::image_cache_key("m1", "hosted:1", thumb_dims.0, thumb_dims.1);
+        let mut cache = HashMap::new();
+        cache.insert(
+            cache_key,
+            RenderedTerminalImage {
+                width_px: 100,
+                height_px: 80,
+                cols: 20,
+                rows: 2,
+                format_label: "PNG".into(),
+                lines: vec![Line::from("▀▄▀▄"), Line::from("▄▀▄▀")],
+                protocol: img_preview::TerminalImageProtocol::Halfblock,
+                pixel_payload: None,
+            },
+        );
+
+        let view = ChatRender {
+            messages: std::slice::from_ref(&msg),
+            is_channel: false,
+            selected_index: None,
+        };
+        let mut out = Vec::new();
+        let theme = Theme::default();
+        let _ranges = build_chat_body_lines(
+            &mut out,
+            &view,
+            DensityMode::Cozy,
+            None,
+            "",
+            None,
+            None,
+            None,
+            &theme,
+            80,
+            Some(&cache),
+            thumb_dims,
+        );
+
+        let thumb_lines: Vec<_> = out
+            .iter()
+            .filter(|l| {
+                let text: String = l.line.spans.iter().map(|s| s.content.as_ref()).collect();
+                text.contains("▀▄▀▄") || text.contains("click or Alt+v for HD preview")
+            })
+            .collect();
+        assert_eq!(thumb_lines.len(), 2);
+        for line in thumb_lines {
+            assert_eq!(
+                line.target,
+                Some(HitTarget::Attachment {
+                    scope: MessageScope::Chat,
+                    msg_index: 0,
+                    attach_index: 0,
+                })
+            );
+        }
     }
 }

@@ -1811,12 +1811,122 @@ async fn e2e_inline_image_preview_and_self_updater() {
     )
     .expect("decode_and_render_for_protocol(Sixel)");
     assert_eq!(sixel_tui.protocol, TerminalImageProtocol::Sixel);
-    assert!(
-        sixel_tui
-            .pixel_payload
-            .as_deref()
-            .is_some_and(|p| p.starts_with("\x1bP0;1;q\"1;1;") && p.ends_with("\x1b\\"))
-    );
+        assert!(
+            sixel_tui
+                .pixel_payload
+                .as_deref()
+                .is_some_and(|p| p.starts_with("\x1bP0;1;q\"1;1;") && p.ends_with("\x1b\\"))
+        );
+
+    // 1b. End-to-end mock Graph hostedContents inline screenshot synthesis -> fetch -> Halfblock/Sixel render
+    ensure_isolated_env();
+    #[derive(Clone)]
+    struct HostedImgMockState {
+        base_url: String,
+        png_bytes: Vec<u8>,
+    }
+    let hosted_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind hostedContents mock Graph server");
+    let hosted_addr = hosted_listener.local_addr().unwrap();
+    let hosted_base = format!("http://{hosted_addr}");
+    let hosted_state = HostedImgMockState {
+        base_url: hosted_base.clone(),
+        png_bytes: png_bytes.clone(),
+    };
+    let hosted_app = Router::new()
+        .route(
+            "/v1.0/chats/c-img/messages",
+            get(|State(st): State<HostedImgMockState>, headers: HeaderMap| async move {
+                if let Err(resp) = check_bearer_header(&headers, "inline-img-tok") {
+                    return resp;
+                }
+                let img_url = format!(
+                    "{}/v1.0/chats/c-img/messages/m-img/hostedContents/hc-1/$value",
+                    st.base_url
+                );
+                Json(json!({
+                    "value": [{
+                        "id": "m-img",
+                        "messageType": "message",
+                        "createdDateTime": "2026-11-18T12:00:00Z",
+                        "from": { "user": { "id": "peer-kim", "displayName": "Alice" } },
+                        "body": {
+                            "contentType": "html",
+                            "content": format!("<p>Screenshot:</p><img src=\"{img_url}\">")
+                        },
+                        "mentions": [],
+                        "attachments": [],
+                        "reactions": []
+                    }]
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1.0/chats/c-img/messages/m-img/hostedContents/hc-1/$value",
+            get(|State(st): State<HostedImgMockState>, headers: HeaderMap| async move {
+                if let Err(resp) = check_bearer_header(&headers, "inline-img-tok") {
+                    return resp;
+                }
+                (StatusCode::OK, st.png_bytes).into_response()
+            }),
+        )
+        .with_state(hosted_state);
+
+    let hosted_server = tokio::spawn(async move {
+        axum::serve(hosted_listener, hosted_app)
+            .await
+            .expect("serve hostedContents mock Graph");
+    });
+
+    let hosted_tmp = tempfile::tempdir().expect("hosted tmp");
+    let hosted_cfg = build_test_config(&hosted_base, hosted_tmp.path());
+    let hosted_tokens = StoredTokens {
+        access_token: "inline-img-tok".to_string(),
+        refresh_token: None,
+        expires_at: chrono::Utc::now().timestamp() + 3600,
+        client_id: hosted_cfg.client_id.clone(),
+        tenant_id: hosted_cfg.tenant_id.clone(),
+        user_id: Some("me-user-1".to_string()),
+        user_display_name: None,
+        user_email: None,
+        auth_mode: "access_token".to_string(),
+    };
+    let hosted_auth = AuthManager::from_tokens(hosted_cfg.clone(), hosted_tokens);
+    let hosted_graph = GraphClient::new(hosted_cfg, hosted_auth).expect("hosted GraphClient");
+
+    let fetched_msgs = hosted_graph
+        .list_chat_messages("c-img", 10)
+        .await
+        .expect("list_chat_messages with inline hostedContents img");
+    assert_eq!(fetched_msgs.len(), 1);
+    let eff_atts = fetched_msgs[0].effective_attachments();
+    assert_eq!(eff_atts.len(), 1);
+    assert_eq!(eff_atts[0].id, "hosted:hc-1");
+    assert_eq!(eff_atts[0].content_type, "hostedContent");
+
+    let (_dl_name, _dl_ct, dl_bytes) = hosted_graph
+        .fetch_attachment_bytes(&eff_atts[0])
+        .await
+        .expect("fetch_attachment_bytes for hosted:hc-1");
+    assert_eq!(dl_bytes, png_bytes);
+
+    let hosted_halfblock = img_preview::decode_and_render_halfblocks(&dl_bytes, 16, 8, (0, 0, 0))
+        .expect("render fetched hosted:hc-1 halfblocks");
+    assert!(!hosted_halfblock.lines.is_empty());
+
+    let hosted_sixel = img_preview::render_ansi_stdout_with_pref(
+        &dl_bytes,
+        16,
+        8,
+        ImageProtocolPreference::Sixel,
+    )
+    .expect("render fetched hosted:hc-1 Sixel");
+    assert!(hosted_sixel.starts_with("\x1bP0;1;q\"1;1;"));
+    assert!(hosted_sixel.ends_with("\x1b\\\n"));
+
+    hosted_server.abort();
 
     // 2. Self-Updater E2E against mock GitHub Releases server
     #[derive(Clone)]

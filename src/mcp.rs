@@ -417,7 +417,7 @@ async fn call_tool(
                 ));
             };
 
-            let thread = map_graph_result(
+            let mut thread = map_graph_result(
                 graph,
                 graph
                     .get_thread(team_id, channel_id, &root_msg_id, limit)
@@ -433,6 +433,7 @@ async fn call_tool(
             })
             .await
             .map_err(format_error)?;
+            cli::hydrate_thread_attachments(&mut thread);
 
             Ok(json!({
                 "conversation": conv,
@@ -461,13 +462,14 @@ async fn call_tool(
                 outgoing.importance = Some("high".to_string());
             }
 
-            let sent =
+            let mut sent =
                 map_graph_result(graph, graph.send_message(&conv.target, &outgoing).await).await?;
             let sent_clone = sent.clone();
             let _ = with_storage(storage, move |s| {
                 s.upsert_messages(std::slice::from_ref(&sent_clone))
             })
             .await;
+            cli::hydrate_message_attachments(&mut sent);
 
             Ok(json!({
                 "ok": true,
@@ -497,7 +499,7 @@ async fn call_tool(
                 outgoing.importance = Some("high".to_string());
             }
 
-            let sent = map_graph_result(
+            let mut sent = map_graph_result(
                 graph,
                 graph.reply_message(&conv.target, &msg_id, &outgoing).await,
             )
@@ -507,6 +509,7 @@ async fn call_tool(
                 s.upsert_messages(std::slice::from_ref(&sent_clone))
             })
             .await;
+            cli::hydrate_message_attachments(&mut sent);
 
             Ok(json!({
                 "ok": true,
@@ -1887,5 +1890,187 @@ mod tests {
             BoundedLine::Eof => {}
             _ => panic!("expected Eof"),
         }
+    }
+
+    #[tokio::test]
+    async fn cached_inline_hosted_image_exposed_in_mcp_get_messages_and_download() {
+        use crate::auth::StoredTokens;
+        use crate::models::{ConversationKind, MessageItem};
+        use axum::{http::StatusCode, routing::get, Router};
+
+        let png_bytes = b"\x89PNG\r\n\x1a\nmcp-inline-shot".to_vec();
+        let served_bytes = png_bytes.clone();
+        let mock_app = Router::new().route(
+            "/v1.0/chats/c1/messages/m2/hostedContents/1/$value",
+            get(move || {
+                let bytes = served_bytes.clone();
+                async move { (StatusCode::OK, bytes) }
+            }),
+        );
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        let mock_server = tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app).await.unwrap();
+        });
+
+        let dl_dir = tempfile::tempdir().unwrap();
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{mock_addr}/v1.0"),
+            download_dir: dl_dir.path().display().to_string(),
+            ..AppConfig::default()
+        };
+        let tokens = StoredTokens {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: cfg.client_id.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            user_id: Some("me-1".to_string()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "pkce".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg.clone(), auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+
+        storage
+            .upsert_conversations(&[ConversationSummary {
+                conv_key: "chat:c1".to_string(),
+                target: ConversationTarget::Chat {
+                    chat_id: "c1".to_string(),
+                },
+                kind: ConversationKind::OneOnOne,
+                team_id: None,
+                team_name: None,
+                title: "MCP Inline Chat".to_string(),
+                topic: None,
+                unread_count: 0,
+                last_read_at: None,
+                last_msg_id: Some("m2".to_string()),
+                last_msg_author: Some("Alice".to_string()),
+                last_msg_preview: Some("Inline".to_string()),
+                last_updated_at: Some("2026-11-18T10:01:00Z".to_string()),
+                pinned: false,
+                peer_user_id: None,
+                web_url: None,
+            }])
+            .unwrap();
+
+        let graph_hosted_url =
+            "https://graph.microsoft.com/v1.0/chats/c1/messages/m1/hostedContents/1/$value";
+        let local_hosted_url =
+            format!("http://{mock_addr}/v1.0/chats/c1/messages/m2/hostedContents/1/$value");
+
+        storage
+            .upsert_messages(&[
+                MessageItem {
+                    msg_key: "chat:c1|m1".to_string(),
+                    conv_key: "chat:c1".to_string(),
+                    msg_id: "m1".to_string(),
+                    parent_msg_id: None,
+                    reply_to_id: None,
+                    reply_to_author: None,
+                    reply_to_preview: None,
+                    subject: None,
+                    author_id: Some("u1".to_string()),
+                    author_name: "Alice".to_string(),
+                    is_me: false,
+                    created_at: "2026-11-18T10:00:00Z".to_string(),
+                    last_modified_at: None,
+                    deleted: false,
+                    importance: "normal".to_string(),
+                    message_type: "message".to_string(),
+                    body_html: format!(r#"<p>Inline</p><img src="{graph_hosted_url}">"#),
+                    body_plain: "Inline".to_string(),
+                    attachments: vec![],
+                    mentions: vec![],
+                    reactions: vec![],
+                    reply_count: 0,
+                    web_url: None,
+                },
+                MessageItem {
+                    msg_key: "chat:c1|m2".to_string(),
+                    conv_key: "chat:c1".to_string(),
+                    msg_id: "m2".to_string(),
+                    parent_msg_id: None,
+                    reply_to_id: None,
+                    reply_to_author: None,
+                    reply_to_preview: None,
+                    subject: None,
+                    author_id: Some("u1".to_string()),
+                    author_name: "Alice".to_string(),
+                    is_me: false,
+                    created_at: "2026-11-18T10:01:00Z".to_string(),
+                    last_modified_at: None,
+                    deleted: false,
+                    importance: "normal".to_string(),
+                    message_type: "message".to_string(),
+                    body_html: format!(r#"<img src="{local_hosted_url}">"#),
+                    body_plain: String::new(),
+                    attachments: vec![],
+                    mentions: vec![],
+                    reactions: vec![],
+                    reply_count: 0,
+                    web_url: None,
+                },
+            ])
+            .unwrap();
+
+        // MCP get_messages (offline) hydrates hosted:1 attachment
+        let resp = handle_rpc_line(
+            &cfg,
+            &graph,
+            &storage,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 30,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_messages",
+                    "arguments": { "target": "chat:c1", "offline": true }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], false, "{resp}");
+        let payload: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["messages"][0]["attachments"][0]["id"], "hosted:1");
+        assert_eq!(
+            payload["messages"][0]["attachments"][0]["content_url"],
+            graph_hosted_url
+        );
+
+        // MCP download_attachment downloads hosted:1 from cached message
+        let dl_resp = handle_rpc_line(
+            &cfg,
+            &graph,
+            &storage,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 31,
+                "method": "tools/call",
+                "params": {
+                    "name": "download_attachment",
+                    "arguments": { "target": "chat:c1", "msg_id": "m2", "index": 0 }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dl_resp["result"]["isError"], false, "{dl_resp}");
+        let dl_payload: Value =
+            serde_json::from_str(dl_resp["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(dl_payload["ok"], true);
+        assert_eq!(dl_payload["bytes_written"], png_bytes.len());
+        let saved_path = dl_payload["path"].as_str().unwrap();
+        assert_eq!(std::fs::read(saved_path).unwrap(), png_bytes);
+
+        mock_server.abort();
     }
 }

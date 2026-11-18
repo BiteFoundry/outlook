@@ -5,11 +5,127 @@ pub mod html_in;
 pub mod md_out;
 
 use crate::models::{
-    AttachmentInfo, InlineImageUpload, MentionInfo, OutgoingMessage, QuotedReply, RichBlock,
-    UploadedReferenceAttachment,
+    AttachmentInfo, ConversationTarget, InlineImageUpload, MentionInfo, OutgoingMessage,
+    QuotedReply, RichBlock, UploadedReferenceAttachment,
 };
 
 pub use html_in::parse_message_blocks_arc;
+
+/// Extracts `AttachmentInfo` entries for inline `<img src="...">` elements in `body_html`
+/// not already represented in `existing`.
+pub fn extract_inline_image_attachments(
+    body_html: &str,
+    existing: &[AttachmentInfo],
+    conv_key: &str,
+    msg_id: &str,
+    parent_msg_id: Option<&str>,
+) -> Vec<AttachmentInfo> {
+    if !body_html
+        .as_bytes()
+        .windows(4)
+        .any(|w| w.eq_ignore_ascii_case(b"<img"))
+    {
+        return Vec::new();
+    }
+
+    let blocks = parse_message_blocks_arc(body_html, existing, &[]);
+    let mut out = Vec::new();
+
+    for block in blocks.iter() {
+        let RichBlock::InlineImageChip { src, index } = block else {
+            continue;
+        };
+
+        let resolved_url = resolve_inline_image_url(src, conv_key, msg_id, parent_msg_id);
+        let hosted_id = html_in::extract_hosted_content_id(&resolved_url);
+
+        let id = match hosted_id {
+            Some(seg) => format!("hosted:{seg}"),
+            None => format!("inline-img-{}", index + 1),
+        };
+
+        let is_duplicate = |att: &AttachmentInfo| {
+            att.content_url
+                .as_deref()
+                .is_some_and(|u| u == src || u == resolved_url)
+                || att.id == id
+                || hosted_id.is_some_and(|hid| att.id == hid || att.id == format!("hosted:{hid}"))
+        };
+
+        if existing.iter().any(is_duplicate) || out.iter().any(is_duplicate) {
+            continue;
+        }
+
+        let content_type = if hosted_id.is_some() {
+            "hostedContent".to_string()
+        } else {
+            "image/png".to_string()
+        };
+
+        out.push(AttachmentInfo {
+            id,
+            content_type,
+            content_url: Some(resolved_url),
+            name: Some(format!("inline-image-{}.png", index + 1)),
+            content_json: None,
+            thumbnail_url: None,
+        });
+    }
+
+    out
+}
+
+fn resolve_inline_image_url(
+    src: &str,
+    conv_key: &str,
+    msg_id: &str,
+    parent_msg_id: Option<&str>,
+) -> String {
+    let tail = src
+        .strip_prefix("../")
+        .or_else(|| src.strip_prefix("./"))
+        .unwrap_or(src);
+
+    if tail.starts_with("hostedContents/") && !msg_id.is_empty() {
+        if let Some(target) = ConversationTarget::from_conv_key(conv_key) {
+            return match target {
+                ConversationTarget::Chat { chat_id } => format!(
+                    "/chats/{}/messages/{}/{}",
+                    urlencoding::encode(&chat_id),
+                    urlencoding::encode(msg_id),
+                    tail
+                ),
+                ConversationTarget::Channel {
+                    team_id,
+                    channel_id,
+                } => {
+                    if let Some(root_id) =
+                        parent_msg_id.filter(|p| !p.is_empty() && *p != msg_id)
+                    {
+                        format!(
+                            "/teams/{}/channels/{}/messages/{}/replies/{}/{}",
+                            urlencoding::encode(&team_id),
+                            urlencoding::encode(&channel_id),
+                            urlencoding::encode(root_id),
+                            urlencoding::encode(msg_id),
+                            tail
+                        )
+                    } else {
+                        format!(
+                            "/teams/{}/channels/{}/messages/{}/{}",
+                            urlencoding::encode(&team_id),
+                            urlencoding::encode(&channel_id),
+                            urlencoding::encode(msg_id),
+                            tail
+                        )
+                    }
+                }
+            };
+        }
+    }
+
+    src.to_string()
+}
 
 /// Strips HTML tags and formats Adaptive Cards into clean plain text for previews & FTS5 indexing.
 pub fn html_and_cards_to_plain(html: &str, attachments: &[AttachmentInfo]) -> String {
@@ -297,5 +413,45 @@ mod tests {
         let styled_arc = parse_message_blocks_arc(styled_html, &[], &[]);
         let md = html_in::blocks_to_markdown(&styled_arc);
         assert_eq!(md, "[<u>~~***combo***~~</u>](https://example.com)");
+    }
+
+    #[test]
+    fn test_extract_inline_image_attachments_skips_emojis_and_resolves_relative() {
+        let emoji_html = r#"<p><emoji alt="🚀"><img itemtype="http://schema.skype.com/Emoji" src="https://statics.teams.cdn.office.net/emoji.png" alt="🚀"></emoji></p>"#;
+        assert!(
+            extract_inline_image_attachments(emoji_html, &[], "chat:19:abc", "m1", None)
+                .is_empty()
+        );
+
+        let rel_html = r#"<p><img src="../hostedContents/1/$value"></p>"#;
+        let chat_atts =
+            extract_inline_image_attachments(rel_html, &[], "chat:19:abc", "m1", None);
+        assert_eq!(chat_atts.len(), 1);
+        assert_eq!(chat_atts[0].id, "hosted:1");
+        assert_eq!(chat_atts[0].content_type, "hostedContent");
+        assert_eq!(
+            chat_atts[0].content_url.as_deref(),
+            Some("/chats/19%3Aabc/messages/m1/hostedContents/1/$value")
+        );
+        assert_eq!(chat_atts[0].name.as_deref(), Some("inline-image-1.png"));
+
+        let reply_atts = extract_inline_image_attachments(
+            rel_html,
+            &[],
+            "chan:t1:c1",
+            "reply-2",
+            Some("root-1"),
+        );
+        assert_eq!(reply_atts.len(), 1);
+        assert_eq!(
+            reply_atts[0].content_url.as_deref(),
+            Some("/teams/t1/channels/c1/messages/root-1/replies/reply-2/hostedContents/1/$value")
+        );
+
+        // Deduplicates when already present in `existing`
+        assert!(
+            extract_inline_image_attachments(rel_html, &chat_atts, "chat:19:abc", "m1", None)
+                .is_empty()
+        );
     }
 }

@@ -935,7 +935,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             if let Some((scope, msg_index)) = selected_message_scope_and_index(app, ui) {
                 if app
                     .message_at(scope, msg_index)
-                    .is_some_and(|m| !m.attachments.is_empty())
+                    .is_some_and(|m| !m.effective_attachments().is_empty())
                 {
                     app.download_attachment(ui, scope, msg_index, 0);
                     return false;
@@ -946,7 +946,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 .iter()
                 .enumerate()
                 .rev()
-                .find(|(_, m)| !m.attachments.is_empty())
+                .find(|(_, m)| !m.effective_attachments().is_empty())
             {
                 app.download_attachment(ui, MessageScope::Chat, idx, 0);
             } else {
@@ -1249,22 +1249,7 @@ fn theme_bg_rgb(color: ratatui::style::Color) -> (u8, u8, u8) {
     }
 }
 
-fn open_image_preview(app: &mut AppState, ui: &mut UiState) {
-    let preview_opt = selected_message_scope_and_index(app, ui)
-        .and_then(|(scope, idx)| app.message_at(scope, idx))
-        .and_then(|msg| ImagePreviewOverlay::from_teams_message(msg, Some(ui.attach_index)))
-        .or_else(|| {
-            app.messages
-                .iter()
-                .rev()
-                .find_map(|msg| ImagePreviewOverlay::from_teams_message(msg, None))
-        });
-
-    let Some(preview) = preview_opt else {
-        ui.info("No image attachments to preview");
-        return;
-    };
-
+fn push_image_preview(preview: ImagePreviewOverlay, app: &mut AppState, ui: &mut UiState) {
     ui.close_overlays_of(OverlayKind::ImagePreview);
     if let Some(target) = preview.current().cloned() {
         let (cols, rows) = preview.target_dimensions(ui.term_width, ui.term_height);
@@ -1285,6 +1270,48 @@ fn open_image_preview(app: &mut AppState, ui: &mut UiState) {
         );
     }
     ui.push_overlay(Overlay::ImagePreview(preview));
+}
+
+fn open_image_preview(app: &mut AppState, ui: &mut UiState) {
+    let in_thread_context =
+        ui.focus() == Focus::Thread || (ui.composer_target_thread && ui.thread_drawer_open);
+    let thread_preview = if in_thread_context {
+        selected_thread_scope_and_index(app, ui)
+            .and_then(|(scope, idx)| app.message_at(scope, idx))
+            .and_then(|msg| ImagePreviewOverlay::from_teams_message(msg, Some(ui.attach_index)))
+            .or_else(|| {
+                app.active_thread.as_ref().and_then(|thread| {
+                    thread
+                        .replies
+                        .iter()
+                        .rev()
+                        .chain(std::iter::once(&thread.root))
+                        .find_map(|msg| ImagePreviewOverlay::from_teams_message(msg, None))
+                })
+            })
+    } else {
+        None
+    };
+
+    let preview_opt = thread_preview
+        .or_else(|| {
+            selected_message_scope_and_index(app, ui)
+                .and_then(|(scope, idx)| app.message_at(scope, idx))
+                .and_then(|msg| ImagePreviewOverlay::from_teams_message(msg, Some(ui.attach_index)))
+        })
+        .or_else(|| {
+            app.messages
+                .iter()
+                .rev()
+                .find_map(|msg| ImagePreviewOverlay::from_teams_message(msg, None))
+        });
+
+    let Some(preview) = preview_opt else {
+        ui.info("No image attachments to preview");
+        return;
+    };
+
+    push_image_preview(preview, app, ui);
 }
 
 fn cycle_focus(app: &AppState, ui: &mut UiState, forward: bool) {
@@ -1757,6 +1784,16 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
             return dispatch(Action::OpenComposer, app, ui);
         }
 
+        if let HitTarget::Attachment {
+            scope,
+            msg_index,
+            attach_index,
+        } = hit
+        {
+            click_attachment(scope, msg_index, attach_index, app, ui);
+            return false;
+        }
+
         let act = action_for_target(hit);
         return dispatch(act, app, ui);
     }
@@ -1771,6 +1808,35 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
         ui.set_focus(Focus::Nav);
     }
     false
+}
+
+fn click_attachment(
+    scope: MessageScope,
+    msg_index: usize,
+    attach_index: usize,
+    app: &mut AppState,
+    ui: &mut UiState,
+) {
+    let _ = dispatch(Action::SelectMessage { scope, msg_index }, app, ui);
+    ui.attach_index = attach_index;
+
+    let preview_opt = app.message_at(scope, msg_index).and_then(|msg| {
+        let eff = msg.effective_attachments();
+        let is_img = eff.get(attach_index).is_some_and(|att| {
+            crate::img_preview::is_image_mime_or_name(&att.content_type, att.name.as_deref())
+        });
+        if is_img {
+            ImagePreviewOverlay::from_teams_message(msg, Some(attach_index))
+        } else {
+            None
+        }
+    });
+
+    if let Some(preview) = preview_opt {
+        push_image_preview(preview, app, ui);
+    } else {
+        app.download_attachment(ui, scope, msg_index, attach_index);
+    }
 }
 
 fn action_for_target(target: HitTarget) -> Action {
@@ -2421,5 +2487,126 @@ mod tests {
         assert!(ui.pending_pixel_graphic.is_none());
 
         app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn click_attachment_opens_preview_for_hosted_image_and_downloads_for_pdf() {
+        let (mut app, mut ui) = test_app_and_ui();
+        app.messages = vec![
+            crate::models::MessageItem {
+                msg_key: "chat:c1|m1".to_string(),
+                conv_key: "chat:c1".to_string(),
+                msg_id: "m1".to_string(),
+                parent_msg_id: None,
+                reply_to_id: None,
+                reply_to_author: None,
+                reply_to_preview: None,
+                subject: None,
+                author_id: None,
+                author_name: "Alice".to_string(),
+                is_me: false,
+                created_at: "2026-11-18T00:00:00Z".to_string(),
+                last_modified_at: None,
+                deleted: false,
+                importance: "normal".to_string(),
+                message_type: "message".to_string(),
+                body_html: "<p>Look:</p><img src=\"https://graph.microsoft.com/v1.0/chats/c1/messages/m1/hostedContents/1/$value\">".to_string(),
+                body_plain: "Look:".to_string(),
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+                reactions: Vec::new(),
+                reply_count: 0,
+                web_url: None,
+            },
+            crate::models::MessageItem {
+                msg_key: "chat:c1|m2".to_string(),
+                conv_key: "chat:c1".to_string(),
+                msg_id: "m2".to_string(),
+                parent_msg_id: None,
+                reply_to_id: None,
+                reply_to_author: None,
+                reply_to_preview: None,
+                subject: None,
+                author_id: None,
+                author_name: "Bob".to_string(),
+                is_me: false,
+                created_at: "2026-11-18T00:01:00Z".to_string(),
+                last_modified_at: None,
+                deleted: false,
+                importance: "normal".to_string(),
+                message_type: "message".to_string(),
+                body_html: String::new(),
+                body_plain: String::new(),
+                attachments: vec![crate::models::AttachmentInfo {
+                    id: "att-pdf".to_string(),
+                    content_type: "application/pdf".to_string(),
+                    content_url: Some("https://contoso.sharepoint.com/report.pdf".to_string()),
+                    name: Some("report.pdf".to_string()),
+                    content_json: None,
+                    thumbnail_url: None,
+                }],
+                mentions: Vec::new(),
+                reactions: Vec::new(),
+                reply_count: 0,
+                web_url: None,
+            },
+        ];
+
+        ui.hitmap.clear();
+        ui.hitmap.add_line(
+            2,
+            5,
+            20,
+            HitTarget::Attachment {
+                scope: MessageScope::Chat,
+                msg_index: 0,
+                attach_index: 0,
+            },
+        );
+        ui.hitmap.add_line(
+            2,
+            8,
+            20,
+            HitTarget::Attachment {
+                scope: MessageScope::Chat,
+                msg_index: 1,
+                attach_index: 0,
+            },
+        );
+
+        // Clicking inline hosted image attachment opens Overlay::ImagePreview focused on hosted:1.
+        assert!(!dispatch(Action::Click { column: 4, row: 5 }, &mut app, &mut ui));
+        assert_eq!(ui.chat_scroll.selected_idx, Some(0));
+        assert_eq!(ui.attach_index, 0);
+        assert!(matches!(
+            ui.overlays.last(),
+            Some(Overlay::ImagePreview(p))
+                if p.items.len() == 1 && p.current().is_some_and(|t| t.att_id() == "hosted:1")
+        ));
+
+        // Close preview, then click a PDF attachment -> triggers download instead of ImagePreview.
+        ui.overlays.clear();
+        assert!(!dispatch(Action::Click { column: 4, row: 8 }, &mut app, &mut ui));
+        assert_eq!(ui.chat_scroll.selected_idx, Some(1));
+        assert!(ui.overlays.is_empty());
+        assert!(ui
+            .tasks
+            .first_running()
+            .is_some_and(|t| t.label.contains("Download: report.pdf")));
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[test]
+    fn alt_v_in_composer_maps_to_open_image_preview() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let keymap = crate::ui::keymap::Keymap::default_teams();
+        let action = crate::ui::event::key_to_action(
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT),
+            Focus::Composer,
+            &keymap,
+            true,
+        );
+        assert_eq!(action, Some(Action::OpenImagePreview));
     }
 }

@@ -837,6 +837,15 @@ pub(crate) fn normalize_chat_message(
         });
     }
 
+    let extra_inline = crate::parser::extract_inline_image_attachments(
+        &body_html,
+        &attachments,
+        conv_key,
+        &msg_id,
+        parent_msg_id.as_deref(),
+    );
+    attachments.extend(extra_inline);
+
     let mentions = raw
         .mentions
         .into_iter()
@@ -1173,6 +1182,38 @@ mod tests {
         assert_eq!(item.reactions[1].reaction_type, "heart");
         assert_eq!(item.reactions[1].count, 1);
         assert!(!item.reactions[1].me_reacted);
+    }
+
+    #[test]
+    fn test_normalize_chat_message_synthesizes_inline_hosted_image_attachment() {
+        let json = serde_json::json!({
+            "id": "m1",
+            "messageType": "message",
+            "createdDateTime": "2026-11-18T10:00:00Z",
+            "from": {
+                "user": { "id": "u-peer", "displayName": "Bob" }
+            },
+            "body": {
+                "contentType": "html",
+                "content": "<p><img src=\"https://graph.microsoft.com/v1.0/chats/19:abc/messages/m1/hostedContents/aWQ9MQ==/$value\"></p>"
+            },
+            "attachments": []
+        });
+
+        let raw: GraphChatMessage = serde_json::from_value(json).unwrap();
+        let item = normalize_chat_message("chat:19:abc", None, Some("u-me"), raw);
+        assert!(!is_pure_system_noise(&item));
+        assert_eq!(item.attachments.len(), 1);
+        assert_eq!(item.attachments[0].id, "hosted:aWQ9MQ==");
+        assert_eq!(item.attachments[0].content_type, "hostedContent");
+        assert_eq!(
+            item.attachments[0].content_url.as_deref(),
+            Some("https://graph.microsoft.com/v1.0/chats/19:abc/messages/m1/hostedContents/aWQ9MQ==/$value")
+        );
+        assert!(crate::img_preview::is_image_mime_or_name(
+            &item.attachments[0].content_type,
+            item.attachments[0].name.as_deref()
+        ));
     }
 
     #[test]

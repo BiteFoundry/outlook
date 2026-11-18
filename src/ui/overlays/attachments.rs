@@ -48,7 +48,7 @@ impl AttachmentRow {
 pub fn rows_from(messages: &[MessageItem], scope: MessageScope) -> Vec<AttachmentRow> {
     let mut rows = Vec::new();
     for (msg_index, msg) in messages.iter().enumerate().rev() {
-        for (attach_index, att) in msg.attachments.iter().enumerate() {
+        for (attach_index, att) in msg.effective_attachments().iter().enumerate() {
             if att
                 .content_type
                 .to_ascii_lowercase()

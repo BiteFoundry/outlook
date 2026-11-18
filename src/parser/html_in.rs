@@ -225,6 +225,8 @@ fn parse_message_blocks_uncached(
         attachments,
         mentions,
         seen_attachments: HashSet::new(),
+        seen_inline_srcs: HashSet::new(),
+        seen_hosted_ids: HashSet::new(),
         blocks: Vec::new(),
         current_spans: Vec::new(),
         next_image_index: 0,
@@ -237,7 +239,7 @@ fn parse_message_blocks_uncached(
     }
 
     for att in attachments {
-        if !ctx.seen_attachments.contains(&att.id) {
+        if !ctx.seen_attachments.contains(&att.id) && !ctx.is_seen_inline_attachment(att) {
             ctx.push_attachment_block(att);
         }
     }
@@ -441,6 +443,8 @@ struct ParserContext<'a> {
     attachments: &'a [AttachmentInfo],
     mentions: &'a [MentionInfo],
     seen_attachments: HashSet<String>,
+    seen_inline_srcs: HashSet<String>,
+    seen_hosted_ids: HashSet<String>,
     blocks: Vec<RichBlock>,
     current_spans: Vec<RichSpan>,
     next_image_index: usize,
@@ -596,9 +600,43 @@ impl<'a> ParserContext<'a> {
                     }
                 }
             }
+            "emoji" => {
+                let emoji_text = non_empty_attr(el, "alt")
+                    .or_else(|| non_empty_attr(el, "title"))
+                    .map(str::to_string)
+                    .or_else(|| {
+                        el_ref.descendants().find_map(|desc| {
+                            let desc_el = ElementRef::wrap(desc)?;
+                            if desc_el.value().name() == "img" {
+                                non_empty_attr(desc_el.value(), "alt")
+                                    .or_else(|| non_empty_attr(desc_el.value(), "title"))
+                                    .map(str::to_string)
+                            } else {
+                                None
+                            }
+                        })
+                    });
+                if let Some(alt) = emoji_text {
+                    self.push_raw_span(&alt, style);
+                } else {
+                    self.walk_children(el_ref, style);
+                }
+            }
             "img" => {
+                if is_emoji_sprite_img(el) {
+                    if let Some(alt) =
+                        non_empty_attr(el, "alt").or_else(|| non_empty_attr(el, "title"))
+                    {
+                        self.push_raw_span(alt, style);
+                    }
+                    return;
+                }
                 if let Some(src) = el.attr("src").map(str::trim).filter(|s| !s.is_empty()) {
                     self.flush_paragraph();
+                    self.seen_inline_srcs.insert(src.to_string());
+                    if let Some(hid) = extract_hosted_content_id(src) {
+                        self.seen_hosted_ids.insert(hid.to_string());
+                    }
                     let index = self.next_image_index;
                     self.next_image_index += 1;
                     self.blocks.push(RichBlock::InlineImageChip {
@@ -747,6 +785,57 @@ impl<'a> ParserContext<'a> {
             name: att.name.clone(),
         });
     }
+
+    fn is_seen_inline_attachment(&self, att: &AttachmentInfo) -> bool {
+        if let Some(url) = att.content_url.as_deref() {
+            if self.seen_inline_srcs.contains(url) {
+                return true;
+            }
+            if let Some(hid) = extract_hosted_content_id(url) {
+                if self.seen_hosted_ids.contains(hid) {
+                    return true;
+                }
+            }
+        }
+        let att_hid = att.id.strip_prefix("hosted:").unwrap_or(&att.id);
+        self.seen_hosted_ids.contains(att_hid)
+    }
+}
+
+pub(crate) fn extract_hosted_content_id(url: &str) -> Option<&str> {
+    let rest = url
+        .split_once("/hostedContents/")
+        .map(|(_, r)| r)
+        .or_else(|| url.strip_prefix("hostedContents/"))?;
+    let seg = rest.split(['/', '?', '#']).next()?.trim();
+    if seg.is_empty() {
+        None
+    } else {
+        Some(seg)
+    }
+}
+
+fn non_empty_attr<'a>(el: &'a scraper::node::Element, name: &str) -> Option<&'a str> {
+    el.attr(name).map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn is_emoji_sprite_img(el: &scraper::node::Element) -> bool {
+    if el
+        .attr("itemtype")
+        .is_some_and(|t| t.to_ascii_lowercase().contains("emoji"))
+    {
+        return true;
+    }
+    if let Some(src) = el.attr("src") {
+        let lower = src.to_ascii_lowercase();
+        if lower.contains("statics.teams.cdn.office.net")
+            || lower.contains("/personal-expressions/")
+            || lower.contains("/emoticons/")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn detect_code_lang(pre_el: ElementRef<'_>) -> Option<String> {
@@ -1029,5 +1118,29 @@ mod tests {
         cache.insert((99999, 1, 99999), Arc::from(Vec::new()));
         assert!(cache.get(&(0, 1, 0)).is_some());
         assert!(cache.get(&(1, 1, 1)).is_none());
+    }
+
+    #[test]
+    fn emoji_sprites_render_inline_text_without_image_chips() {
+        let html = r#"<p>Ship it <emoji alt="🚀"><img itemtype="http://schema.skype.com/Emoji" src="https://statics.teams.cdn.office.net/evergreen-assets/personal-expressions/v2/assets/emoticons/rocket/default/50_f.png" alt="🚀"></emoji> now <img itemtype="http://schema.skype.com/Emoji" src="https://example.com/e.png" alt="👍"> and <img src="https://statics.teams.cdn.office.net/evergreen-assets/personal-expressions/v2/assets/emoticons/smile/default/50_f.png" title="😊"></p>"#;
+        let blocks = parse_message_blocks(html, &[], &[]);
+        assert!(
+            !blocks
+                .iter()
+                .any(|b| matches!(b, RichBlock::InlineImageChip { .. })),
+            "emoji sprites must not produce InlineImageChip: {blocks:?}"
+        );
+        let plain = blocks_to_plain(&blocks);
+        assert_eq!(plain, "Ship it 🚀 now 👍 and 😊");
+    }
+
+    #[test]
+    fn emoji_without_wrapper_alt_falls_back_to_child_img_alt() {
+        let html = r#"<p>Done <emoji><img itemtype="http://schema.skype.com/Emoji" src="https://statics.teams.cdn.office.net/e.png" alt="✅"></emoji></p>"#;
+        let blocks = parse_message_blocks(html, &[], &[]);
+        assert!(blocks
+            .iter()
+            .all(|b| !matches!(b, RichBlock::InlineImageChip { .. })));
+        assert_eq!(blocks_to_plain(&blocks), "Done ✅");
     }
 }

@@ -1956,11 +1956,13 @@ fn print_read_output(
     json_out: bool,
 ) -> Result<()> {
     if json_out {
+        let mut messages = res.messages.clone();
+        hydrate_messages_attachments(&mut messages);
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "conversation": conv,
-                "messages": res.messages,
+                "messages": messages,
                 "has_more": res.has_more,
                 "next_before": res.next_before,
             }))?
@@ -2081,7 +2083,8 @@ async fn cmd_thread_with_cache(
         if let Ok(storage) = open_storage_only(cfg) {
             if let Ok(cached_convs) = storage.list_conversations() {
                 if let Ok(conv) = resolver::resolve_from_slice(&cached_convs, channel_target) {
-                    if let Some(thread) = storage.get_thread(&conv.conv_key, root_msg_id, limit)? {
+                    if let Some(mut thread) = storage.get_thread(&conv.conv_key, root_msg_id, limit)? {
+                        hydrate_thread_attachments(&mut thread);
                         return print_thread_output(&conv, &thread, json_out);
                     }
                 }
@@ -2103,7 +2106,7 @@ async fn cmd_thread_with_cache(
         bail!("The `thread` command can only be used in team channels: {}", conv.conv_key);
     };
 
-    let thread = if offline {
+    let mut thread = if offline {
         storage
             .get_thread(&conv.conv_key, root_msg_id, limit)?
             .with_context(|| format!("Thread not found in local cache: {root_msg_id}"))?
@@ -2121,6 +2124,7 @@ async fn cmd_thread_with_cache(
         storage.upsert_messages(&all)?;
         view
     };
+    hydrate_thread_attachments(&mut thread);
 
     print_thread_output(&conv, &thread, json_out)
 }
@@ -2131,11 +2135,13 @@ fn print_thread_output(
     json_out: bool,
 ) -> Result<()> {
     if json_out {
+        let mut hydrated = thread.clone();
+        hydrate_thread_attachments(&mut hydrated);
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "conversation": conv,
-                "thread": thread,
+                "thread": hydrated,
             }))?
         );
     } else {
@@ -2152,7 +2158,8 @@ fn print_thread_output(
     Ok(())
 }
 
-fn print_message_line(msg: &MessageItem, indent: &str) {
+fn format_message_line(msg: &MessageItem, indent: &str) -> String {
+    let attachments = msg.effective_attachments();
     let mut tags = Vec::new();
     if let Some(ref subj) = msg.subject {
         if !subj.trim().is_empty() {
@@ -2165,9 +2172,8 @@ fn print_message_line(msg: &MessageItem, indent: &str) {
     if msg.reply_count > 0 {
         tags.push(format!("[💬 {}]", msg.reply_count));
     }
-    if !msg.attachments.is_empty() {
-        let names: Vec<String> = msg
-            .attachments
+    if !attachments.is_empty() {
+        let names: Vec<String> = attachments
             .iter()
             .map(|a| {
                 a.name
@@ -2191,7 +2197,7 @@ fn print_message_line(msg: &MessageItem, indent: &str) {
     } else if !msg.body_plain.trim().is_empty() {
         msg.body_plain.trim().to_string()
     } else {
-        parser::html_and_cards_to_plain(&msg.body_html, &msg.attachments)
+        parser::html_and_cards_to_plain(&msg.body_html, &attachments)
             .trim()
             .to_string()
     };
@@ -2207,10 +2213,14 @@ fn print_message_line(msg: &MessageItem, indent: &str) {
         format!(" {}", tags.join(" "))
     };
 
-    println!(
+    format!(
         "{indent}[{}] {} ({}){quote}{tag_str}: {}",
         msg.created_at, msg.author_name, msg.msg_id, body
-    );
+    )
+}
+
+fn print_message_line(msg: &MessageItem, indent: &str) {
+    println!("{}", format_message_line(msg, indent));
 }
 
 fn reaction_symbol(reaction_type: &str) -> &str {
@@ -2869,6 +2879,11 @@ async fn cmd_export(
         }
     }
 
+    hydrate_messages_attachments(&mut messages);
+    for replies in threads_by_root.values_mut() {
+        hydrate_messages_attachments(replies);
+    }
+
     let body = match format {
         "json" => {
             if include_threads {
@@ -3128,6 +3143,23 @@ fn trim_older_window(mut rows: Vec<MessageItem>, limit: usize) -> (Vec<MessageIt
     }
 }
 
+pub(crate) fn hydrate_message_attachments(msg: &mut MessageItem) {
+    if let std::borrow::Cow::Owned(effective) = msg.effective_attachments() {
+        msg.attachments = effective;
+    }
+}
+
+pub(crate) fn hydrate_messages_attachments(messages: &mut [MessageItem]) {
+    for msg in messages {
+        hydrate_message_attachments(msg);
+    }
+}
+
+pub(crate) fn hydrate_thread_attachments(thread: &mut crate::models::ThreadView) {
+    hydrate_message_attachments(&mut thread.root);
+    hydrate_messages_attachments(&mut thread.replies);
+}
+
 pub(crate) fn read_conversation_messages_offline(
     storage: &Storage,
     conv: &ConversationSummary,
@@ -3135,7 +3167,7 @@ pub(crate) fn read_conversation_messages_offline(
     before: Option<&str>,
 ) -> Result<ReadMessagesResult> {
     let limit = clamp_limit(limit);
-    let (messages, has_more) = match before {
+    let (mut messages, has_more) = match before {
         None => {
             let rows = storage.list_root_messages(&conv.conv_key, limit + 1, None)?;
             trim_older_window(rows, limit)
@@ -3151,6 +3183,7 @@ pub(crate) fn read_conversation_messages_offline(
             trim_older_window(rows, limit)
         }
     };
+    hydrate_messages_attachments(&mut messages);
     let next_before = messages.first().map(|m| m.msg_id.clone());
     Ok(ReadMessagesResult {
         messages,
@@ -3217,6 +3250,7 @@ pub(crate) async fn read_conversation_messages(
                     .flatten()
                     .is_some_and(|c| !c.is_history_eof() && c.delta_link.is_some());
             }
+            hydrate_messages_attachments(&mut messages);
             let next_before = messages.first().map(|m| m.msg_id.clone());
             Ok(ReadMessagesResult {
                 messages,
@@ -3290,7 +3324,7 @@ pub(crate) async fn read_conversation_messages(
                 &before_ts,
                 before_id.as_deref(),
             )?;
-            let (messages, mut has_more) = trim_older_window(rows, limit);
+            let (mut messages, mut has_more) = trim_older_window(rows, limit);
             if !has_more {
                 has_more = storage
                     .get_sync_cursor(&scope_key)
@@ -3298,6 +3332,7 @@ pub(crate) async fn read_conversation_messages(
                     .flatten()
                     .is_some_and(|c| !c.is_history_eof() && c.delta_link.is_some());
             }
+            hydrate_messages_attachments(&mut messages);
             let next_before = messages.first().map(|m| m.msg_id.clone());
             Ok(ReadMessagesResult {
                 messages,
@@ -3427,7 +3462,7 @@ pub(crate) async fn send_file_or_inline(
         bail!("File not found: {}", path.display());
     }
 
-    let sent = if inline {
+    let mut sent = if inline {
         let mime_type = image_mime_for_path(path).with_context(|| {
             format!(
                 "--inline only supports image files (png/jpg/jpeg/gif/webp/bmp): {}",
@@ -3480,6 +3515,7 @@ pub(crate) async fn send_file_or_inline(
     };
 
     let _ = storage.upsert_messages(std::slice::from_ref(&sent));
+    hydrate_message_attachments(&mut sent);
     Ok(sent)
 }
 
@@ -3531,13 +3567,14 @@ pub(crate) async fn download_message_attachment(
     dest_dir: &Path,
 ) -> Result<DownloadedFile> {
     let msg = find_message_with_fallback(graph, storage, conv, msg_id, thread_root_id).await?;
-    if msg.attachments.is_empty() {
+    let attachments = msg.effective_attachments();
+    if attachments.is_empty() {
         bail!("Message has no attachments: {msg_id}");
     }
-    let att = msg.attachments.get(index).with_context(|| {
+    let att = attachments.get(index).with_context(|| {
         format!(
             "Attachment index {index} is out of range (total {})",
-            msg.attachments.len()
+            attachments.len()
         )
     })?;
     graph.download_attachment(att, dest_dir).await
@@ -3657,44 +3694,45 @@ async fn cmd_preview_teams(
     let conv = resolve_target(&storage, &graph, target, false).await?;
     let msg = find_message_with_fallback(&graph, &storage, &conv, msg_id, thread).await?;
     let att = select_teams_attachment(&msg, attachment)?;
-    let (_name, _ct, bytes) = graph.fetch_attachment_bytes(att).await?;
+    let (_name, _ct, bytes) = graph.fetch_attachment_bytes(&att).await?;
     let (c, r) = default_preview_dimensions(cols, rows);
     let rendered = img_preview::render_ansi_stdout_with_pref(&bytes, c, r, effective_pref)?;
     print_rendered_preview(&rendered)
 }
 
 
-pub(crate) fn select_teams_attachment<'a>(
-    msg: &'a MessageItem,
+pub(crate) fn select_teams_attachment(
+    msg: &MessageItem,
     selector: Option<&str>,
-) -> Result<&'a AttachmentInfo> {
-    if msg.attachments.is_empty() {
+) -> Result<AttachmentInfo> {
+    let attachments = msg.effective_attachments();
+    if attachments.is_empty() {
         bail!("Message has no attachments: {}", msg.msg_id);
     }
     if let Some(sel) = selector.map(str::trim).filter(|s| !s.is_empty()) {
         if let Ok(idx) = sel.parse::<usize>() {
-            return msg.attachments.get(idx).with_context(|| {
+            return attachments.get(idx).cloned().with_context(|| {
                 format!(
                     "Attachment index {idx} is out of range (total {})",
-                    msg.attachments.len()
+                    attachments.len()
                 )
             });
         }
-        if let Some(found) = msg.attachments.iter().find(|a| {
+        if let Some(found) = attachments.iter().find(|a| {
             a.id == sel
                 || a.name
                     .as_deref()
                     .is_some_and(|n| n.eq_ignore_ascii_case(sel))
         }) {
-            return Ok(found);
+            return Ok(found.clone());
         }
         bail!("Matching attachment not found: {sel}");
     }
-    Ok(msg
-        .attachments
+    Ok(attachments
         .iter()
         .find(|a| img_preview::is_image_mime_or_name(&a.content_type, a.name.as_deref()))
-        .unwrap_or(&msg.attachments[0]))
+        .unwrap_or(&attachments[0])
+        .clone())
 }
 
 
@@ -4329,5 +4367,140 @@ mod tests {
                 command: DaemonCommand::Run
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn cached_inline_hosted_image_exposes_effective_attachment_for_cli_helpers() {
+        use axum::{http::StatusCode, routing::get, Router};
+
+        let storage = Storage::open_in_memory().unwrap();
+        let conv = ConversationSummary {
+            conv_key: "chat:c1".to_string(),
+            target: ConversationTarget::Chat {
+                chat_id: "c1".to_string(),
+            },
+            kind: ConversationKind::OneOnOne,
+            team_id: None,
+            team_name: None,
+            title: "Inline Hosted".to_string(),
+            topic: None,
+            unread_count: 0,
+            last_read_at: None,
+            last_msg_id: Some("m1".to_string()),
+            last_msg_author: Some("Alice".to_string()),
+            last_msg_preview: Some("Screenshot".to_string()),
+            last_updated_at: Some("2026-11-18T10:00:00Z".to_string()),
+            pinned: false,
+            peer_user_id: None,
+            web_url: None,
+        };
+        storage.upsert_conversations(std::slice::from_ref(&conv)).unwrap();
+
+        let graph_hosted_url =
+            "https://graph.microsoft.com/v1.0/chats/c1/messages/m1/hostedContents/1/$value";
+        let cached_msg = MessageItem {
+            msg_key: "chat:c1|m1".to_string(),
+            conv_key: "chat:c1".to_string(),
+            msg_id: "m1".to_string(),
+            parent_msg_id: None,
+            reply_to_id: None,
+            reply_to_author: None,
+            reply_to_preview: None,
+            subject: None,
+            author_id: Some("u1".to_string()),
+            author_name: "Alice".to_string(),
+            is_me: false,
+            created_at: "2026-11-18T10:00:00Z".to_string(),
+            last_modified_at: None,
+            deleted: false,
+            importance: "normal".to_string(),
+            message_type: "message".to_string(),
+            body_html: format!(r#"<p>See screenshot</p><img src="{graph_hosted_url}">"#),
+            body_plain: "See screenshot".to_string(),
+            attachments: vec![],
+            mentions: vec![],
+            reactions: vec![],
+            reply_count: 0,
+            web_url: None,
+        };
+        storage.upsert_messages(std::slice::from_ref(&cached_msg)).unwrap();
+
+        // 1. CLI read helper hydrates attachments for --json & renders [📎 ...] tag in text.
+        let read_res = read_conversation_messages_offline(&storage, &conv, 10, None).unwrap();
+        assert_eq!(read_res.messages.len(), 1);
+        assert_eq!(read_res.messages[0].attachments.len(), 1);
+        assert_eq!(read_res.messages[0].attachments[0].id, "hosted:1");
+        assert_eq!(
+            read_res.messages[0].attachments[0].content_url.as_deref(),
+            Some(graph_hosted_url)
+        );
+        let raw_msg = storage.get_message("chat:c1", "m1").unwrap().unwrap();
+        assert!(raw_msg.attachments.is_empty());
+        let line = format_message_line(&raw_msg, "");
+        assert!(line.contains("[📎 "), "expected attachment tag in line: {line}");
+
+        // 2. CLI preview selector finds hosted:1 even on unhydrated cached MessageItem.
+        for selector in [None, Some("0"), Some("hosted:1")] {
+            let att = select_teams_attachment(&raw_msg, selector).unwrap();
+            assert_eq!(att.id, "hosted:1");
+            assert_eq!(att.content_url.as_deref(), Some(graph_hosted_url));
+            assert!(img_preview::is_image_mime_or_name(
+                &att.content_type,
+                att.name.as_deref()
+            ));
+        }
+
+        // 3. CLI download helper fetches hosted:1 from mock Graph server for cached message.
+        let png_bytes = b"\x89PNG\r\n\x1a\nfake-png-bytes".to_vec();
+        let served_bytes = png_bytes.clone();
+        let mock_app = Router::new().route(
+            "/v1.0/chats/c1/messages/m1/hostedContents/1/$value",
+            get(move || {
+                let bytes = served_bytes.clone();
+                async move { (StatusCode::OK, bytes) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mock_server = tokio::spawn(async move {
+            axum::serve(listener, mock_app).await.unwrap();
+        });
+
+        let local_hosted_url = format!(
+            "http://{addr}/v1.0/chats/c1/messages/m1/hostedContents/1/$value"
+        );
+        let mut local_msg = cached_msg;
+        local_msg.msg_key = "chat:c1|m2".to_string();
+        local_msg.msg_id = "m2".to_string();
+        local_msg.body_html = format!(r#"<img src="{local_hosted_url}">"#);
+        storage.upsert_messages(&[local_msg]).unwrap();
+
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
+        let tokens = StoredTokens {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: cfg.client_id.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            user_id: Some("me-1".to_string()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "pkce".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg, auth).unwrap();
+        let dl_dir = tempfile::tempdir().unwrap();
+
+        let downloaded =
+            download_message_attachment(&graph, &storage, &conv, "m2", 0, None, dl_dir.path())
+                .await
+                .unwrap();
+        assert_eq!(downloaded.bytes_written, png_bytes.len() as u64);
+        assert_eq!(std::fs::read(&downloaded.path).unwrap(), png_bytes);
+
+        mock_server.abort();
     }
 }

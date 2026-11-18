@@ -94,7 +94,13 @@ fn compute_thread_sig(
     h.finish()
 }
 
-pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hitmap: &mut HitMap) {
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    app: &mut AppState,
+    ui: &mut UiState,
+    hitmap: &mut HitMap,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -170,6 +176,35 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hit
     ui.thread_scroll.total_lines = cached.lines.len();
     let offset = ui.thread_scroll.offset(height);
     ui.thread_scroll.offset = offset;
+
+    if ui.inline_images {
+        let vis_start = offset.saturating_sub(20);
+        let vis_end = offset.saturating_add(height).saturating_add(20);
+        let mut to_fetch = Vec::new();
+        for (sel_idx, &(r_start, r_end)) in cached.ranges.iter().enumerate() {
+            if r_end > vis_start && r_start < vis_end {
+                let msg = if sel_idx == 0 {
+                    Some(&thread.root)
+                } else {
+                    thread.replies.get(sel_idx - 1)
+                };
+                if let Some(msg) = msg {
+                    let eff = msg.effective_attachments();
+                    for att in eff.iter() {
+                        if crate::img_preview::is_image_mime_or_name(
+                            &att.content_type,
+                            att.name.as_deref(),
+                        ) {
+                            to_fetch.push((msg.msg_id.clone(), att.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        for (msg_id, att) in to_fetch {
+            app.request_teams_image(msg_id, att, thumb_cols, thumb_rows);
+        }
+    }
 
     let selection = ui.thread_scroll.selected_idx.and_then(|sel_idx| {
         let range = *cached.ranges.get(sel_idx)?;

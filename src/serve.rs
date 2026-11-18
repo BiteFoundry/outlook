@@ -697,7 +697,7 @@ async fn send_message(
         outgoing.importance = Some("high".to_string());
     }
 
-    let sent = match state.graph.send_message(&conv.target, &outgoing).await {
+    let mut sent = match state.graph.send_message(&conv.target, &outgoing).await {
         Ok(m) => m,
         Err(err) => return Err(map_graph_error(&state.graph, err).await),
     };
@@ -706,6 +706,7 @@ async fn send_message(
         s.upsert_messages(std::slice::from_ref(&sent_clone))
     })
     .await;
+    cli::hydrate_message_attachments(&mut sent);
 
     Ok(Json(json!({
         "ok": true,
@@ -733,7 +734,7 @@ async fn get_thread(
         )));
     };
 
-    let thread = if query.offline {
+    let mut thread = if query.offline {
         let conv_key = conv.conv_key.clone();
         let root_id_clone = root_id.clone();
         with_storage(&state.storage, move |s| s.get_thread(&conv_key, &root_id_clone, limit))
@@ -758,6 +759,7 @@ async fn get_thread(
         .await?;
         view
     };
+    cli::hydrate_thread_attachments(&mut thread);
 
     Ok(Json(json!({ "thread": thread })))
 }
@@ -781,7 +783,7 @@ async fn reply_message(
         outgoing.importance = Some("high".to_string());
     }
 
-    let sent = match state
+    let mut sent = match state
         .graph
         .reply_message(&conv.target, &msg_id, &outgoing)
         .await
@@ -794,6 +796,7 @@ async fn reply_message(
         s.upsert_messages(std::slice::from_ref(&sent_clone))
     })
     .await;
+    cli::hydrate_message_attachments(&mut sent);
 
     Ok(Json(json!({
         "ok": true,
@@ -1771,6 +1774,200 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        api_server.abort();
+        mock_server.abort();
+    }
+
+    #[tokio::test]
+    async fn cached_inline_hosted_image_exposed_in_messages_threads_and_download() {
+        use crate::auth::StoredTokens;
+        use crate::models::{ConversationSummary, MessageItem};
+
+        let png_bytes = b"\x89PNG\r\n\x1a\nhttp-inline-shot".to_vec();
+        let served_bytes = png_bytes.clone();
+        let mock_app = Router::new().route(
+            "/v1.0/chats/c1/messages/m2/hostedContents/1/$value",
+            get(move || {
+                let bytes = served_bytes.clone();
+                async move { (StatusCode::OK, bytes) }
+            }),
+        );
+        let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        let mock_server = tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app).await.unwrap();
+        });
+
+        let dl_dir = tempfile::tempdir().unwrap();
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{mock_addr}/v1.0"),
+            download_dir: dl_dir.path().display().to_string(),
+            ..AppConfig::default()
+        };
+        let tokens = StoredTokens {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: cfg.client_id.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            user_id: Some("me-1".to_string()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "pkce".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg.clone(), auth)
+            .unwrap()
+            .with_my_user_id("me-1");
+        let storage = Storage::open_in_memory().unwrap();
+
+        storage
+            .upsert_conversations(&[
+                ConversationSummary {
+                    conv_key: "chat:c1".to_string(),
+                    target: ConversationTarget::Chat {
+                        chat_id: "c1".to_string(),
+                    },
+                    kind: ConversationKind::OneOnOne,
+                    team_id: None,
+                    team_name: None,
+                    title: "Inline Chat".to_string(),
+                    topic: None,
+                    unread_count: 0,
+                    last_read_at: None,
+                    last_msg_id: None,
+                    last_msg_author: None,
+                    last_msg_preview: None,
+                    last_updated_at: None,
+                    pinned: false,
+                    peer_user_id: None,
+                    web_url: None,
+                },
+                ConversationSummary {
+                    conv_key: "chan:t1:ch1".to_string(),
+                    target: ConversationTarget::Channel {
+                        team_id: "t1".to_string(),
+                        channel_id: "ch1".to_string(),
+                    },
+                    kind: ConversationKind::Channel,
+                    team_id: Some("t1".to_string()),
+                    team_name: Some("Eng".to_string()),
+                    title: "General".to_string(),
+                    topic: None,
+                    unread_count: 0,
+                    last_read_at: None,
+                    last_msg_id: None,
+                    last_msg_author: None,
+                    last_msg_preview: None,
+                    last_updated_at: None,
+                    pinned: false,
+                    peer_user_id: None,
+                    web_url: None,
+                },
+            ])
+            .unwrap();
+
+        let graph_hosted_url =
+            "https://graph.microsoft.com/v1.0/chats/c1/messages/m1/hostedContents/1/$value";
+        let local_hosted_url =
+            format!("http://{mock_addr}/v1.0/chats/c1/messages/m2/hostedContents/1/$value");
+
+        let mk_cached = |conv_key: &str, msg_id: &str, parent: Option<&str>, ts: &str, url: &str| {
+            MessageItem {
+                msg_key: format!("{conv_key}|{msg_id}"),
+                conv_key: conv_key.to_string(),
+                msg_id: msg_id.to_string(),
+                parent_msg_id: parent.map(str::to_string),
+                reply_to_id: None,
+                reply_to_author: None,
+                reply_to_preview: None,
+                subject: None,
+                author_id: Some("u1".to_string()),
+                author_name: "Alice".to_string(),
+                is_me: false,
+                created_at: ts.to_string(),
+                last_modified_at: None,
+                deleted: false,
+                importance: "normal".to_string(),
+                message_type: "message".to_string(),
+                body_html: format!(r#"<p>Inline</p><img src="{url}">"#),
+                body_plain: "Inline".to_string(),
+                attachments: vec![],
+                mentions: vec![],
+                reactions: vec![],
+                reply_count: 0,
+                web_url: None,
+            }
+        };
+
+        storage
+            .upsert_messages(&[
+                mk_cached("chat:c1", "m1", None, "2026-11-18T10:00:00Z", graph_hosted_url),
+                mk_cached("chat:c1", "m2", None, "2026-11-18T10:01:00Z", &local_hosted_url),
+                mk_cached(
+                    "chan:t1:ch1",
+                    "root-1",
+                    None,
+                    "2026-11-18T10:02:00Z",
+                    graph_hosted_url,
+                ),
+            ])
+            .unwrap();
+
+        let router = build_router(cfg, graph, storage, None);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let api_server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        // GET /conversations/{key}/messages?offline=true exposes hosted:1
+        let res = client
+            .get(format!("{base}/conversations/chat%3Ac1/messages?offline=true"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["messages"][0]["attachments"][0]["id"], "hosted:1");
+        assert_eq!(
+            body["messages"][0]["attachments"][0]["content_url"],
+            graph_hosted_url
+        );
+
+        // GET /conversations/{key}/threads/{root_id}?offline=true exposes hosted:1
+        let res = client
+            .get(format!(
+                "{base}/conversations/chan%3At1%3Ach1/threads/root-1?offline=true"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let thread_body: Value = res.json().await.unwrap();
+        assert_eq!(
+            thread_body["thread"]["root"]["attachments"][0]["id"],
+            "hosted:1"
+        );
+
+        // POST /conversations/{key}/messages/{msg_id}/attachments/download downloads hosted:1
+        let res = client
+            .post(format!(
+                "{base}/conversations/chat%3Ac1/messages/m2/attachments/download"
+            ))
+            .json(&json!({ "index": 0 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let dl_body: Value = res.json().await.unwrap();
+        assert_eq!(dl_body["ok"], true);
+        assert_eq!(dl_body["bytes_written"], png_bytes.len());
+        let saved_path = dl_body["path"].as_str().unwrap();
+        assert_eq!(std::fs::read(saved_path).unwrap(), png_bytes);
 
         api_server.abort();
         mock_server.abort();

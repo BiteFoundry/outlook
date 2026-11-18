@@ -1914,7 +1914,7 @@ impl AppState {
         let Some(msg) = self.message_at(scope, msg_index) else {
             return;
         };
-        let Some(att) = msg.attachments.get(attach_index).cloned() else {
+        let Some(att) = msg.effective_attachments().get(attach_index).cloned() else {
             ui.info("Attachment not found");
             return;
         };

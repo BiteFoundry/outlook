@@ -1,6 +1,6 @@
 {
   "name": "@shinick/teams-win32-x64",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "description": "Prebuilt teams binary for Windows x64",
   "repository": {
     "type": "git",

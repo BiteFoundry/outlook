@@ -213,6 +213,35 @@ impl MessageItem {
     pub fn make_msg_key(conv_key: &str, msg_id: &str) -> String {
         format!("{conv_key}|{msg_id}")
     }
+
+    /// Returns `self.attachments` augmented on-the-fly with any inline `<img src="...">` images
+    /// from `self.body_html` not already represented in `self.attachments`.
+    /// Fast path: returns `Cow::Borrowed(&self.attachments)` in O(1) when `self.body_html` contains no `<img`/`<IMG`.
+    pub fn effective_attachments(&self) -> std::borrow::Cow<'_, [AttachmentInfo]> {
+        if !self
+            .body_html
+            .as_bytes()
+            .windows(4)
+            .any(|w| w.eq_ignore_ascii_case(b"<img"))
+        {
+            return std::borrow::Cow::Borrowed(&self.attachments);
+        }
+        let extra = crate::parser::extract_inline_image_attachments(
+            &self.body_html,
+            &self.attachments,
+            &self.conv_key,
+            &self.msg_id,
+            self.parent_msg_id.as_deref(),
+        );
+        if extra.is_empty() {
+            std::borrow::Cow::Borrowed(&self.attachments)
+        } else {
+            let mut combined = Vec::with_capacity(self.attachments.len() + extra.len());
+            combined.extend(self.attachments.iter().cloned());
+            combined.extend(extra);
+            std::borrow::Cow::Owned(combined)
+        }
+    }
 }
 
 /// Thread bundle: root channel post + ordered replies.
@@ -436,4 +465,80 @@ pub struct UpdateCheckResult {
     pub asset_size: Option<u64>,
     pub updated: bool,
     pub binary_path: PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    fn sample_message(conv_key: &str, msg_id: &str, body_html: &str) -> MessageItem {
+        MessageItem {
+            msg_key: MessageItem::make_msg_key(conv_key, msg_id),
+            conv_key: conv_key.to_string(),
+            msg_id: msg_id.to_string(),
+            parent_msg_id: None,
+            reply_to_id: None,
+            reply_to_author: None,
+            reply_to_preview: None,
+            subject: None,
+            author_id: None,
+            author_name: "Alice".to_string(),
+            is_me: false,
+            created_at: "2026-11-18T00:00:00Z".to_string(),
+            last_modified_at: None,
+            deleted: false,
+            importance: "normal".to_string(),
+            message_type: "message".to_string(),
+            body_html: body_html.to_string(),
+            body_plain: String::new(),
+            attachments: Vec::new(),
+            mentions: Vec::new(),
+            reactions: Vec::new(),
+            reply_count: 0,
+            web_url: None,
+        }
+    }
+
+    #[test]
+    fn effective_attachments_fast_path_and_inline_synthesis() {
+        let plain_msg = sample_message("chat:19:abc", "m1", "<p>hello</p>");
+        assert!(matches!(plain_msg.effective_attachments(), Cow::Borrowed(_)));
+        assert!(plain_msg.effective_attachments().is_empty());
+
+        let hosted_msg = sample_message(
+            "chat:19:abc",
+            "m1",
+            r#"<p><img src="https://graph.microsoft.com/v1.0/chats/19:abc/messages/m1/hostedContents/aWQ9MQ==/$value"></p>"#,
+        );
+        let eff = hosted_msg.effective_attachments();
+        assert!(matches!(eff, Cow::Owned(_)));
+        assert_eq!(eff.len(), 1);
+        assert_eq!(eff[0].id, "hosted:aWQ9MQ==");
+        assert_eq!(eff[0].content_type, "hostedContent");
+        assert!(crate::img_preview::is_image_mime_or_name(
+            &eff[0].content_type,
+            eff[0].name.as_deref()
+        ));
+
+        // When already persisted in `attachments`, effective_attachments borrows without duplicating.
+        let owned = eff.into_owned();
+        let mut persisted = hosted_msg;
+        persisted.attachments = owned;
+        assert!(matches!(persisted.effective_attachments(), Cow::Borrowed(_)));
+        assert_eq!(persisted.effective_attachments().len(), 1);
+
+        // Relative ../hostedContents/1/$value resolution for chats
+        let rel_msg = sample_message(
+            "chat:19:abc",
+            "m1",
+            r#"<p><img src="../hostedContents/1/$value"></p>"#,
+        );
+        let rel_eff = rel_msg.effective_attachments();
+        assert_eq!(rel_eff.len(), 1);
+        assert_eq!(
+            rel_eff[0].content_url.as_deref(),
+            Some("/chats/19%3Aabc/messages/m1/hostedContents/1/$value")
+        );
+    }
 }
