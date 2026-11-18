@@ -20,34 +20,34 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 /** Supported Rust targets mapped to npm platform packages. */
 export const TARGETS = {
   'x86_64-pc-windows-msvc': {
-    package: 'teams-win32-x64',
-    source: 'teams.exe',
-    binary: 'teams.exe',
+    package: 'outlook-win32-x64',
+    source: 'outlook.exe',
+    binary: 'outlook.exe',
   },
   'aarch64-pc-windows-msvc': {
-    package: 'teams-win32-arm64',
-    source: 'teams.exe',
-    binary: 'teams.exe',
+    package: 'outlook-win32-arm64',
+    source: 'outlook.exe',
+    binary: 'outlook.exe',
   },
   'x86_64-apple-darwin': {
-    package: 'teams-darwin-x64',
-    source: 'teams',
-    binary: 'teams',
+    package: 'outlook-darwin-x64',
+    source: 'outlook',
+    binary: 'outlook',
   },
   'aarch64-apple-darwin': {
-    package: 'teams-darwin-arm64',
-    source: 'teams',
-    binary: 'teams',
+    package: 'outlook-darwin-arm64',
+    source: 'outlook',
+    binary: 'outlook',
   },
   'x86_64-unknown-linux-gnu': {
-    package: 'teams-linux-x64',
-    source: 'teams',
-    binary: 'teams',
+    package: 'outlook-linux-x64',
+    source: 'outlook',
+    binary: 'outlook',
   },
   'aarch64-unknown-linux-gnu': {
-    package: 'teams-linux-arm64',
-    source: 'teams',
-    binary: 'teams',
+    package: 'outlook-linux-arm64',
+    source: 'outlook',
+    binary: 'outlook',
   },
 };
 
@@ -160,7 +160,7 @@ function copyBinary(source, packageDir, binary) {
   const destination = path.join(binDir, binary);
   fs.mkdirSync(binDir, { recursive: true });
   fs.copyFileSync(source, destination);
-  if (binary !== 'teams.exe') fs.chmodSync(destination, 0o755);
+  if (binary !== 'outlook.exe') fs.chmodSync(destination, 0o755);
   return destination;
 }
 

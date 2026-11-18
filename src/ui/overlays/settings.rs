@@ -1,4 +1,4 @@
-//! Settings overlay (`Ctrl+,` or `[Settings]`).
+//! Settings overlay (`Ctrl+,`).
 //! Reads & persists `crate::config::AppConfig` (`config.toml`).
 
 use ratatui::{
@@ -19,7 +19,7 @@ use crate::{
     },
 };
 
-const ITEMS: usize = 10;
+const ITEMS: usize = 12;
 
 #[derive(Debug, Clone, Default)]
 pub struct SettingsState {
@@ -36,9 +36,11 @@ impl SettingsState {
     pub fn rows(app: &AppState, ui: &UiState) -> [(&'static str, String); ITEMS] {
         [
             ("Notifications", toggle(ui.notify)),
-            ("Left rail", toggle(ui.show_nav_rail)),
-            ("Auto thread pane", toggle(ui.auto_thread_pane)),
+            ("Left sidebar", toggle(ui.show_nav_rail)),
+            ("Thread grouping", toggle(ui.group_threads)),
+            ("Focused inbox filter", toggle(ui.focused_only)),
             ("Inline image previews", toggle(ui.inline_images)),
+            ("Image protocol", ui.graphics_caps.protocol.label().to_string()),
             ("Message density", ui.density.label().to_string()),
             ("Color theme", ui.theme_preset.label().to_string()),
             (
@@ -64,13 +66,15 @@ impl SettingsState {
             Action::Activate => match self.selected {
                 0 => OverlayOutcome::Dispatch(Action::ToggleNotify),
                 1 => OverlayOutcome::Dispatch(Action::ToggleNavRail),
-                2 => OverlayOutcome::Dispatch(Action::ToggleAutoThreadPane),
-                3 => OverlayOutcome::Dispatch(Action::ToggleInlineImages),
-                4 => OverlayOutcome::Dispatch(Action::ToggleDensity),
-                5 => OverlayOutcome::Dispatch(Action::CycleTheme),
-                6 => OverlayOutcome::Dispatch(Action::ShowDownloadDir),
-                7 => OverlayOutcome::CloseAndDispatch(Action::OpenOverlay(OverlayKind::Help)),
-                8 => OverlayOutcome::Dispatch(Action::ShowToast(format!(
+                2 => OverlayOutcome::Dispatch(Action::ToggleGroupThreads),
+                3 => OverlayOutcome::Dispatch(Action::ToggleFocusedOnly),
+                4 => OverlayOutcome::Dispatch(Action::ToggleInlineImages),
+                5 => OverlayOutcome::Dispatch(Action::CycleImageProtocol),
+                6 => OverlayOutcome::Dispatch(Action::ToggleDensity),
+                7 => OverlayOutcome::Dispatch(Action::CycleTheme),
+                8 => OverlayOutcome::Dispatch(Action::ShowDownloadDir),
+                9 => OverlayOutcome::CloseAndDispatch(Action::OpenOverlay(OverlayKind::Help)),
+                10 => OverlayOutcome::Dispatch(Action::ShowToast(format!(
                     "Graph URL: {} (edit in config.toml)",
                     app.config.graph_base_url
                 ))),
@@ -96,6 +100,7 @@ impl SettingsState {
         let rect = centered_rect(area, 76, (ITEMS as u16 + 4).min(area.height));
         frame.render_widget(Clear, rect);
         hitmap.add(rect, HitTarget::OverlayBody);
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)

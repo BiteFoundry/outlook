@@ -1,8 +1,8 @@
-//! Adaptive 2-lane background synchronization engine for Microsoft Teams (Fast Interactive Lane + Background Poll Lane).
+//! Adaptive two-lane background synchronization engine for Microsoft Outlook
+//! (Lane 1: Fast Interactive Lane + Lane 2: Quiet Background Poll Lane).
 
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap, HashSet},
-    hash::{Hash, Hasher},
+    collections::HashSet,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -23,8 +23,8 @@ use crate::{
     config::AppConfig,
     graph::GraphClient,
     models::{
-        ConversationKind, ConversationSummary, ConversationTarget, CoreEvent, MessageItem,
-        NotificationCandidate, PresenceStatus, SyncCursor, POLL_RETRY_SUMMARY,
+        CoreEvent, MailFolder, MailMessage, NotificationCandidate, SyncCursor, TodoList,
+        POLL_RETRY_SUMMARY,
     },
     storage::Storage,
 };
@@ -33,10 +33,8 @@ const IDLE_THRESHOLD_SECS: u64 = 120;
 const DEEP_IDLE_THRESHOLD_SECS: u64 = 600;
 const AUTH_EXPIRY_PAUSE_SECS: u64 = 30;
 const MAX_ERROR_BACKOFF_MS: u64 = 300_000;
-const MAX_POLLED_PRESENCE_PEERS: usize = 60;
-
-type ChatPollCache = HashMap<String, (Option<String>, Option<String>, String, i32)>;
-type PresencePollCache = HashMap<String, (String, String)>;
+const HISTORY_EOF_MARKER: &str = "__eof__";
+const INBOX_PREFETCH_UNREAD_LIMIT: usize = 5;
 
 pub(crate) struct SyncSharedState {
     epoch: Instant,
@@ -118,6 +116,7 @@ pub(crate) fn classify_sync_error(err: &anyhow::Error) -> SyncErrorKind {
         || lower.contains("forbidden")
         || lower.contains("authorization_requestdenied")
         || lower.contains("insufficient")
+        || lower.contains("erroraccessdenied")
         || lower.contains("aclcheckfailed")
     {
         return SyncErrorKind::Forbidden403;
@@ -140,6 +139,8 @@ pub(crate) fn is_expired_delta_error(err: &anyhow::Error) -> bool {
         || detail.contains("400")
         || lower.contains("resyncrequired")
         || lower.contains("syncstatenotfound")
+        || lower.contains("invalidskiptoken")
+        || lower.contains("skiptoken")
 }
 
 #[derive(Debug)]
@@ -209,6 +210,33 @@ impl ErrorBackoffState {
     }
 }
 
+/// Per-capability `403 Forbidden` circuit-breakers keyed by token fingerprint so missing
+/// optional scopes (`Calendars.*`, `Tasks.*`, `Contacts.*`) stop hitting Graph silently.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct CapabilityCircuitBreakers {
+    pub calendar_disabled: Option<String>,
+    pub todo_disabled: Option<String>,
+    pub contacts_disabled: Option<String>,
+}
+
+impl CapabilityCircuitBreakers {
+    #[cfg(test)]
+    pub(crate) fn is_calendar_disabled(&self, token_fp: &str) -> bool {
+        self.calendar_disabled.as_deref() == Some(token_fp)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_todo_disabled(&self, token_fp: &str) -> bool {
+        self.todo_disabled.as_deref() == Some(token_fp)
+    }
+
+    pub(crate) fn reset_all(&mut self) {
+        self.calendar_disabled = None;
+        self.todo_disabled = None;
+        self.contacts_disabled = None;
+    }
+}
+
 pub(crate) fn idle_multiplier(idle_duration: Duration) -> u64 {
     let secs = idle_duration.as_secs();
     if secs >= DEEP_IDLE_THRESHOLD_SECS {
@@ -242,10 +270,25 @@ impl PeriodicBackoffTracker {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FocusTarget {
-    pub target: Option<ConversationTarget>,
-    pub thread_root_id: Option<String>,
+    pub active_folder_id: Option<String>,
+    pub active_message_id: Option<String>,
+    pub active_todo_list_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SyncCommand {
+    Bootstrap,
+    RefreshAll,
+    SyncFolder { folder_id: String },
+    LoadOlderMail { folder_id: String, explicit: bool },
+    HydrateMessage { message_id: String },
+    SyncCalendar,
+    SyncTodo { list_id: Option<String> },
+    SyncContacts,
+    NotifyUserActivity,
+    Shutdown,
 }
 
 #[derive(Clone)]
@@ -253,42 +296,33 @@ pub struct SyncController {
     focus_tx: watch::Sender<FocusTarget>,
     nudge_tx: mpsc::UnboundedSender<SyncCommand>,
     shared: Arc<SyncSharedState>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SyncCommand {
-    RefreshConversations,
-    SyncActiveNow,
-    SyncChannelHistory {
-        team_id: String,
-        channel_id: String,
-    },
-    NotifyUserActivity,
-    Shutdown,
+    shutdown_tx: Option<watch::Sender<bool>>,
 }
 
 impl SyncController {
     pub fn from_channels(
         focus_tx: watch::Sender<FocusTarget>,
         nudge_tx: mpsc::UnboundedSender<SyncCommand>,
-        _legacy_background_all: bool,
     ) -> Self {
         Self {
             focus_tx,
             nudge_tx,
             shared: Arc::new(SyncSharedState::new()),
+            shutdown_tx: None,
         }
     }
 
-    pub fn set_focus(&self, target: Option<ConversationTarget>, thread_root_id: Option<String>) {
+    pub fn set_focus(&self, focus: FocusTarget) {
         self.shared.record_activity(Instant::now());
-        let _ = self.focus_tx.send(FocusTarget {
-            target,
-            thread_root_id,
-        });
+        let _ = self.focus_tx.send(focus);
     }
 
     pub fn request(&self, cmd: SyncCommand) {
+        if matches!(cmd, SyncCommand::Shutdown) {
+            if let Some(tx) = &self.shutdown_tx {
+                let _ = tx.send(true);
+            }
+        }
         let _ = self.nudge_tx.send(cmd);
     }
 
@@ -313,19 +347,6 @@ where
         .map_err(|e| anyhow::anyhow!("Storage blocking task failed: {e}"))?
 }
 
-fn compute_messages_signature(messages: &[MessageItem]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    messages.len().hash(&mut hasher);
-    for m in messages {
-        m.msg_id.hash(&mut hasher);
-        m.last_modified_at.hash(&mut hasher);
-        m.deleted.hash(&mut hasher);
-        m.reply_count.hash(&mut hasher);
-        m.reactions.len().hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
 async fn current_token_fingerprint(graph: &GraphClient) -> String {
     match graph.auth().current_tokens().await {
         Some(tokens) => {
@@ -337,53 +358,76 @@ async fn current_token_fingerprint(graph: &GraphClient) -> String {
     }
 }
 
-/// Performs an initial bootstrap sync (chats + joined teams/channels) into SQLite.
-pub async fn bootstrap_conversations(graph: &GraphClient, storage: &Storage) -> Result<()> {
-    let (chats_res, teams_res) = tokio::join!(
-        graph.list_chats_page(50, None),
-        graph.list_joined_teams_with_channels(),
+pub(crate) fn default_calendar_window() -> (String, String) {
+    let now = chrono::Utc::now();
+    let start = (now - chrono::Duration::days(7)).to_rfc3339();
+    let end = (now + chrono::Duration::days(30)).to_rfc3339();
+    (start, end)
+}
+
+fn pick_default_todo_list(lists: &[TodoList]) -> Option<&TodoList> {
+    lists
+        .iter()
+        .find(|l| {
+            l.wellknown_list_name
+                .as_deref()
+                .is_some_and(|w| w.eq_ignore_ascii_case("defaultList"))
+        })
+        .or_else(|| lists.first())
+}
+
+/// Performs initial Outlook bootstrap sync (profile, mail folders, inbox messages,
+/// calendar window `now - 7d .. now + 30d`, contacts, and To Do lists/tasks) into SQLite.
+/// Best-effort per optional capability so missing scopes never abort bootstrap.
+pub async fn bootstrap_outlook(graph: &GraphClient, storage: &Storage) -> Result<()> {
+    let (start_iso, end_iso) = default_calendar_window();
+    let (me_res, folders_res, inbox_res, events_res, contacts_res, lists_res) = tokio::join!(
+        graph.get_me(),
+        graph.list_mail_folders(),
+        graph.list_mail_messages("inbox", 50, true),
+        graph.list_calendar_view(&start_iso, &end_iso, 100),
+        graph.list_contacts(100),
+        graph.list_todo_lists(),
     );
-    let (chats, next_link) = chats_res?;
-    run_storage(storage, move |st| {
-        st.upsert_conversations(&chats)?;
-        save_initial_chats_list_cursor_if_absent(st, next_link)
-    })
-    .await?;
-    if let Ok(teams) = teams_res {
-        let _ = run_storage(storage, move |st| st.upsert_teams(&teams)).await;
+
+    let _ = me_res;
+
+    if let Ok(folders) = folders_res {
+        run_storage(storage, move |st| st.upsert_mail_folders(&folders)).await?;
     }
+
+    let inbox_msgs = inbox_res?;
+    if !inbox_msgs.is_empty() {
+        run_storage(storage, move |st| {
+            st.upsert_mail_messages(&inbox_msgs)?;
+            Ok(())
+        })
+        .await?;
+    }
+
+    if let Ok(events) = events_res {
+        let _ = run_storage(storage, move |st| st.upsert_calendar_events(&events)).await;
+    }
+
+    if let Ok(contacts) = contacts_res {
+        let _ = run_storage(storage, move |st| st.upsert_contacts(&contacts)).await;
+    }
+
+    if let Ok(lists) = lists_res {
+        let default_list_id = pick_default_todo_list(&lists).map(|l| l.id.clone());
+        let _ = run_storage(storage, move |st| st.upsert_todo_lists(&lists)).await;
+        if let Some(list_id) = default_list_id {
+            if let Ok(tasks) = graph.list_todo_tasks(&list_id, true, 100).await {
+                let _ = run_storage(storage, move |st| st.upsert_todo_tasks(&tasks)).await;
+            }
+        }
+    }
+
+    let _ = prefetch_unread_bodies("inbox", INBOX_PREFETCH_UNREAD_LIMIT, graph, storage, None).await;
     Ok(())
 }
 
-fn handle_lane1_error(
-    err: &anyhow::Error,
-    focus: &FocusTarget,
-    shared: &SyncSharedState,
-    restricted_convs: &mut HashSet<String>,
-    err_backoff: &mut ErrorBackoffState,
-    event_tx: &mpsc::UnboundedSender<CoreEvent>,
-) {
-    match classify_sync_error(err) {
-        SyncErrorKind::Forbidden403 => {
-            if let Some(target) = &focus.target {
-                restricted_convs.insert(target.conv_key());
-            }
-        }
-        SyncErrorKind::Unauthorized401 => {
-            shared.pause_auth(Instant::now(), Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS));
-        }
-        SyncErrorKind::Transient => {
-            if err_backoff.record_transient_failure(Instant::now()) {
-                let _ = event_tx.send(CoreEvent::SyncStateChanged {
-                    busy: false,
-                    summary: POLL_RETRY_SUMMARY.to_string(),
-                });
-            }
-        }
-    }
-}
-
-/// Spawns the two-lane background sync engine (Fast Interactive Lane + Background Poll Lane)
+/// Spawns the quiet two-lane background sync engine (Fast Interactive Lane + Background Poll Lane)
 /// and returns a `SyncController` handle.
 pub fn spawn_sync_engine(
     config: AppConfig,
@@ -397,11 +441,12 @@ pub fn spawn_sync_engine(
     let (bg_tx, mut bg_rx) = mpsc::unbounded_channel::<SyncCommand>();
 
     let active_ms = config.active_poll_ms.max(250);
-    let chat_ms = config.chat_poll_ms.max(500);
-    let channel_ms = config.channel_poll_ms.max(1_000);
+    let mail_ms = config.mail_poll_ms.max(500);
+    let calendar_ms = config.calendar_poll_ms.max(1_000);
     let shared = Arc::new(SyncSharedState::new());
 
-    // Lane 1: Fast Interactive Lane (active conversation/thread polling + immediate commands)
+    let ctrl_shutdown_tx = shutdown_tx.clone();
+    // Lane 1: Fast Interactive Lane (message hydration, active folder delta, folder pagination)
     let fast_graph = graph.clone();
     let fast_storage = storage.clone();
     let fast_event_tx = event_tx.clone();
@@ -411,11 +456,11 @@ pub fn spawn_sync_engine(
         let mut active_tick = time::interval(Duration::from_millis(active_ms));
         active_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut active_backoff = PeriodicBackoffTracker::default();
-        let mut restricted_convs: HashSet<String> = HashSet::new();
-        let mut last_active_sig: HashMap<String, u64> = HashMap::new();
         let mut active_err_backoff = ErrorBackoffState::new(active_ms);
+        let mut restricted_folders: HashSet<String> = HashSet::new();
+        let mut prev_focus = FocusTarget::default();
 
-        // Consume initial immediate tick so startup isn't flooded simultaneously before focus/commands arrive.
+        // Consume initial immediate tick so startup waits for explicit bootstrap/focus.
         active_tick.tick().await;
 
         loop {
@@ -423,6 +468,7 @@ pub fn spawn_sync_engine(
                 break;
             }
             tokio::select! {
+                biased;
                 _ = fast_shutdown_rx.changed() => {
                     if *fast_shutdown_rx.borrow() {
                         break;
@@ -434,40 +480,61 @@ pub fn spawn_sync_engine(
                             let _ = shutdown_tx.send(true);
                             break;
                         }
-                        Some(cmd @ SyncCommand::RefreshConversations) => {
+                        Some(
+                            cmd @ (SyncCommand::Bootstrap
+                            | SyncCommand::RefreshAll
+                            | SyncCommand::SyncCalendar
+                            | SyncCommand::SyncTodo { .. }
+                            | SyncCommand::SyncContacts),
+                        ) => {
                             fast_shared.record_activity(Instant::now());
                             fast_shared.clear_auth_pause();
-                            restricted_convs.clear();
+                            if matches!(cmd, SyncCommand::RefreshAll) {
+                                restricted_folders.clear();
+                                active_err_backoff.reset_window();
+                            }
                             let _ = bg_tx.send(cmd);
                         }
-                        Some(SyncCommand::SyncActiveNow) => {
+                        Some(SyncCommand::HydrateMessage { message_id }) => {
                             fast_shared.record_activity(Instant::now());
                             fast_shared.clear_auth_pause();
-                            restricted_convs.clear();
+                            match hydrate_message_if_needed(&message_id, true, &fast_graph, &fast_storage, &fast_event_tx).await {
+                                Ok(()) => emit_recovered_if_needed(&mut active_err_backoff, &fast_event_tx),
+                                Err(err) => {
+                                    handle_quiet_mail_error(
+                                        &err,
+                                        None,
+                                        &fast_shared,
+                                        &mut restricted_folders,
+                                        &mut active_err_backoff,
+                                        &fast_event_tx,
+                                    );
+                                }
+                            }
+                        }
+                        Some(SyncCommand::SyncFolder { folder_id }) => {
+                            fast_shared.record_activity(Instant::now());
+                            fast_shared.clear_auth_pause();
+                            restricted_folders.remove(&folder_id);
                             active_err_backoff.reset_window();
-                            let focus = focus_rx.borrow_and_update().clone();
-                            match sync_active_focus_with_state(
-                                &focus,
-                                &fast_graph,
-                                &fast_storage,
-                                &fast_event_tx,
-                                &mut last_active_sig,
-                                false,
-                            ).await {
+                            match sync_mail_folder(&folder_id, &fast_graph, &fast_storage, &fast_event_tx, false).await {
                                 Ok(()) => {
-                                    if active_err_backoff.record_success() {
-                                        let _ = fast_event_tx.send(CoreEvent::SyncStateChanged {
-                                            busy: false,
-                                            summary: "Synced".to_string(),
-                                        });
-                                    }
+                                    emit_recovered_if_needed(&mut active_err_backoff, &fast_event_tx);
+                                    let _ = prefetch_unread_bodies(
+                                        &folder_id,
+                                        INBOX_PREFETCH_UNREAD_LIMIT,
+                                        &fast_graph,
+                                        &fast_storage,
+                                        Some(&fast_event_tx),
+                                    )
+                                    .await;
                                 }
                                 Err(err) => {
-                                    handle_lane1_error(
+                                    handle_quiet_mail_error(
                                         &err,
-                                        &focus,
+                                        Some(&folder_id),
                                         &fast_shared,
-                                        &mut restricted_convs,
+                                        &mut restricted_folders,
                                         &mut active_err_backoff,
                                         &fast_event_tx,
                                     );
@@ -475,27 +542,22 @@ pub fn spawn_sync_engine(
                             }
                             active_tick.reset();
                         }
-                        Some(SyncCommand::SyncChannelHistory { team_id, channel_id }) => {
+                        Some(SyncCommand::LoadOlderMail { folder_id, explicit }) => {
                             fast_shared.record_activity(Instant::now());
                             fast_shared.clear_auth_pause();
-                            let _ = fast_event_tx.send(CoreEvent::SyncStateChanged {
-                                busy: true,
-                                summary: "Syncing channel history...".to_string(),
-                            });
-                            match sync_channel_history(&team_id, &channel_id, &fast_graph, &fast_storage, &fast_event_tx).await {
-                                Ok(()) => {
-                                    active_err_backoff.record_success();
-                                    let _ = fast_event_tx.send(CoreEvent::SyncStateChanged {
-                                        busy: false,
-                                        summary: "Synced".to_string(),
-                                    });
-                                }
-                                Err(err) => {
-                                    let _ = fast_event_tx.send(CoreEvent::SyncError(format!("Failed to sync channel: {err}")));
-                                    let _ = fast_event_tx.send(CoreEvent::SyncStateChanged {
-                                        busy: false,
-                                        summary: POLL_RETRY_SUMMARY.to_string(),
-                                    });
+                            if !restricted_folders.contains(&folder_id) {
+                                match load_older_mail_page(&folder_id, explicit, &fast_graph, &fast_storage, &fast_event_tx).await {
+                                    Ok(()) => emit_recovered_if_needed(&mut active_err_backoff, &fast_event_tx),
+                                    Err(err) => {
+                                        handle_quiet_mail_error(
+                                            &err,
+                                            Some(&folder_id),
+                                            &fast_shared,
+                                            &mut restricted_folders,
+                                            &mut active_err_backoff,
+                                            &fast_event_tx,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -512,37 +574,53 @@ pub fn spawn_sync_engine(
                     let now = Instant::now();
                     fast_shared.record_activity(now);
                     let focus = focus_rx.borrow_and_update().clone();
-                    let is_restricted = focus
-                        .target
-                        .as_ref()
-                        .is_some_and(|t| restricted_convs.contains(&t.conv_key()));
-                    if !is_restricted && !fast_shared.is_auth_paused(now) {
-                        match sync_active_focus_with_state(
-                            &focus,
-                            &fast_graph,
-                            &fast_storage,
-                            &fast_event_tx,
-                            &mut last_active_sig,
-                            false,
-                        ).await {
-                            Ok(()) => {
-                                if active_err_backoff.record_success() {
-                                    let _ = fast_event_tx.send(CoreEvent::SyncStateChanged {
-                                        busy: false,
-                                        summary: "Synced".to_string(),
-                                    });
+                    let folder_changed = focus.active_folder_id != prev_focus.active_folder_id;
+                    let msg_changed = focus.active_message_id != prev_focus.active_message_id;
+                    let todo_changed = focus.active_todo_list_id != prev_focus.active_todo_list_id;
+                    prev_focus = focus.clone();
+
+                    if !fast_shared.is_auth_paused(now) {
+                        if let (true, Some(mid)) = (msg_changed, focus.active_message_id.as_deref()) {
+                            let _ = hydrate_message_if_needed(
+                                mid,
+                                false,
+                                &fast_graph,
+                                &fast_storage,
+                                &fast_event_tx,
+                            )
+                            .await;
+                        }
+                        if let (true, Some(fid)) = (folder_changed, focus.active_folder_id.as_deref()) {
+                            if !restricted_folders.contains(fid) {
+                                match sync_mail_folder(fid, &fast_graph, &fast_storage, &fast_event_tx, false).await {
+                                    Ok(()) => {
+                                        emit_recovered_if_needed(&mut active_err_backoff, &fast_event_tx);
+                                        let _ = prefetch_unread_bodies(
+                                            fid,
+                                            INBOX_PREFETCH_UNREAD_LIMIT,
+                                            &fast_graph,
+                                            &fast_storage,
+                                            Some(&fast_event_tx),
+                                        )
+                                        .await;
+                                    }
+                                    Err(err) => {
+                                        handle_quiet_mail_error(
+                                            &err,
+                                            Some(fid),
+                                            &fast_shared,
+                                            &mut restricted_folders,
+                                            &mut active_err_backoff,
+                                            &fast_event_tx,
+                                        );
+                                    }
                                 }
                             }
-                            Err(err) => {
-                                handle_lane1_error(
-                                    &err,
-                                    &focus,
-                                    &fast_shared,
-                                    &mut restricted_convs,
-                                    &mut active_err_backoff,
-                                    &fast_event_tx,
-                                );
-                            }
+                        }
+                        if let (true, Some(lid)) = (todo_changed, focus.active_todo_list_id.as_deref()) {
+                            let _ = bg_tx.send(SyncCommand::SyncTodo {
+                                list_id: Some(lid.to_string()),
+                            });
                         }
                     }
                     active_tick.reset();
@@ -555,36 +633,30 @@ pub fn spawn_sync_engine(
                         && !active_err_backoff.is_backed_off(now)
                     {
                         let focus = focus_rx.borrow().clone();
-                        let allowed = focus
-                            .target
-                            .as_ref()
-                            .is_some_and(|t| !restricted_convs.contains(&t.conv_key()));
-                        if allowed {
-                            match sync_active_focus_with_state(
-                                &focus,
-                                &fast_graph,
-                                &fast_storage,
-                                &fast_event_tx,
-                                &mut last_active_sig,
-                                true,
-                            ).await {
-                                Ok(()) => {
-                                    if active_err_backoff.record_success() {
-                                        let _ = fast_event_tx.send(CoreEvent::SyncStateChanged {
-                                            busy: false,
-                                            summary: "Synced".to_string(),
-                                        });
+                        if let Some(fid) = focus.active_folder_id.as_deref() {
+                            if !restricted_folders.contains(fid) {
+                                match sync_mail_folder(fid, &fast_graph, &fast_storage, &fast_event_tx, true).await {
+                                    Ok(()) => {
+                                        emit_recovered_if_needed(&mut active_err_backoff, &fast_event_tx);
+                                        let _ = prefetch_unread_bodies(
+                                            fid,
+                                            INBOX_PREFETCH_UNREAD_LIMIT,
+                                            &fast_graph,
+                                            &fast_storage,
+                                            Some(&fast_event_tx),
+                                        )
+                                        .await;
                                     }
-                                }
-                                Err(err) => {
-                                    handle_lane1_error(
-                                        &err,
-                                        &focus,
-                                        &fast_shared,
-                                        &mut restricted_convs,
-                                        &mut active_err_backoff,
-                                        &fast_event_tx,
-                                    );
+                                    Err(err) => {
+                                        handle_quiet_mail_error(
+                                            &err,
+                                            Some(fid),
+                                            &fast_shared,
+                                            &mut restricted_folders,
+                                            &mut active_err_backoff,
+                                            &fast_event_tx,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -594,27 +666,23 @@ pub fn spawn_sync_engine(
         }
     });
 
-    // Lane 2: Background Poll Lane (chat preview diff + $batch, presence polling, bulk refreshes)
+    // Lane 2: Quiet Background Poll Lane (folders + Inbox every 15s; Calendar + To Do + Contacts every 60s)
     let bg_shared = Arc::clone(&shared);
     tokio::spawn(async move {
-        let mut chat_tick = time::interval(Duration::from_millis(chat_ms));
-        chat_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut channel_tick = time::interval(Duration::from_millis(channel_ms));
-        channel_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut chat_backoff = PeriodicBackoffTracker::default();
-        let mut channel_backoff = PeriodicBackoffTracker::default();
+        let mut mail_tick = time::interval(Duration::from_millis(mail_ms));
+        mail_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut slow_tick = time::interval(Duration::from_millis(calendar_ms));
+        slow_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut mail_backoff = PeriodicBackoffTracker::default();
+        let mut slow_backoff = PeriodicBackoffTracker::default();
+        let mut mail_err_backoff = ErrorBackoffState::new(mail_ms);
+        let mut slow_err_backoff = ErrorBackoffState::new(calendar_ms);
+        let mut breakers = CapabilityCircuitBreakers::default();
+        let mut last_folders: Option<Vec<MailFolder>> = None;
         let mut was_idle = false;
-        let mut chat_cache: ChatPollCache = HashMap::new();
-        let mut chat_cache_seeded = false;
-        let mut chats_cursor_initialized = false;
-        let mut presence_cache: PresencePollCache = HashMap::new();
-        let mut presence_disabled_for_token: Option<String> = None;
-        let mut chat_err_backoff = ErrorBackoffState::new(chat_ms);
-        let mut presence_err_backoff = ErrorBackoffState::new(channel_ms);
 
-        // Consume initial immediate ticks so startup isn't flooded simultaneously before focus/commands arrive.
-        chat_tick.tick().await;
-        channel_tick.tick().await;
+        mail_tick.tick().await;
+        slow_tick.tick().await;
 
         let mut shutdown_rx = shutdown_rx;
         loop {
@@ -622,6 +690,7 @@ pub fn spawn_sync_engine(
                 break;
             }
             tokio::select! {
+                biased;
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         break;
@@ -630,148 +699,146 @@ pub fn spawn_sync_engine(
                 cmd = bg_rx.recv() => {
                     match cmd {
                         None => break,
-                        Some(SyncCommand::RefreshConversations) => {
+                        Some(SyncCommand::Bootstrap) => {
                             bg_shared.clear_auth_pause();
-                            presence_disabled_for_token = None;
-                            chat_err_backoff.reset_window();
-                            presence_err_backoff.reset_window();
-                            let _ = event_tx.send(CoreEvent::SyncStateChanged {
-                                busy: true,
-                                summary: "Syncing conversations...".to_string(),
-                            });
-                            match refresh_all_conversations_with_cache(
+                            breakers.reset_all();
+                            mail_err_backoff.reset_window();
+                            slow_err_backoff.reset_window();
+                            run_bootstrap_and_emit(
                                 &graph,
                                 &storage,
                                 &event_tx,
-                                &mut chat_cache,
-                                &mut chat_cache_seeded,
-                                &mut chats_cursor_initialized,
-                            ).await {
-                                Ok(()) => {
-                                    chat_err_backoff.record_success();
-                                    presence_err_backoff.record_success();
-                                    let _ = event_tx.send(CoreEvent::SyncStateChanged {
-                                        busy: false,
-                                        summary: "Synced".to_string(),
-                                    });
-                                }
-                                Err(err) => {
-                                    let _ = event_tx.send(CoreEvent::SyncError(format!("Failed to sync conversations: {err}")));
-                                    let _ = event_tx.send(CoreEvent::SyncStateChanged {
-                                        busy: false,
-                                        summary: POLL_RETRY_SUMMARY.to_string(),
-                                    });
-                                }
-                            }
+                                &bg_shared,
+                                &mut mail_err_backoff,
+                                &mut breakers,
+                                &mut last_folders,
+                            )
+                            .await;
+                        }
+                        Some(SyncCommand::RefreshAll) => {
+                            bg_shared.clear_auth_pause();
+                            breakers.reset_all();
+                            mail_err_backoff.reset_window();
+                            slow_err_backoff.reset_window();
+                            run_refresh_all_and_emit(
+                                &graph,
+                                &storage,
+                                &event_tx,
+                                &bg_shared,
+                                &mut mail_err_backoff,
+                                &mut slow_err_backoff,
+                                &mut breakers,
+                                &mut last_folders,
+                            )
+                            .await;
+                        }
+                        Some(SyncCommand::SyncCalendar) => {
+                            let token_fp = current_token_fingerprint(&graph).await;
+                            breakers.calendar_disabled = None;
+                            poll_calendar_quiet(
+                                &graph,
+                                &storage,
+                                &event_tx,
+                                &bg_shared,
+                                &mut slow_err_backoff,
+                                &mut breakers,
+                                &token_fp,
+                            )
+                            .await;
+                        }
+                        Some(SyncCommand::SyncTodo { list_id }) => {
+                            let token_fp = current_token_fingerprint(&graph).await;
+                            breakers.todo_disabled = None;
+                            poll_todo_quiet(
+                                list_id.as_deref(),
+                                &graph,
+                                &storage,
+                                &event_tx,
+                                &bg_shared,
+                                &mut slow_err_backoff,
+                                &mut breakers,
+                                &token_fp,
+                            )
+                            .await;
+                        }
+                        Some(SyncCommand::SyncContacts) => {
+                            let token_fp = current_token_fingerprint(&graph).await;
+                            breakers.contacts_disabled = None;
+                            poll_contacts_quiet(
+                                &graph,
+                                &storage,
+                                &event_tx,
+                                &bg_shared,
+                                &mut slow_err_backoff,
+                                &mut breakers,
+                                &token_fp,
+                            )
+                            .await;
                         }
                         Some(_) => {}
                     }
                 }
-                _ = chat_tick.tick() => {
+                _ = mail_tick.tick() => {
                     let now = Instant::now();
                     let (idle, seq) = bg_shared.idle_snapshot(now);
                     maybe_shrink_on_idle_async(idle, &mut was_idle, &storage);
-                    if chat_backoff.on_tick(idle, seq)
+                    if mail_backoff.on_tick(idle, seq)
                         && !bg_shared.is_auth_paused(now)
-                        && !chat_err_backoff.is_backed_off(now)
+                        && !mail_err_backoff.is_backed_off(now)
                     {
-                        match poll_chats_tier2_with_cache(
+                        poll_mail_lane2_quiet(
                             &graph,
                             &storage,
                             &event_tx,
-                            &mut chat_cache,
-                            &mut chat_cache_seeded,
-                            &mut chats_cursor_initialized,
-                        ).await {
-                            Ok(()) => {
-                                let was_degraded = chat_err_backoff.is_degraded() || presence_err_backoff.is_degraded();
-                                chat_err_backoff.record_success();
-                                let now_degraded = chat_err_backoff.is_degraded() || presence_err_backoff.is_degraded();
-                                if was_degraded && !now_degraded {
-                                    let _ = event_tx.send(CoreEvent::SyncStateChanged {
-                                        busy: false,
-                                        summary: "Synced".to_string(),
-                                    });
-                                }
-                            }
-                            Err(err) => {
-                                match classify_sync_error(&err) {
-                                    SyncErrorKind::Unauthorized401 => {
-                                        bg_shared.pause_auth(now, Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS));
-                                    }
-                                    SyncErrorKind::Forbidden403 => {
-                                        // Quietly back off on forbidden /me/chats without toast spam.
-                                        chat_err_backoff.record_transient_failure(now);
-                                    }
-                                    SyncErrorKind::Transient => {
-                                        let was_degraded = chat_err_backoff.is_degraded() || presence_err_backoff.is_degraded();
-                                        chat_err_backoff.record_transient_failure(now);
-                                        let now_degraded = chat_err_backoff.is_degraded() || presence_err_backoff.is_degraded();
-                                        if !was_degraded && now_degraded {
-                                            let _ = event_tx.send(CoreEvent::SyncStateChanged {
-                                                busy: false,
-                                                summary: POLL_RETRY_SUMMARY.to_string(),
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                            &bg_shared,
+                            &mut mail_err_backoff,
+                            &slow_err_backoff,
+                            &mut last_folders,
+                        )
+                        .await;
                     }
                 }
-                _ = channel_tick.tick() => {
+                _ = slow_tick.tick() => {
                     let now = Instant::now();
                     let (idle, seq) = bg_shared.idle_snapshot(now);
                     maybe_shrink_on_idle_async(idle, &mut was_idle, &storage);
                     if idle < Duration::from_secs(IDLE_THRESHOLD_SECS)
-                        && channel_backoff.on_tick(idle, seq)
+                        && slow_backoff.on_tick(idle, seq)
                         && !bg_shared.is_auth_paused(now)
-                        && !presence_err_backoff.is_backed_off(now)
+                        && !slow_err_backoff.is_backed_off(now)
                     {
                         let token_fp = current_token_fingerprint(&graph).await;
-                        if presence_disabled_for_token.as_ref() == Some(&token_fp) {
-                            continue;
-                        }
-                        presence_disabled_for_token = None;
-                        match poll_presences_tier3_with_cache(
+                        poll_calendar_quiet(
                             &graph,
                             &storage,
                             &event_tx,
-                            &mut presence_cache,
-                        ).await {
-                            Ok(()) => {
-                                let was_degraded = chat_err_backoff.is_degraded() || presence_err_backoff.is_degraded();
-                                presence_err_backoff.record_success();
-                                let now_degraded = chat_err_backoff.is_degraded() || presence_err_backoff.is_degraded();
-                                if was_degraded && !now_degraded {
-                                    let _ = event_tx.send(CoreEvent::SyncStateChanged {
-                                        busy: false,
-                                        summary: "Synced".to_string(),
-                                    });
-                                }
-                            }
-                            Err(err) => {
-                                match classify_sync_error(&err) {
-                                    SyncErrorKind::Forbidden403 => {
-                                        presence_disabled_for_token = Some(token_fp);
-                                    }
-                                    SyncErrorKind::Unauthorized401 => {
-                                        bg_shared.pause_auth(now, Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS));
-                                    }
-                                    SyncErrorKind::Transient => {
-                                        let was_degraded = chat_err_backoff.is_degraded() || presence_err_backoff.is_degraded();
-                                        presence_err_backoff.record_transient_failure(now);
-                                        let now_degraded = chat_err_backoff.is_degraded() || presence_err_backoff.is_degraded();
-                                        if !was_degraded && now_degraded {
-                                            let _ = event_tx.send(CoreEvent::SyncStateChanged {
-                                                busy: false,
-                                                summary: POLL_RETRY_SUMMARY.to_string(),
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                            &bg_shared,
+                            &mut slow_err_backoff,
+                            &mut breakers,
+                            &token_fp,
+                        )
+                        .await;
+                        poll_todo_quiet(
+                            None,
+                            &graph,
+                            &storage,
+                            &event_tx,
+                            &bg_shared,
+                            &mut slow_err_backoff,
+                            &mut breakers,
+                            &token_fp,
+                        )
+                        .await;
+                        poll_contacts_quiet(
+                            &graph,
+                            &storage,
+                            &event_tx,
+                            &bg_shared,
+                            &mut slow_err_backoff,
+                            &mut breakers,
+                            &token_fp,
+                        )
+                        .await;
                     }
                 }
             }
@@ -782,7 +849,807 @@ pub fn spawn_sync_engine(
         focus_tx,
         nudge_tx,
         shared,
+        shutdown_tx: Some(ctrl_shutdown_tx),
     }
+}
+
+fn emit_recovered_if_needed(
+    err_backoff: &mut ErrorBackoffState,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+) {
+    if err_backoff.record_success() {
+        let _ = event_tx.send(CoreEvent::SyncStateChanged {
+            busy: false,
+            summary: "Synced".to_string(),
+        });
+    }
+}
+
+fn handle_quiet_mail_error(
+    err: &anyhow::Error,
+    folder_id: Option<&str>,
+    shared: &SyncSharedState,
+    restricted_folders: &mut HashSet<String>,
+    err_backoff: &mut ErrorBackoffState,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+) {
+    match classify_sync_error(err) {
+        SyncErrorKind::Forbidden403 => {
+            if let Some(fid) = folder_id {
+                restricted_folders.insert(fid.to_string());
+            }
+        }
+        SyncErrorKind::Unauthorized401 => {
+            shared.pause_auth(Instant::now(), Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS));
+        }
+        SyncErrorKind::Transient => {
+            if err_backoff.record_transient_failure(Instant::now()) {
+                let _ = event_tx.send(CoreEvent::SyncStateChanged {
+                    busy: false,
+                    summary: POLL_RETRY_SUMMARY.to_string(),
+                });
+            }
+        }
+    }
+}
+
+async fn hydrate_message_if_needed(
+    message_id: &str,
+    force: bool,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+) -> Result<()> {
+    let trimmed = message_id.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    if !force {
+        let id_owned = trimmed.to_string();
+        if let Ok(Some(cached)) = run_storage(storage, move |st| st.get_mail_message(&id_owned)).await {
+            if cached.body_loaded {
+                return Ok(());
+            }
+        }
+    }
+
+    let mut full = graph.get_mail_message(trimmed).await?;
+    full.body_loaded = true;
+    let for_db = full.clone();
+    run_storage(storage, move |st| {
+        st.upsert_mail_messages(&[for_db])?;
+        Ok(())
+    })
+    .await?;
+    let _ = event_tx.send(CoreEvent::MailMessageHydrated(Box::new(full)));
+    Ok(())
+}
+
+async fn prefetch_unread_bodies(
+    folder_id: &str,
+    max_count: usize,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: Option<&mpsc::UnboundedSender<CoreEvent>>,
+) -> Result<usize> {
+    let fid = folder_id.to_string();
+    let unread_ids: Vec<String> = run_storage(storage, move |st| {
+        let msgs = st.list_mail_messages(Some(&fid), true, false, false, max_count.saturating_mul(4).max(10))?;
+        Ok(msgs
+            .into_iter()
+            .filter(|m| !m.body_loaded)
+            .take(max_count)
+            .map(|m| m.id)
+            .collect())
+    })
+    .await?;
+
+    if unread_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut hydrated = graph.batch_get_mail_messages(&unread_ids).await?;
+    for msg in &mut hydrated {
+        msg.body_loaded = true;
+    }
+    if hydrated.is_empty() {
+        return Ok(0);
+    }
+
+    let to_store = hydrated.clone();
+    run_storage(storage, move |st| {
+        st.upsert_mail_messages(&to_store)?;
+        Ok(())
+    })
+    .await?;
+
+    if let Some(tx) = event_tx {
+        for msg in hydrated.iter() {
+            let _ = tx.send(CoreEvent::MailMessageHydrated(Box::new(msg.clone())));
+        }
+    }
+    Ok(hydrated.len())
+}
+
+async fn load_older_mail_page(
+    folder_id: &str,
+    explicit: bool,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+) -> Result<()> {
+    let scope_key = format!("mail_history:{folder_id}");
+    let scope_clone = scope_key.clone();
+    let cursor = run_storage(storage, move |st| st.get_sync_cursor(&scope_clone)).await?;
+    let existing_next = cursor.and_then(|c| c.history_next_link);
+
+    if existing_next.as_deref() == Some(HISTORY_EOF_MARKER) && !explicit {
+        return Ok(());
+    }
+
+    let mut next_arg: Option<String> = existing_next
+        .as_deref()
+        .filter(|s| *s != HISTORY_EOF_MARKER)
+        .map(str::to_string);
+
+    let mut total_changed = 0usize;
+    let mut final_next_link: Option<String> = None;
+
+    for _ in 0..5 {
+        let (messages, next_link) = match graph
+            .list_mail_messages_page(folder_id, 50, next_arg.as_deref(), true)
+            .await
+        {
+            Ok(res) => res,
+            Err(err) if next_arg.is_some() && is_expired_delta_error(&err) => {
+                graph
+                    .list_mail_messages_page(folder_id, 50, None, true)
+                    .await?
+            }
+            Err(err) => return Err(err),
+        };
+
+        let msgs_for_db = messages;
+        let changed = run_storage(storage, move |st| st.upsert_mail_messages(&msgs_for_db)).await?;
+        total_changed += changed;
+        final_next_link = next_link.clone();
+        if changed > 0 || next_link.is_none() {
+            break;
+        }
+        next_arg = next_link;
+    }
+
+    let fid_owned = folder_id.to_string();
+    let stored_list = run_storage(storage, move |st| {
+        st.upsert_sync_cursor(&SyncCursor {
+            scope_key,
+            delta_link: None,
+            history_next_link: final_next_link.or_else(|| Some(HISTORY_EOF_MARKER.to_string())),
+            last_synced_at: chrono::Utc::now().to_rfc3339(),
+        })?;
+        st.list_mail_messages(Some(&fid_owned), false, false, false, 500)
+    })
+    .await?;
+
+    if total_changed > 0 || explicit {
+        let _ = event_tx.send(CoreEvent::MailMessagesUpdated {
+            folder_id: folder_id.to_string(),
+            messages: stored_list,
+            notify_candidate: None,
+        });
+    }
+    Ok(())
+}
+
+async fn sync_mail_folder(
+    folder_id: &str,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    is_periodic: bool,
+) -> Result<()> {
+    let scope_key = format!("mail_delta:{folder_id}");
+    let scope_for_read = scope_key.clone();
+    let fid_for_read = folder_id.to_string();
+    let (prev_cursor, existing_count) = run_storage(storage, move |st| {
+        let cursor = st.get_sync_cursor(&scope_for_read)?;
+        let summaries = st.list_mail_summaries(Some(&fid_for_read), 1)?;
+        Ok((cursor, summaries.len()))
+    })
+    .await?;
+
+    let had_initial = prev_cursor.is_some() || existing_count > 0;
+    let delta_res = graph
+        .delta_mail_messages(
+            folder_id,
+            prev_cursor.as_ref().and_then(|c| c.delta_link.as_deref()),
+            50,
+        )
+        .await;
+
+    let (incoming, deleted_ids, new_delta_link) = match delta_res {
+        Ok(res) => res,
+        Err(err) if is_expired_delta_error(&err) => {
+            // Clear stale delta token and fall back to page listing cleanly.
+            let stale_scope = scope_key.clone();
+            let hist_link = prev_cursor
+                .as_ref()
+                .and_then(|c| c.history_next_link.clone());
+            let _ = run_storage(storage, move |st| {
+                st.upsert_sync_cursor(&SyncCursor {
+                    scope_key: stale_scope,
+                    delta_link: None,
+                    history_next_link: hist_link,
+                    last_synced_at: chrono::Utc::now().to_rfc3339(),
+                })
+            })
+            .await;
+
+            let (page_msgs, next_link) = graph
+                .list_mail_messages_page(folder_id, 50, None, true)
+                .await?;
+            let fid_clone = folder_id.to_string();
+            let hist_scope = format!("mail_history:{folder_id}");
+            let (changed_rows, notify_candidate, stored_msgs) = run_storage(storage, move |st| {
+                let notify = if had_initial {
+                    find_new_unread_mail_candidate(&fid_clone, st, &page_msgs)
+                } else {
+                    None
+                };
+                let changed = st.upsert_mail_messages(&page_msgs)?;
+                if st.get_sync_cursor(&hist_scope)?.is_none() {
+                    st.upsert_sync_cursor(&SyncCursor {
+                        scope_key: hist_scope,
+                        delta_link: None,
+                        history_next_link: next_link.or_else(|| Some(HISTORY_EOF_MARKER.to_string())),
+                        last_synced_at: chrono::Utc::now().to_rfc3339(),
+                    })?;
+                }
+                let list = st.list_mail_messages(Some(&fid_clone), false, false, false, 100)?;
+                Ok((changed, notify, list))
+            })
+            .await?;
+
+            if !is_periodic || changed_rows > 0 {
+                let _ = event_tx.send(CoreEvent::MailMessagesUpdated {
+                    folder_id: folder_id.to_string(),
+                    messages: stored_msgs,
+                    notify_candidate,
+                });
+            }
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
+
+    let fid_clone = folder_id.to_string();
+    let effective_delta = new_delta_link
+        .or_else(|| prev_cursor.as_ref().and_then(|c| c.delta_link.clone()));
+    let hist_link = prev_cursor.and_then(|c| c.history_next_link);
+    let had_deleted = !deleted_ids.is_empty();
+
+    let (changed_rows, notify_candidate, stored_msgs) = run_storage(storage, move |st| {
+        let notify = if had_initial {
+            find_new_unread_mail_candidate(&fid_clone, st, &incoming)
+        } else {
+            None
+        };
+        if !deleted_ids.is_empty() {
+            st.delete_mail_messages_by_ids(&deleted_ids)?;
+        }
+        let changed = st.upsert_mail_messages(&incoming)?;
+        st.upsert_sync_cursor(&SyncCursor {
+            scope_key,
+            delta_link: effective_delta,
+            history_next_link: hist_link,
+            last_synced_at: chrono::Utc::now().to_rfc3339(),
+        })?;
+        let list = if changed > 0 || had_deleted || !is_periodic {
+            st.list_mail_messages(Some(&fid_clone), false, false, false, 100)?
+        } else {
+            Vec::new()
+        };
+        Ok((changed, notify, list))
+    })
+    .await?;
+
+    if !is_periodic || changed_rows > 0 || had_deleted {
+        let _ = event_tx.send(CoreEvent::MailMessagesUpdated {
+            folder_id: folder_id.to_string(),
+            messages: stored_msgs,
+            notify_candidate,
+        });
+    }
+    Ok(())
+}
+
+async fn poll_mail_folders_quiet(
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    last_folders: &mut Option<Vec<MailFolder>>,
+) -> Result<()> {
+    let folders = graph.list_mail_folders().await?;
+    let changed = last_folders.as_ref() != Some(&folders);
+    if changed {
+        let to_store = folders.clone();
+        run_storage(storage, move |st| st.upsert_mail_folders(&to_store)).await?;
+        *last_folders = Some(folders.clone());
+        let _ = event_tx.send(CoreEvent::MailFoldersUpdated(folders));
+    }
+    Ok(())
+}
+
+async fn poll_mail_lane2_quiet(
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    shared: &SyncSharedState,
+    mail_err_backoff: &mut ErrorBackoffState,
+    slow_err_backoff: &ErrorBackoffState,
+    last_folders: &mut Option<Vec<MailFolder>>,
+) {
+    let (folders_res, inbox_res) = tokio::join!(
+        poll_mail_folders_quiet(graph, storage, event_tx, last_folders),
+        sync_mail_folder("inbox", graph, storage, event_tx, true),
+    );
+
+    if let Err(err) = folders_res.and(inbox_res) {
+        match classify_sync_error(&err) {
+            SyncErrorKind::Unauthorized401 => {
+                shared.pause_auth(Instant::now(), Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS));
+            }
+            SyncErrorKind::Forbidden403 => {
+                mail_err_backoff.record_transient_failure(Instant::now());
+            }
+            SyncErrorKind::Transient => {
+                let was_degraded =
+                    mail_err_backoff.is_degraded() || slow_err_backoff.is_degraded();
+                mail_err_backoff.record_transient_failure(Instant::now());
+                let now_degraded =
+                    mail_err_backoff.is_degraded() || slow_err_backoff.is_degraded();
+                if !was_degraded && now_degraded {
+                    let _ = event_tx.send(CoreEvent::SyncStateChanged {
+                        busy: false,
+                        summary: POLL_RETRY_SUMMARY.to_string(),
+                    });
+                }
+            }
+        }
+    } else {
+        let was_degraded = mail_err_backoff.is_degraded() || slow_err_backoff.is_degraded();
+        mail_err_backoff.record_success();
+        let now_degraded = mail_err_backoff.is_degraded() || slow_err_backoff.is_degraded();
+        if was_degraded && !now_degraded {
+            let _ = event_tx.send(CoreEvent::SyncStateChanged {
+                busy: false,
+                summary: "Synced".to_string(),
+            });
+        }
+        let _ = prefetch_unread_bodies(
+            "inbox",
+            INBOX_PREFETCH_UNREAD_LIMIT,
+            graph,
+            storage,
+            Some(event_tx),
+        )
+        .await;
+    }
+}
+
+pub(crate) async fn poll_calendar_quiet(
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    shared: &SyncSharedState,
+    err_backoff: &mut ErrorBackoffState,
+    breakers: &mut CapabilityCircuitBreakers,
+    token_fp: &str,
+) {
+    poll_calendar_with_flag(
+        graph,
+        storage,
+        event_tx,
+        shared,
+        err_backoff,
+        &mut breakers.calendar_disabled,
+        token_fp,
+    )
+    .await;
+}
+
+async fn poll_calendar_with_flag(
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    shared: &SyncSharedState,
+    err_backoff: &mut ErrorBackoffState,
+    calendar_disabled: &mut Option<String>,
+    token_fp: &str,
+) {
+    if calendar_disabled.as_deref() == Some(token_fp) {
+        return;
+    }
+
+    let (start_iso, end_iso) = default_calendar_window();
+    let cursor = run_storage(storage, |st| st.get_sync_cursor("calendar_delta")).await.ok().flatten();
+
+    let delta_res = graph
+        .delta_calendar_view(
+            &start_iso,
+            &end_iso,
+            cursor.as_ref().and_then(|c| c.delta_link.as_deref()),
+        )
+        .await;
+
+    let res = match delta_res {
+        Ok((events, removed_ids, new_delta_link)) => {
+            let effective_delta = new_delta_link
+                .or_else(|| cursor.as_ref().and_then(|c| c.delta_link.clone()));
+            let has_changes = !events.is_empty() || !removed_ids.is_empty();
+            let stored = run_storage(storage, move |st| {
+                if !removed_ids.is_empty() {
+                    st.delete_calendar_events_by_ids(&removed_ids)?;
+                }
+                if !events.is_empty() {
+                    st.upsert_calendar_events(&events)?;
+                }
+                st.upsert_sync_cursor(&SyncCursor {
+                    scope_key: "calendar_delta".to_string(),
+                    delta_link: effective_delta,
+                    history_next_link: None,
+                    last_synced_at: chrono::Utc::now().to_rfc3339(),
+                })?;
+                if has_changes {
+                    st.list_calendar_events(Some(&start_iso), Some(&end_iso), 200)
+                } else {
+                    Ok(Vec::new())
+                }
+            })
+            .await;
+            if let Ok(list) = stored {
+                if has_changes {
+                    let _ = event_tx.send(CoreEvent::CalendarEventsUpdated(list));
+                }
+                Ok(())
+            } else {
+                stored.map(|_| ())
+            }
+        }
+        Err(err) if is_expired_delta_error(&err) => {
+            match graph.list_calendar_view(&start_iso, &end_iso, 100).await {
+                Ok(events) => {
+                    let to_store = events.clone();
+                    let _ = run_storage(storage, move |st| {
+                        st.upsert_sync_cursor(&SyncCursor {
+                            scope_key: "calendar_delta".to_string(),
+                            delta_link: None,
+                            history_next_link: None,
+                            last_synced_at: chrono::Utc::now().to_rfc3339(),
+                        })?;
+                        st.upsert_calendar_events(&to_store)
+                    })
+                    .await;
+                    let _ = event_tx.send(CoreEvent::CalendarEventsUpdated(events));
+                    Ok(())
+                }
+                Err(fallback_err) => Err(fallback_err),
+            }
+        }
+        Err(err) => Err(err),
+    };
+
+    if let Err(err) = res {
+        match classify_sync_error(&err) {
+            SyncErrorKind::Forbidden403 => {
+                *calendar_disabled = Some(token_fp.to_string());
+            }
+            SyncErrorKind::Unauthorized401 => {
+                shared.pause_auth(Instant::now(), Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS));
+            }
+            SyncErrorKind::Transient => {
+                if err_backoff.record_transient_failure(Instant::now()) {
+                    let _ = event_tx.send(CoreEvent::SyncStateChanged {
+                        busy: false,
+                        summary: POLL_RETRY_SUMMARY.to_string(),
+                    });
+                }
+            }
+        }
+    } else {
+        emit_recovered_if_needed(err_backoff, event_tx);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn poll_todo_quiet(
+    target_list_id: Option<&str>,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    shared: &SyncSharedState,
+    err_backoff: &mut ErrorBackoffState,
+    breakers: &mut CapabilityCircuitBreakers,
+    token_fp: &str,
+) {
+    poll_todo_with_flag(
+        target_list_id,
+        graph,
+        storage,
+        event_tx,
+        shared,
+        err_backoff,
+        &mut breakers.todo_disabled,
+        token_fp,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn poll_todo_with_flag(
+    target_list_id: Option<&str>,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    shared: &SyncSharedState,
+    err_backoff: &mut ErrorBackoffState,
+    todo_disabled: &mut Option<String>,
+    token_fp: &str,
+) {
+    if todo_disabled.as_deref() == Some(token_fp) {
+        return;
+    }
+
+    let lists = match graph.list_todo_lists().await {
+        Ok(l) => l,
+        Err(err) => {
+            match classify_sync_error(&err) {
+                SyncErrorKind::Forbidden403 => {
+                    *todo_disabled = Some(token_fp.to_string());
+                }
+                SyncErrorKind::Unauthorized401 => {
+                    shared.pause_auth(Instant::now(), Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS));
+                }
+                SyncErrorKind::Transient => {
+                    if err_backoff.record_transient_failure(Instant::now()) {
+                        let _ = event_tx.send(CoreEvent::SyncStateChanged {
+                            busy: false,
+                            summary: POLL_RETRY_SUMMARY.to_string(),
+                        });
+                    }
+                }
+            }
+            return;
+        }
+    };
+
+    let chosen_list_id = target_list_id
+        .map(str::to_string)
+        .or_else(|| pick_default_todo_list(&lists).map(|l| l.id.clone()));
+
+    let lists_for_db = lists.clone();
+    if run_storage(storage, move |st| st.upsert_todo_lists(&lists_for_db))
+        .await
+        .is_ok()
+    {
+        let _ = event_tx.send(CoreEvent::TodoListsUpdated(lists));
+    }
+
+    if let Some(lid) = chosen_list_id {
+        match graph.list_todo_tasks(&lid, true, 100).await {
+            Ok(tasks) => {
+                let tasks_for_db = tasks.clone();
+                let _ = run_storage(storage, move |st| st.upsert_todo_tasks(&tasks_for_db)).await;
+                let _ = event_tx.send(CoreEvent::TodoTasksUpdated {
+                    list_id: lid,
+                    tasks,
+                });
+                emit_recovered_if_needed(err_backoff, event_tx);
+            }
+            Err(err) => match classify_sync_error(&err) {
+                SyncErrorKind::Forbidden403 => *todo_disabled = Some(token_fp.to_string()),
+                SyncErrorKind::Unauthorized401 => {
+                    shared.pause_auth(Instant::now(), Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS));
+                }
+                SyncErrorKind::Transient => {
+                    if err_backoff.record_transient_failure(Instant::now()) {
+                        let _ = event_tx.send(CoreEvent::SyncStateChanged {
+                            busy: false,
+                            summary: POLL_RETRY_SUMMARY.to_string(),
+                        });
+                    }
+                }
+            },
+        }
+    } else {
+        emit_recovered_if_needed(err_backoff, event_tx);
+    }
+}
+
+pub(crate) async fn poll_contacts_quiet(
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    shared: &SyncSharedState,
+    err_backoff: &mut ErrorBackoffState,
+    breakers: &mut CapabilityCircuitBreakers,
+    token_fp: &str,
+) {
+    poll_contacts_with_flag(
+        graph,
+        storage,
+        event_tx,
+        shared,
+        err_backoff,
+        &mut breakers.contacts_disabled,
+        token_fp,
+    )
+    .await;
+}
+
+async fn poll_contacts_with_flag(
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    shared: &SyncSharedState,
+    err_backoff: &mut ErrorBackoffState,
+    contacts_disabled: &mut Option<String>,
+    token_fp: &str,
+) {
+    if contacts_disabled.as_deref() == Some(token_fp) {
+        return;
+    }
+
+    match graph.list_contacts(100).await {
+        Ok(contacts) => {
+            let to_store = contacts.clone();
+            if run_storage(storage, move |st| st.upsert_contacts(&to_store))
+                .await
+                .is_ok()
+            {
+                let _ = event_tx.send(CoreEvent::ContactsUpdated(contacts));
+            }
+            emit_recovered_if_needed(err_backoff, event_tx);
+        }
+        Err(err) => match classify_sync_error(&err) {
+            SyncErrorKind::Forbidden403 => {
+                *contacts_disabled = Some(token_fp.to_string());
+            }
+            SyncErrorKind::Unauthorized401 => {
+                shared.pause_auth(Instant::now(), Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS));
+            }
+            SyncErrorKind::Transient => {
+                if err_backoff.record_transient_failure(Instant::now()) {
+                    let _ = event_tx.send(CoreEvent::SyncStateChanged {
+                        busy: false,
+                        summary: POLL_RETRY_SUMMARY.to_string(),
+                    });
+                }
+            }
+        },
+    }
+}
+
+async fn run_bootstrap_and_emit(
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    shared: &SyncSharedState,
+    mail_err_backoff: &mut ErrorBackoffState,
+    breakers: &mut CapabilityCircuitBreakers,
+    last_folders: &mut Option<Vec<MailFolder>>,
+) {
+    let _ = event_tx.send(CoreEvent::SyncStateChanged {
+        busy: true,
+        summary: "Syncing Outlook...".to_string(),
+    });
+
+    if let Ok(profile) = graph.get_me().await {
+        let _ = event_tx.send(CoreEvent::ProfileLoaded(profile));
+    }
+
+    let token_fp = current_token_fingerprint(graph).await;
+    let (folders_res, inbox_res) = tokio::join!(
+        poll_mail_folders_quiet(graph, storage, event_tx, last_folders),
+        sync_mail_folder("inbox", graph, storage, event_tx, false),
+    );
+
+    let mail_ok = match folders_res.and(inbox_res) {
+        Ok(()) => {
+            mail_err_backoff.record_success();
+            let _ = prefetch_unread_bodies(
+                "inbox",
+                INBOX_PREFETCH_UNREAD_LIMIT,
+                graph,
+                storage,
+                Some(event_tx),
+            )
+            .await;
+            true
+        }
+        Err(err) => {
+            if classify_sync_error(&err) == SyncErrorKind::Unauthorized401 {
+                shared.pause_auth(Instant::now(), Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS));
+            } else {
+                mail_err_backoff.record_transient_failure(Instant::now());
+            }
+            false
+        }
+    };
+
+    let mut cal_backoff = ErrorBackoffState::new(60_000);
+    let mut todo_backoff = ErrorBackoffState::new(60_000);
+    let mut contacts_backoff = ErrorBackoffState::new(60_000);
+    let mut cal_disabled = breakers.calendar_disabled.take();
+    let mut todo_disabled = breakers.todo_disabled.take();
+    let mut contacts_disabled = breakers.contacts_disabled.take();
+
+    tokio::join!(
+        poll_calendar_with_flag(
+            graph,
+            storage,
+            event_tx,
+            shared,
+            &mut cal_backoff,
+            &mut cal_disabled,
+            &token_fp,
+        ),
+        poll_todo_with_flag(
+            None,
+            graph,
+            storage,
+            event_tx,
+            shared,
+            &mut todo_backoff,
+            &mut todo_disabled,
+            &token_fp,
+        ),
+        poll_contacts_with_flag(
+            graph,
+            storage,
+            event_tx,
+            shared,
+            &mut contacts_backoff,
+            &mut contacts_disabled,
+            &token_fp,
+        ),
+    );
+    breakers.calendar_disabled = cal_disabled;
+    breakers.todo_disabled = todo_disabled;
+    breakers.contacts_disabled = contacts_disabled;
+
+    let _ = event_tx.send(CoreEvent::SyncStateChanged {
+        busy: false,
+        summary: if mail_ok {
+            "Synced".to_string()
+        } else {
+            POLL_RETRY_SUMMARY.to_string()
+        },
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_refresh_all_and_emit(
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    shared: &SyncSharedState,
+    mail_err_backoff: &mut ErrorBackoffState,
+    slow_err_backoff: &mut ErrorBackoffState,
+    breakers: &mut CapabilityCircuitBreakers,
+    last_folders: &mut Option<Vec<MailFolder>>,
+) {
+    run_bootstrap_and_emit(
+        graph,
+        storage,
+        event_tx,
+        shared,
+        mail_err_backoff,
+        breakers,
+        last_folders,
+    )
+    .await;
+    slow_err_backoff.record_success();
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -809,542 +1676,43 @@ fn maybe_shrink_on_idle_async(idle_duration: Duration, was_idle: &mut bool, stor
     }
 }
 
-fn save_initial_history_cursor_if_absent(
+pub(crate) fn find_new_unread_mail_candidate(
+    folder_id: &str,
     storage: &Storage,
-    conv_key: &str,
-    msgs: &[MessageItem],
-    next_link: Option<String>,
-) -> Result<()> {
-    let scope = SyncCursor::history_scope(conv_key);
-    if storage.get_sync_cursor(&scope)?.is_none() {
-        let oldest_msg_ts = if next_link.is_none() {
-            Some(SyncCursor::HISTORY_EOF.to_string())
-        } else {
-            msgs.iter()
-                .map(|m| m.created_at.as_str())
-                .min()
-                .map(str::to_string)
-        };
-        storage.save_sync_cursor(&SyncCursor {
-            scope_key: scope,
-            delta_link: next_link,
-            oldest_msg_ts,
-            synced_at: chrono::Utc::now().to_rfc3339(),
-        })?;
-    }
-    Ok(())
-}
-
-fn save_initial_chats_list_cursor_if_absent(
-    storage: &Storage,
-    next_link: Option<String>,
-) -> Result<()> {
-    if storage
-        .get_sync_cursor(SyncCursor::CHATS_LIST_SCOPE)?
-        .is_none()
-    {
-        let oldest_msg_ts = if next_link.is_none() {
-            Some(SyncCursor::HISTORY_EOF.to_string())
-        } else {
-            None
-        };
-        storage.save_sync_cursor(&SyncCursor {
-            scope_key: SyncCursor::CHATS_LIST_SCOPE.to_string(),
-            delta_link: next_link,
-            oldest_msg_ts,
-            synced_at: chrono::Utc::now().to_rfc3339(),
-        })?;
-    }
-    Ok(())
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-async fn sync_active_focus(
-    focus: &FocusTarget,
-    graph: &GraphClient,
-    storage: &Storage,
-    event_tx: &mpsc::UnboundedSender<CoreEvent>,
-) -> Result<()> {
-    let mut sigs = HashMap::new();
-    sync_active_focus_with_state(focus, graph, storage, event_tx, &mut sigs, false).await
-}
-
-async fn sync_active_focus_with_state(
-    focus: &FocusTarget,
-    graph: &GraphClient,
-    storage: &Storage,
-    event_tx: &mpsc::UnboundedSender<CoreEvent>,
-    last_active_sig: &mut HashMap<String, u64>,
-    is_periodic: bool,
-) -> Result<()> {
-    let Some(target) = &focus.target else {
-        return Ok(());
-    };
-    let conv_key = target.conv_key();
-
-    match target {
-        ConversationTarget::Chat { .. } => {
-            let (messages, next_link) = graph.list_messages_page(target, 50, None).await?;
-            let sig = compute_messages_signature(&messages);
-            let prev_sig = last_active_sig.get(&conv_key).copied();
-            if is_periodic && prev_sig == Some(sig) {
-                return Ok(());
-            }
-
-            let msgs_for_db = messages.clone();
-            let key_for_db = conv_key.clone();
-            let changed_rows = run_storage(storage, move |st| {
-                let changed = st.upsert_messages(&msgs_for_db)?;
-                save_initial_history_cursor_if_absent(st, &key_for_db, &msgs_for_db, next_link)?;
-                Ok(changed)
-            })
-            .await?;
-            last_active_sig.insert(conv_key.clone(), sig);
-
-            if !is_periodic || prev_sig.is_none() || changed_rows > 0 {
-                let _ = event_tx.send(CoreEvent::MessagesUpdated {
-                    conv_key,
-                    parent_msg_id: None,
-                    messages,
-                    notify_candidate: None,
-                });
-            }
-        }
-        ConversationTarget::Channel {
-            team_id,
-            channel_id,
-        } => {
-            let key_for_cursor = conv_key.clone();
-            let cursor =
-                run_storage(storage, move |st| st.get_sync_cursor(&key_for_cursor)).await?;
-            let delta_fut = graph.sync_channel_messages_delta(
-                team_id,
-                channel_id,
-                cursor.as_ref().and_then(|c| c.delta_link.as_deref()),
-            );
-            let replies_fut = async {
-                match &focus.thread_root_id {
-                    Some(root_id) => Some((
-                        root_id.clone(),
-                        graph
-                            .list_thread_replies(team_id, channel_id, root_id, 50)
-                            .await,
-                    )),
-                    None => None,
-                }
-            };
-            let (delta_res, replies_opt) = tokio::join!(delta_fut, replies_fut);
-
-            match delta_res {
-                Ok((messages, new_delta_link)) => {
-                    let oldest_ts = messages
-                        .iter()
-                        .map(|m| m.created_at.as_str())
-                        .min()
-                        .map(str::to_string)
-                        .or_else(|| cursor.as_ref().and_then(|c| c.oldest_msg_ts.clone()));
-                    let effective_delta_link = new_delta_link
-                        .or_else(|| cursor.as_ref().and_then(|c| c.delta_link.clone()));
-                    let new_cursor = SyncCursor {
-                        scope_key: conv_key.clone(),
-                        delta_link: effective_delta_link,
-                        oldest_msg_ts: oldest_ts,
-                        synced_at: chrono::Utc::now().to_rfc3339(),
-                    };
-
-                    let sig = compute_messages_signature(&messages);
-                    let prev_sig = last_active_sig.get(&conv_key).copied();
-                    let skip_msg_update =
-                        is_periodic && !messages.is_empty() && prev_sig == Some(sig);
-
-                    let msgs_for_db = messages.clone();
-                    let changed_rows = run_storage(storage, move |st| {
-                        st.save_sync_cursor(&new_cursor)?;
-                        if !msgs_for_db.is_empty() && !skip_msg_update {
-                            st.upsert_messages(&msgs_for_db)
-                        } else {
-                            Ok(0)
-                        }
-                    })
-                    .await?;
-
-                    if !messages.is_empty() {
-                        last_active_sig.insert(conv_key.clone(), sig);
-                        if !skip_msg_update
-                            && (!is_periodic || prev_sig.is_none() || changed_rows > 0)
-                        {
-                            let _ = event_tx.send(CoreEvent::MessagesUpdated {
-                                conv_key: conv_key.clone(),
-                                parent_msg_id: None,
-                                messages,
-                                notify_candidate: None,
-                            });
-                        }
-                    }
-                }
-                Err(err) => {
-                    if !is_expired_delta_error(&err) {
-                        return Err(err);
-                    }
-                    // Clear stale delta token before falling back to page listing.
-                    let stale_key = conv_key.clone();
-                    let stale_oldest = cursor.as_ref().and_then(|c| c.oldest_msg_ts.clone());
-                    run_storage(storage, move |st| {
-                        st.save_sync_cursor(&SyncCursor {
-                            scope_key: stale_key,
-                            delta_link: None,
-                            oldest_msg_ts: stale_oldest,
-                            synced_at: chrono::Utc::now().to_rfc3339(),
-                        })
-                    })
-                    .await?;
-
-                    let (messages, next_link) = graph.list_messages_page(target, 50, None).await?;
-                    let sig = compute_messages_signature(&messages);
-                    let prev_sig = last_active_sig.get(&conv_key).copied();
-                    if !(is_periodic && prev_sig == Some(sig)) {
-                        let msgs_for_db = messages.clone();
-                        let key_for_db = conv_key.clone();
-                        let changed_rows = run_storage(storage, move |st| {
-                            let changed = st.upsert_messages(&msgs_for_db)?;
-                            save_initial_history_cursor_if_absent(
-                                st,
-                                &key_for_db,
-                                &msgs_for_db,
-                                next_link,
-                            )?;
-                            Ok(changed)
-                        })
-                        .await?;
-                        last_active_sig.insert(conv_key.clone(), sig);
-
-                        if !is_periodic || prev_sig.is_none() || changed_rows > 0 {
-                            let _ = event_tx.send(CoreEvent::MessagesUpdated {
-                                conv_key: conv_key.clone(),
-                                parent_msg_id: None,
-                                messages,
-                                notify_candidate: None,
-                            });
-                        }
-                    }
-                }
-            }
-
-            if let Some((root_id, replies_res)) = replies_opt {
-                let replies = replies_res?;
-                let thread_sig_key = format!("{conv_key}|thread:{root_id}");
-                let sig = compute_messages_signature(&replies);
-                let prev_sig = last_active_sig.get(&thread_sig_key).copied();
-                if !(is_periodic && prev_sig == Some(sig)) {
-                    let replies_for_db = replies.clone();
-                    let changed_rows =
-                        run_storage(storage, move |st| st.upsert_messages(&replies_for_db))
-                            .await?;
-                    last_active_sig.insert(thread_sig_key, sig);
-
-                    if !is_periodic || prev_sig.is_none() || changed_rows > 0 {
-                        let _ = event_tx.send(CoreEvent::MessagesUpdated {
-                            conv_key,
-                            parent_msg_id: Some(root_id),
-                            messages: replies,
-                            notify_candidate: None,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn poll_chats_tier2_with_cache(
-    graph: &GraphClient,
-    storage: &Storage,
-    event_tx: &mpsc::UnboundedSender<CoreEvent>,
-    chat_cache: &mut ChatPollCache,
-    chat_cache_seeded: &mut bool,
-    chats_cursor_initialized: &mut bool,
-) -> Result<()> {
-    if !*chat_cache_seeded {
-        let existing = run_storage(storage, |st| st.list_conversations()).await?;
-        for conv in existing {
-            chat_cache.insert(
-                conv.conv_key,
-                (
-                    conv.last_msg_id,
-                    conv.last_updated_at,
-                    conv.title,
-                    conv.unread_count,
-                ),
-            );
-        }
-        *chat_cache_seeded = true;
-    }
-
-    let (chats, next_link) = graph.list_chats_page(50, None).await?;
-
-    let mut dirty_ids = Vec::new();
-    let mut changed_chats = Vec::new();
-    for chat in &chats {
-        let next_entry = (
-            chat.last_msg_id.clone(),
-            chat.last_updated_at.clone(),
-            chat.title.clone(),
-            chat.unread_count,
-        );
-        let cached = chat_cache.get(&chat.conv_key);
-        let changed = cached != Some(&next_entry);
-        if changed {
-            changed_chats.push(chat.clone());
-        }
-
-        if let ConversationTarget::Chat { chat_id } = &chat.target {
-            let is_dirty = match cached {
-                None => chat.last_msg_id.is_some() || chat.last_updated_at.is_some(),
-                Some((cached_msg_id, cached_updated_at, _, _)) => {
-                    (chat.last_msg_id.is_some() && &chat.last_msg_id != cached_msg_id)
-                        || (chat.last_updated_at.is_some()
-                            && &chat.last_updated_at != cached_updated_at)
-                }
-            };
-            if is_dirty {
-                dirty_ids.push(chat_id.clone());
-            }
-        }
-    }
-
-    let chat_by_id: HashMap<String, &ConversationSummary> = chats
-        .iter()
-        .filter_map(|c| match &c.target {
-            ConversationTarget::Chat { chat_id } => Some((chat_id.clone(), c)),
-            _ => None,
-        })
-        .collect();
-
-    if !changed_chats.is_empty() || !*chats_cursor_initialized {
-        let to_upsert = changed_chats.clone();
-        let save_cursor = !*chats_cursor_initialized;
-        run_storage(storage, move |st| {
-            if !to_upsert.is_empty() {
-                st.upsert_conversations(&to_upsert)?;
-            }
-            if save_cursor {
-                save_initial_chats_list_cursor_if_absent(st, next_link)?;
-            }
-            Ok(())
-        })
-        .await?;
-        *chats_cursor_initialized = true;
-    }
-
-    if !dirty_ids.is_empty() {
-        let fetched = graph.batch_fetch_chat_messages(&dirty_ids, 20).await?;
-        for (chat_id, messages) in fetched {
-            let msgs_for_db = messages.clone();
-            let changed_msgs =
-                run_storage(storage, move |st| st.upsert_messages(&msgs_for_db)).await?;
-            if changed_msgs > 0 {
-                let conv_key = ConversationTarget::Chat {
-                    chat_id: chat_id.clone(),
-                }
-                .conv_key();
-                let conv_title = chat_by_id
-                    .get(&chat_id)
-                    .map(|c| c.title.clone())
-                    .unwrap_or_else(|| conv_key.clone());
-                let notify_candidate =
-                    build_notification_candidate(&conv_key, &conv_title, &messages);
-
-                let _ = event_tx.send(CoreEvent::MessagesUpdated {
-                    conv_key,
-                    parent_msg_id: None,
-                    messages,
-                    notify_candidate,
-                });
-            }
-        }
-    }
-
-    for chat in &changed_chats {
-        chat_cache.insert(
-            chat.conv_key.clone(),
-            (
-                chat.last_msg_id.clone(),
-                chat.last_updated_at.clone(),
-                chat.title.clone(),
-                chat.unread_count,
-            ),
-        );
-    }
-
-    if !changed_chats.is_empty() {
-        let all_convs = run_storage(storage, |st| st.list_conversations()).await?;
-        let _ = event_tx.send(CoreEvent::ConversationsUpdated(all_convs));
-    }
-
-    Ok(())
-}
-
-async fn poll_presences_tier3_with_cache(
-    graph: &GraphClient,
-    storage: &Storage,
-    event_tx: &mpsc::UnboundedSender<CoreEvent>,
-    presence_cache: &mut PresencePollCache,
-) -> Result<()> {
-    let convs = run_storage(storage, |st| st.list_conversations()).await?;
-    let mut seen = HashSet::new();
-    let mut user_ids = Vec::new();
-    for c in convs {
-        if c.kind == ConversationKind::OneOnOne {
-            if let Some(uid) = c.peer_user_id {
-                if seen.insert(uid.clone()) {
-                    user_ids.push(uid);
-                    if user_ids.len() >= MAX_POLLED_PRESENCE_PEERS {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    if user_ids.is_empty() {
-        return Ok(());
-    }
-
-    let presences = graph.get_presences_by_user_ids(&user_ids).await?;
-    let changed: Vec<PresenceStatus> = presences
-        .into_iter()
-        .filter(|p| {
-            presence_cache
-                .get(&p.user_id)
-                .is_none_or(|(avail, act)| avail != &p.availability || act != &p.activity)
-        })
-        .collect();
-
-    if !changed.is_empty() {
-        let to_upsert = changed.clone();
-        run_storage(storage, move |st| st.upsert_presences(&to_upsert)).await?;
-        for p in &changed {
-            presence_cache.insert(
-                p.user_id.clone(),
-                (p.availability.clone(), p.activity.clone()),
-            );
-        }
-        let _ = event_tx.send(CoreEvent::PresenceUpdated(changed));
-    }
-
-    Ok(())
-}
-
-async fn refresh_all_conversations_with_cache(
-    graph: &GraphClient,
-    storage: &Storage,
-    event_tx: &mpsc::UnboundedSender<CoreEvent>,
-    chat_cache: &mut ChatPollCache,
-    chat_cache_seeded: &mut bool,
-    chats_cursor_initialized: &mut bool,
-) -> Result<()> {
-    let (chats_res, teams_res) = tokio::join!(
-        poll_chats_tier2_with_cache(
-            graph,
-            storage,
-            event_tx,
-            chat_cache,
-            chat_cache_seeded,
-            chats_cursor_initialized,
-        ),
-        graph.list_joined_teams_with_channels(),
-    );
-    chats_res?;
-    if let Ok(teams) = teams_res {
-        let teams_for_db = teams.clone();
-        let all_convs = run_storage(storage, move |st| {
-            st.upsert_teams(&teams_for_db)?;
-            st.list_conversations()
-        })
-        .await?;
-        let _ = event_tx.send(CoreEvent::TeamsUpdated(teams));
-        let _ = event_tx.send(CoreEvent::ConversationsUpdated(all_convs));
-    }
-    Ok(())
-}
-
-async fn sync_channel_history(
-    team_id: &str,
-    channel_id: &str,
-    graph: &GraphClient,
-    storage: &Storage,
-    event_tx: &mpsc::UnboundedSender<CoreEvent>,
-) -> Result<()> {
-    let target = ConversationTarget::Channel {
-        team_id: team_id.to_string(),
-        channel_id: channel_id.to_string(),
-    };
-    let conv_key = target.conv_key();
-    let (messages, next_link) = graph.list_messages_page(&target, 50, None).await?;
-    let msgs_for_db = messages.clone();
-    let key_for_db = conv_key.clone();
-    run_storage(storage, move |st| {
-        st.upsert_messages(&msgs_for_db)?;
-        save_initial_history_cursor_if_absent(st, &key_for_db, &msgs_for_db, next_link)
-    })
-    .await?;
-    let _ = event_tx.send(CoreEvent::MessagesUpdated {
-        conv_key,
-        parent_msg_id: None,
-        messages,
-        notify_candidate: None,
-    });
-    Ok(())
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn collect_dirty_chat_ids(
-    fresh_chats: &[ConversationSummary],
-    cached_by_key: &HashMap<String, ConversationSummary>,
-) -> Vec<String> {
-    let mut dirty = Vec::new();
-    for chat in fresh_chats {
-        let ConversationTarget::Chat { chat_id } = &chat.target else {
-            continue;
-        };
-        let is_dirty = match cached_by_key.get(&chat.conv_key) {
-            None => chat.last_msg_id.is_some() || chat.last_updated_at.is_some(),
-            Some(cached) => {
-                (chat.last_msg_id.is_some() && chat.last_msg_id != cached.last_msg_id)
-                    || (chat.last_updated_at.is_some()
-                        && chat.last_updated_at != cached.last_updated_at)
-            }
-        };
-        if is_dirty {
-            dirty.push(chat_id.clone());
-        }
-    }
-    dirty
-}
-
-pub(crate) fn build_notification_candidate(
-    conv_key: &str,
-    conv_title: &str,
-    messages: &[MessageItem],
+    incoming: &[MailMessage],
 ) -> Option<NotificationCandidate> {
-    let newest = messages
+    let newest = incoming
         .iter()
-        .filter(|m| !m.deleted)
-        .max_by(|a, b| a.created_at.cmp(&b.created_at).then(a.msg_id.cmp(&b.msg_id)))?;
-    if newest.is_me {
-        return None;
-    }
-    let preview = newest
-        .body_plain
+        .filter(|m| !m.is_read && !m.is_draft)
+        .filter(|m| matches!(storage.get_mail_message(&m.id), Ok(None)))
+        .max_by(|a, b| a.received_at.cmp(&b.received_at).then(a.id.cmp(&b.id)))?;
+
+    let folder_name = storage
+        .list_mail_folders()
+        .ok()
+        .and_then(|folders| {
+            folders.into_iter().find(|f| {
+                f.id == folder_id
+                    || f.well_known_name
+                        .as_deref()
+                        .is_some_and(|w| w.eq_ignore_ascii_case(folder_id))
+            })
+        })
+        .map(|f| f.display_name)
+        .unwrap_or_else(|| folder_id.to_string());
+
+    let preview_body = newest
+        .preview
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
+
     Some(NotificationCandidate {
-        conv_key: conv_key.to_string(),
-        conv_title: conv_title.to_string(),
-        sender: newest.author_name.clone(),
-        preview,
+        item_id: newest.id.clone(),
+        folder_name,
+        sender: newest.from_display(),
+        subject: newest.effective_subject().to_string(),
+        preview: preview_body,
     })
 }
 
@@ -1352,561 +1720,60 @@ pub(crate) fn build_notification_candidate(
 mod tests {
     use super::*;
     use crate::auth::{AuthManager, StoredTokens};
+    use crate::models::EmailRecipient;
 
-    fn chat_summary(id: &str, last_msg_id: Option<&str>, updated: Option<&str>) -> ConversationSummary {
-        let target = ConversationTarget::Chat {
-            chat_id: id.to_string(),
-        };
-        ConversationSummary {
-            conv_key: target.conv_key(),
-            target,
-            kind: ConversationKind::OneOnOne,
-            team_id: None,
-            team_name: None,
-            title: format!("Chat {id}"),
-            topic: None,
-            unread_count: 0,
-            last_read_at: None,
-            last_msg_id: last_msg_id.map(str::to_string),
-            last_msg_author: None,
-            last_msg_preview: None,
-            last_updated_at: updated.map(str::to_string),
-            pinned: false,
-            peer_user_id: None,
-            web_url: None,
-        }
-    }
-
-    fn sample_msg(conv_key: &str, msg_id: &str, created_at: &str) -> MessageItem {
-        MessageItem {
-            msg_key: MessageItem::make_msg_key(conv_key, msg_id),
-            conv_key: conv_key.to_string(),
-            msg_id: msg_id.to_string(),
-            parent_msg_id: None,
-            reply_to_id: None,
-            reply_to_author: None,
-            reply_to_preview: None,
-            subject: None,
-            author_id: Some("u2".to_string()),
-            author_name: "Alice".to_string(),
-            is_me: false,
-            created_at: created_at.to_string(),
-            last_modified_at: None,
-            deleted: false,
-            importance: "normal".to_string(),
-            message_type: "message".to_string(),
-            body_html: "<p>message</p>".to_string(),
-            body_plain: "message".to_string(),
-            attachments: Vec::new(),
-            mentions: Vec::new(),
-            reactions: Vec::new(),
-            reply_count: 0,
-            web_url: None,
-        }
-    }
-
-    #[test]
-    fn test_collect_dirty_chat_ids_and_notification_candidate() {
-        let fresh = vec![
-            chat_summary("c1", Some("m2"), Some("2026-11-15T10:05:00Z")),
-            chat_summary("c2", Some("m1"), Some("2026-11-15T09:00:00Z")),
-            chat_summary("c3", Some("m9"), Some("2026-11-15T11:00:00Z")),
-        ];
-        let mut cached = HashMap::new();
-        cached.insert(
-            "chat:c1".to_string(),
-            chat_summary("c1", Some("m1"), Some("2026-11-15T10:00:00Z")),
-        );
-        cached.insert(
-            "chat:c2".to_string(),
-            chat_summary("c2", Some("m1"), Some("2026-11-15T09:00:00Z")),
-        );
-
-        let dirty = collect_dirty_chat_ids(&fresh, &cached);
-        assert_eq!(dirty, vec!["c1".to_string(), "c3".to_string()]);
-
-        let mut msg_other = sample_msg("chat:c1", "m2", "2026-11-15T10:05:00Z");
-        msg_other.body_plain = "New\nmessage".to_string();
-        let cand = build_notification_candidate("chat:c1", "Alice", &[msg_other.clone()]).unwrap();
-        assert_eq!(cand.sender, "Alice");
-        assert_eq!(cand.preview, "New message");
-
-        let mut msg_me = msg_other;
-        msg_me.is_me = true;
-        assert!(build_notification_candidate("chat:c1", "Alice", &[msg_me]).is_none());
-    }
-
-    #[tokio::test]
-    async fn test_spawn_sync_engine_controller_and_shutdown() {
-        let config = AppConfig::default();
-        let auth = AuthManager::new(config.clone()).unwrap();
-        let graph = GraphClient::new(config.clone(), auth).unwrap();
-        let storage = Storage::open_in_memory().unwrap();
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-
-        let ctrl = spawn_sync_engine(config, graph, storage, event_tx);
-        ctrl.set_focus(
-            Some(ConversationTarget::Chat {
-                chat_id: "c1".to_string(),
-            }),
-            None,
-        );
-        ctrl.request(SyncCommand::Shutdown);
-        tokio::task::yield_now().await;
-    }
-
-    #[tokio::test]
-    async fn test_spawn_sync_engine_two_lane_routing_and_drop_shutdown() {
-        let config = AppConfig::default();
-        let auth = AuthManager::new(config.clone()).unwrap();
-        let graph = GraphClient::new(config.clone(), auth).unwrap();
-        let storage = Storage::open_in_memory().unwrap();
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-
-        let ctrl = spawn_sync_engine(config, graph, storage, event_tx);
-
-        // Coalesce rapid focus switches and verify both lanes process commands without deadlocking
-        ctrl.request(SyncCommand::RefreshConversations);
-        ctrl.set_focus(
-            Some(ConversationTarget::Chat {
-                chat_id: "c-first".to_string(),
-            }),
-            None,
-        );
-        ctrl.set_focus(
-            Some(ConversationTarget::Chat {
-                chat_id: "c-latest".to_string(),
-            }),
-            None,
-        );
-        ctrl.request(SyncCommand::SyncActiveNow);
-
-        // Wait briefly for Background Poll Lane to emit SyncStateChanged and Fast Lane to process
-        let mut saw_conv_refresh_state = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(200), event_rx.recv()).await {
-                Ok(Some(CoreEvent::SyncStateChanged { summary, .. }))
-                    if summary.contains("conversations") =>
-                {
-                    saw_conv_refresh_state = true;
-                    break;
-                }
-                Ok(Some(_)) => continue,
-                _ => break,
-            }
-        }
-        assert!(saw_conv_refresh_state);
-
-        // Dropping controller closes nudge_tx + focus_tx and shuts down both lanes cleanly
-        drop(ctrl);
-        let closed = tokio::time::timeout(Duration::from_secs(2), async {
-            while event_rx.recv().await.is_some() {}
-        })
-        .await;
-        assert!(closed.is_ok(), "both sync lanes should terminate when controller is dropped");
-    }
-
-    #[test]
-    fn test_idle_backoff_multiplier_and_immediate_activity_reset() {
-        assert_eq!(idle_multiplier(Duration::from_secs(0)), 1);
-        assert_eq!(idle_multiplier(Duration::from_secs(119)), 1);
-        assert_eq!(idle_multiplier(Duration::from_secs(120)), 4);
-        assert_eq!(idle_multiplier(Duration::from_secs(599)), 4);
-        assert_eq!(idle_multiplier(Duration::from_secs(600)), 10);
-        assert_eq!(idle_multiplier(Duration::from_secs(1_800)), 10);
-
-        let epoch = Instant::now();
-        let state = SyncSharedState::with_epoch(epoch);
-        let mut tracker = PeriodicBackoffTracker::default();
-
-        // Active (< 120s): every tick runs (1x)
-        let (idle, seq) = state.idle_snapshot(epoch + Duration::from_secs(30));
-        assert!(tracker.on_tick(idle, seq));
-        assert!(tracker.on_tick(idle, seq));
-
-        // Idle (120s .. 600s): 4x — skips 3 out of 4 ticks
-        let (idle_4x, seq_4x) = state.idle_snapshot(epoch + Duration::from_secs(150));
-        let results_4x: Vec<bool> = (0..8)
-            .map(|_| tracker.on_tick(idle_4x, seq_4x))
-            .collect();
-        assert_eq!(
-            results_4x,
-            vec![false, false, false, true, false, false, false, true]
-        );
-
-        // Deep idle (>= 600s): 10x — skips 9 out of 10 ticks
-        let mut deep_tracker = PeriodicBackoffTracker::default();
-        let (idle_10x, seq_10x) = state.idle_snapshot(epoch + Duration::from_secs(600));
-        let results_10x: Vec<bool> = (0..20)
-            .map(|_| deep_tracker.on_tick(idle_10x, seq_10x))
-            .collect();
-        let expected_10x: Vec<bool> = (1..=20).map(|i| i % 10 == 0).collect();
-        assert_eq!(results_10x, expected_10x);
-
-        // User activity arrives at 610s -> immediate reset to 1x active!
-        state.record_activity(epoch + Duration::from_secs(610));
-        let (idle_after, seq_after) = state.idle_snapshot(epoch + Duration::from_secs(611));
-        assert_eq!(idle_multiplier(idle_after), 1);
-        assert!(deep_tracker.on_tick(idle_after, seq_after));
-        assert!(tracker.on_tick(idle_after, seq_after));
-    }
-
-    #[tokio::test]
-    async fn test_sync_controller_activity_and_shutdown_cleanly() {
-        let config = AppConfig::default();
-        let auth = AuthManager::new(config.clone()).unwrap();
-        let graph = GraphClient::new(config.clone(), auth).unwrap();
-        let storage = Storage::open_in_memory().unwrap();
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-
-        let ctrl = spawn_sync_engine(config, graph, storage, event_tx);
-        ctrl.notify_activity();
-        ctrl.request(SyncCommand::Shutdown);
-
-        let closed = tokio::time::timeout(Duration::from_secs(2), async {
-            while event_rx.recv().await.is_some() {}
-        })
-        .await;
-        assert!(closed.is_ok());
-    }
-
-    #[test]
-    fn test_maybe_shrink_on_idle_transition_state_machine() {
-        let storage = Storage::open_in_memory().unwrap();
-        let mut was_idle = false;
-
-        // Active duration stays false
-        maybe_shrink_on_idle(
-            Duration::from_secs(IDLE_THRESHOLD_SECS - 1),
-            &mut was_idle,
-            &storage,
-        );
-        assert!(!was_idle);
-
-        // Crossing threshold sets was_idle = true and runs shrink_memory
-        maybe_shrink_on_idle(
-            Duration::from_secs(IDLE_THRESHOLD_SECS),
-            &mut was_idle,
-            &storage,
-        );
-        assert!(was_idle);
-
-        // Staying idle keeps was_idle = true
-        maybe_shrink_on_idle(
-            Duration::from_secs(DEEP_IDLE_THRESHOLD_SECS),
-            &mut was_idle,
-            &storage,
-        );
-        assert!(was_idle);
-
-        // Returning to active resets was_idle = false
-        maybe_shrink_on_idle(Duration::from_secs(5), &mut was_idle, &storage);
-        assert!(!was_idle);
-    }
-
-    #[test]
-    fn test_initial_history_and_chats_list_cursor_preservation() {
-        let storage = Storage::open_in_memory().unwrap();
-        let conv_key = "chat:c1";
-        let msgs = vec![
-            sample_msg(conv_key, "m1", "2026-11-15T09:00:00Z"),
-            sample_msg(conv_key, "m2", "2026-11-15T10:00:00Z"),
-        ];
-
-        // 1) Initial save with nextLink records delta_link + oldest_msg_ts
-        let next_url = "https://graph.microsoft.com/v1.0/chats/c1/messages?$skiptoken=page2";
-        save_initial_history_cursor_if_absent(
-            &storage,
-            conv_key,
-            &msgs,
-            Some(next_url.to_string()),
-        )
-        .unwrap();
-        let saved = storage
-            .get_sync_cursor(&SyncCursor::history_scope(conv_key))
-            .unwrap()
-            .unwrap();
-        assert_eq!(saved.delta_link.as_deref(), Some(next_url));
-        assert_eq!(
-            saved.oldest_msg_ts.as_deref(),
-            Some("2026-11-15T09:00:00Z")
-        );
-        assert!(!saved.is_history_eof());
-
-        // 2) Subsequent sync must NOT overwrite an existing deeper history cursor
-        let deeper_cursor = SyncCursor {
-            scope_key: SyncCursor::history_scope(conv_key),
-            delta_link: Some("https://graph.microsoft.com/v1.0/chats/c1/messages?$skiptoken=page3".to_string()),
-            oldest_msg_ts: Some("2026-11-10T00:00:00Z".to_string()),
-            synced_at: "2026-11-15T10:05:00Z".to_string(),
-        };
-        storage.save_sync_cursor(&deeper_cursor).unwrap();
-        save_initial_history_cursor_if_absent(&storage, conv_key, &msgs, None).unwrap();
-        let preserved = storage
-            .get_sync_cursor(&SyncCursor::history_scope(conv_key))
-            .unwrap()
-            .unwrap();
-        assert_eq!(preserved.delta_link, deeper_cursor.delta_link);
-        assert_eq!(preserved.oldest_msg_ts, deeper_cursor.oldest_msg_ts);
-
-        // 3) Conversation with no nextLink records HISTORY_EOF immediately
-        let eof_key = "chat:c-eof";
-        save_initial_history_cursor_if_absent(&storage, eof_key, &msgs, None).unwrap();
-        let eof_cursor = storage
-            .get_sync_cursor(&SyncCursor::history_scope(eof_key))
-            .unwrap()
-            .unwrap();
-        assert!(eof_cursor.is_history_eof());
-        assert_eq!(
-            eof_cursor.oldest_msg_ts.as_deref(),
-            Some(SyncCursor::HISTORY_EOF)
-        );
-
-        // 4) CHATS_LIST_SCOPE saves initial next_link and does not overwrite existing cursor
-        let chats_next = "https://graph.microsoft.com/v1.0/me/chats?$skiptoken=chats2";
-        save_initial_chats_list_cursor_if_absent(&storage, Some(chats_next.to_string())).unwrap();
-        let chats_cursor = storage
-            .get_sync_cursor(SyncCursor::CHATS_LIST_SCOPE)
-            .unwrap()
-            .unwrap();
-        assert_eq!(chats_cursor.delta_link.as_deref(), Some(chats_next));
-        assert!(!chats_cursor.is_history_eof());
-
-        save_initial_chats_list_cursor_if_absent(&storage, None).unwrap();
-        let chats_preserved = storage
-            .get_sync_cursor(SyncCursor::CHATS_LIST_SCOPE)
-            .unwrap()
-            .unwrap();
-        assert_eq!(chats_preserved.delta_link.as_deref(), Some(chats_next));
-    }
-
-    #[tokio::test]
-    async fn test_sync_active_focus_and_channel_history_record_history_cursor() {
-        use axum::{routing::get, Json, Router};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let base_url = format!("http://{addr}/v1.0");
-
-        let app = Router::new()
-            .route(
-                "/v1.0/chats/c1/messages",
-                get(|| async {
-                    Json(serde_json::json!({
-                        "value": [{
-                            "id": "m1",
-                            "createdDateTime": "2026-11-16T09:00:00Z",
-                            "messageType": "message",
-                            "importance": "normal",
-                            "from": { "user": { "id": "u2", "displayName": "Alice" } },
-                            "body": { "contentType": "text", "content": "Hello" }
-                        }]
-                    }))
-                }),
-            )
-            .route(
-                "/v1.0/teams/t1/channels/ch1/messages",
-                get(|| async {
-                    Json(serde_json::json!({
-                        "value": [{
-                            "id": "cm1",
-                            "createdDateTime": "2026-11-16T09:05:00Z",
-                            "messageType": "message",
-                            "importance": "normal",
-                            "from": { "user": { "id": "u2", "displayName": "Alice" } },
-                            "body": { "contentType": "text", "content": "Channel post" }
-                        }]
-                    }))
-                }),
-            );
-
-        let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-
-        let cfg = AppConfig {
-            graph_base_url: base_url,
-            ..AppConfig::default()
-        };
-        let tokens = StoredTokens {
-            access_token: "test-tok".to_string(),
+    fn mock_client(base_url: String) -> GraphClient {
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = base_url;
+        let tok = StoredTokens {
+            access_token: "test-access-token".into(),
             refresh_token: None,
-            expires_at: chrono::Utc::now().timestamp() + 3600,
-            client_id: cfg.client_id.clone(),
-            tenant_id: cfg.tenant_id.clone(),
-            user_id: Some("u1".to_string()),
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("u1".into()),
             user_display_name: None,
             user_email: None,
-            auth_mode: "pkce".to_string(),
+            auth_mode: "access_token".into(),
         };
-        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
-        let graph = GraphClient::new(cfg, auth).unwrap();
-        let storage = Storage::open_in_memory().unwrap();
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-
-        let focus = FocusTarget {
-            target: Some(ConversationTarget::Chat {
-                chat_id: "c1".to_string(),
-            }),
-            thread_root_id: None,
-        };
-        sync_active_focus(&focus, &graph, &storage, &event_tx)
-            .await
-            .unwrap();
-        assert!(storage
-            .get_sync_cursor(&SyncCursor::history_scope("chat:c1"))
-            .unwrap()
-            .is_some());
-
-        sync_channel_history("t1", "ch1", &graph, &storage, &event_tx)
-            .await
-            .unwrap();
-        assert!(storage
-            .get_sync_cursor(&SyncCursor::history_scope("chan:t1:ch1"))
-            .unwrap()
-            .is_some());
-
-        server.abort();
-    }
-
-    #[test]
-    fn test_classify_sync_error_and_expired_delta() {
-        assert_eq!(
-            classify_sync_error(&anyhow::anyhow!(
-                "Graph API error (GET https://graph.microsoft.com/v1.0/me/presence): 403 Forbidden [Authorization_RequestDenied]"
-            )),
-            SyncErrorKind::Forbidden403
-        );
-        assert_eq!(
-            classify_sync_error(&anyhow::anyhow!("AclCheckFailed on channel")),
-            SyncErrorKind::Forbidden403
-        );
-        assert_eq!(
-            classify_sync_error(&anyhow::anyhow!("Insufficient privileges")),
-            SyncErrorKind::Forbidden403
-        );
-        assert_eq!(
-            classify_sync_error(&anyhow::anyhow!(
-                "Graph API error (GET https://graph.microsoft.com/v1.0/me/chats): 401 Unauthorized"
-            )),
-            SyncErrorKind::Unauthorized401
-        );
-        assert_eq!(
-            classify_sync_error(&anyhow::anyhow!("Token expired (exp: 123, auth_mode=env_token)")),
-            SyncErrorKind::Unauthorized401
-        );
-        // URL containing "403" must not misclassify a 500 response as 403 Forbidden.
-        assert_eq!(
-            classify_sync_error(&anyhow::anyhow!(
-                "Graph API error (GET https://graph.microsoft.com/v1.0/chats/19:403abc/messages): 500 Internal Server Error"
-            )),
-            SyncErrorKind::Transient
-        );
-        assert_eq!(
-            classify_sync_error(&anyhow::anyhow!("request timed out")),
-            SyncErrorKind::Transient
-        );
-
-        assert!(is_expired_delta_error(&anyhow::anyhow!(
-            "Graph API error (GET https://graph.microsoft.com/v1.0/teams/t1/channels/c1/messages/delta): 410 Gone [resyncRequired]"
-        )));
-        assert!(is_expired_delta_error(&anyhow::anyhow!(
-            "400 Bad Request [syncStateNotFound]"
-        )));
-        assert!(!is_expired_delta_error(&anyhow::anyhow!("403 Forbidden")));
-        assert!(!is_expired_delta_error(&anyhow::anyhow!("401 Unauthorized")));
-        assert!(!is_expired_delta_error(&anyhow::anyhow!("429 Too Many Requests")));
-    }
-
-    #[test]
-    fn test_error_backoff_state_exponential_jitter_and_recovery() {
-        assert_eq!(ErrorBackoffState::compute_backoff_ms(1_000, 1, 1.0), 2_000);
-        assert_eq!(ErrorBackoffState::compute_backoff_ms(1_000, 6, 1.0), 64_000);
-        assert_eq!(
-            ErrorBackoffState::compute_backoff_ms(10_000, 10, 1.0),
-            300_000
-        );
-        let jittered = ErrorBackoffState::compute_backoff_ms(1_000, 1, 0.8);
-        assert_eq!(jittered, 1_600);
-
-        let mut backoff = ErrorBackoffState::new(1_000);
-        let t0 = Instant::now();
-        assert!(!backoff.is_degraded());
-        assert!(backoff.record_transient_failure(t0));
-        assert!(backoff.is_degraded());
-        assert!(backoff.is_backed_off(t0));
-        // Subsequent failure stays degraded without re-emitting transition.
-        assert!(!backoff.record_transient_failure(t0 + Duration::from_secs(5)));
-        assert!(backoff.record_success());
-        assert!(!backoff.is_degraded());
-        assert!(!backoff.is_backed_off(t0));
+        let auth = AuthManager::from_tokens(cfg.clone(), tok);
+        GraphClient::new(cfg, auth).unwrap().with_my_user_id("u1")
     }
 
     #[tokio::test]
-    async fn test_channel_delta_fallback_respects_error_kind_and_preserves_cursor() {
+    async fn test_403_capability_circuit_breakers_trip_silently() {
         use axum::{http::StatusCode, routing::get, Json, Router};
         use std::sync::atomic::AtomicUsize;
 
-        let delta_mode = Arc::new(AtomicUsize::new(0)); // 0=403, 1=429, 2=410, 3=ok_no_link
-        let fallback_hits = Arc::new(AtomicUsize::new(0));
-
-        let dm = Arc::clone(&delta_mode);
-        let fh = Arc::clone(&fallback_hits);
+        let cal_hits = Arc::new(AtomicUsize::new(0));
+        let todo_hits = Arc::new(AtomicUsize::new(0));
+        let cal_c = Arc::clone(&cal_hits);
+        let todo_c = Arc::clone(&todo_hits);
 
         let app = Router::new()
             .route(
-                "/v1.0/teams/t1/channels/ch1/messages/delta",
+                "/v1.0/me/calendarView/delta",
                 get(move || {
-                    let dm = Arc::clone(&dm);
-                    async move {
-                        match dm.load(Ordering::SeqCst) {
-                            0 => (
-                                StatusCode::FORBIDDEN,
-                                Json(serde_json::json!({ "error": { "code": "Forbidden", "message": "Denied" } })),
-                            ),
-                            1 => (
-                                StatusCode::TOO_MANY_REQUESTS,
-                                Json(serde_json::json!({ "error": { "code": "TooManyRequests", "message": "Throttled" } })),
-                            ),
-                            2 => (
-                                StatusCode::GONE,
-                                Json(serde_json::json!({ "error": { "code": "resyncRequired", "message": "Expired" } })),
-                            ),
-                            _ => (
-                                StatusCode::OK,
-                                Json(serde_json::json!({
-                                    "value": [{
-                                        "id": "cm-delta",
-                                        "createdDateTime": "2026-11-16T09:10:00Z",
-                                        "messageType": "message",
-                                        "importance": "normal",
-                                        "from": { "user": { "id": "u2", "displayName": "Alice" } },
-                                        "body": { "contentType": "text", "content": "Delta msg" }
-                                    }]
-                                })),
-                            ),
-                        }
+                    cal_c.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        (
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": { "code": "ErrorAccessDenied", "message": "Access is denied" }
+                            })),
+                        )
                     }
                 }),
             )
             .route(
-                "/v1.0/teams/t1/channels/ch1/messages",
+                "/v1.0/me/todo/lists",
                 get(move || {
-                    let fh = Arc::clone(&fh);
-                    async move {
-                        fh.fetch_add(1, Ordering::SeqCst);
+                    todo_c.fetch_add(1, Ordering::SeqCst);
+                    async {
                         (
-                            StatusCode::OK,
+                            StatusCode::FORBIDDEN,
                             Json(serde_json::json!({
-                                "value": [{
-                                    "id": "cm-fallback",
-                                    "createdDateTime": "2026-11-16T09:05:00Z",
-                                    "messageType": "message",
-                                    "importance": "normal",
-                                    "from": { "user": { "id": "u2", "displayName": "Alice" } },
-                                    "body": { "contentType": "text", "content": "Fallback post" }
-                                }]
+                                "error": { "code": "Forbidden", "message": "Insufficient privileges" }
                             })),
                         )
                     }
@@ -1915,142 +1782,90 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
+        tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
 
-        let cfg = AppConfig {
-            graph_base_url: format!("http://{addr}/v1.0"),
-            ..AppConfig::default()
-        };
-        let tokens = StoredTokens {
-            access_token: "tok".to_string(),
-            refresh_token: None,
-            expires_at: chrono::Utc::now().timestamp() + 3600,
-            client_id: cfg.client_id.clone(),
-            tenant_id: cfg.tenant_id.clone(),
-            user_id: Some("u1".to_string()),
-            user_display_name: None,
-            user_email: None,
-            auth_mode: "pkce".to_string(),
-        };
-        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
-        let graph = GraphClient::new(cfg, auth).unwrap();
+        let client = mock_client(format!("http://{addr}/v1.0"));
         let storage = Storage::open_in_memory().unwrap();
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let shared = SyncSharedState::new();
+        let mut backoff = ErrorBackoffState::new(60_000);
+        let mut breakers = CapabilityCircuitBreakers::default();
+        let fp = current_token_fingerprint(&client).await;
 
-        let focus = FocusTarget {
-            target: Some(ConversationTarget::Channel {
-                team_id: "t1".to_string(),
-                channel_id: "ch1".to_string(),
-            }),
-            thread_root_id: None,
-        };
+        // First call gets 403 and trips both circuit breakers silently
+        poll_calendar_quiet(&client, &storage, &event_tx, &shared, &mut backoff, &mut breakers, &fp).await;
+        poll_todo_quiet(None, &client, &storage, &event_tx, &shared, &mut backoff, &mut breakers, &fp).await;
+        assert!(breakers.is_calendar_disabled(&fp));
+        assert!(breakers.is_todo_disabled(&fp));
+        assert_eq!(cal_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(todo_hits.load(Ordering::SeqCst), 1);
 
-        // 403 must NOT trigger list_messages_page fallback.
-        delta_mode.store(0, Ordering::SeqCst);
-        let err_403 = sync_active_focus(&focus, &graph, &storage, &event_tx)
-            .await
-            .unwrap_err();
-        assert_eq!(classify_sync_error(&err_403), SyncErrorKind::Forbidden403);
-        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+        // Second call does NOT hit Graph at all
+        poll_calendar_quiet(&client, &storage, &event_tx, &shared, &mut backoff, &mut breakers, &fp).await;
+        poll_todo_quiet(None, &client, &storage, &event_tx, &shared, &mut backoff, &mut breakers, &fp).await;
+        assert_eq!(cal_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(todo_hits.load(Ordering::SeqCst), 1);
 
-        // 410 resyncRequired MUST trigger list_messages_page fallback and clear stale delta_link.
-        storage
-            .save_sync_cursor(&SyncCursor {
-                scope_key: "chan:t1:ch1".to_string(),
-                delta_link: Some(format!("http://{addr}/v1.0/teams/t1/channels/ch1/messages/delta?state=stale")),
-                oldest_msg_ts: None,
-                synced_at: "2026-11-16T09:00:00Z".to_string(),
-            })
-            .unwrap();
-        delta_mode.store(2, Ordering::SeqCst);
-        sync_active_focus(&focus, &graph, &storage, &event_tx)
-            .await
-            .unwrap();
-        assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
-        assert!(storage
-            .get_sync_cursor("chan:t1:ch1")
-            .unwrap()
-            .unwrap()
-            .delta_link
-            .is_none());
-
-        // Ok with new_delta_link = None must preserve an existing delta_link.
-        let keep_url = format!("http://{addr}/v1.0/teams/t1/channels/ch1/messages/delta?state=keep");
-        storage
-            .save_sync_cursor(&SyncCursor {
-                scope_key: "chan:t1:ch1".to_string(),
-                delta_link: Some(keep_url.clone()),
-                oldest_msg_ts: None,
-                synced_at: "2026-11-16T09:00:00Z".to_string(),
-            })
-            .unwrap();
-        delta_mode.store(3, Ordering::SeqCst);
-        sync_active_focus(&focus, &graph, &storage, &event_tx)
-            .await
-            .unwrap();
-        assert_eq!(
-            storage
-                .get_sync_cursor("chan:t1:ch1")
-                .unwrap()
-                .unwrap()
-                .delta_link
-                .as_deref(),
-            Some(keep_url.as_str())
-        );
-
-        server.abort();
+        // Zero SyncError and zero POLL_RETRY_SUMMARY emitted on 403
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn test_quiet_background_poll_403_circuit_breaker_and_transient_retry_spinner() {
+    async fn test_quiet_poll_retry_summary_and_recovery_without_sync_error() {
         use axum::{http::StatusCode, routing::get, Json, Router};
-        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::AtomicBool;
 
-        let c403_hits = Arc::new(AtomicUsize::new(0));
-        let c500_hits = Arc::new(AtomicUsize::new(0));
-
-        let h403 = Arc::clone(&c403_hits);
-        let h500 = Arc::clone(&c500_hits);
+        let fail_mode = Arc::new(AtomicBool::new(true));
+        let fail_c1 = Arc::clone(&fail_mode);
+        let fail_c2 = Arc::clone(&fail_mode);
 
         let app = Router::new()
             .route(
-                "/v1.0/chats/c403/messages",
+                "/v1.0/me/mailFolders",
                 get(move || {
-                    let h403 = Arc::clone(&h403);
+                    let should_fail = fail_c1.load(Ordering::SeqCst);
                     async move {
-                        h403.fetch_add(1, Ordering::SeqCst);
-                        (
-                            StatusCode::FORBIDDEN,
-                            Json(serde_json::json!({ "error": { "code": "Forbidden", "message": "No access" } })),
-                        )
-                    }
-                }),
-            )
-            .route(
-                "/v1.0/chats/c500/messages",
-                get(move || {
-                    let h500 = Arc::clone(&h500);
-                    async move {
-                        let n = h500.fetch_add(1, Ordering::SeqCst);
-                        if n == 0 {
+                        if should_fail {
                             (
                                 StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(serde_json::json!({ "error": { "code": "InternalServerError", "message": "Boom" } })),
+                                Json(serde_json::json!({ "error": { "code": "InternalServerError", "message": "transient" } })),
                             )
                         } else {
                             (
                                 StatusCode::OK,
                                 Json(serde_json::json!({
                                     "value": [{
-                                        "id": "m1",
-                                        "createdDateTime": "2026-11-16T09:00:00Z",
-                                        "messageType": "message",
-                                        "importance": "normal",
-                                        "from": { "user": { "id": "u2", "displayName": "Alice" } },
-                                        "body": { "contentType": "text", "content": "Recovered" }
+                                        "id": "fld-inbox",
+                                        "displayName": "Inbox",
+                                        "wellKnownName": "inbox",
+                                        "childFolderCount": 0,
+                                        "unreadItemCount": 0,
+                                        "totalItemCount": 0
                                     }]
+                                })),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/inbox/messages/delta",
+                get(move || {
+                    let should_fail = fail_c2.load(Ordering::SeqCst);
+                    async move {
+                        if should_fail {
+                            (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(serde_json::json!({ "error": { "code": "ServiceUnavailable", "message": "busy" } })),
+                            )
+                        } else {
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "value": [],
+                                    "@odata.deltaLink": "https://example.com/delta?tok=1"
                                 })),
                             )
                         }
@@ -2060,86 +1875,123 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
+        tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
 
-        let cfg = AppConfig {
-            graph_base_url: format!("http://{addr}/v1.0"),
-            active_poll_ms: 250,
-            chat_poll_ms: 60_000,
-            channel_poll_ms: 60_000,
-            ..AppConfig::default()
-        };
-        let tokens = StoredTokens {
-            access_token: "tok".to_string(),
-            refresh_token: None,
-            expires_at: chrono::Utc::now().timestamp() + 3600,
-            client_id: cfg.client_id.clone(),
-            tenant_id: cfg.tenant_id.clone(),
-            user_id: Some("u1".to_string()),
-            user_display_name: None,
-            user_email: None,
-            auth_mode: "pkce".to_string(),
-        };
-        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
-        let graph = GraphClient::new(cfg.clone(), auth).unwrap();
+        let client = mock_client(format!("http://{addr}/v1.0"));
+        let storage = Storage::open_in_memory().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let shared = SyncSharedState::new();
+        let mut mail_backoff = ErrorBackoffState::new(15_000);
+        let slow_backoff = ErrorBackoffState::new(60_000);
+        let mut last_folders = None;
+
+        // First transient failure emits POLL_RETRY_SUMMARY (never SyncError!)
+        poll_mail_lane2_quiet(
+            &client,
+            &storage,
+            &event_tx,
+            &shared,
+            &mut mail_backoff,
+            &slow_backoff,
+            &mut last_folders,
+        )
+        .await;
+        assert!(mail_backoff.is_degraded());
+
+        let ev1 = event_rx.try_recv().unwrap();
+        assert!(matches!(
+            ev1,
+            CoreEvent::SyncStateChanged { busy: false, ref summary } if summary == POLL_RETRY_SUMMARY
+        ));
+        assert!(event_rx.try_recv().is_err());
+
+        // Recovery transitions back to "Synced"
+        fail_mode.store(false, Ordering::SeqCst);
+        poll_mail_lane2_quiet(
+            &client,
+            &storage,
+            &event_tx,
+            &shared,
+            &mut mail_backoff,
+            &slow_backoff,
+            &mut last_folders,
+        )
+        .await;
+        assert!(!mail_backoff.is_degraded());
+
+        let mut saw_synced = false;
+        while let Ok(ev) = event_rx.try_recv() {
+            assert!(!matches!(ev, CoreEvent::SyncError(_)));
+            if matches!(
+                ev,
+                CoreEvent::SyncStateChanged { busy: false, ref summary } if summary == "Synced"
+            ) {
+                saw_synced = true;
+            }
+        }
+        assert!(saw_synced);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_sync_engine_lifecycle_and_idle_shrink() {
+        let config = AppConfig::default();
+        let client = mock_client("http://127.0.0.1:1/v1.0".to_string());
         let storage = Storage::open_in_memory().unwrap();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
-        let ctrl = spawn_sync_engine(cfg, graph, storage, event_tx);
-
-        // 1) Focus on 403 room: hit once, circuit-breaker skips subsequent 250ms ticks, zero SyncError/POLL_RETRY_SUMMARY.
-        ctrl.set_focus(
-            Some(ConversationTarget::Chat {
-                chat_id: "c403".to_string(),
-            }),
-            None,
-        );
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        assert_eq!(c403_hits.load(Ordering::SeqCst), 1);
-
-        // Explicit SyncActiveNow clears restricted_convs and tries once more (still 403 -> stops again).
-        ctrl.request(SyncCommand::SyncActiveNow);
-        tokio::time::sleep(Duration::from_millis(650)).await;
-        assert_eq!(c403_hits.load(Ordering::SeqCst), 2);
-
-        // 2) Focus on 500 -> 200 room: emits POLL_RETRY_SUMMARY quietly, then recovers to "Synced".
-        ctrl.set_focus(
-            Some(ConversationTarget::Chat {
-                chat_id: "c500".to_string(),
-            }),
-            None,
-        );
-        let mut saw_retry_summary = false;
-        let mut saw_recovered_synced = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(150), event_rx.recv()).await {
-                Ok(Some(CoreEvent::SyncError(err))) => {
-                    panic!("background poll must not emit SyncError: {err}");
-                }
-                Ok(Some(CoreEvent::SyncStateChanged { busy: false, summary })) => {
-                    if summary == POLL_RETRY_SUMMARY {
-                        saw_retry_summary = true;
-                    } else if saw_retry_summary && summary == "Synced" {
-                        saw_recovered_synced = true;
-                        break;
-                    }
-                }
-                Ok(Some(_)) => continue,
-                Ok(None) => break,
-                Err(_) => {
-                    if saw_retry_summary && !saw_recovered_synced {
-                        continue;
-                    }
-                }
-            }
-        }
-        assert!(saw_retry_summary, "expected POLL_RETRY_SUMMARY on transient failure");
-        assert!(saw_recovered_synced, "expected Synced after transient recovery");
-
+        let ctrl = spawn_sync_engine(config, client, storage.clone(), event_tx);
+        ctrl.set_focus(FocusTarget {
+            active_folder_id: Some("inbox".to_string()),
+            active_message_id: None,
+            active_todo_list_id: None,
+        });
+        ctrl.notify_activity();
         ctrl.request(SyncCommand::Shutdown);
-        server.abort();
+
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            while event_rx.recv().await.is_some() {}
+        })
+        .await;
+        assert!(closed.is_ok());
+
+        let mut was_idle = false;
+        maybe_shrink_on_idle(Duration::from_secs(IDLE_THRESHOLD_SECS), &mut was_idle, &storage);
+        assert!(was_idle);
+
+        let incoming = vec![MailMessage {
+            id: "m-new".to_string(),
+            internet_message_id: None,
+            conversation_id: None,
+            folder_id: Some("inbox".to_string()),
+            subject: "Alert".to_string(),
+            from: Some(EmailRecipient {
+                name: Some("Alice".to_string()),
+                address: "alice@example.com".to_string(),
+            }),
+            to_recipients: Vec::new(),
+            cc_recipients: Vec::new(),
+            bcc_recipients: Vec::new(),
+            reply_to: Vec::new(),
+            received_at: "2026-11-18T12:00:00Z".to_string(),
+            sent_at: None,
+            is_read: false,
+            is_draft: false,
+            flagged: false,
+            importance: "normal".to_string(),
+            inference_classification: None,
+            has_attachments: false,
+            body_loaded: false,
+            preview: "Server alert".to_string(),
+            body_html: String::new(),
+            body_plain: String::new(),
+            attachments: Vec::new(),
+            meeting_request: None,
+            web_link: None,
+        }];
+        let cand = find_new_unread_mail_candidate("inbox", &storage, &incoming).unwrap();
+        assert_eq!(cand.item_id, "m-new");
+        assert_eq!(cand.subject, "Alert");
     }
 }

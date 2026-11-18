@@ -1,4 +1,4 @@
-//! One-click GitHub Release self-updater (`teams update`) with SHA-256 verification
+//! One-click GitHub Release self-updater (`outlook update`) with SHA-256 verification
 //! and safe Windows NTFS running-executable replacement.
 
 use std::{
@@ -42,7 +42,7 @@ pub fn cleanup_stale_old_binary() {
     }
 }
 
-/// Checks GitHub Releases (`repo` = `"shinick-dev/teams"`) for a newer version and optionally replaces the current binary.
+/// Checks GitHub Releases (`repo` = `"shinick-dev/outlook"`) for a newer version and optionally replaces the current binary.
 pub async fn check_or_apply_update(
     repo: &str,
     check_only: bool,
@@ -64,7 +64,8 @@ pub async fn check_or_apply_update_with_api_base(
     check_or_apply_update_at(api_base_url, repo, check_only, force, &binary_path, token).await
 }
 
-async fn check_or_apply_update_at(
+/// Testable entry point operating against a specific executable path and GitHub API base URL.
+pub async fn check_or_apply_update_at(
     api_base_url: &str,
     repo: &str,
     check_only: bool,
@@ -79,7 +80,7 @@ async fn check_or_apply_update_at(
         .build()
         .context("Failed to create HTTP client")?;
 
-    let ua = format!("teams-cli/{current_version}");
+    let ua = format!("outlook-cli/{current_version}");
     let api_base = api_base_url.trim_end_matches('/');
     let release_api_url = format!("{api_base}/repos/{repo}/releases/latest");
 
@@ -100,7 +101,7 @@ async fn check_or_apply_update_at(
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         bail!(
-            "GitHub Release lookup failed (HTTP {status}): {}. For private repositories, TEAMS_GITHUB_TOKEN / GH_TOKEN or `gh auth login` is required.",
+            "GitHub Release lookup failed (HTTP {status}): {}. For private repositories, OUTLOOK_GITHUB_TOKEN / TEAMS_GITHUB_TOKEN / GH_TOKEN or `gh auth login` is required.",
             body.trim()
         );
     }
@@ -177,7 +178,12 @@ async fn check_or_apply_update_at(
 }
 
 async fn discover_github_token(api_base_url: &str) -> Option<String> {
-    for var in ["TEAMS_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
+    for var in [
+        "OUTLOOK_GITHUB_TOKEN",
+        "TEAMS_GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    ] {
         if let Ok(val) = std::env::var(var) {
             let trimmed = val.trim();
             if !trimmed.is_empty() {
@@ -375,41 +381,41 @@ fn select_platform_asset_for<'a>(
 ) -> Option<&'a GitHubAsset> {
     let candidates: Vec<String> = match (os, arch) {
         ("windows", "x86_64") => vec![
-            "teams.exe".to_string(),
-            format!("teams-{latest}-x86_64-pc-windows-msvc.zip"),
-            "teams-x86_64-pc-windows-msvc.zip".to_string(),
+            "outlook.exe".to_string(),
+            format!("outlook-{latest}-x86_64-pc-windows-msvc.zip"),
+            "outlook-x86_64-pc-windows-msvc.zip".to_string(),
         ],
         ("windows", "aarch64") => vec![
-            format!("teams-{latest}-aarch64-pc-windows-msvc.zip"),
-            "teams-aarch64-pc-windows-msvc.zip".to_string(),
-            "teams.exe".to_string(),
+            format!("outlook-{latest}-aarch64-pc-windows-msvc.zip"),
+            "outlook-aarch64-pc-windows-msvc.zip".to_string(),
+            "outlook.exe".to_string(),
         ],
         ("macos", "x86_64") => vec![
-            format!("teams-{latest}-x86_64-apple-darwin.tar.gz"),
-            "teams-x86_64-apple-darwin.tar.gz".to_string(),
-            "teams".to_string(),
+            format!("outlook-{latest}-x86_64-apple-darwin.tar.gz"),
+            "outlook-x86_64-apple-darwin.tar.gz".to_string(),
+            "outlook".to_string(),
         ],
         ("macos", "aarch64") => vec![
-            format!("teams-{latest}-aarch64-apple-darwin.tar.gz"),
-            "teams-aarch64-apple-darwin.tar.gz".to_string(),
-            "teams".to_string(),
+            format!("outlook-{latest}-aarch64-apple-darwin.tar.gz"),
+            "outlook-aarch64-apple-darwin.tar.gz".to_string(),
+            "outlook".to_string(),
         ],
         ("linux", "x86_64") => vec![
-            format!("teams-{latest}-x86_64-unknown-linux-gnu.tar.gz"),
-            format!("teams-{latest}-x86_64-unknown-linux-musl.tar.gz"),
-            "teams-x86_64-unknown-linux-gnu.tar.gz".to_string(),
-            "teams".to_string(),
+            format!("outlook-{latest}-x86_64-unknown-linux-gnu.tar.gz"),
+            format!("outlook-{latest}-x86_64-unknown-linux-musl.tar.gz"),
+            "outlook-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+            "outlook".to_string(),
         ],
         ("linux", "aarch64") => vec![
-            format!("teams-{latest}-aarch64-unknown-linux-gnu.tar.gz"),
-            format!("teams-{latest}-aarch64-unknown-linux-musl.tar.gz"),
-            "teams-aarch64-unknown-linux-gnu.tar.gz".to_string(),
-            "teams".to_string(),
+            format!("outlook-{latest}-aarch64-unknown-linux-gnu.tar.gz"),
+            format!("outlook-{latest}-aarch64-unknown-linux-musl.tar.gz"),
+            "outlook-aarch64-unknown-linux-gnu.tar.gz".to_string(),
+            "outlook".to_string(),
         ],
         _ => vec![if os == "windows" {
-            "teams.exe".to_string()
+            "outlook.exe".to_string()
         } else {
-            "teams".to_string()
+            "outlook".to_string()
         }],
     };
 
@@ -500,7 +506,11 @@ fn extract_binary_from_asset(asset_name: &str, asset_bytes: &[u8]) -> Result<Vec
         bail!("Failed to extract archive ({asset_name}): exit code {status}");
     }
 
-    let target_bin = if cfg!(windows) { "teams.exe" } else { "teams" };
+    let target_bin = if cfg!(windows) {
+        "outlook.exe"
+    } else {
+        "outlook"
+    };
     let found = find_file_recursive(&extract_dir, target_bin)?.ok_or_else(|| {
         anyhow::anyhow!("Executable '{target_bin}' not found in extracted archive ({asset_name})")
     })?;
@@ -638,12 +648,12 @@ mod tests {
 
     #[test]
     fn test_sha256_verification_success_and_mismatch() {
-        let payload = b"teams-binary-content-v0.9.0";
+        let payload = b"outlook-binary-content-v0.2.0";
         let digest = hex::encode(Sha256::digest(payload));
-        let sums = format!("{digest}  teams.exe\n0000000000000000000000000000000000000000000000000000000000000000  other.tar.gz\n");
-        verify_sha256_sums(&sums, "teams.exe", payload).unwrap();
+        let sums = format!("{digest}  outlook.exe\n0000000000000000000000000000000000000000000000000000000000000000  other.tar.gz\n");
+        verify_sha256_sums(&sums, "outlook.exe", payload).unwrap();
 
-        let err = verify_sha256_sums(&sums, "teams.exe", b"tampered-bytes").unwrap_err();
+        let err = verify_sha256_sums(&sums, "outlook.exe", b"tampered-bytes").unwrap_err();
         assert!(err.to_string().contains("SHA-256 verification failed"));
 
         let missing = verify_sha256_sums(&sums, "missing.zip", payload).unwrap_err();
@@ -654,35 +664,47 @@ mod tests {
     fn test_platform_asset_selection() {
         let assets = vec![
             GitHubAsset {
-                name: "teams-9.9.9-x86_64-pc-windows-msvc.zip".into(),
+                name: "outlook-0.2.0-x86_64-pc-windows-msvc.zip".into(),
                 size: 100,
                 url: String::new(),
                 browser_download_url: String::new(),
             },
             GitHubAsset {
-                name: "teams.exe".into(),
+                name: "outlook.exe".into(),
                 size: 200,
                 url: String::new(),
                 browser_download_url: String::new(),
             },
             GitHubAsset {
-                name: "teams-9.9.9-aarch64-apple-darwin.tar.gz".into(),
+                name: "outlook-0.2.0-aarch64-apple-darwin.tar.gz".into(),
                 size: 300,
+                url: String::new(),
+                browser_download_url: String::new(),
+            },
+            GitHubAsset {
+                name: "outlook-0.2.0-x86_64-unknown-linux-gnu.tar.gz".into(),
+                size: 400,
                 url: String::new(),
                 browser_download_url: String::new(),
             },
         ];
         assert_eq!(
-            select_platform_asset_for(&assets, "9.9.9", "windows", "x86_64")
+            select_platform_asset_for(&assets, "0.2.0", "windows", "x86_64")
                 .unwrap()
                 .name,
-            "teams.exe"
+            "outlook.exe"
         );
         assert_eq!(
-            select_platform_asset_for(&assets, "9.9.9", "macos", "aarch64")
+            select_platform_asset_for(&assets, "0.2.0", "macos", "aarch64")
                 .unwrap()
                 .name,
-            "teams-9.9.9-aarch64-apple-darwin.tar.gz"
+            "outlook-0.2.0-aarch64-apple-darwin.tar.gz"
+        );
+        assert_eq!(
+            select_platform_asset_for(&assets, "0.2.0", "linux", "x86_64")
+                .unwrap()
+                .name,
+            "outlook-0.2.0-x86_64-unknown-linux-gnu.tar.gz"
         );
     }
 
@@ -711,7 +733,7 @@ mod tests {
         }
         let body = serde_json::json!({
             "tag_name": state.tag_name,
-            "html_url": format!("{}/shinick-dev/teams/releases/tag/{}", state.base_url, state.tag_name),
+            "html_url": format!("{}/shinick-dev/outlook/releases/tag/{}", state.base_url, state.tag_name),
             "assets": [
                 {
                     "name": state.asset_name,
@@ -756,8 +778,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let base_url = format!("http://{addr}");
 
-        let new_binary = b"NEW-TEAMS-BINARY-V9.9.9".to_vec();
-        let asset_name = if cfg!(windows) { "teams.exe" } else { "teams" }.to_string();
+        let new_binary = b"NEW-OUTLOOK-BINARY-V9.9.9".to_vec();
+        let asset_name = if cfg!(windows) {
+            "outlook.exe"
+        } else {
+            "outlook"
+        }
+        .to_string();
         let digest = hex::encode(Sha256::digest(&new_binary));
         let sums_text = format!("{digest}  {asset_name}\n");
 
@@ -771,7 +798,10 @@ mod tests {
         };
 
         let app = Router::new()
-            .route("/repos/shinick-dev/teams/releases/latest", get(mock_latest_release))
+            .route(
+                "/repos/shinick-dev/outlook/releases/latest",
+                get(mock_latest_release),
+            )
             .route("/assets/binary", get(mock_binary_api))
             .route("/assets/sums", get(mock_sums_api))
             .route("/download/SHA256SUMS.txt", get(mock_sums_api))
@@ -784,12 +814,12 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let fake_exe = tmp.path().join(&asset_name);
-        std::fs::write(&fake_exe, b"OLD-TEAMS-BINARY-V0.2.0").unwrap();
+        std::fs::write(&fake_exe, b"OLD-OUTLOOK-BINARY-V0.1.0").unwrap();
 
         // 1. check_only = true leaves binary untouched
         let check_res = check_or_apply_update_at(
             &base_url,
-            "shinick-dev/teams",
+            "shinick-dev/outlook",
             true,
             false,
             &fake_exe,
@@ -800,12 +830,15 @@ mod tests {
         assert!(check_res.update_available);
         assert!(!check_res.updated);
         assert_eq!(check_res.latest_version, "9.9.9");
-        assert_eq!(std::fs::read(&fake_exe).unwrap(), b"OLD-TEAMS-BINARY-V0.2.0");
+        assert_eq!(
+            std::fs::read(&fake_exe).unwrap(),
+            b"OLD-OUTLOOK-BINARY-V0.1.0"
+        );
 
         // 2. check_only = false downloads, verifies SHA-256, and atomically moves old -> .old
         let apply_res = check_or_apply_update_at(
             &base_url,
-            "shinick-dev/teams",
+            "shinick-dev/outlook",
             false,
             false,
             &fake_exe,
@@ -820,7 +853,10 @@ mod tests {
         if cfg!(unix) {
             assert!(!old_exe.exists());
         } else {
-            assert_eq!(std::fs::read(&old_exe).unwrap(), b"OLD-TEAMS-BINARY-V0.2.0");
+            assert_eq!(
+                std::fs::read(&old_exe).unwrap(),
+                b"OLD-OUTLOOK-BINARY-V0.1.0"
+            );
         }
         assert!(!append_ext_suffix(&fake_exe, ".new").exists());
 
@@ -833,7 +869,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let base_url = format!("http://{addr}");
 
-        let asset_name = if cfg!(windows) { "teams.exe" } else { "teams" }.to_string();
+        let asset_name = if cfg!(windows) {
+            "outlook.exe"
+        } else {
+            "outlook"
+        }
+        .to_string();
         let state = MockReleaseState {
             base_url: base_url.clone(),
             tag_name: "v9.9.9".to_string(),
@@ -846,7 +887,10 @@ mod tests {
         };
 
         let app = Router::new()
-            .route("/repos/shinick-dev/teams/releases/latest", get(mock_latest_release))
+            .route(
+                "/repos/shinick-dev/outlook/releases/latest",
+                get(mock_latest_release),
+            )
             .route("/assets/binary", get(mock_binary_api))
             .route("/assets/sums", get(mock_sums_api))
             .route("/download/SHA256SUMS.txt", get(mock_sums_api))
@@ -863,7 +907,7 @@ mod tests {
 
         let err = check_or_apply_update_at(
             &base_url,
-            "shinick-dev/teams",
+            "shinick-dev/outlook",
             false,
             false,
             &fake_exe,
@@ -872,7 +916,10 @@ mod tests {
         .await
         .unwrap_err();
         let err_chain = format!("{err:#}");
-        assert!(err_chain.contains("SHA-256"), "unexpected error: {err_chain}");
+        assert!(
+            err_chain.contains("SHA-256"),
+            "unexpected error: {err_chain}"
+        );
         assert_eq!(std::fs::read(&fake_exe).unwrap(), b"ORIGINAL-SAFE-BINARY");
         assert!(!append_ext_suffix(&fake_exe, ".old").exists());
 
@@ -882,10 +929,10 @@ mod tests {
     #[test]
     fn test_validate_github_repo_and_auth_host_check() {
         assert_eq!(
-            validate_github_repo("shinick-dev/teams").unwrap(),
-            "shinick-dev/teams"
+            validate_github_repo("shinick-dev/outlook").unwrap(),
+            "shinick-dev/outlook"
         );
-        assert!(validate_github_repo("../evil/teams").is_err());
+        assert!(validate_github_repo("../evil/outlook").is_err());
         assert!(validate_github_repo("owner/repo/extra").is_err());
         assert!(validate_github_repo("owner").is_err());
         assert!(validate_github_repo("owner/..").is_err());
@@ -897,7 +944,7 @@ mod tests {
         ));
         assert!(should_attach_github_auth(
             "https://api.github.com",
-            "https://github.com/a/b/releases/download/v1/teams"
+            "https://github.com/a/b/releases/download/v1/outlook"
         ));
         assert!(!should_attach_github_auth(
             "https://api.github.com",
@@ -914,19 +961,24 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base_url = format!("http://{addr}");
-        let asset_name = if cfg!(windows) { "teams.exe" } else { "teams" }.to_string();
+        let asset_name = if cfg!(windows) {
+            "outlook.exe"
+        } else {
+            "outlook"
+        }
+        .to_string();
         let asset_name_clone = asset_name.clone();
         let base_clone = base_url.clone();
 
         let app = Router::new().route(
-            "/repos/shinick-dev/teams/releases/latest",
+            "/repos/shinick-dev/outlook/releases/latest",
             get(move || {
                 let asset_name = asset_name_clone.clone();
                 let base_url = base_clone.clone();
                 async move {
                     Json(serde_json::json!({
                         "tag_name": "v9.9.9",
-                        "html_url": format!("{base_url}/shinick-dev/teams/releases/tag/v9.9.9"),
+                        "html_url": format!("{base_url}/shinick-dev/outlook/releases/tag/v9.9.9"),
                         "assets": [
                             {
                                 "name": asset_name,
@@ -950,7 +1002,7 @@ mod tests {
 
         let err = check_or_apply_update_at(
             &base_url,
-            "shinick-dev/teams",
+            "shinick-dev/outlook",
             false,
             false,
             &fake_exe,

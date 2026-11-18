@@ -1,78 +1,50 @@
-//! Hybrid FTS5 (`trigram` / `unicode61`) + `LIKE` message search with contextual Korean-safe snippets.
+//! Hybrid FTS5 (`trigram` / `unicode61`) + `LIKE` mail search with contextual snippets.
 
 use anyhow::Result;
 use rusqlite::{params, Connection, Row};
 
 use crate::{
-    models::{ConversationKind, SearchHit},
-    storage::repo::escape_like,
+    models::MailSearchHit,
+    storage::outlook::{escape_like, FOLDER_FILTER_PREDICATE},
 };
 
-struct SearchQueryContext {
-    query_lower: String,
-    tokens_lower: Vec<String>,
-}
+const SEARCH_SELECT_COLS: &str = "
+    m.id, m.conversation_id, m.folder_id, m.subject, m.from_display,
+    m.received_at, m.body_plain, m.preview, m.has_attachments, m.is_read, m.flagged
+";
 
-impl SearchQueryContext {
-    fn new(trimmed_query: &str) -> Self {
-        let query_lower = trimmed_query.to_lowercase();
-        let tokens_lower = query_lower
-            .split_whitespace()
-            .map(str::to_string)
-            .collect();
-        Self {
-            query_lower,
-            tokens_lower,
-        }
-    }
-}
-
-pub fn search_messages(
+pub fn search_mail(
     conn: &Connection,
     query: &str,
-    conv_key_filter: Option<&str>,
+    folder_id: Option<&str>,
     limit: usize,
-) -> Result<Vec<SearchHit>> {
+    trigram_enabled: bool,
+) -> Result<Vec<MailSearchHit>> {
     let trimmed = query.trim();
     if trimmed.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
+    let folder = folder_id.map(str::trim).filter(|s| !s.is_empty());
 
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-    if tokens.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let query_ctx = SearchQueryContext::new(trimmed);
     let all_tokens_at_least_3 = tokens.iter().all(|t| t.chars().count() >= 3);
-    let char_count = trimmed.chars().count();
-    if char_count >= 3 {
-        if let Some(fts_query) =
-            build_fts_query_from_tokens(trimmed, &tokens, all_tokens_at_least_3)
-        {
-            if let Ok(hits) =
-                run_fts_search(conn, &fts_query, &query_ctx, conv_key_filter, limit)
-            {
-                if all_tokens_at_least_3 || !hits.is_empty() {
+    if trigram_enabled && trimmed.chars().count() >= 3 {
+        if let Some(fts_query) = build_fts_query(trimmed, &tokens, all_tokens_at_least_3) {
+            if let Ok(hits) = run_mail_fts_search(conn, &fts_query, trimmed, folder, limit) {
+                if !hits.is_empty() {
                     return Ok(hits);
                 }
             }
         }
     }
 
-    run_like_search(conn, &query_ctx, conv_key_filter, limit)
+    run_mail_like_search(conn, trimmed, folder, limit)
 }
 
-fn build_fts_query_from_tokens(
-    trimmed: &str,
-    tokens: &[&str],
-    all_tokens_at_least_3: bool,
-) -> Option<String> {
+fn build_fts_query(trimmed: &str, tokens: &[&str], all_tokens_at_least_3: bool) -> Option<String> {
     if tokens.is_empty() {
         return None;
     }
-    // In FTS5 trigram mode, every token in an AND query needs >= 3 chars to match.
-    // If any token is < 3 chars, try exact phrase if overall >= 3 chars; if 0 hits, LIKE handles it.
     if tokens.len() > 1 && all_tokens_at_least_3 {
         let quoted: Vec<String> = tokens
             .iter()
@@ -84,202 +56,149 @@ fn build_fts_query_from_tokens(
     }
 }
 
-fn run_fts_search(
+fn run_mail_fts_search(
     conn: &Connection,
     fts_query: &str,
-    query_ctx: &SearchQueryContext,
-    conv_key_filter: Option<&str>,
+    raw_query: &str,
+    folder_filter: Option<&str>,
     limit: usize,
-) -> Result<Vec<SearchHit>> {
-    let hits = if let Some(conv_key) = conv_key_filter {
-        let mut stmt = conn.prepare_cached(
+) -> Result<Vec<MailSearchHit>> {
+    if let Some(folder) = folder_filter {
+        let sql = format!(
             "
-            SELECT
-                m.conv_key,
-                COALESCE(c.title, m.conv_key) AS conv_title,
-                c.kind,
-                m.msg_id,
-                m.parent_msg_id,
-                m.author_name,
-                m.created_at,
-                m.body_plain,
-                m.subject
-            FROM messages_fts f
-            JOIN messages m ON m.msg_key = f.msg_key
-            LEFT JOIN conversations c ON c.conv_key = m.conv_key
-            WHERE messages_fts MATCH ?1
-              AND m.deleted = 0
-              AND m.conv_key = ?2
-            ORDER BY m.created_at DESC, m.msg_id DESC
+            SELECT {SEARCH_SELECT_COLS}
+            FROM mail_fts f
+            JOIN mail_messages m ON m.rowid = f.rowid
+            WHERE mail_fts MATCH ?2
+              AND {FOLDER_FILTER_PREDICATE}
+            ORDER BY m.received_at DESC, m.id DESC
             LIMIT ?3
-            ",
-        )?;
-        let rows = stmt.query_map(params![fts_query, conv_key, limit as i64], |row| {
-            map_search_hit_row(row, query_ctx)
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    } else {
-        let mut stmt = conn.prepare_cached(
             "
-            SELECT
-                m.conv_key,
-                COALESCE(c.title, m.conv_key) AS conv_title,
-                c.kind,
-                m.msg_id,
-                m.parent_msg_id,
-                m.author_name,
-                m.created_at,
-                m.body_plain,
-                m.subject
-            FROM messages_fts f
-            JOIN messages m ON m.msg_key = f.msg_key
-            LEFT JOIN conversations c ON c.conv_key = m.conv_key
-            WHERE messages_fts MATCH ?1
-              AND m.deleted = 0
-            ORDER BY m.created_at DESC, m.msg_id DESC
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params![folder, fts_query, limit as i64], |row| {
+            map_mail_search_hit_row(row, raw_query)
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    } else {
+        let sql = format!(
+            "
+            SELECT {SEARCH_SELECT_COLS}
+            FROM mail_fts f
+            JOIN mail_messages m ON m.rowid = f.rowid
+            WHERE mail_fts MATCH ?1
+            ORDER BY m.received_at DESC, m.id DESC
             LIMIT ?2
-            ",
-        )?;
+            "
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
-            map_search_hit_row(row, query_ctx)
+            map_mail_search_hit_row(row, raw_query)
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-
-    Ok(hits)
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
 }
 
-fn run_like_search(
+fn run_mail_like_search(
     conn: &Connection,
-    query_ctx: &SearchQueryContext,
-    conv_key_filter: Option<&str>,
+    raw_query: &str,
+    folder_filter: Option<&str>,
     limit: usize,
-) -> Result<Vec<SearchHit>> {
-    let pattern = format!("%{}%", escape_like(&query_ctx.query_lower));
-    let hits = if let Some(conv_key) = conv_key_filter {
-        let mut stmt = conn.prepare_cached(
+) -> Result<Vec<MailSearchHit>> {
+    let pattern = format!("%{}%", escape_like(&raw_query.to_lowercase()));
+    if let Some(folder) = folder_filter {
+        let sql = format!(
             "
-            SELECT
-                m.conv_key,
-                COALESCE(c.title, m.conv_key) AS conv_title,
-                c.kind,
-                m.msg_id,
-                m.parent_msg_id,
-                m.author_name,
-                m.created_at,
-                m.body_plain,
-                m.subject
-            FROM messages m
-            LEFT JOIN conversations c ON c.conv_key = m.conv_key
-            WHERE m.deleted = 0
-              AND m.conv_key = ?1
+            SELECT {SEARCH_SELECT_COLS}
+            FROM mail_messages m
+            WHERE {FOLDER_FILTER_PREDICATE}
               AND (
-                  LOWER(m.body_plain) LIKE ?2 ESCAPE '\\'
-                  OR LOWER(COALESCE(m.subject, '')) LIKE ?2 ESCAPE '\\'
-                  OR LOWER(m.author_name) LIKE ?2 ESCAPE '\\'
+                  LOWER(m.subject) LIKE ?2 ESCAPE '\\'
+                  OR LOWER(m.from_display) LIKE ?2 ESCAPE '\\'
+                  OR LOWER(m.body_plain) LIKE ?2 ESCAPE '\\'
+                  OR LOWER(m.preview) LIKE ?2 ESCAPE '\\'
               )
-            ORDER BY m.created_at DESC, m.msg_id DESC
+            ORDER BY m.received_at DESC, m.id DESC
             LIMIT ?3
-            ",
-        )?;
-        let rows = stmt.query_map(params![conv_key, pattern, limit as i64], |row| {
-            map_search_hit_row(row, query_ctx)
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    } else {
-        let mut stmt = conn.prepare_cached(
             "
-            SELECT
-                m.conv_key,
-                COALESCE(c.title, m.conv_key) AS conv_title,
-                c.kind,
-                m.msg_id,
-                m.parent_msg_id,
-                m.author_name,
-                m.created_at,
-                m.body_plain,
-                m.subject
-            FROM messages m
-            LEFT JOIN conversations c ON c.conv_key = m.conv_key
-            WHERE m.deleted = 0
-              AND (
-                  LOWER(m.body_plain) LIKE ?1 ESCAPE '\\'
-                  OR LOWER(COALESCE(m.subject, '')) LIKE ?1 ESCAPE '\\'
-                  OR LOWER(m.author_name) LIKE ?1 ESCAPE '\\'
-              )
-            ORDER BY m.created_at DESC, m.msg_id DESC
-            LIMIT ?2
-            ",
-        )?;
-        let rows = stmt.query_map(params![pattern, limit as i64], |row| {
-            map_search_hit_row(row, query_ctx)
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params![folder, pattern, limit as i64], |row| {
+            map_mail_search_hit_row(row, raw_query)
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-
-    Ok(hits)
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    } else {
+        let sql = format!(
+            "
+            SELECT {SEARCH_SELECT_COLS}
+            FROM mail_messages m
+            WHERE (
+                LOWER(m.subject) LIKE ?1 ESCAPE '\\'
+                OR LOWER(m.from_display) LIKE ?1 ESCAPE '\\'
+                OR LOWER(m.body_plain) LIKE ?1 ESCAPE '\\'
+                OR LOWER(m.preview) LIKE ?1 ESCAPE '\\'
+            )
+            ORDER BY m.received_at DESC, m.id DESC
+            LIMIT ?2
+            "
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params![pattern, limit as i64], |row| {
+            map_mail_search_hit_row(row, raw_query)
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
 }
 
-fn map_search_hit_row(row: &Row<'_>, query_ctx: &SearchQueryContext) -> rusqlite::Result<SearchHit> {
-    let conv_key: String = row.get(0)?;
-    let conv_title: String = row.get(1)?;
-    let kind_opt: Option<String> = row.get(2)?;
-    let kind = match kind_opt.as_deref() {
-        Some(k) => ConversationKind::from_db_str(k),
-        None if conv_key.starts_with("chan:") => ConversationKind::Channel,
-        None => ConversationKind::Group,
+fn map_mail_search_hit_row(row: &Row<'_>, raw_query: &str) -> rusqlite::Result<MailSearchHit> {
+    let id: String = row.get(0)?;
+    let conversation_id: Option<String> = row.get(1)?;
+    let folder_id: Option<String> = row.get(2)?;
+    let subject: String = row.get(3)?;
+    let from_display: String = row.get(4)?;
+    let received_at: String = row.get(5)?;
+    let body_plain: String = row.get(6)?;
+    let preview: String = row.get(7)?;
+    let has_att_int: i32 = row.get(8)?;
+    let is_read_int: i32 = row.get(9)?;
+    let flagged_int: i32 = row.get(10)?;
+
+    let body_source = if body_plain.trim().is_empty() {
+        preview.as_str()
+    } else {
+        body_plain.as_str()
     };
-    let msg_id: String = row.get(3)?;
-    let parent_msg_id: Option<String> = row.get(4)?;
-    let author_name: String = row.get(5)?;
-    let created_at: String = row.get(6)?;
-    let body_plain: String = row.get(7)?;
-    let subject: Option<String> = row.get(8)?;
+    let snippet = build_mail_snippet(&subject, body_source, &from_display, raw_query, 120);
 
-    let snippet = build_contextual_snippet(
-        subject.as_deref(),
-        &body_plain,
-        &author_name,
-        query_ctx,
-        120,
-    );
-
-    Ok(SearchHit {
-        conv_key,
-        conv_title,
-        kind,
-        msg_id,
-        parent_msg_id,
-        author_name,
-        created_at,
+    Ok(MailSearchHit {
+        id,
+        conversation_id,
+        folder_id,
+        subject,
+        from_display,
+        received_at,
         snippet,
+        has_attachments: has_att_int != 0,
+        is_read: is_read_int != 0,
+        flagged: flagged_int != 0,
     })
 }
 
-fn normalize_whitespace(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for word in input.split_whitespace() {
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(word);
-    }
-    out
-}
-
-fn build_contextual_snippet(
-    subject: Option<&str>,
+fn build_mail_snippet(
+    subject: &str,
     body_plain: &str,
-    author_name: &str,
-    query_ctx: &SearchQueryContext,
+    from_display: &str,
+    query: &str,
     max_chars: usize,
 ) -> String {
-    let clean_body = normalize_whitespace(body_plain);
-    let source = match subject.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(subj) if !clean_body.is_empty() => format!("[{subj}] {clean_body}"),
-        Some(subj) => format!("[{subj}]"),
-        None if !clean_body.is_empty() => clean_body,
-        None => author_name.to_string(),
+    let clean_body = body_plain.split_whitespace().collect::<Vec<_>>().join(" ");
+    let clean_subj = subject.trim();
+    let source = if !clean_body.is_empty() {
+        clean_body
+    } else if !clean_subj.is_empty() {
+        clean_subj.to_string()
+    } else {
+        from_display.to_string()
     };
 
     let total_chars = source.chars().count();
@@ -287,13 +206,12 @@ fn build_contextual_snippet(
         return source;
     }
 
-    let source_lower = source.to_lowercase();
-    let match_char_idx = find_lower_char_pos(&source_lower, &query_ctx.query_lower)
+    let query_lower = query.trim().to_lowercase();
+    let match_char_idx = find_case_insensitive_char_pos(&source, &query_lower)
         .or_else(|| {
-            query_ctx
-                .tokens_lower
-                .iter()
-                .filter_map(|tok| find_lower_char_pos(&source_lower, tok))
+            query_lower
+                .split_whitespace()
+                .filter_map(|tok| find_case_insensitive_char_pos(&source, tok))
                 .min()
         })
         .unwrap_or(0);
@@ -327,10 +245,11 @@ fn build_contextual_snippet(
     out
 }
 
-fn find_lower_char_pos(haystack_lower: &str, needle_lower: &str) -> Option<usize> {
+fn find_case_insensitive_char_pos(haystack: &str, needle_lower: &str) -> Option<usize> {
     if needle_lower.is_empty() {
         return None;
     }
+    let haystack_lower = haystack.to_lowercase();
     let byte_idx = haystack_lower.find(needle_lower)?;
     Some(haystack_lower[..byte_idx].chars().count())
 }

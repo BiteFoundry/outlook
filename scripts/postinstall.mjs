@@ -1,20 +1,20 @@
 #!/usr/bin/env node
 // Zero-Node-Process npm native binary linker.
 //
-// On Unix (linux/darwin): replaces installed `bin/teams.js` with
-// hardlinks/symlinks directly to `@shinick/teams-<platform>-<arch>/bin/teams` so npm's
+// On Unix (linux/darwin): replaces installed `bin/outlook.js` with
+// hardlinks/symlinks directly to `@shinick/outlook-<platform>-<arch>/bin/outlook` so npm's
 // bin symlink execve's the native Rust binary directly (0ms Node startup, 0MB Node RSS).
 //
-// On Windows (win32): creates an NTFS hardlink (fallback copy) `bin/teams.exe`
-// and rewrites npm's `.bin/teams[.cmd|.ps1]` shims when present to invoke
-// `teams.exe` directly without spawning `node.exe`.
+// On Windows (win32): creates an NTFS hardlink (fallback copy) `bin/outlook.exe`
+// and rewrites npm's `.bin/outlook[.cmd|.ps1]` shims when present to invoke
+// `outlook.exe` directly without spawning `node.exe`.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
-const BIN_NAMES = ['teams'];
+const BIN_NAMES = ['outlook'];
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function linkOrCopyFile(source, destination) {
@@ -79,7 +79,7 @@ function collectWindowsShimDirs(pkgRoot, env = process.env) {
     path.basename(nodeModulesDir) === 'node_modules'
   ) {
     dirs.push(path.join(nodeModulesDir, '.bin'));
-    // On global Windows npm installs (`%APPDATA%\npm\node_modules\@shinick\teams`),
+    // On global Windows npm installs (`%APPDATA%\npm\node_modules\@shinick\outlook`),
     // shims sit directly in the parent of `node_modules` even when `npm_config_prefix` is unset in npm v9+.
     dirs.push(path.dirname(nodeModulesDir));
   }
@@ -96,7 +96,7 @@ function collectWindowsShimDirs(pkgRoot, env = process.env) {
 function shimReferencesLauncher(content, name) {
   const normalized = content.replace(/\\/g, '/').toLowerCase();
   return (
-    normalized.includes('@shinick/teams') &&
+    normalized.includes('@shinick/outlook') &&
     normalized.includes(`bin/${name}.js`)
   );
 }
@@ -191,8 +191,8 @@ export function runPostinstall(options = {}) {
   }
 
   const platformKey = `${platform}-${arch}`;
-  const packageName = `@shinick/teams-${platformKey}`;
-  const binaryName = platform === 'win32' ? 'teams.exe' : 'teams';
+  const packageName = `@shinick/outlook-${platformKey}`;
+  const binaryName = platform === 'win32' ? 'outlook.exe' : 'outlook';
 
   let packageDir = null;
   try {

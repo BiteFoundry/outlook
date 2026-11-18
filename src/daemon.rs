@@ -1,4 +1,4 @@
-//! Optional ultra-lightweight single-instance background sync daemon (`teams daemon`).
+//! Optional ultra-lightweight single-instance background sync daemon (`outlook daemon`).
 
 use std::{
     fs::{self, OpenOptions},
@@ -18,8 +18,12 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf},
+    io::{
+        AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
+        BufReader, ReadBuf,
+    },
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc, watch},
 };
@@ -101,7 +105,7 @@ struct DaemonRuntimeInfo {
 
 #[derive(Debug, Clone)]
 struct DaemonPaths {
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
     config_dir: PathBuf,
     state_file: PathBuf,
     lock_file: PathBuf,
@@ -111,8 +115,8 @@ impl DaemonPaths {
     fn from_config_dir(dir: &Path) -> Self {
         Self {
             config_dir: dir.to_path_buf(),
-            state_file: dir.join("daemon.json"),
-            lock_file: dir.join("daemon.lock"),
+            state_file: dir.join("outlook-daemon.json"),
+            lock_file: dir.join("outlook-daemon.lock"),
         }
     }
 
@@ -179,10 +183,7 @@ struct DaemonSharedState {
 }
 
 impl DaemonSharedState {
-    fn new(
-        info: &DaemonRuntimeInfo,
-        started_instant: Instant,
-    ) -> Self {
+    fn new(info: &DaemonRuntimeInfo, started_instant: Instant) -> Self {
         Self {
             pid: info.pid,
             version: info.version.clone(),
@@ -227,14 +228,20 @@ impl DaemonSharedState {
                 guard.sync_busy = *busy;
                 guard.sync_summary = summary.clone();
             }
-            CoreEvent::ConversationsUpdated(_) | CoreEvent::MessagesUpdated { .. } => {
+            CoreEvent::ProfileLoaded(_)
+            | CoreEvent::MailFoldersUpdated(_)
+            | CoreEvent::MailMessagesUpdated { .. }
+            | CoreEvent::MailMessageHydrated(_)
+            | CoreEvent::CalendarEventsUpdated(_)
+            | CoreEvent::ContactsUpdated(_)
+            | CoreEvent::TodoListsUpdated(_)
+            | CoreEvent::TodoTasksUpdated { .. } => {
                 guard.last_sync_at = Some(chrono::Utc::now().to_rfc3339());
                 guard.last_error = None;
             }
             CoreEvent::SyncError(err) => {
                 guard.last_error = Some(err.clone());
             }
-            _ => {}
         }
     }
 }
@@ -257,7 +264,7 @@ impl AttachedClientGuard {
 impl Drop for AttachedClientGuard {
     fn drop(&mut self) {
         if self.counter.fetch_sub(1, Ordering::SeqCst) == 1 {
-            self.sync_ctrl.set_focus(None, None);
+            self.sync_ctrl.set_focus(FocusTarget::default());
         }
     }
 }
@@ -299,7 +306,10 @@ impl StartupLockGuard {
                 }
                 Err(err) => {
                     return Err(err).with_context(|| {
-                        format!("Failed to create daemon startup lock file: {}", path.display())
+                        format!(
+                            "Failed to create daemon startup lock file: {}",
+                            path.display()
+                        )
                     });
                 }
             }
@@ -317,10 +327,15 @@ enum IpcListener {
     Tcp(TcpListener),
     #[cfg(unix)]
     Unix(tokio::net::UnixListener),
+    #[cfg(windows)]
+    Pipe {
+        name: String,
+        server: tokio::net::windows::named_pipe::NamedPipeServer,
+    },
 }
 
 impl IpcListener {
-    async fn accept(&self) -> io::Result<IpcStream> {
+    async fn accept(&mut self) -> io::Result<IpcStream> {
         match self {
             IpcListener::Tcp(listener) => {
                 let (stream, _) = listener.accept().await?;
@@ -332,6 +347,14 @@ impl IpcListener {
                 let (stream, _) = listener.accept().await?;
                 Ok(IpcStream::Unix(stream))
             }
+            #[cfg(windows)]
+            IpcListener::Pipe { name, server } => {
+                server.connect().await?;
+                let next_server =
+                    tokio::net::windows::named_pipe::ServerOptions::new().create(name.as_str())?;
+                let connected = std::mem::replace(server, next_server);
+                Ok(IpcStream::PipeServer(connected))
+            }
         }
     }
 }
@@ -340,6 +363,10 @@ enum IpcStream {
     Tcp(TcpStream),
     #[cfg(unix)]
     Unix(tokio::net::UnixStream),
+    #[cfg(windows)]
+    PipeServer(tokio::net::windows::named_pipe::NamedPipeServer),
+    #[cfg(windows)]
+    PipeClient(tokio::net::windows::named_pipe::NamedPipeClient),
 }
 
 impl AsyncRead for IpcStream {
@@ -352,6 +379,10 @@ impl AsyncRead for IpcStream {
             IpcStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
             #[cfg(unix)]
             IpcStream::Unix(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(windows)]
+            IpcStream::PipeServer(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(windows)]
+            IpcStream::PipeClient(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -366,6 +397,10 @@ impl AsyncWrite for IpcStream {
             IpcStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(unix)]
             IpcStream::Unix(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(windows)]
+            IpcStream::PipeServer(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(windows)]
+            IpcStream::PipeClient(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -374,6 +409,10 @@ impl AsyncWrite for IpcStream {
             IpcStream::Tcp(s) => Pin::new(s).poll_flush(cx),
             #[cfg(unix)]
             IpcStream::Unix(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(windows)]
+            IpcStream::PipeServer(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(windows)]
+            IpcStream::PipeClient(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -382,6 +421,10 @@ impl AsyncWrite for IpcStream {
             IpcStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
             #[cfg(unix)]
             IpcStream::Unix(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(windows)]
+            IpcStream::PipeServer(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(windows)]
+            IpcStream::PipeClient(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -421,7 +464,7 @@ fn write_secret_file_atomic(path: &Path, data: &[u8]) -> Result<()> {
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("daemon.json");
+        .unwrap_or("outlook-daemon.json");
     let tmp = parent.join(format!(".{file_name}.tmp.{}", std::process::id()));
 
     #[cfg(unix)]
@@ -509,12 +552,20 @@ fn cleanup_owned_files(paths: &DaemonPaths, our_secret: &str, sock_path: Option<
     let _ = sock_path;
 }
 
+#[cfg(windows)]
+fn select_windows_pipe_name(config_dir: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(config_dir.to_string_lossy().as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    let short_hash = &digest[..12];
+    format!(r"\\.\pipe\outlook-cli-daemon-{short_hash}")
+}
+
 #[cfg(unix)]
 fn select_unix_socket_path(config_dir: &Path) -> PathBuf {
-    use sha2::{Digest, Sha256};
     use std::os::unix::ffi::OsStrExt;
 
-    let candidate = config_dir.join("daemon.sock");
+    let candidate = config_dir.join("outlook-daemon.sock");
     if candidate.as_os_str().as_bytes().len() <= 90 {
         return candidate;
     }
@@ -522,7 +573,9 @@ fn select_unix_socket_path(config_dir: &Path) -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
         let trimmed = xdg.trim();
         if !trimmed.is_empty() {
-            let xdg_candidate = PathBuf::from(trimmed).join("teams-cli").join("daemon.sock");
+            let xdg_candidate = PathBuf::from(trimmed)
+                .join("outlook-cli")
+                .join("outlook-daemon.sock");
             if xdg_candidate.as_os_str().as_bytes().len() <= 90 {
                 return xdg_candidate;
             }
@@ -533,7 +586,7 @@ fn select_unix_socket_path(config_dir: &Path) -> PathBuf {
     hasher.update(config_dir.as_os_str().as_bytes());
     let digest = hex::encode(hasher.finalize());
     let short_hash = &digest[..12];
-    PathBuf::from(format!("/tmp/teams-cli-{short_hash}/daemon.sock"))
+    PathBuf::from(format!("/tmp/outlook-cli-{short_hash}/outlook-daemon.sock"))
 }
 
 #[cfg(unix)]
@@ -542,16 +595,39 @@ fn ensure_unix_socket_dir(sock_path: &Path) -> Result<()> {
     if let Some(parent) = sock_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create socket directory: {}", parent.display()))?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("Failed to set permissions on socket directory: {}", parent.display()))?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!(
+                "Failed to set permissions on socket directory: {}",
+                parent.display()
+            )
+        })?;
     }
     Ok(())
 }
 
-#[cfg_attr(not(unix), allow(unused_variables))]
+#[cfg_attr(not(any(unix, windows)), allow(unused_variables))]
 async fn bind_ipc_listener(
     paths: &DaemonPaths,
 ) -> Result<(IpcListener, String, String, Option<PathBuf>)> {
+    #[cfg(windows)]
+    {
+        let pipe_name = select_windows_pipe_name(&paths.config_dir);
+        if let Ok(server) = tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+        {
+            return Ok((
+                IpcListener::Pipe {
+                    name: pipe_name.clone(),
+                    server,
+                },
+                "pipe".to_string(),
+                pipe_name,
+                None,
+            ));
+        }
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -593,6 +669,25 @@ async fn bind_ipc_listener(
 
 async fn connect_ipc(transport: &str, endpoint: &str, timeout: Duration) -> Result<IpcStream> {
     match transport {
+        #[cfg(windows)]
+        "pipe" => {
+            if !endpoint.starts_with(r"\\.\pipe\outlook-cli-daemon-") {
+                bail!("Invalid Outlook daemon pipe endpoint: {endpoint}");
+            }
+            let deadline = Instant::now() + timeout;
+            loop {
+                match tokio::net::windows::named_pipe::ClientOptions::new().open(endpoint) {
+                    Ok(client) => return Ok(IpcStream::PipeClient(client)),
+                    Err(err) if err.raw_os_error() == Some(231) && Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(err) => {
+                        return Err(err)
+                            .with_context(|| format!("Named pipe connection failed: {endpoint}"));
+                    }
+                }
+            }
+        }
         #[cfg(unix)]
         "unix" => {
             let stream =
@@ -609,7 +704,6 @@ async fn connect_ipc(transport: &str, endpoint: &str, timeout: Duration) -> Resu
             if !addr.ip().is_loopback() {
                 bail!("Refusing to connect to non-loopback IPC address for security: {endpoint}");
             }
-            // Windows loopback TCP connect takes ~2s to surface WSAECONNREFUSED on a dead port.
             let connect_timeout = if cfg!(windows) {
                 timeout.max(Duration::from_millis(2_500))
             } else {
@@ -734,6 +828,21 @@ fn is_daemon_alive_fast_at(paths: &DaemonPaths, expected_user_id: Option<&str>) 
     }
 
     match info.transport.as_str() {
+        #[cfg(windows)]
+        "pipe" => {
+            if !info.endpoint.starts_with(r"\\.\pipe\outlook-cli-daemon-") {
+                cleanup_stale_files(paths, Some(&info));
+                return false;
+            }
+            match OpenOptions::new().read(true).write(true).open(&info.endpoint) {
+                Ok(_) => true,
+                Err(err) if err.raw_os_error() == Some(231) => true, // ERROR_PIPE_BUSY
+                Err(_) => {
+                    cleanup_stale_files(paths, Some(&info));
+                    false
+                }
+            }
+        }
         #[cfg(unix)]
         "unix" => {
             if !Path::new(&info.endpoint).exists() {
@@ -810,7 +919,9 @@ async fn ensure_daemon_started_at(cfg: &AppConfig, paths: &DaemonPaths) -> Resul
         cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
     }
 
-    let mut child = cmd.spawn().context("Failed to spawn background daemon process")?;
+    let mut child = cmd
+        .spawn()
+        .context("Failed to spawn background daemon process")?;
     let deadline = Instant::now() + STARTUP_WAIT_TIMEOUT;
     while Instant::now() < deadline {
         let status = query_daemon_status_at(paths).await?;
@@ -821,7 +932,7 @@ async fn ensure_daemon_started_at(cfg: &AppConfig, paths: &DaemonPaths) -> Resul
             if !exit.success() {
                 if let Ok(auth) = AuthManager::new(cfg.clone()) {
                     if auth.current_tokens().await.is_none() {
-                        bail!("Not logged in. Run 'teams login' first.");
+                        bail!("Not logged in. Run 'outlook login' first.");
                     }
                 }
                 bail!("Background daemon exited unexpectedly (exit: {exit})");
@@ -945,7 +1056,7 @@ async fn try_connect_tui_at(
     let (focus_tx, mut focus_rx) = watch::channel(FocusTarget::default());
     let (nudge_tx, mut nudge_rx) = mpsc::unbounded_channel::<SyncCommand>();
     let (events_tx, events_rx) = mpsc::unbounded_channel::<CoreEvent>();
-    let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx, false);
+    let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
 
     tokio::spawn(async move {
         loop {
@@ -1012,7 +1123,7 @@ async fn try_connect_tui_at(
 pub async fn run_daemon_foreground(cfg: AppConfig) -> Result<()> {
     let auth = AuthManager::new(cfg.clone())?;
     let Some(tokens) = auth.current_tokens().await else {
-        bail!("Not logged in. Run 'teams login' first.");
+        bail!("Not logged in. Run 'outlook login' first.");
     };
     let user_id = tokens.user_id.clone();
     let storage = Storage::open(&crate::config::db_path(user_id.as_deref()))?;
@@ -1072,18 +1183,25 @@ async fn run_initial_bootstrap(
         summary: "Initial sync...".to_string(),
     });
 
-    match sync::bootstrap_conversations(&graph, &storage).await {
+    match sync::bootstrap_outlook(&graph, &storage).await {
         Ok(()) => {
-            let st_convs = storage.clone();
-            if let Ok(Ok(convs)) =
-                tokio::task::spawn_blocking(move || st_convs.list_conversations()).await
+            let st_folders = storage.clone();
+            if let Ok(Ok(folders)) =
+                tokio::task::spawn_blocking(move || st_folders.list_mail_folders()).await
             {
-                let _ = event_tx.send(CoreEvent::ConversationsUpdated(convs));
+                let _ = event_tx.send(CoreEvent::MailFoldersUpdated(folders));
             }
-            let st_teams = storage.clone();
-            if let Ok(Ok(teams)) = tokio::task::spawn_blocking(move || st_teams.list_teams()).await
+            let st_msgs = storage.clone();
+            if let Ok(Ok(messages)) = tokio::task::spawn_blocking(move || {
+                st_msgs.list_mail_messages(Some("inbox"), false, false, false, 100)
+            })
+            .await
             {
-                let _ = event_tx.send(CoreEvent::TeamsUpdated(teams));
+                let _ = event_tx.send(CoreEvent::MailMessagesUpdated {
+                    folder_id: "inbox".to_string(),
+                    messages,
+                    notify_candidate: None,
+                });
             }
             let _ = event_tx.send(CoreEvent::SyncStateChanged {
                 busy: false,
@@ -1113,7 +1231,7 @@ async fn run_daemon_with_engine(
         return Ok(());
     }
 
-    let (listener, transport, endpoint, sock_path) = bind_ipc_listener(&paths).await?;
+    let (mut listener, transport, endpoint, sock_path) = bind_ipc_listener(&paths).await?;
     let now = chrono::Utc::now();
     let info = DaemonRuntimeInfo {
         pid: std::process::id(),
@@ -1267,7 +1385,7 @@ async fn handle_client_connection(
         }
         ClientOp::Nudge { cmd, focus } => {
             if let Some(f) = focus {
-                sync_ctrl.set_focus(f.target, f.thread_root_id);
+                sync_ctrl.set_focus(f);
             }
             if let Some(c) = cmd {
                 if !matches!(c, SyncCommand::Shutdown) {
@@ -1321,7 +1439,7 @@ async fn handle_client_connection(
                                         }
                                     }
                                     Ok(ClientStreamCmd::SetFocus(focus)) => {
-                                        sync_ctrl.set_focus(focus.target, focus.thread_root_id);
+                                        sync_ctrl.set_focus(focus);
                                     }
                                     Ok(ClientStreamCmd::Ping) => {
                                         if write_json_line(&mut write_half, &ServerFrame::Pong).await.is_err() {
@@ -1343,8 +1461,8 @@ async fn handle_client_connection(
                             }
                             Err(broadcast::error::RecvError::Lagged(_)) => {
                                 let st = storage.clone();
-                                if let Ok(Ok(convs)) = tokio::task::spawn_blocking(move || st.list_conversations()).await {
-                                    let ev = CoreEvent::ConversationsUpdated(convs);
+                                if let Ok(Ok(folders)) = tokio::task::spawn_blocking(move || st.list_mail_folders()).await {
+                                    let ev = CoreEvent::MailFoldersUpdated(folders);
                                     if write_json_line(&mut write_half, &ServerFrame::Event(ev)).await.is_err() {
                                         break;
                                     }
@@ -1364,7 +1482,7 @@ async fn handle_client_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ConversationKind, ConversationSummary, ConversationTarget};
+    use crate::models::MailFolder;
 
     struct TestDaemonHarness {
         _dir: tempfile::TempDir,
@@ -1382,7 +1500,7 @@ mod tests {
             let (focus_tx, focus_rx) = watch::channel(FocusTarget::default());
             let (nudge_tx, nudge_rx) = mpsc::unbounded_channel::<SyncCommand>();
             let (engine_event_tx, engine_event_rx) = mpsc::unbounded_channel::<CoreEvent>();
-            let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx, true);
+            let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
 
             let task_paths = paths.clone();
             let uid = user_id.map(str::to_string);
@@ -1429,6 +1547,14 @@ mod tests {
     #[tokio::test]
     async fn daemon_lifecycle_status_and_graceful_shutdown() {
         let mut harness = TestDaemonHarness::start(Some("user-1")).await;
+        assert_eq!(
+            harness.paths.state_file.file_name().unwrap(),
+            "outlook-daemon.json"
+        );
+        assert_eq!(
+            harness.paths.lock_file.file_name().unwrap(),
+            "outlook-daemon.lock"
+        );
 
         assert!(is_daemon_alive_fast_at(&harness.paths, Some("user-1")));
         assert!(is_daemon_alive_fast_at(&harness.paths, None));
@@ -1441,6 +1567,15 @@ mod tests {
         assert_eq!(status.user_id.as_deref(), Some("user-1"));
         assert_eq!(status.attached_clients, 0);
 
+        #[cfg(windows)]
+        {
+            assert_eq!(status.transport.as_deref(), Some("pipe"));
+            assert!(status
+                .endpoint
+                .as_deref()
+                .unwrap()
+                .starts_with(r"\\.\pipe\outlook-cli-daemon-"));
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1450,6 +1585,13 @@ mod tests {
                 .mode()
                 & 0o777;
             assert_eq!(mode, 0o600);
+            if status.transport.as_deref() == Some("unix") {
+                assert!(status
+                    .endpoint
+                    .as_deref()
+                    .unwrap()
+                    .ends_with("outlook-daemon.sock"));
+            }
         }
 
         let stopped = stop_daemon_at(&harness.paths).await.unwrap();
@@ -1483,7 +1625,6 @@ mod tests {
         let resp: ServerFrame = serde_json::from_str(&resp_line).unwrap();
         assert!(matches!(resp, ServerFrame::Error { ref message } if message == "unauthorized"));
 
-        // Daemon must still be alive and state file intact after unauthorized attempt.
         let status = query_daemon_status_at(&harness.paths).await.unwrap();
         assert!(status.running);
 
@@ -1502,7 +1643,6 @@ mod tests {
         assert!(conn.status.running);
         assert_eq!(conn.status.attached_clients, 1);
 
-        // Initial NotifyUserActivity triggered on Subscribe.
         let first_cmd = tokio::time::timeout(Duration::from_secs(1), harness.nudge_rx.recv())
             .await
             .unwrap()
@@ -1512,34 +1652,26 @@ mod tests {
         let live_status = query_daemon_status_at(&harness.paths).await.unwrap();
         assert_eq!(live_status.attached_clients, 1);
 
-        // Forward SyncCommand & FocusTarget from TUI -> daemon.
-        conn.sync_ctrl.request(SyncCommand::RefreshConversations);
+        conn.sync_ctrl.request(SyncCommand::RefreshAll);
         let forwarded_cmd = tokio::time::timeout(Duration::from_secs(1), harness.nudge_rx.recv())
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(forwarded_cmd, SyncCommand::RefreshConversations));
+        assert!(matches!(forwarded_cmd, SyncCommand::RefreshAll));
 
-        conn.sync_ctrl.set_focus(
-            Some(ConversationTarget::Chat {
-                chat_id: "chat-42".to_string(),
-            }),
-            Some("root-1".to_string()),
-        );
+        conn.sync_ctrl.set_focus(FocusTarget {
+            active_folder_id: Some("inbox".to_string()),
+            active_message_id: Some("msg-1".to_string()),
+            active_todo_list_id: None,
+        });
         tokio::time::timeout(Duration::from_secs(1), harness.focus_rx.changed())
             .await
             .unwrap()
             .unwrap();
         let focus = harness.focus_rx.borrow().clone();
-        assert_eq!(
-            focus.target,
-            Some(ConversationTarget::Chat {
-                chat_id: "chat-42".to_string()
-            })
-        );
-        assert_eq!(focus.thread_root_id.as_deref(), Some("root-1"));
+        assert_eq!(focus.active_folder_id.as_deref(), Some("inbox"));
+        assert_eq!(focus.active_message_id.as_deref(), Some("msg-1"));
 
-        // Broadcast CoreEvent from daemon -> TUI + status update.
         harness
             .engine_event_tx
             .send(CoreEvent::SyncStateChanged {
@@ -1549,25 +1681,14 @@ mod tests {
             .unwrap();
         harness
             .engine_event_tx
-            .send(CoreEvent::ConversationsUpdated(vec![ConversationSummary {
-                conv_key: "chat:chat-42".to_string(),
-                target: ConversationTarget::Chat {
-                    chat_id: "chat-42".to_string(),
-                },
-                kind: ConversationKind::OneOnOne,
-                team_id: None,
-                team_name: None,
-                title: "Test Chat".to_string(),
-                topic: None,
-                unread_count: 1,
-                last_read_at: None,
-                last_msg_id: None,
-                last_msg_author: None,
-                last_msg_preview: Some("hello".to_string()),
-                last_updated_at: None,
-                pinned: false,
-                peer_user_id: None,
-                web_url: None,
+            .send(CoreEvent::MailFoldersUpdated(vec![MailFolder {
+                id: "fld-inbox".to_string(),
+                display_name: "Inbox".to_string(),
+                well_known_name: Some("inbox".to_string()),
+                parent_folder_id: None,
+                child_folder_count: 0,
+                unread_item_count: 1,
+                total_item_count: 1,
             }]))
             .unwrap();
 
@@ -1584,15 +1705,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(ev2, CoreEvent::ConversationsUpdated(ref items) if items.len() == 1));
+        assert!(matches!(ev2, CoreEvent::MailFoldersUpdated(ref items) if items.len() == 1));
 
         let updated_status = query_daemon_status_at(&harness.paths).await.unwrap();
         assert!(updated_status.sync_busy);
         assert_eq!(updated_status.sync_summary, "Syncing");
         assert!(updated_status.last_sync_at.is_some());
 
-        // Simulating TUI exit sends Shutdown through sync_ctrl then drops connection:
-        // shared daemon MUST keep running with attached_clients == 0.
         conn.sync_ctrl.request(SyncCommand::Shutdown);
         drop(conn);
 
@@ -1608,14 +1727,13 @@ mod tests {
         }
         assert!(detached, "daemon should remain running with 0 clients");
         assert!(
-            harness.focus_rx.borrow().target.is_none(),
+            harness.focus_rx.borrow().active_folder_id.is_none(),
             "focus must be cleared when last TUI client detaches"
         );
 
-        // Also test nudge_daemon RPC directly.
         assert!(nudge_daemon_at(
             &harness.paths,
-            Some(SyncCommand::SyncActiveNow),
+            Some(SyncCommand::SyncCalendar),
             None,
         )
         .await
@@ -1624,7 +1742,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(nudged, SyncCommand::SyncActiveNow));
+        assert!(matches!(nudged, SyncCommand::SyncCalendar));
 
         assert!(stop_daemon_at(&harness.paths).await.unwrap());
         harness.wait_exit().await.unwrap();
@@ -1635,7 +1753,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = DaemonPaths::from_config_dir(dir.path());
 
-        // Find an unused ephemeral port then immediately drop the listener.
         let dead_port = {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.local_addr().unwrap().port()
@@ -1658,11 +1775,9 @@ mod tests {
         .unwrap();
         assert!(paths.state_file.exists());
 
-        // Fast probe detects dead endpoint and cleans up daemon.json.
         assert!(!is_daemon_alive_fast_at(&paths, Some("stale-user")));
         assert!(!paths.state_file.exists());
 
-        // Recreate stale file and verify query_daemon_status_at also cleans it up.
         write_secret_file_atomic(
             &paths.state_file,
             &serde_json::to_vec_pretty(&stale).unwrap(),
@@ -1674,7 +1789,6 @@ mod tests {
         assert!(!status.running);
         assert!(!paths.state_file.exists());
 
-        // Corrupt JSON is also auto-cleaned.
         write_secret_file_atomic(&paths.state_file, b"{corrupt json").unwrap();
         assert!(!is_daemon_alive_fast_at(&paths, None));
         assert!(!paths.state_file.exists());
@@ -1687,7 +1801,7 @@ mod tests {
         let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
         let (nudge_tx, _nudge_rx) = mpsc::unbounded_channel();
         let (_ev_tx, ev_rx) = mpsc::unbounded_channel();
-        let dup_ctrl = SyncController::from_channels(focus_tx, nudge_tx, true);
+        let dup_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
 
         let dup_res = run_daemon_with_engine(
             harness.paths.clone(),
@@ -1700,7 +1814,6 @@ mod tests {
         .await;
         assert!(dup_res.is_ok());
 
-        // Original daemon must still be alive.
         assert!(query_daemon_status_at(&harness.paths).await.unwrap().running);
 
         assert!(stop_daemon_at(&harness.paths).await.unwrap());
@@ -1714,7 +1827,6 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = listener.local_addr().unwrap().to_string();
 
-        // Accept the connection and hold it open without responding so read times out.
         let stall_server = tokio::spawn(async move {
             if let Ok((stream, _)) = listener.accept().await {
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1744,7 +1856,7 @@ mod tests {
         assert!(resp.is_none());
         assert!(
             paths.state_file.exists(),
-            "read timeout must NOT delete live daemon.json"
+            "read timeout must NOT delete live outlook-daemon.json"
         );
 
         stall_server.abort();

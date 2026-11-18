@@ -1,91 +1,58 @@
-//! Left navigation pane:
-//! - Tab 0 (`Ctrl+1`): Chats (1:1 · Group · Meeting)
-//! - Tab 1 (`Ctrl+2`): Teams / Channels
-//! - Tab 2 (`Ctrl+3`): Activity (`@mentions`)
+//! Unified Left Sidebar (`ui/nav_pane.rs`):
+//! - Top tab header: `1 Mail · 2 Cal · 3 Tasks` (clickable + `1`/`2`/`3` & `Alt+1..3`)
+//! - Action strip: `[Ctrl+K Jump]` + `[Filter]` + `[+New]`
+//! - Tab 0 (`Mail`): `FAVORITES` (Inbox, Unread, Flagged, Drafts, Sent, Archive, Trash + user favorites) + `FOLDERS`
+//! - Tab 1 (`Calendar`): Compact Mini Month Calendar Grid (today + `•` event days) + Quick Range Jumpers
+//! - Tab 2 (`Tasks`): Microsoft To Do lists + `n` to create list
 
-use std::borrow::Cow;
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::HashSet;
 
+use chrono::{Datelike, Duration, Local, NaiveDate};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::{
-    models::ConversationKind,
-    ui::{
-        app::{AppState, UiState},
-        chat_view::DualHasher,
-        hitmap::{ButtonId, HitMap, HitTarget},
-    },
+use crate::ui::{
+    app::{AppState, CalendarRangeFilter, Focus, UiState},
+    hitmap::{ButtonId, HitMap, HitTarget},
 };
 
-pub const TAB_CHATS: usize = 0;
-pub const TAB_TEAMS: usize = 1;
-pub const TAB_ACTIVITY: usize = 2;
+pub const TAB_MAIL: usize = 0;
+pub const TAB_CALENDAR: usize = 1;
+pub const TAB_TASKS: usize = 2;
 pub const TAB_COUNT: usize = 3;
 
-pub const TAB_LABELS: [&str; TAB_COUNT] = ["Chats", "Teams", "Activity"];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NavTab {
-    Chats = 0,
-    Teams = 1,
-    Activity = 2,
-}
-
-impl NavTab {
-    pub fn from_index(idx: usize) -> Self {
-        match idx {
-            TAB_TEAMS => Self::Teams,
-            TAB_ACTIVITY => Self::Activity,
-            _ => Self::Chats,
-        }
-    }
-
-    pub fn index(self) -> usize {
-        self as usize
-    }
-}
+pub const VIRTUAL_UNREAD_FOLDER: &str = "__virtual_unread__";
+pub const VIRTUAL_FLAGGED_FOLDER: &str = "__virtual_flagged__";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavRow {
     SectionHeader {
         label: &'static str,
     },
-    Chat {
-        conv_key: String,
-        title: String,
-        kind: ConversationKind,
-        peer_user_id: Option<String>,
-        unread: i32,
-    },
-    TeamHeader {
-        team_id: String,
+    MailFolder {
+        folder_id: String,
         display_name: String,
-        collapsed: bool,
-        channel_count: usize,
         unread: i32,
+        is_virtual: bool,
     },
-    TeamChannel {
-        conv_key: String,
+    CalendarRange {
+        label: &'static str,
+        range: CalendarRangeFilter,
+    },
+    TodoList {
+        list_id: String,
         display_name: String,
-        is_private: bool,
-        unread: i32,
+        wellknown: Option<String>,
     },
-    ActivityMention {
-        conv_key: String,
-        msg_id: String,
-        parent_msg_id: Option<String>,
-        author_name: String,
-        preview: String,
-        created_at: String,
+    ActionButton {
+        label: &'static str,
+        action_id: ButtonId,
     },
 }
 
@@ -95,346 +62,215 @@ impl NavRow {
     }
 }
 
-const NAV_CACHE_CAPACITY: usize = 16;
-
-struct NavRowsCache {
-    entries: Vec<((u64, u64), Arc<[NavRow]>)>,
-    max_entries: usize,
-}
-
-impl NavRowsCache {
-    fn new(max_entries: usize) -> Self {
-        Self {
-            entries: Vec::with_capacity(max_entries),
-            max_entries: max_entries.max(1),
-        }
-    }
-
-    fn get(&mut self, key: (u64, u64)) -> Option<Arc<[NavRow]>> {
-        let pos = self.entries.iter().position(|(k, _)| *k == key)?;
-        if pos + 1 < self.entries.len() {
-            let entry = self.entries.remove(pos);
-            self.entries.push(entry);
-        }
-        self.entries.last().map(|(_, val)| Arc::clone(val))
-    }
-
-    fn insert(&mut self, key: (u64, u64), val: Arc<[NavRow]>) {
-        if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key) {
-            self.entries.remove(pos);
-        } else if self.entries.len() >= self.max_entries {
-            self.entries.remove(0);
-        }
-        self.entries.push((key, val));
-    }
-}
-
-thread_local! {
-    static NAV_ROWS_CACHE: RefCell<NavRowsCache> = RefCell::new(NavRowsCache::new(NAV_CACHE_CAPACITY));
-}
-
-#[inline]
-fn write_opt_str(h: &mut DualHasher, s: Option<&str>) {
-    match s {
-        Some(v) => {
-            h.write_hash(&1u8);
-            h.write_str(v);
-        }
-        None => h.write_hash(&0u8),
-    }
-}
-
-/// Computes a 128-bit signature of all inputs that affect `NavRow` output for the active tab.
-fn compute_nav_sig(app: &AppState, ui: &UiState) -> (u64, u64) {
-    let mut h = DualHasher::new(0x4e41_565f_524f_5753);
-    h.write_hash(&ui.active_nav_tab);
-    h.write_hash(&ui.nav_unread_only);
-    match ui.active_nav_tab {
-        TAB_CHATS => {
-            let mut pinned_keys: Vec<&str> = ui.pinned_convs.iter().map(String::as_str).collect();
-            pinned_keys.sort_unstable();
-            h.write_hash(&pinned_keys.len());
-            for key in pinned_keys {
-                h.write_str(key);
-            }
-            let mut count = 0usize;
-            for c in &app.conversations {
-                if c.kind != ConversationKind::Channel {
-                    h.write_str(&c.conv_key);
-                    h.write_str(&c.title);
-                    h.write_hash(&c.kind);
-                    write_opt_str(&mut h, c.peer_user_id.as_deref());
-                    h.write_hash(&c.unread_count);
-                    h.write_hash(&c.pinned);
-                    count += 1;
-                }
-            }
-            h.write_hash(&count);
-        }
-        TAB_TEAMS => {
-            h.write_hash(&app.teams.len());
-            for team in &app.teams {
-                h.write_str(&team.id);
-                h.write_str(&team.display_name);
-                let collapsed = ui.collapsed_team_ids.contains(&team.id);
-                h.write_hash(&collapsed);
-                h.write_hash(&team.channels.len());
-                for ch in &team.channels {
-                    h.write_str(&ch.team_id);
-                    h.write_str(&ch.id);
-                    h.write_str(&ch.display_name);
-                    h.write_hash(&(!ch.membership_type.eq_ignore_ascii_case("standard")));
-                }
-            }
-            let mut chan_conv_count = 0usize;
-            for c in &app.conversations {
-                if c.kind == ConversationKind::Channel || c.conv_key.starts_with("chan:") {
-                    h.write_str(&c.conv_key);
-                    h.write_hash(&c.unread_count);
-                    chan_conv_count += 1;
-                }
-            }
-            h.write_hash(&chan_conv_count);
-        }
-        TAB_ACTIVITY => {
-            h.write_hash(&app.activity_mentions.len());
-            for m in &app.activity_mentions {
-                h.write_str(&m.conv_key);
-                h.write_str(&m.msg_id);
-                write_opt_str(&mut h, m.parent_msg_id.as_deref());
-                h.write_str(&m.author_name);
-                h.write_str(&m.body_plain);
-                h.write_str(&m.created_at);
-            }
-        }
-        _ => {}
-    }
-    h.finish()
-}
-
-/// Returns the cached `Arc<[NavRow]>` slice for the active tab, rebuilding only on signature miss.
-pub fn nav_rows_cached(app: &AppState, ui: &UiState) -> Arc<[NavRow]> {
-    let sig = compute_nav_sig(app, ui);
-    if let Some(hit) = NAV_ROWS_CACHE.with(|cache| cache.borrow_mut().get(sig)) {
-        return hit;
-    }
-    let rows: Arc<[NavRow]> = build_nav_rows_uncached(app, ui).into();
-    NAV_ROWS_CACHE.with(|cache| cache.borrow_mut().insert(sig, Arc::clone(&rows)));
-    rows
-}
-
-#[inline]
-fn is_conv_pinned(conv_key: &str, conv_pinned: bool, ui: &UiState) -> bool {
-    conv_pinned || ui.pinned_convs.contains(conv_key)
-}
-
-/// Returns the number of visible rows in the active nav tab without allocating rows.
-pub fn nav_row_count(app: &AppState, ui: &UiState) -> usize {
-    match ui.active_nav_tab {
-        TAB_CHATS => {
-            let mut pinned = 0usize;
-            let mut unread = 0usize;
-            let mut recent = 0usize;
-            for c in &app.conversations {
-                if c.kind == ConversationKind::Channel {
-                    continue;
-                }
-                if ui.nav_unread_only && c.unread_count <= 0 {
-                    continue;
-                }
-                if is_conv_pinned(&c.conv_key, c.pinned, ui) {
-                    pinned += 1;
-                } else if c.unread_count > 0 {
-                    unread += 1;
-                } else {
-                    recent += 1;
-                }
-            }
-            if pinned == 0 && unread == 0 {
-                recent
-            } else {
-                (if pinned > 0 { 1 + pinned } else { 0 })
-                    + (if unread > 0 { 1 + unread } else { 0 })
-                    + (if recent > 0 { 1 + recent } else { 0 })
-            }
-        }
-        TAB_TEAMS => {
-            if !ui.nav_unread_only {
-                return app
-                    .teams
-                    .iter()
-                    .map(|team| {
-                        1 + if ui.collapsed_team_ids.contains(&team.id) {
-                            0
-                        } else {
-                            team.channels.len()
-                        }
-                    })
-                    .sum();
-            }
-            let mut channel_unread: HashMap<&str, i32> =
-                HashMap::with_capacity(app.conversations.len());
-            for c in &app.conversations {
-                if c.kind == ConversationKind::Channel || c.conv_key.starts_with("chan:") {
-                    channel_unread
-                        .entry(c.conv_key.as_str())
-                        .or_insert(c.unread_count);
-                }
-            }
-            let mut total = 0usize;
-            for team in &app.teams {
-                let unread_chans = team
-                    .channels
-                    .iter()
-                    .filter(|ch| channel_unread.get(ch.conv_key().as_str()).copied().unwrap_or(0) > 0)
-                    .count();
-                if unread_chans > 0 {
-                    total += 1
-                        + if ui.collapsed_team_ids.contains(&team.id) {
-                            0
-                        } else {
-                            unread_chans
-                        };
-                }
-            }
-            total
-        }
-        TAB_ACTIVITY => app.activity_mentions.len(),
-        _ => 0,
-    }
-}
-
-pub fn nav_row_at(app: &AppState, ui: &UiState, index: usize) -> Option<NavRow> {
-    nav_rows_cached(app, ui).get(index).cloned()
-}
-
 pub fn build_nav_rows(app: &AppState, ui: &UiState) -> Vec<NavRow> {
-    nav_rows_cached(app, ui).to_vec()
-}
-
-fn build_nav_rows_uncached(app: &AppState, ui: &UiState) -> Vec<NavRow> {
     match ui.active_nav_tab {
-        TAB_CHATS => {
-            let mut pinned = Vec::new();
-            let mut unread = Vec::new();
-            let mut recent = Vec::new();
-            for c in &app.conversations {
-                if c.kind == ConversationKind::Channel {
-                    continue;
-                }
-                if ui.nav_unread_only && c.unread_count <= 0 {
-                    continue;
-                }
-                let row = NavRow::Chat {
-                    conv_key: c.conv_key.clone(),
-                    title: c.title.clone(),
-                    kind: c.kind,
-                    peer_user_id: c.peer_user_id.clone(),
-                    unread: c.unread_count,
-                };
-                if is_conv_pinned(&c.conv_key, c.pinned, ui) {
-                    pinned.push(row);
-                } else if c.unread_count > 0 {
-                    unread.push(row);
-                } else {
-                    recent.push(row);
-                }
-            }
-            if pinned.is_empty() && unread.is_empty() {
-                return recent;
-            }
-            let mut rows = Vec::with_capacity(pinned.len() + unread.len() + recent.len() + 3);
-            if !pinned.is_empty() {
-                rows.push(NavRow::SectionHeader { label: "PINNED" });
-                rows.extend(pinned);
-            }
-            if !unread.is_empty() {
-                rows.push(NavRow::SectionHeader { label: "UNREAD" });
-                rows.extend(unread);
-            }
-            if !recent.is_empty() {
-                rows.push(NavRow::SectionHeader { label: "RECENT" });
-                rows.extend(recent);
-            }
-            rows
-        }
-        TAB_TEAMS => {
-            let mut channel_unread: HashMap<&str, i32> =
-                HashMap::with_capacity(app.conversations.len());
-            for c in &app.conversations {
-                if c.kind == ConversationKind::Channel || c.conv_key.starts_with("chan:") {
-                    channel_unread
-                        .entry(c.conv_key.as_str())
-                        .or_insert(c.unread_count);
-                }
-            }
-            let mut rows = Vec::new();
-            for team in &app.teams {
-                let collapsed = ui.collapsed_team_ids.contains(&team.id);
-                let team_unread: i32 = team
-                    .channels
-                    .iter()
-                    .map(|ch| {
-                        channel_unread
-                            .get(ch.conv_key().as_str())
-                            .copied()
-                            .unwrap_or(0)
-                            .max(0)
-                    })
-                    .sum();
-                if ui.nav_unread_only && team_unread <= 0 {
-                    continue;
-                }
-                rows.push(NavRow::TeamHeader {
-                    team_id: team.id.clone(),
-                    display_name: team.display_name.clone(),
-                    collapsed,
-                    channel_count: team.channels.len(),
-                    unread: team_unread,
-                });
-                if !collapsed {
-                    for ch in &team.channels {
-                        let conv_key = ch.conv_key();
-                        let unread = channel_unread.get(conv_key.as_str()).copied().unwrap_or(0);
-                        if ui.nav_unread_only && unread <= 0 {
-                            continue;
-                        }
-                        let is_private = !ch.membership_type.eq_ignore_ascii_case("standard");
-                        rows.push(NavRow::TeamChannel {
-                            conv_key,
-                            display_name: ch.display_name.clone(),
-                            is_private,
-                            unread,
-                        });
-                    }
-                }
-            }
-            rows
-        }
-        TAB_ACTIVITY => app
-            .activity_mentions
-            .iter()
-            .map(|m| NavRow::ActivityMention {
-                conv_key: m.conv_key.clone(),
-                msg_id: m.msg_id.clone(),
-                parent_msg_id: m.parent_msg_id.clone(),
-                author_name: m.author_name.clone(),
-                preview: m.body_plain.replace(['\n', '\r'], " "),
-                created_at: m.created_at.clone(),
-            })
-            .collect(),
+        TAB_MAIL => build_mail_nav_rows(app),
+        TAB_CALENDAR => build_calendar_nav_rows(),
+        TAB_TASKS => build_todo_nav_rows(app),
         _ => Vec::new(),
     }
 }
 
-pub fn tab_counts(app: &AppState) -> [usize; TAB_COUNT] {
-    let chat_count = app
-        .conversations
+pub fn nav_row_count(app: &AppState, ui: &UiState) -> usize {
+    build_nav_rows(app, ui).len()
+}
+
+pub fn nav_row_at(app: &AppState, ui: &UiState, index: usize) -> Option<NavRow> {
+    build_nav_rows(app, ui).into_iter().nth(index)
+}
+
+fn find_folder_by_wellknown<'a>(
+    app: &'a AppState,
+    well_known: &str,
+    fallback_names: &[&str],
+) -> Option<&'a crate::models::MailFolder> {
+    app.mail_folders
         .iter()
-        .filter(|c| c.kind != ConversationKind::Channel)
-        .count();
-    let team_channel_count: usize = app.teams.iter().map(|t| t.channels.len()).sum();
-    [chat_count, team_channel_count, app.activity_mentions.len()]
+        .find(|f| {
+            f.well_known_name
+                .as_deref()
+                .is_some_and(|wk| wk.eq_ignore_ascii_case(well_known))
+        })
+        .or_else(|| {
+            app.mail_folders.iter().find(|f| {
+                fallback_names
+                    .iter()
+                    .any(|n| f.display_name.eq_ignore_ascii_case(n))
+            })
+        })
+}
+
+fn build_mail_nav_rows(app: &AppState) -> Vec<NavRow> {
+    let mut rows = Vec::new();
+    let mut shown_ids: HashSet<String> = HashSet::new();
+
+    rows.push(NavRow::SectionHeader { label: "FAVORITES" });
+
+    // 1. Inbox
+    if let Some(inbox) = find_folder_by_wellknown(app, "inbox", &["Inbox"]) {
+        shown_ids.insert(inbox.id.clone());
+        rows.push(NavRow::MailFolder {
+            folder_id: inbox.id.clone(),
+            display_name: "Inbox".to_string(),
+            unread: inbox.unread_item_count,
+            is_virtual: false,
+        });
+    } else {
+        shown_ids.insert("inbox".to_string());
+        rows.push(NavRow::MailFolder {
+            folder_id: "inbox".to_string(),
+            display_name: "Inbox".to_string(),
+            unread: app.unread_inbox_count(),
+            is_virtual: false,
+        });
+    }
+
+    // 2. Virtual smart views
+    let unread_total = app
+        .mail_messages
+        .iter()
+        .filter(|m| !m.is_read)
+        .count() as i32;
+    rows.push(NavRow::MailFolder {
+        folder_id: VIRTUAL_UNREAD_FOLDER.to_string(),
+        display_name: "Unread".to_string(),
+        unread: unread_total,
+        is_virtual: true,
+    });
+    let flagged_total = app
+        .mail_messages
+        .iter()
+        .filter(|m| m.flagged)
+        .count() as i32;
+    rows.push(NavRow::MailFolder {
+        folder_id: VIRTUAL_FLAGGED_FOLDER.to_string(),
+        display_name: "Flagged".to_string(),
+        unread: flagged_total,
+        is_virtual: true,
+    });
+
+    // 3. Well-known folders
+    let well_known_specs: [(&str, &str, &[&str]); 4] = [
+        ("drafts", "Drafts", &["Drafts"]),
+        ("sentitems", "Sent", &["Sent Items", "Sent"]),
+        ("archive", "Archive", &["Archive"]),
+        ("deleteditems", "Trash", &["Deleted Items", "Trash"]),
+    ];
+    for (wk_id, label, aliases) in well_known_specs {
+        if let Some(folder) = find_folder_by_wellknown(app, wk_id, aliases) {
+            shown_ids.insert(folder.id.clone());
+            rows.push(NavRow::MailFolder {
+                folder_id: folder.id.clone(),
+                display_name: label.to_string(),
+                unread: folder.unread_item_count,
+                is_virtual: false,
+            });
+        } else {
+            shown_ids.insert(wk_id.to_string());
+            rows.push(NavRow::MailFolder {
+                folder_id: wk_id.to_string(),
+                display_name: label.to_string(),
+                unread: 0,
+                is_virtual: false,
+            });
+        }
+    }
+
+    // 4. User favorite_folders from config
+    for fav_id in &app.config.favorite_folders {
+        if let Some(folder) = app.mail_folders.iter().find(|f| &f.id == fav_id) {
+            if shown_ids.insert(folder.id.clone()) {
+                rows.push(NavRow::MailFolder {
+                    folder_id: folder.id.clone(),
+                    display_name: folder.display_name.clone(),
+                    unread: folder.unread_item_count,
+                    is_virtual: false,
+                });
+            }
+        }
+    }
+
+    // 5. Custom folders
+    let mut custom: Vec<&crate::models::MailFolder> = app
+        .mail_folders
+        .iter()
+        .filter(|f| !shown_ids.contains(&f.id))
+        .collect();
+    custom.sort_by(|a, b| {
+        a.display_name
+            .to_ascii_lowercase()
+            .cmp(&b.display_name.to_ascii_lowercase())
+    });
+    if !custom.is_empty() {
+        rows.push(NavRow::SectionHeader { label: "FOLDERS" });
+        for f in custom {
+            rows.push(NavRow::MailFolder {
+                folder_id: f.id.clone(),
+                display_name: f.display_name.clone(),
+                unread: f.unread_item_count,
+                is_virtual: false,
+            });
+        }
+    }
+
+    rows
+}
+
+fn build_calendar_nav_rows() -> Vec<NavRow> {
+    vec![
+        NavRow::SectionHeader {
+            label: "QUICK RANGES",
+        },
+        NavRow::CalendarRange {
+            label: "Today",
+            range: CalendarRangeFilter::Today,
+        },
+        NavRow::CalendarRange {
+            label: "Tomorrow",
+            range: CalendarRangeFilter::Tomorrow,
+        },
+        NavRow::CalendarRange {
+            label: "Next 7 Days",
+            range: CalendarRangeFilter::Next7Days,
+        },
+        NavRow::CalendarRange {
+            label: "This Month",
+            range: CalendarRangeFilter::ThisMonth,
+        },
+        NavRow::CalendarRange {
+            label: "All Upcoming",
+            range: CalendarRangeFilter::AllUpcoming,
+        },
+    ]
+}
+
+fn build_todo_nav_rows(app: &AppState) -> Vec<NavRow> {
+    let mut rows = vec![NavRow::SectionHeader {
+        label: "TASK LISTS",
+    }];
+    let mut lists = app.todo_lists.clone();
+    lists.sort_by(|a, b| {
+        let rank = |l: &crate::models::TodoList| match l.wellknown_list_name.as_deref() {
+            Some("defaultList") => 0,
+            Some("flaggedEmails") => 1,
+            _ => 2,
+        };
+        rank(a)
+            .cmp(&rank(b))
+            .then_with(|| a.display_name.cmp(&b.display_name))
+    });
+    for list in lists {
+        rows.push(NavRow::TodoList {
+            list_id: list.id,
+            display_name: list.display_name,
+            wellknown: list.wellknown_list_name,
+        });
+    }
+    rows.push(NavRow::ActionButton {
+        label: "+ New List (n)",
+        action_id: ButtonId::NewTodoList,
+    });
+    rows
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hitmap: &mut HitMap) {
@@ -460,82 +296,65 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hit
 
     draw_filter_strip(frame, area, ui, hitmap);
 
-    let show_loading =
-        ui.active_nav_tab == TAB_CHATS && app.loading_older_chats && area.height > 3;
-    let list_y = area.y.saturating_add(2);
-    let list_h = area
-        .height
-        .saturating_sub(2 + if show_loading { 1 } else { 0 });
-    let list_area = Rect::new(area.x, list_y, area.width, list_h);
-    ui.nav_area = list_area;
+    let mut content_y = area.y.saturating_add(2);
 
-    let rows = nav_rows_cached(app, ui);
-
-    if list_area.width > 0 && list_area.height > 0 {
-        if rows.is_empty() {
-            let empty_msg = match ui.active_nav_tab {
-                TAB_CHATS => {
-                    if ui.nav_unread_only {
-                        "No unread chats"
-                    } else {
-                        "No chats yet"
-                    }
-                }
-                TAB_TEAMS => "No teams joined",
-                TAB_ACTIVITY => "No @mentions yet",
-                _ => "No items",
-            };
-            let empty_style = if theme.no_color {
-                theme.muted_style()
-            } else {
-                theme.muted_style().bg(theme.bg_sidebar)
-            };
-            frame.render_widget(
-                Paragraph::new(format!(" {}", truncate(empty_msg, (list_area.width as usize).saturating_sub(1))))
-                    .style(empty_style),
-                list_area,
-            );
-        } else {
-            let selected = ui.nav_selected.min(rows.len().saturating_sub(1));
-            let height = list_area.height as usize;
-            let offset = selection_offset(selected, height, rows.len());
-            let width = list_area.width as usize;
-
-            let mut lines = Vec::with_capacity(height);
-            for (idx, row) in rows.iter().enumerate().skip(offset).take(height) {
-                let is_selected = idx == selected && row.is_selectable();
-                let is_active = match row {
-                    NavRow::Chat { conv_key, .. } | NavRow::TeamChannel { conv_key, .. } => {
-                        app.active_conv_key.as_deref() == Some(conv_key.as_str())
-                    }
-                    _ => false,
-                };
-                lines.push(render_nav_row(row, width, is_selected, is_active, app, ui));
-                if row.is_selectable() {
-                    hitmap.add_line(
-                        list_area.x,
-                        list_area.y + lines.len() as u16 - 1,
-                        list_area.width,
-                        HitTarget::NavRow(idx),
-                    );
-                }
-            }
-            frame.render_widget(Paragraph::new(lines).style(sidebar_style), list_area);
-        }
+    // Tab 1 (Calendar) renders a compact Mini Month Calendar Grid above the quick range jumpers!
+    if ui.active_nav_tab == TAB_CALENDAR && area.bottom() > content_y + 8 {
+        let cal_h = 8u16;
+        let cal_rect = Rect::new(area.x, content_y, area.width, cal_h);
+        draw_mini_calendar(frame, cal_rect, app, ui, hitmap);
+        content_y = content_y.saturating_add(cal_h + 1);
     }
 
-    if show_loading {
-        let status_y = area.bottom().saturating_sub(1);
-        let status_style = if theme.no_color {
+    let list_h = area.bottom().saturating_sub(content_y);
+    let list_area = Rect::new(area.x, content_y, area.width, list_h);
+    ui.nav_area = list_area;
+
+    if list_area.width == 0 || list_area.height == 0 {
+        return;
+    }
+
+    let rows = build_nav_rows(app, ui);
+    if rows.is_empty() {
+        let empty_style = if theme.no_color {
             theme.muted_style()
         } else {
             theme.muted_style().bg(theme.bg_sidebar)
         };
         frame.render_widget(
-            Paragraph::new(truncate(" Loading older chats…", area.width as usize)).style(status_style),
-            Rect::new(area.x, status_y, area.width, 1),
+            Paragraph::new(" No items").style(empty_style),
+            list_area,
         );
+        return;
     }
+
+    let selected = ui.nav_selected.min(rows.len().saturating_sub(1));
+    let height = list_area.height as usize;
+    let offset = selection_offset(selected, height, rows.len());
+    let width = list_area.width as usize;
+
+    let nav_focused = ui.focus() == Focus::Nav;
+    let mut lines = Vec::with_capacity(height);
+
+    for (idx, row) in rows.iter().enumerate().skip(offset).take(height) {
+        let is_selected = nav_focused && idx == selected && row.is_selectable();
+        let is_active = match row {
+            NavRow::MailFolder { folder_id, .. } => {
+                app.active_folder_id.eq_ignore_ascii_case(folder_id)
+            }
+            NavRow::CalendarRange { range, .. } => ui.cal_range == *range,
+            NavRow::TodoList { list_id, .. } => {
+                app.active_todo_list_id.as_deref() == Some(list_id.as_str())
+            }
+            _ => false,
+        };
+        lines.push(render_nav_row(row, width, is_selected, is_active, ui));
+        if row.is_selectable() {
+            let row_y = list_area.y + lines.len() as u16 - 1;
+            hitmap.add_line(list_area.x, row_y, list_area.width, HitTarget::NavRow(idx));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).style(sidebar_style), list_area);
 }
 
 fn draw_tab_strip(
@@ -551,38 +370,31 @@ fn draw_tab_strip(
     } else {
         Style::default().bg(theme.bg_header).fg(theme.fg_secondary)
     };
-    let row_rect = Rect::new(area.x, area.y, area.width, 1);
-    frame.render_widget(Paragraph::new("").style(header_bg), row_rect);
+    frame.render_widget(
+        Paragraph::new("").style(header_bg),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
 
-    let unread_chats = app.unread_chat_count();
-    let unread_chans = app.unread_channel_count();
-    let mentions = app.activity_mentions.len();
-
-    let labels = [
-        if unread_chats > 0 {
-            format!(" 1 Chats ({unread_chats}) ")
-        } else {
-            " 1 Chats ".to_string()
-        },
-        if unread_chans > 0 {
-            format!(" 2 Teams ({unread_chans}) ")
-        } else {
-            " 2 Teams ".to_string()
-        },
-        if mentions > 0 {
-            format!(" 3 Act ({mentions}) ")
-        } else {
-            " 3 Act ".to_string()
-        },
-    ];
+    let unread_inbox = app.unread_inbox_count();
+    let mail_label = if unread_inbox > 0 {
+        format!("1 Mail ({unread_inbox})")
+    } else {
+        "1 Mail".to_string()
+    };
+    let labels = [mail_label, "2 Cal".to_string(), "3 Tasks".to_string()];
 
     let mut x = area.x;
     for (idx, label) in labels.iter().enumerate() {
+        let pill = if idx == 0 {
+            format!(" {label} ")
+        } else {
+            format!("· {label} ")
+        };
         let avail = area.right().saturating_sub(x) as usize;
         if avail == 0 {
             break;
         }
-        let clipped = truncate(label, avail);
+        let clipped = truncate(&pill, avail);
         let w = UnicodeWidthStr::width(clipped.as_str()) as u16;
         if w == 0 {
             break;
@@ -622,19 +434,29 @@ fn draw_filter_strip(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut H
         Rect::new(area.x, y, area.width, 1),
     );
 
-    let filter_label = if ui.nav_unread_only {
-        "[Unread]"
-    } else {
-        "[All]"
+    let (filter_label, new_label, new_btn) = match ui.active_nav_tab {
+        TAB_MAIL => (
+            if ui.mail_unread_only {
+                "[Unread]"
+            } else if ui.focused_only {
+                "[Focused]"
+            } else {
+                "[All]"
+            },
+            "[+New]",
+            ButtonId::NewMail,
+        ),
+        TAB_CALENDAR => ("[Today]", "[+Event]", ButtonId::NewEvent),
+        _ => ("[Tasks]", "[+Task]", ButtonId::NewTodoTask),
     };
-    let new_label = "[+New]";
+
     let filter_w = UnicodeWidthStr::width(filter_label) as u16;
     let new_w = UnicodeWidthStr::width(new_label) as u16;
     let right_w = filter_w + 1 + new_w;
 
     let left_budget = area.width.saturating_sub(right_w + 1) as usize;
-    let jump_label = if left_budget >= 14 {
-        " Ctrl+K Jump… "
+    let jump_label = if left_budget >= 13 {
+        " Ctrl+K Jump "
     } else if left_budget >= 8 {
         " Ctrl+K "
     } else {
@@ -659,7 +481,9 @@ fn draw_filter_strip(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut H
         let filter_x = area.right().saturating_sub(right_w);
         let new_x = area.right().saturating_sub(new_w);
 
-        let filter_style = if ui.nav_unread_only {
+        let filter_active =
+            ui.active_nav_tab == TAB_MAIL && (ui.mail_unread_only || ui.focused_only);
+        let filter_style = if filter_active {
             if theme.no_color {
                 Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
             } else {
@@ -687,330 +511,299 @@ fn draw_filter_strip(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut H
             Paragraph::new(Span::styled(filter_label, filter_style)),
             Rect::new(filter_x, y, filter_w, 1),
         );
-        hitmap.add_line(filter_x, y, filter_w, HitTarget::Button(ButtonId::FilterToggle));
+        hitmap.add_line(
+            filter_x,
+            y,
+            filter_w,
+            HitTarget::Button(ButtonId::FilterToggle),
+        );
 
         frame.render_widget(
             Paragraph::new(Span::styled(new_label, new_style)),
             Rect::new(new_x, y, new_w, 1),
         );
-        hitmap.add_line(new_x, y, new_w, HitTarget::Button(ButtonId::NewChat));
+        hitmap.add_line(new_x, y, new_w, HitTarget::Button(new_btn));
     }
 }
 
-const MARKER_WIDTH: usize = 2;
+fn draw_mini_calendar(
+    frame: &mut Frame,
+    area: Rect,
+    app: &AppState,
+    ui: &UiState,
+    hitmap: &mut HitMap,
+) {
+    let theme = &ui.theme;
+    let today = Local::now().date_naive();
+    let month_anchor = ui.cal_month_cursor;
+    let year = month_anchor.year();
+    let month = month_anchor.month();
 
-const SPACES: &str = "                                                                                                                                ";
+    let header_title = format!("  {} {year}", month_name(month));
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            truncate(&header_title, area.width as usize),
+            theme.accent_style().add_modifier(Modifier::BOLD),
+        )),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    if area.height < 2 {
+        return;
+    }
 
-#[inline]
-fn spaces_cow(n: usize) -> Cow<'static, str> {
-    if n <= SPACES.len() {
-        Cow::Borrowed(&SPACES[..n])
-    } else {
-        Cow::Owned(" ".repeat(n))
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            truncate("  Mo Tu We Th Fr Sa Su", area.width as usize),
+            theme.muted_style(),
+        )),
+        Rect::new(area.x, area.y + 1, area.width, 1),
+    );
+
+    let event_days: HashSet<NaiveDate> = app
+        .calendar_events
+        .iter()
+        .filter(|e| !e.is_cancelled)
+        .filter_map(|e| parse_event_local_date(&e.start_iso))
+        .collect();
+
+    let first_of_month = NaiveDate::from_ymd_opt(year, month, 1).unwrap_or(today);
+    let offset_mon = first_of_month.weekday().num_days_from_monday() as i64;
+    let grid_start = first_of_month - Duration::days(offset_mon);
+
+    let selected_date = match ui.cal_range {
+        CalendarRangeFilter::SpecificDate(d) => Some(d),
+        CalendarRangeFilter::Today => Some(today),
+        CalendarRangeFilter::Tomorrow => Some(today + Duration::days(1)),
+        _ => None,
+    };
+
+    for week in 0..6u16 {
+        let y = area.y + 2 + week;
+        if y >= area.bottom() {
+            break;
+        }
+        let mut spans = vec![Span::raw(" ")];
+        for dow in 0..7i64 {
+            let day_date = grid_start + Duration::days((week as i64) * 7 + dow);
+            let in_month = day_date.month() == month;
+            let is_today = day_date == today;
+            let is_sel = selected_date == Some(day_date);
+            let has_event = event_days.contains(&day_date);
+
+            let num = format!("{:2}", day_date.day());
+            let marker = if has_event { "•" } else { " " };
+            let cell_text = format!("{num}{marker}");
+
+            let style = if is_sel {
+                theme.nav_selection()
+            } else if is_today {
+                if theme.no_color {
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                }
+            } else if !in_month {
+                theme.subtle_style()
+            } else if has_event {
+                Style::default()
+                    .fg(theme.accent_soft)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.fg_primary)
+            };
+
+            let cell_x = area.x + 1 + (dow as u16) * 3;
+            if cell_x + 3 <= area.right() {
+                hitmap.add_line(
+                    cell_x,
+                    y,
+                    3,
+                    HitTarget::MiniCalDay {
+                        year: day_date.year(),
+                        month: day_date.month(),
+                        day: day_date.day(),
+                    },
+                );
+            }
+            spans.push(Span::styled(cell_text, style));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(area.x, y, area.width, 1),
+        );
+    }
+}
+
+fn parse_event_local_date(iso: &str) -> Option<NaiveDate> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(iso) {
+        return Some(dt.with_timezone(&Local).date_naive());
+    }
+    NaiveDate::parse_from_str(iso.get(..10)?, "%Y-%m-%d").ok()
+}
+
+fn month_name(m: u32) -> &'static str {
+    match m {
+        1 => "January",
+        2 => "February",
+        3 => "March",
+        4 => "April",
+        5 => "May",
+        6 => "June",
+        7 => "July",
+        8 => "August",
+        9 => "September",
+        10 => "October",
+        11 => "November",
+        12 => "December",
+        _ => "",
     }
 }
 
 fn render_nav_row(
     row: &NavRow,
     width: usize,
-    selected: bool,
-    active: bool,
-    app: &AppState,
+    is_selected: bool,
+    is_active: bool,
     ui: &UiState,
 ) -> Line<'static> {
     let theme = &ui.theme;
-    let sidebar_bg = if theme.no_color {
-        Style::default()
-    } else {
-        Style::default().bg(theme.bg_sidebar).fg(theme.fg_primary)
-    };
-
-    if let NavRow::SectionHeader { label } = row {
-        let hdr_text = truncate(label, width.saturating_sub(2));
-        let pad = width.saturating_sub(2 + UnicodeWidthStr::width(hdr_text.as_str()));
-        let hdr_style = if theme.no_color {
-            theme.muted_style().add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-                .fg(theme.fg_muted)
-                .bg(theme.bg_sidebar)
-                .add_modifier(Modifier::BOLD)
-        };
-        let mut spans = vec![
-            Span::styled("  ", sidebar_bg),
-            Span::styled(hdr_text, hdr_style),
-        ];
-        if pad > 0 {
-            spans.push(Span::styled(spaces_cow(pad), sidebar_bg));
-        }
-        return Line::from(spans);
-    }
-
-    let marker: &'static str = if selected {
-        "▎ "
-    } else if active {
-        "• "
-    } else {
-        "  "
-    };
-
-    let base_style = if selected {
-        theme.nav_selection()
-    } else if active {
-        if theme.no_color {
-            theme.accent_style().add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-                .fg(theme.accent)
-                .bg(theme.bg_sidebar)
-                .add_modifier(Modifier::BOLD)
-        }
-    } else {
-        sidebar_bg
-    };
-
-    let marker_style = if selected {
-        if theme.no_color || theme.ansi16_only {
-            base_style
-        } else {
-            Style::default()
-                .fg(theme.accent)
-                .bg(theme.bg_selected)
-                .add_modifier(Modifier::BOLD)
-        }
-    } else if active {
-        base_style
-    } else {
-        sidebar_bg
-    };
-
     match row {
-        NavRow::SectionHeader { .. } => unreachable!(),
-        NavRow::Chat {
-            title,
-            kind,
-            peer_user_id,
+        NavRow::SectionHeader { label } => {
+            let text = truncate(&format!(" {label}"), width);
+            Line::from(Span::styled(
+                text,
+                theme.muted_style().add_modifier(Modifier::BOLD),
+            ))
+        }
+        NavRow::MailFolder {
+            folder_id,
+            display_name,
             unread,
-            ..
+            is_virtual,
         } => {
-            let (prefix_glyph, glyph_color): (Cow<'static, str>, Color) = match kind {
-                ConversationKind::OneOnOne => {
-                    let avail = peer_user_id
-                        .as_deref()
-                        .and_then(|id| app.presences.get(id))
-                        .map(|p| p.availability.as_str());
-                    let (dot, color) = theme.presence_indicator(avail);
-                    (Cow::Owned(format!("{dot} ")), color)
-                }
-                ConversationKind::Group => (Cow::Borrowed("[Group] "), theme.accent),
-                ConversationKind::Meeting => (Cow::Borrowed("[Meeting] "), theme.reply),
-                ConversationKind::Channel => (Cow::Borrowed("# "), theme.accent),
+            let icon = if folder_id.eq_ignore_ascii_case("inbox") {
+                "📥 "
+            } else if folder_id == VIRTUAL_UNREAD_FOLDER {
+                "● "
+            } else if folder_id == VIRTUAL_FLAGGED_FOLDER {
+                "⚑ "
+            } else if display_name.eq_ignore_ascii_case("Drafts") {
+                "✎ "
+            } else if display_name.eq_ignore_ascii_case("Sent") {
+                "↗ "
+            } else if display_name.eq_ignore_ascii_case("Archive") {
+                "▣ "
+            } else if display_name.eq_ignore_ascii_case("Trash") {
+                "⌫ "
+            } else {
+                "▸ "
             };
             let badge = if *unread > 0 {
-                format!(" ({unread})")
+                format!(" {unread}")
             } else {
                 String::new()
             };
-            let used_fixed = MARKER_WIDTH
-                + UnicodeWidthStr::width(prefix_glyph.as_ref())
-                + badge.len();
-            let name_w = width.saturating_sub(used_fixed).max(4);
-            let (name, name_used) = truncate_with_width(title, name_w);
-            let pad = width.saturating_sub(used_fixed + name_used);
+            let prefix = if is_active { "▎" } else { " " };
+            let badge_w = UnicodeWidthStr::width(badge.as_str());
+            let icon_w = UnicodeWidthStr::width(icon);
+            let label_max = width.saturating_sub(1 + icon_w + badge_w + 1);
+            let title = truncate(display_name, label_max);
+            let title_w = UnicodeWidthStr::width(title.as_str());
+            let pad = width.saturating_sub(1 + icon_w + title_w + badge_w);
 
-            let glyph_style = if selected {
-                base_style
-            } else if theme.no_color {
-                Style::default().fg(glyph_color)
-            } else {
-                Style::default().fg(glyph_color).bg(theme.bg_sidebar)
-            };
-            let name_style = if !selected && *unread > 0 {
-                base_style.add_modifier(Modifier::BOLD)
-            } else {
-                base_style
-            };
-            let mut spans = Vec::with_capacity(5);
-            spans.push(Span::styled(marker, marker_style));
-            spans.push(Span::styled(prefix_glyph, glyph_style));
-            spans.push(Span::styled(name, name_style));
-            if pad > 0 {
-                spans.push(Span::styled(spaces_cow(pad), base_style));
-            }
-            if !badge.is_empty() {
-                let badge_style = if selected {
-                    base_style
-                } else if theme.no_color {
-                    Style::default()
-                        .fg(theme.unread)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                        .fg(theme.unread)
-                        .bg(theme.bg_sidebar)
-                        .add_modifier(Modifier::BOLD)
-                };
-                spans.push(Span::styled(badge, badge_style));
-            }
-            Line::from(spans)
-        }
-        NavRow::TeamHeader {
-            display_name,
-            collapsed,
-            channel_count,
-            unread,
-            ..
-        } => {
-            let arrow = if *collapsed { "▸ " } else { "▾ " };
-            let suffix = if *unread > 0 {
-                format!(" ({unread})")
-            } else {
-                format!(" ({channel_count})")
-            };
-            let fixed = MARKER_WIDTH + UnicodeWidthStr::width(arrow) + suffix.len();
-            let (name, name_used) =
-                truncate_with_width(display_name, width.saturating_sub(fixed).max(4));
-            let pad = width.saturating_sub(fixed + name_used);
-            let style = if selected {
-                base_style
-            } else if theme.no_color {
-                theme.accent_style().add_modifier(Modifier::BOLD)
-            } else {
+            let row_style = if is_selected {
+                theme.nav_selection()
+            } else if is_active {
                 Style::default()
                     .fg(theme.accent)
-                    .bg(theme.bg_sidebar)
+                    .bg(theme.bg_selected)
+                    .add_modifier(Modifier::BOLD)
+            } else if *unread > 0 && !*is_virtual {
+                Style::default()
+                    .fg(theme.fg_primary)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.fg_secondary)
+            };
+
+            let badge_style = if is_selected || is_active {
+                row_style
+            } else {
+                Style::default()
+                    .fg(theme.unread)
                     .add_modifier(Modifier::BOLD)
             };
-            let suffix_style = if selected {
-                base_style
-            } else if *unread > 0 {
-                if theme.no_color {
-                    Style::default()
-                        .fg(theme.unread)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                        .fg(theme.unread)
-                        .bg(theme.bg_sidebar)
-                        .add_modifier(Modifier::BOLD)
-                }
-            } else if theme.no_color {
-                theme.muted_style()
-            } else {
-                theme.muted_style().bg(theme.bg_sidebar)
-            };
-            let mut spans = vec![
-                Span::styled(marker, marker_style),
-                Span::styled(arrow, style),
-                Span::styled(name, style),
-            ];
-            if pad > 0 {
-                spans.push(Span::styled(spaces_cow(pad), base_style));
-            }
-            spans.push(Span::styled(suffix, suffix_style));
-            Line::from(spans)
+
+            Line::from(vec![
+                Span::styled(format!("{prefix}{icon}{title}{}", " ".repeat(pad)), row_style),
+                Span::styled(badge, badge_style),
+            ])
         }
-        NavRow::TeamChannel {
+        NavRow::CalendarRange { label, .. } => {
+            let prefix = if is_active { "▎ " } else { "  " };
+            let text = truncate(&format!("{prefix}{label}"), width);
+            let pad = width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+            let style = if is_selected {
+                theme.nav_selection()
+            } else if is_active {
+                Style::default()
+                    .fg(theme.accent)
+                    .bg(theme.bg_selected)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.fg_secondary)
+            };
+            Line::from(Span::styled(format!("{text}{}", " ".repeat(pad)), style))
+        }
+        NavRow::TodoList {
             display_name,
-            is_private,
-            unread,
+            wellknown,
             ..
         } => {
-            let (icon, icon_w) = if *is_private {
-                ("  🔒 ", 5usize)
-            } else {
-                ("  # ", 4usize)
+            let icon = match wellknown.as_deref() {
+                Some("defaultList") => "☑ ",
+                Some("flaggedEmails") => "⚑ ",
+                _ => "☰ ",
             };
-            let badge = if *unread > 0 {
-                format!(" ({unread})")
+            let prefix = if is_active { "▎" } else { " " };
+            let text = truncate(&format!("{prefix}{icon}{display_name}"), width);
+            let pad = width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+            let style = if is_selected {
+                theme.nav_selection()
+            } else if is_active {
+                Style::default()
+                    .fg(theme.accent)
+                    .bg(theme.bg_selected)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                String::new()
+                Style::default().fg(theme.fg_secondary)
             };
-            let fixed = MARKER_WIDTH + icon_w + badge.len();
-            let (name, name_used) =
-                truncate_with_width(display_name, width.saturating_sub(fixed).max(4));
-            let pad = width.saturating_sub(fixed + name_used);
-            let name_style = if !selected && *unread > 0 {
-                base_style.add_modifier(Modifier::BOLD)
-            } else {
-                base_style
-            };
-            let icon_style = if selected {
-                base_style
-            } else if theme.no_color {
-                theme.muted_style()
-            } else {
-                theme.muted_style().bg(theme.bg_sidebar)
-            };
-            let mut spans = Vec::with_capacity(5);
-            spans.push(Span::styled(marker, marker_style));
-            spans.push(Span::styled(icon, icon_style));
-            spans.push(Span::styled(name, name_style));
-            if pad > 0 {
-                spans.push(Span::styled(spaces_cow(pad), base_style));
-            }
-            if !badge.is_empty() {
-                let badge_style = if selected {
-                    base_style
-                } else if theme.no_color {
-                    Style::default()
-                        .fg(theme.unread)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                        .fg(theme.unread)
-                        .bg(theme.bg_sidebar)
-                        .add_modifier(Modifier::BOLD)
-                };
-                spans.push(Span::styled(badge, badge_style));
-            }
-            Line::from(spans)
+            Line::from(Span::styled(format!("{text}{}", " ".repeat(pad)), style))
         }
-        NavRow::ActivityMention {
-            author_name,
-            preview,
-            ..
-        } => {
-            let label = format!("@{author_name}: {preview}");
-            let (body, body_used) =
-                truncate_with_width(&label, width.saturating_sub(MARKER_WIDTH));
-            let pad = width.saturating_sub(MARKER_WIDTH + body_used);
-            let mut spans = vec![
-                Span::styled(marker, marker_style),
-                Span::styled(body, base_style),
-            ];
-            if pad > 0 {
-                spans.push(Span::styled(spaces_cow(pad), base_style));
-            }
-            Line::from(spans)
+        NavRow::ActionButton { label, .. } => {
+            let text = truncate(&format!("  {label}"), width);
+            let style = if is_selected {
+                theme.nav_selection()
+            } else {
+                theme.accent_style()
+            };
+            Line::from(Span::styled(text, style))
         }
     }
 }
 
-pub fn selection_offset(selected: usize, height: usize, total: usize) -> usize {
+fn selection_offset(selected: usize, height: usize, total: usize) -> usize {
     if height == 0 || total <= height {
         return 0;
     }
-    if selected < height {
-        0
-    } else {
-        (selected + 1)
-            .saturating_sub(height)
-            .min(total.saturating_sub(height))
-    }
+    let half = height / 2;
+    selected.saturating_sub(half).min(total - height)
 }
 
-fn truncate_with_width(text: &str, width: usize) -> (String, usize) {
-    if width == 0 {
-        return (String::new(), 0);
-    }
-    if text.bytes().all(|b| (0x20..0x7f).contains(&b)) {
-        if text.len() <= width {
-            return (text.to_string(), text.len());
-        }
-        return (text[..width].to_string(), width);
-    }
-    let mut out = String::with_capacity(text.len().min(width.saturating_mul(3)));
+fn truncate(text: &str, width: usize) -> String {
+    let mut out = String::new();
     let mut used = 0usize;
     for ch in text.chars() {
         let w = UnicodeWidthChar::width(ch).unwrap_or(0);
@@ -1020,321 +813,5 @@ fn truncate_with_width(text: &str, width: usize) -> (String, usize) {
         out.push(ch);
         used += w;
     }
-    (out, used)
-}
-
-fn truncate(text: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    if text.is_ascii() {
-        if text.len() <= width {
-            return text.to_string();
-        }
-        if text.bytes().all(|b| (0x20..0x7f).contains(&b)) {
-            return text[..width].to_string();
-        }
-    }
-    truncate_with_width(text, width).0
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn three_tabs_map_roundtrip() {
-        assert_eq!(TAB_COUNT, 3);
-        assert_eq!(TAB_LABELS.len(), TAB_COUNT);
-        assert_eq!(TAB_LABELS[TAB_CHATS], "Chats");
-        assert_eq!(TAB_LABELS[TAB_TEAMS], "Teams");
-        assert_eq!(TAB_LABELS[TAB_ACTIVITY], "Activity");
-        for i in 0..TAB_COUNT {
-            let tab = NavTab::from_index(i);
-            assert_eq!(tab.index(), i);
-        }
-        assert_eq!(UnicodeWidthStr::width("▎ "), MARKER_WIDTH);
-    }
-
-    #[test]
-    fn truncate_and_spaces_helpers_handle_ascii_and_wide_chars() {
-        assert_eq!(UnicodeWidthStr::width("▸ "), MARKER_WIDTH);
-        assert_eq!(UnicodeWidthStr::width("• "), MARKER_WIDTH);
-        assert_eq!(UnicodeWidthStr::width("  "), MARKER_WIDTH);
-
-        assert_eq!(truncate("hello", 10), "hello");
-        assert_eq!(truncate("hello", 5), "hello");
-        assert_eq!(truncate("hello world", 5), "hello");
-        assert_eq!(truncate("hello", 0), "");
-
-        let (s, w) = truncate_with_width("한글ABC", 4);
-        assert_eq!(s, "한글");
-        assert_eq!(w, 4);
-
-        let (s2, w2) = truncate_with_width("한글ABC", 5);
-        assert_eq!(s2, "한글A");
-        assert_eq!(w2, 5);
-
-        assert_eq!(spaces_cow(0).as_ref(), "");
-        assert_eq!(spaces_cow(5).as_ref(), "     ");
-        assert!(matches!(spaces_cow(128), Cow::Borrowed(_)));
-        assert_eq!(spaces_cow(140).len(), 140);
-    }
-
-    fn make_populated_test_state() -> (AppState, UiState, crate::sync::SyncController) {
-        use crate::auth::AuthManager;
-        use crate::config::AppConfig;
-        use crate::graph::GraphClient;
-        use crate::models::{
-            ChannelSummary, ConversationSummary, ConversationTarget, MessageItem, TeamSummary,
-        };
-        use crate::storage::Storage;
-        use crate::sync;
-
-        let cfg = AppConfig::default();
-        let auth = AuthManager::new(cfg.clone()).unwrap();
-        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
-        let storage = Storage::open_in_memory().unwrap();
-        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let sync_ctrl =
-            sync::spawn_sync_engine(cfg.clone(), graph.clone(), storage.clone(), event_tx);
-        let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let mut app = AppState::new(cfg, auth, graph, storage, sync_ctrl.clone(), ui_tx);
-        let ui = UiState::new();
-
-        app.conversations = vec![
-            ConversationSummary {
-                conv_key: "chat:c1".to_string(),
-                target: ConversationTarget::Chat {
-                    chat_id: "c1".to_string(),
-                },
-                kind: ConversationKind::OneOnOne,
-                team_id: None,
-                team_name: None,
-                title: "Alice".to_string(),
-                topic: None,
-                unread_count: 2,
-                last_read_at: None,
-                last_msg_id: None,
-                last_msg_author: None,
-                last_msg_preview: None,
-                last_updated_at: None,
-                pinned: false,
-                peer_user_id: Some("u1".to_string()),
-                web_url: None,
-            },
-            ConversationSummary {
-                conv_key: "chat:c2".to_string(),
-                target: ConversationTarget::Chat {
-                    chat_id: "c2".to_string(),
-                },
-                kind: ConversationKind::Group,
-                team_id: None,
-                team_name: None,
-                title: "Design Sync".to_string(),
-                topic: None,
-                unread_count: 0,
-                last_read_at: None,
-                last_msg_id: None,
-                last_msg_author: None,
-                last_msg_preview: None,
-                last_updated_at: None,
-                pinned: false,
-                peer_user_id: None,
-                web_url: None,
-            },
-            ConversationSummary {
-                conv_key: "chan:t1:ch1".to_string(),
-                target: ConversationTarget::Channel {
-                    team_id: "t1".to_string(),
-                    channel_id: "ch1".to_string(),
-                },
-                kind: ConversationKind::Channel,
-                team_id: Some("t1".to_string()),
-                team_name: Some("Core".to_string()),
-                title: "General".to_string(),
-                topic: None,
-                unread_count: 5,
-                last_read_at: None,
-                last_msg_id: None,
-                last_msg_author: None,
-                last_msg_preview: None,
-                last_updated_at: None,
-                pinned: false,
-                peer_user_id: None,
-                web_url: None,
-            },
-        ];
-
-        app.teams = vec![
-            TeamSummary {
-                id: "t1".to_string(),
-                display_name: "Core".to_string(),
-                description: None,
-                channels: vec![
-                    ChannelSummary {
-                        id: "ch1".to_string(),
-                        team_id: "t1".to_string(),
-                        team_name: "Core".to_string(),
-                        display_name: "General".to_string(),
-                        description: None,
-                        membership_type: "standard".to_string(),
-                        web_url: None,
-                    },
-                    ChannelSummary {
-                        id: "ch2".to_string(),
-                        team_id: "t1".to_string(),
-                        team_name: "Core".to_string(),
-                        display_name: "Secret".to_string(),
-                        description: None,
-                        membership_type: "private".to_string(),
-                        web_url: None,
-                    },
-                ],
-            },
-            TeamSummary {
-                id: "t2".to_string(),
-                display_name: "Infra".to_string(),
-                description: None,
-                channels: vec![ChannelSummary {
-                    id: "ch3".to_string(),
-                    team_id: "t2".to_string(),
-                    team_name: "Infra".to_string(),
-                    display_name: "Alerts".to_string(),
-                    description: None,
-                    membership_type: "standard".to_string(),
-                    web_url: None,
-                }],
-            },
-        ];
-
-        app.activity_mentions = vec![MessageItem {
-            msg_key: "chan:t1:ch1|m1".to_string(),
-            conv_key: "chan:t1:ch1".to_string(),
-            msg_id: "m1".to_string(),
-            parent_msg_id: None,
-            reply_to_id: None,
-            reply_to_author: None,
-            reply_to_preview: None,
-            subject: None,
-            author_id: None,
-            author_name: "Bob".to_string(),
-            is_me: false,
-            created_at: "2026-11-18T00:00:00Z".to_string(),
-            last_modified_at: None,
-            deleted: false,
-            importance: "normal".to_string(),
-            message_type: "message".to_string(),
-            body_html: String::new(),
-            body_plain: "ping\nline2".to_string(),
-            attachments: Vec::new(),
-            mentions: Vec::new(),
-            reactions: Vec::new(),
-            reply_count: 0,
-            web_url: None,
-        }];
-
-        (app, ui, sync_ctrl)
-    }
-
-    #[tokio::test]
-    async fn nav_row_count_and_nav_row_at_match_build_nav_rows_across_all_tabs() {
-        let (app, mut ui, sync_ctrl) = make_populated_test_state();
-
-        for tab in 0..TAB_COUNT {
-            ui.active_nav_tab = tab;
-            let expected = build_nav_rows(&app, &ui);
-            assert_eq!(
-                nav_row_count(&app, &ui),
-                expected.len(),
-                "row count mismatch on tab {tab}"
-            );
-            for (idx, exp_row) in expected.iter().enumerate() {
-                assert_eq!(
-                    nav_row_at(&app, &ui, idx).as_ref(),
-                    Some(exp_row),
-                    "nav_row_at mismatch on tab {tab} idx {idx}"
-                );
-            }
-            assert_eq!(nav_row_at(&app, &ui, expected.len()), None);
-        }
-
-        // TAB_TEAMS with collapsed team
-        ui.active_nav_tab = TAB_TEAMS;
-        ui.collapsed_team_ids.insert("t1".to_string());
-        let teams_collapsed = build_nav_rows(&app, &ui);
-        assert_eq!(nav_row_count(&app, &ui), teams_collapsed.len());
-        assert_eq!(teams_collapsed.len(), 3); // t1 header + t2 header + alerts
-
-        sync_ctrl.request(crate::sync::SyncCommand::Shutdown);
-    }
-
-    #[tokio::test]
-    async fn nav_rows_cached_reuses_arc_and_invalidates_on_relevant_mutations() {
-        let (mut app, mut ui, sync_ctrl) = make_populated_test_state();
-
-        // TAB_CHATS: unread_count mutation invalidates
-        ui.active_nav_tab = TAB_CHATS;
-        let c1 = nav_rows_cached(&app, &ui);
-        let c2 = nav_rows_cached(&app, &ui);
-        assert!(Arc::ptr_eq(&c1, &c2));
-        app.conversations[0].unread_count = 9;
-        let c3 = nav_rows_cached(&app, &ui);
-        assert!(!Arc::ptr_eq(&c1, &c3));
-        assert!(matches!(
-            c3.first(),
-            Some(NavRow::SectionHeader { label: "UNREAD" })
-        ));
-        assert!(matches!(c3.get(1), Some(NavRow::Chat { unread: 9, .. })));
-
-        // Pinning and unread filter invalidate cache and match nav_row_count
-        ui.pinned_convs.insert("chat:c2".to_string());
-        let c4 = nav_rows_cached(&app, &ui);
-        assert!(!Arc::ptr_eq(&c3, &c4));
-        assert!(matches!(
-            c4.first(),
-            Some(NavRow::SectionHeader { label: "PINNED" })
-        ));
-        assert_eq!(nav_row_count(&app, &ui), c4.len());
-
-        ui.nav_unread_only = true;
-        let c5 = nav_rows_cached(&app, &ui);
-        assert!(!Arc::ptr_eq(&c4, &c5));
-        assert_eq!(nav_row_count(&app, &ui), c5.len());
-        assert_eq!(c5.len(), 2); // UNREAD header + Alice
-        ui.nav_unread_only = false;
-        ui.pinned_convs.clear();
-
-        // TAB_TEAMS: channel unread_count & collapsed_team_ids invalidate
-        ui.active_nav_tab = TAB_TEAMS;
-        let t1 = nav_rows_cached(&app, &ui);
-        let t2 = nav_rows_cached(&app, &ui);
-        assert!(Arc::ptr_eq(&t1, &t2));
-
-        app.conversations[2].unread_count = 12;
-        let t3 = nav_rows_cached(&app, &ui);
-        assert!(!Arc::ptr_eq(&t1, &t3));
-        assert!(matches!(
-            t3.first(),
-            Some(NavRow::TeamHeader { unread: 12, .. })
-        ));
-        assert!(matches!(
-            t3.get(1),
-            Some(NavRow::TeamChannel { unread: 12, .. })
-        ));
-
-        ui.nav_unread_only = true;
-        let t_unread = nav_rows_cached(&app, &ui);
-        assert_eq!(nav_row_count(&app, &ui), t_unread.len());
-        assert_eq!(t_unread.len(), 2); // Core header + General
-        ui.nav_unread_only = false;
-
-        ui.collapsed_team_ids.insert("t1".to_string());
-        let t4 = nav_rows_cached(&app, &ui);
-        assert!(!Arc::ptr_eq(&t3, &t4));
-        assert_eq!(t4.len(), 3);
-
-        sync_ctrl.request(crate::sync::SyncCommand::Shutdown);
-    }
+    out
 }

@@ -1,5 +1,7 @@
-//! Search overlay (`Ctrl+F`, `/`): queries `storage.search_messages(...)` live
-//! and jumps directly to the conversation (opening thread if `parent_msg_id.is_some()`).
+//! Mail Search overlay (`/` or `Ctrl+F`):
+//! Queries local SQLite FTS5 (`storage.search_mail_messages`) live as you type,
+//! and `Enter` either jumps to the selected hit OR augments with remote Graph search
+//! (`graph.search_mail_remote`).
 
 use ratatui::{
     layout::Rect,
@@ -48,17 +50,17 @@ impl SearchOverlay {
             Action::Input(ch) => {
                 self.query.push(*ch);
                 self.selected = 0;
-                OverlayOutcome::Dispatch(Action::Search(self.query.clone()))
+                OverlayOutcome::Dispatch(Action::SearchLocalMail(self.query.clone()))
             }
             Action::Paste(text) => {
-                self.query.push_str(text);
+                self.query.push_str(&text.replace(['\r', '\n'], " "));
                 self.selected = 0;
-                OverlayOutcome::Dispatch(Action::Search(self.query.clone()))
+                OverlayOutcome::Dispatch(Action::SearchLocalMail(self.query.clone()))
             }
             Action::Backspace => {
                 let _ = self.query.pop();
                 self.selected = 0;
-                OverlayOutcome::Dispatch(Action::Search(self.query.clone()))
+                OverlayOutcome::Dispatch(Action::SearchLocalMail(self.query.clone()))
             }
             Action::MoveUp => {
                 self.move_up();
@@ -79,7 +81,15 @@ impl SearchOverlay {
                         self.selected,
                     ));
                 }
-                OverlayOutcome::Dispatch(Action::Search(query))
+                OverlayOutcome::Dispatch(Action::SearchRemoteMail(query))
+            }
+            Action::OverlaySubmit => {
+                let query = self.query.trim().to_string();
+                if query.is_empty() {
+                    OverlayOutcome::Handled
+                } else {
+                    OverlayOutcome::Dispatch(Action::SearchRemoteMail(query))
+                }
             }
             Action::CloseOverlay => OverlayOutcome::Close,
             Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
@@ -98,21 +108,25 @@ impl SearchOverlay {
         let theme = &ui.theme;
         let rect = centered_rect(
             area,
-            area.width.saturating_sub(8).min(88),
+            area.width.saturating_sub(8).min(92),
             area.height.saturating_sub(4).min(22),
         );
         frame.render_widget(Clear, rect);
         hitmap.add(rect, HitTarget::OverlayBody);
-        let title = " Search Messages · Enter Jump · Esc Close ";
+
+        let title = " Search Mail · Enter Jump/Remote Search · Ctrl+Enter Remote · Esc Close ";
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
-            .title(Line::from(Span::styled(title, theme.title(true))))
+            .title(Line::from(Span::styled(
+                crate::ui::truncate_width(title, rect.width.saturating_sub(2) as usize),
+                theme.title(true),
+            )))
             .border_style(theme.border_style(true));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
-        if inner.height == 0 {
+        if inner.height == 0 || inner.width == 0 {
             return;
         }
 
@@ -129,20 +143,24 @@ impl SearchOverlay {
         let len = app.search_results.len();
         let status_y = inner.y.saturating_add(1);
         let status = if app.searching {
-            "Searching…".to_string()
+            "Searching mailbox…".to_string()
         } else if app.search_query.is_empty() {
-            "Type to search cached messages in real time".to_string()
+            "Type to search cached mail (FTS5) · Enter to search server".to_string()
         } else {
             format!(
-                "'{}': {} hits · {}/{}",
+                "'{}': {} hit{} · {}/{} (Ctrl+Enter for remote Graph search)",
                 app.search_query,
                 len,
+                if len == 1 { "" } else { "s" },
                 if len == 0 { 0 } else { self.selected + 1 },
                 len
             )
         };
         frame.render_widget(
-            Paragraph::new(Span::styled(status, theme.muted_style())),
+            Paragraph::new(Span::styled(
+                crate::ui::truncate_width(&status, inner.width as usize),
+                theme.muted_style(),
+            )),
             Rect::new(inner.x, status_y, inner.width, 1),
         );
 
@@ -168,15 +186,13 @@ impl SearchOverlay {
                 Style::default()
             };
             let hit = &app.search_results[index];
-            let thread_tag = if hit.parent_msg_id.is_some() {
-                "[Thread] "
-            } else {
-                ""
-            };
+            let unread_dot = if !hit.is_read { "● " } else { "  " };
+            let flag_tag = if hit.flagged { "⚑ " } else { "" };
+            let date_short = hit.received_at.get(..10).unwrap_or("");
             let text = format!(
-                "[{0}] {thread_tag}{1}: {2}",
-                hit.conv_title,
-                hit.author_name,
+                "{unread_dot}{flag_tag}{date_short} · {} · {} — {}",
+                hit.from_display,
+                hit.subject,
                 hit.snippet.replace(['\n', '\r'], " ")
             );
             frame.render_widget(
@@ -210,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn activate_jumps_even_when_query_has_trailing_space() {
+    fn activate_jumps_when_query_matches_results_and_triggers_remote_otherwise() {
         let cfg = crate::config::AppConfig::default();
         let auth = crate::auth::AuthManager::new(cfg.clone()).unwrap();
         let graph = crate::graph::GraphClient::new(cfg.clone(), auth.clone()).unwrap();
@@ -219,28 +235,38 @@ mod tests {
         let sync_ctrl = crate::sync::SyncController::from_channels(
             tokio::sync::watch::channel(crate::sync::FocusTarget::default()).0,
             event_tx,
-            false,
         );
         let (ui_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let mut app = AppState::new(cfg, auth, graph, storage, sync_ctrl, ui_tx);
-        app.search_query = "deploy ".to_string();
-        app.search_results = vec![crate::models::SearchHit {
-            conv_key: "chat:c1".into(),
-            conv_title: "General".into(),
-            kind: crate::models::ConversationKind::OneOnOne,
-            msg_id: "m1".into(),
-            parent_msg_id: None,
-            author_name: "Alice".into(),
-            created_at: "2026-11-18T00:00:00Z".into(),
-            snippet: "deploy now".into(),
+        app.search_query = "budget".to_string();
+        app.search_results = vec![crate::models::MailSearchHit {
+            id: "m1".into(),
+            conversation_id: Some("conv-1".into()),
+            folder_id: Some("inbox".into()),
+            subject: "Budget Q4".into(),
+            from_display: "Alice".into(),
+            received_at: "2026-11-18T00:00:00Z".into(),
+            snippet: "budget review".into(),
+            has_attachments: false,
+            is_read: false,
+            flagged: false,
         }];
         let mut search = SearchOverlay {
-            query: "deploy ".to_string(),
+            query: "budget ".to_string(),
             selected: 0,
         };
         assert_eq!(
             search.handle(&Action::Activate, &app),
             OverlayOutcome::CloseAndDispatch(Action::JumpToSearchHit(0))
+        );
+
+        let mut remote_search = SearchOverlay {
+            query: "invoice".to_string(),
+            selected: 0,
+        };
+        assert_eq!(
+            remote_search.handle(&Action::Activate, &app),
+            OverlayOutcome::Dispatch(Action::SearchRemoteMail("invoice".to_string()))
         );
     }
 }

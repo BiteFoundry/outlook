@@ -12,7 +12,7 @@ where
     match iter.next() {
         None => true,
         Some(arg) => match arg.as_ref().to_str() {
-            Some("tui" | "chat" | "serve" | "api" | "mcp" | "mcp-server") => true,
+            Some("tui" | "serve" | "api" | "mcp" | "mcp-server") => true,
             Some("daemon") => matches!(
                 iter.next().as_ref().and_then(|s| s.as_ref().to_str()),
                 Some("run")
@@ -23,7 +23,20 @@ where
 }
 
 fn main() -> Result<()> {
-    if let Some(res) = teams_cli::cli::try_fast_help_or_version() {
+    // Windows debug binaries default to a 1 MiB main-thread stack, which clap's
+    // unoptimized Subcommand derive builder and deep async futures can exceed.
+    let handle = std::thread::Builder::new()
+        .name("outlook-main".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_main)?;
+    match handle.join() {
+        Ok(res) => res,
+        Err(panic_payload) => std::panic::resume_unwind(panic_payload),
+    }
+}
+
+fn run_main() -> Result<()> {
+    if let Some(res) = outlook_cli::cli::try_fast_help_or_version() {
         return res;
     }
 
@@ -33,16 +46,16 @@ fn main() -> Result<()> {
             .build()?;
         rt.block_on(async {
             let _ = rustls::crypto::ring::default_provider().install_default();
-            tokio::task::spawn_blocking(teams_cli::updater::cleanup_stale_old_binary);
-            teams_cli::cli::run_from_env().await
+            tokio::task::spawn_blocking(outlook_cli::updater::cleanup_stale_old_binary);
+            outlook_cli::cli::run_from_env().await
         })
     } else {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        teams_cli::updater::cleanup_stale_old_binary();
+        outlook_cli::updater::cleanup_stale_old_binary();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        rt.block_on(teams_cli::cli::run_from_env())
+        rt.block_on(outlook_cli::cli::run_from_env())
     }
 }
 
@@ -51,28 +64,57 @@ mod tests {
     use super::needs_multi_thread_runtime;
 
     #[test]
-    fn detects_multi_thread_commands_only_for_tui_serve_mcp() {
-        assert!(needs_multi_thread_runtime(["teams"]));
-        assert!(needs_multi_thread_runtime(["teams", "tui"]));
-        assert!(needs_multi_thread_runtime(["teams", "chat"]));
-        assert!(needs_multi_thread_runtime(["teams", "serve"]));
-        assert!(needs_multi_thread_runtime(["teams", "api"]));
-        assert!(needs_multi_thread_runtime(["teams", "mcp"]));
-        assert!(needs_multi_thread_runtime(["teams", "mcp-server"]));
-        assert!(needs_multi_thread_runtime(["teams", "daemon", "run"]));
+    fn detects_multi_thread_commands_only_for_tui_serve_mcp_and_daemon_run() {
+        assert!(needs_multi_thread_runtime(["outlook"]));
+        assert!(needs_multi_thread_runtime(["outlook", "tui"]));
+        assert!(needs_multi_thread_runtime(["outlook", "serve"]));
+        assert!(needs_multi_thread_runtime(["outlook", "api"]));
+        assert!(needs_multi_thread_runtime(["outlook", "mcp"]));
+        assert!(needs_multi_thread_runtime(["outlook", "mcp-server"]));
+        assert!(needs_multi_thread_runtime(["outlook", "daemon", "run"]));
 
         for sub in ["status", "stop", "start", "restart"] {
             assert!(
-                !needs_multi_thread_runtime(["teams", "daemon", sub]),
+                !needs_multi_thread_runtime(["outlook", "daemon", sub]),
                 "daemon {sub}"
             );
         }
 
         for cmd in [
-            "chats", "teams", "channels", "read", "thread", "send", "reply", "sync", "search",
-            "whoami", "doctor", "--help", "-h", "--version", "-V",
+            "folders",
+            "mail",
+            "read",
+            "send",
+            "reply",
+            "forward",
+            "mark",
+            "move",
+            "archive",
+            "delete",
+            "search",
+            "download",
+            "preview",
+            "preview-file",
+            "calendar",
+            "event",
+            "create-event",
+            "rsvp",
+            "delete-event",
+            "tasks",
+            "task-lists",
+            "add-task",
+            "done",
+            "delete-task",
+            "contacts",
+            "sync",
+            "whoami",
+            "doctor",
+            "--help",
+            "-h",
+            "--version",
+            "-V",
         ] {
-            assert!(!needs_multi_thread_runtime(["teams", cmd]), "{cmd}");
+            assert!(!needs_multi_thread_runtime(["outlook", cmd]), "{cmd}");
         }
     }
 }

@@ -1,4 +1,4 @@
-//! Local HTTP JSON API (`teams serve` / `teams api`) powered by `axum`.
+//! Local HTTP JSON API (`outlook serve` / `outlook api`) + OpenAPI 3.1 powered by `axum`.
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
@@ -18,28 +18,29 @@ use tokio::{net::TcpListener, sync::mpsc};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::{
+    auth::diagnose_access_token_scopes,
     cli,
-    config::AppConfig,
+    config::{self, AppConfig},
     graph::GraphClient,
-    models::{ConversationKind, ConversationTarget, MentionInfo},
-    parser, resolver,
+    models::{MailMessage, OutgoingEvent, OutgoingMail, OutgoingTodoTask},
+    resolver,
     storage::Storage,
-    sync::{self, SyncCommand},
+    sync,
 };
 
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     pub bind: String,
     pub port: u16,
-    pub token: Option<String>,
+    pub api_key: Option<String>,
 }
 
 impl Default for ServeOptions {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1".to_string(),
-            port: 8788,
-            token: None,
+            port: config::DEFAULT_SERVE_PORT,
+            api_key: None,
         }
     }
 }
@@ -49,7 +50,7 @@ pub struct AppState {
     pub config: AppConfig,
     pub graph: GraphClient,
     pub storage: Storage,
-    pub token: Option<String>,
+    pub api_key: Option<String>,
 }
 
 /// JSON error returned by every failing handler.
@@ -101,108 +102,53 @@ pub struct HealthResponse {
 }
 
 #[derive(Debug, Default, Deserialize)]
-pub struct ConversationsQuery {
+pub struct RefreshOfflineQuery {
     #[serde(default)]
     pub refresh: bool,
-    #[serde(default)]
-    pub kind: Option<String>,
-    #[serde(default)]
-    pub limit: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CreateChatBody {
-    pub members: Vec<String>,
-    #[serde(default)]
-    pub topic: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct TeamsQuery {
-    #[serde(default)]
-    pub refresh: bool,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct MessagesQuery {
-    #[serde(default)]
-    pub limit: Option<usize>,
     #[serde(default)]
     pub offline: bool,
-    #[serde(default)]
-    pub before: Option<String>,
-    #[serde(default)]
-    pub fetch_older: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum MentionInput {
-    Spec(String),
-    Object {
-        #[serde(default)]
-        id: Option<i32>,
-        user_id: String,
-        display_name: String,
-    },
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SendMessageBody {
-    pub markdown: String,
-    #[serde(default)]
-    pub subject: Option<String>,
-    #[serde(default)]
-    pub mentions: Vec<MentionInput>,
-    #[serde(default)]
-    pub important: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
-pub struct ThreadQuery {
+pub struct OfflineQuery {
+    #[serde(default)]
+    pub offline: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct MailMessagesQuery {
+    #[serde(default)]
+    pub folder: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
+    #[serde(default)]
+    pub unread: bool,
+    #[serde(default)]
+    pub flagged: bool,
+    #[serde(default)]
+    pub focused: bool,
+    #[serde(default)]
+    pub refresh: bool,
     #[serde(default)]
     pub offline: bool,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ReplyBody {
+pub struct SendMailBody {
+    pub to: Vec<String>,
+    #[serde(default)]
+    pub cc: Vec<String>,
+    #[serde(default)]
+    pub bcc: Vec<String>,
+    pub subject: String,
+    #[serde(default, alias = "body")]
     pub markdown: String,
     #[serde(default)]
-    pub mentions: Vec<MentionInput>,
+    pub importance: Option<String>,
     #[serde(default)]
-    pub important: bool,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SendFileBody {
-    pub path: String,
-    #[serde(default)]
-    pub caption: Option<String>,
-    #[serde(default)]
-    pub thread_root_id: Option<String>,
-    #[serde(default)]
-    pub inline: bool,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct DownloadBody {
-    #[serde(default)]
-    pub index: Option<usize>,
-    #[serde(default)]
-    pub out_dir: Option<String>,
-    #[serde(default)]
-    pub thread_root_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ReactionBody {
-    pub reaction: String,
+    pub attachments: Vec<String>,
     #[serde(default = "default_true")]
-    pub enable: bool,
-    #[serde(default)]
-    pub thread_root_id: Option<String>,
+    pub save_to_sent_items: bool,
 }
 
 fn default_true() -> bool {
@@ -210,59 +156,155 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct EditMessageBody {
+pub struct ReplyMailBody {
+    #[serde(default, alias = "body")]
     pub markdown: String,
     #[serde(default)]
-    pub thread_root_id: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct DeleteMessageParams {
-    #[serde(default)]
-    pub thread_root_id: Option<String>,
+    pub reply_all: bool,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct SearchQuery {
+pub struct ForwardMailBody {
+    pub to: Vec<String>,
+    #[serde(default, alias = "comment")]
+    pub markdown: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PatchMailBody {
+    #[serde(default)]
+    pub is_read: Option<bool>,
+    #[serde(default)]
+    pub flagged: Option<bool>,
+    #[serde(default, alias = "destination_folder")]
+    pub destination_folder_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct AttachmentDownloadBody {
+    #[serde(default, alias = "dir")]
+    pub out_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MailSearchQuery {
     pub q: String,
+    #[serde(default)]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub remote: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct CalendarEventsQuery {
+    #[serde(default, alias = "start")]
+    pub from: Option<String>,
+    #[serde(default, alias = "end")]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub days: Option<i64>,
     #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default)]
-    pub target: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct PresenceQuery {
-    #[serde(default)]
-    pub user_ids: Option<String>,
+    pub offline: bool,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct SetPresenceBody {
-    pub availability: String,
+pub struct CreateCalendarEventBody {
+    pub subject: String,
+    #[serde(alias = "start")]
+    pub start_iso: String,
+    #[serde(alias = "end")]
+    pub end_iso: String,
     #[serde(default)]
-    pub activity: Option<String>,
+    pub time_zone: Option<String>,
     #[serde(default)]
-    pub expiration_mins: Option<u32>,
+    pub is_all_day: bool,
+    #[serde(default)]
+    pub location: Option<String>,
+    #[serde(default, alias = "body")]
+    pub markdown: Option<String>,
+    #[serde(default)]
+    pub attendees: Vec<String>,
+    #[serde(default, alias = "online")]
+    pub is_online_meeting: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RsvpEventBody {
+    pub response: String,
+    #[serde(default)]
+    pub comment: Option<String>,
+}
 
-/// Build the `axum::Router` for the local HTTP JSON API.
+#[derive(Debug, Default, Deserialize)]
+pub struct TodoTasksQuery {
+    #[serde(default)]
+    pub list: Option<String>,
+    #[serde(default, alias = "include_completed")]
+    pub all: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub refresh: bool,
+    #[serde(default)]
+    pub offline: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTodoTaskBody {
+    #[serde(default)]
+    pub list: Option<String>,
+    pub title: String,
+    #[serde(default, alias = "notes")]
+    pub body_plain: Option<String>,
+    #[serde(default, alias = "due")]
+    pub due_date_iso: Option<String>,
+    #[serde(default)]
+    pub importance: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PatchTodoTaskBody {
+    #[serde(default)]
+    pub list: Option<String>,
+    pub completed: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct DeleteTodoTaskQuery {
+    #[serde(default)]
+    pub list: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ContactsQuery {
+    #[serde(default, alias = "query")]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offline: bool,
+}
+
+/// Build the `axum::Router` for the local Outlook HTTP JSON API.
 pub fn build_router(
     config: AppConfig,
     graph: GraphClient,
     storage: Storage,
-    token: Option<String>,
+    api_key: Option<String>,
 ) -> axum::Router {
-    let has_token = token.as_deref().is_some_and(|t| !t.trim().is_empty());
+    let has_key = api_key.as_deref().is_some_and(|t| !t.trim().is_empty());
     let state = Arc::new(AppState {
         config,
         graph,
         storage,
-        token,
+        api_key,
     });
 
-    let cors = if has_token {
+    let cors = if has_key {
         CorsLayer::permissive()
     } else {
         CorsLayer::new()
@@ -276,41 +318,52 @@ pub fn build_router(
                 Method::DELETE,
                 Method::OPTIONS,
             ])
-            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+            .allow_headers([
+                header::CONTENT_TYPE,
+                header::AUTHORIZATION,
+                header::HeaderName::from_static("x-api-key"),
+            ])
     };
 
     Router::new()
         .route("/health", get(health))
-        .route("/conversations", get(list_conversations))
-        .route("/chats", post(create_chat))
-        .route("/teams", get(list_teams))
-        .route(
-            "/conversations/{key}/messages",
-            get(get_messages).post(send_message),
-        )
-        .route("/conversations/{key}/threads/{root_id}", get(get_thread))
-        .route(
-            "/conversations/{key}/messages/{msg_id}/replies",
-            post(reply_message),
-        )
-        .route("/conversations/{key}/files", post(send_file))
-        .route(
-            "/conversations/{key}/messages/{msg_id}/attachments/download",
-            post(download_attachment),
-        )
-        .route(
-            "/conversations/{key}/messages/{msg_id}/reactions",
-            post(react_message),
-        )
-        .route(
-            "/conversations/{key}/messages/{msg_id}",
-            patch(edit_message).delete(delete_message),
-        )
-        .route("/conversations/{key}/read", post(mark_read))
-        .route("/conversations/{key}/members", get(list_members))
-        .route("/search", get(search))
-        .route("/presence", get(get_presence).post(set_presence))
         .route("/openapi.json", get(openapi_spec))
+        .route("/v1/whoami", get(whoami))
+        .route("/v1/mail/folders", get(list_mail_folders))
+        .route("/v1/mail/messages", get(list_mail_messages))
+        .route(
+            "/v1/mail/messages/{id}",
+            get(get_mail_message)
+                .patch(patch_mail_message)
+                .delete(delete_mail_message),
+        )
+        .route("/v1/mail/send", post(send_mail))
+        .route("/v1/mail/messages/{id}/reply", post(reply_mail))
+        .route("/v1/mail/messages/{id}/forward", post(forward_mail))
+        .route(
+            "/v1/mail/messages/{id}/attachments/{att_id}/download",
+            post(download_mail_attachment),
+        )
+        .route("/v1/mail/search", get(search_mail))
+        .route(
+            "/v1/calendar/events",
+            get(list_calendar_events).post(create_calendar_event),
+        )
+        .route(
+            "/v1/calendar/events/{id}",
+            get(get_calendar_event).delete(delete_calendar_event),
+        )
+        .route("/v1/calendar/events/{id}/rsvp", post(rsvp_calendar_event))
+        .route("/v1/todo/lists", get(list_todo_lists))
+        .route(
+            "/v1/todo/tasks",
+            get(list_todo_tasks).post(create_todo_task),
+        )
+        .route(
+            "/v1/todo/tasks/{id}",
+            patch(patch_todo_task).delete(delete_todo_task),
+        )
+        .route("/v1/contacts", get(list_contacts))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(cors)
         .with_state(state)
@@ -326,23 +379,23 @@ pub async fn run(
     let addr: SocketAddr = format!("{}:{}", opts.bind, opts.port)
         .parse()
         .with_context(|| format!("Invalid bind address: {}:{}", opts.bind, opts.port))?;
-    let allow_insecure = std::env::var("TEAMS_ALLOW_INSECURE_SERVE").ok();
-    check_bind_security(addr, opts.token.as_deref(), allow_insecure.as_deref())?;
+    let allow_insecure = std::env::var("OUTLOOK_ALLOW_INSECURE_SERVE").ok();
+    check_bind_security(addr, opts.api_key.as_deref(), allow_insecure.as_deref())?;
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
 
     let sync_ctl =
         sync::spawn_sync_engine(config.clone(), graph.clone(), storage.clone(), event_tx);
-    sync_ctl.request(SyncCommand::RefreshConversations);
+    sync_ctl.request(sync::SyncCommand::Bootstrap);
 
-    let app = build_router(config, graph, storage, opts.token);
+    let app = build_router(config, graph, storage, opts.api_key);
 
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("Failed to bind listener: {addr}"))?;
 
-    println!("teams HTTP API listening on http://{addr}");
+    println!("outlook HTTP API listening on http://{addr}");
 
     axum::serve(listener, app)
         .await
@@ -353,16 +406,16 @@ pub async fn run(
 
 fn check_bind_security(
     addr: SocketAddr,
-    token: Option<&str>,
+    api_key: Option<&str>,
     allow_insecure_env: Option<&str>,
 ) -> Result<()> {
-    let has_token = token.is_some_and(|t| !t.trim().is_empty());
+    let has_key = api_key.is_some_and(|t| !t.trim().is_empty());
     let allow_insecure = allow_insecure_env.map(str::trim) == Some("1");
-    if !addr.ip().is_loopback() && !has_token && !allow_insecure {
+    if !addr.ip().is_loopback() && !has_key && !allow_insecure {
         anyhow::bail!(
-            "Refusing to bind HTTP API on non-loopback address {addr} without `--token <SECRET>`. \
-             Pass `--token <SECRET>` to require Bearer authentication before exposing Teams and host file endpoints, \
-             or set `TEAMS_ALLOW_INSECURE_SERVE=1` to override."
+            "Refusing to bind HTTP API on non-loopback address {addr} without `--api-key <KEY>`. \
+             Pass `--api-key <KEY>` to require Bearer authentication before exposing Outlook and host file endpoints, \
+             or set `OUTLOOK_ALLOW_INSECURE_SERVE=1` to override."
         );
     }
     Ok(())
@@ -402,76 +455,65 @@ async fn map_graph_error(graph: &GraphClient, err: anyhow::Error) -> ApiError {
     ApiError::from(err)
 }
 
-async fn map_target_error(graph: &GraphClient, err: anyhow::Error) -> ApiError {
-    if cli::is_forbidden_error(&err) {
-        let wrapped = cli::wrap_graph_permission_error(graph, err).await;
-        return ApiError::new(StatusCode::FORBIDDEN, format!("{wrapped:#}"));
-    }
+fn map_resolve_error(err: anyhow::Error) -> ApiError {
     let msg = format!("{err:#}");
     let lower = msg.to_ascii_lowercase();
-    if lower.contains("target conversation/channel name is empty") {
+    if lower.contains("empty") {
         ApiError::bad_request(msg)
-    } else if lower.contains("conversation/channel not found")
-        || lower.contains("ambiguous target")
-        || lower.starts_with("multiple ")
-    {
+    } else if lower.contains("not found") || lower.contains("ambiguous") {
         ApiError::not_found(msg)
     } else {
         ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, msg)
     }
 }
 
-async fn map_download_error(graph: &GraphClient, err: anyhow::Error) -> ApiError {
-    if cli::is_forbidden_error(&err) {
-        let wrapped = cli::wrap_graph_permission_error(graph, err).await;
-        return ApiError::new(StatusCode::FORBIDDEN, format!("{wrapped:#}"));
-    }
-    let msg = format!("{err:#}");
-    let lower = msg.to_ascii_lowercase();
-    if lower.contains("message not found") {
-        ApiError::not_found(msg)
-    } else if lower.contains("has no attachments") || lower.contains("is out of range") {
-        ApiError::bad_request(msg)
-    } else {
-        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, msg)
-    }
-}
-
-async fn resolve_target_for_api(
+async fn resolve_mail_folder_for_api(
     state: &AppState,
-    key: &str,
+    folder_query: &str,
     offline: bool,
-) -> Result<crate::models::ConversationSummary, ApiError> {
+) -> Result<crate::models::MailFolder, ApiError> {
     if offline {
-        let key_owned = key.to_string();
+        let q = folder_query.to_string();
         return with_storage(&state.storage, move |s| {
-            let cached = s.list_conversations()?;
-            resolver::resolve_from_slice(&cached, &key_owned)
+            resolver::resolve_mail_folder_cached(s, &q)
         })
         .await
-        .map_err(|err| {
-            let msg = format!("{err:#}");
-            if msg
-                .to_ascii_lowercase()
-                .contains("target conversation/channel name is empty")
-            {
-                ApiError::bad_request(msg)
-            } else if msg
-                .to_ascii_lowercase()
-                .contains("conversation/channel not found")
-                || msg.to_ascii_lowercase().contains("ambiguous target")
-                || msg.to_ascii_lowercase().starts_with("multiple ")
-            {
-                ApiError::not_found(msg)
-            } else {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, msg)
-            }
-        });
+        .map_err(map_resolve_error);
     }
+    match resolver::resolve_mail_folder(&state.graph, &state.storage, folder_query, false).await {
+        Ok(f) => Ok(f),
+        Err(err) => {
+            if cli::is_forbidden_error(&err) {
+                Err(map_graph_error(&state.graph, err).await)
+            } else {
+                Err(map_resolve_error(err))
+            }
+        }
+    }
+}
 
-    match cli::resolve_target(&state.storage, &state.graph, key, false).await {
-        Ok(conv) => Ok(conv),
-        Err(err) => Err(map_target_error(&state.graph, err).await),
+async fn resolve_todo_list_for_api(
+    state: &AppState,
+    list_query: &str,
+    offline: bool,
+) -> Result<crate::models::TodoList, ApiError> {
+    if offline {
+        let q = list_query.to_string();
+        return with_storage(&state.storage, move |s| {
+            resolver::resolve_todo_list_cached(s, &q)
+        })
+        .await
+        .map_err(map_resolve_error);
+    }
+    match resolver::resolve_todo_list(&state.graph, &state.storage, list_query, false).await {
+        Ok(l) => Ok(l),
+        Err(err) => {
+            if cli::is_forbidden_error(&err) {
+                Err(map_graph_error(&state.graph, err).await)
+            } else {
+                Err(map_resolve_error(err))
+            }
+        }
     }
 }
 
@@ -480,15 +522,19 @@ async fn auth_middleware(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    if let Some(expected) = &state.token {
+    if let Some(expected) = &state.api_key {
         if request.uri().path() != "/health" {
-            let presented = request
+            let bearer = request
                 .headers()
                 .get(header::AUTHORIZATION)
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.strip_prefix("Bearer "));
+            let x_api_key = request
+                .headers()
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok());
 
-            if presented != Some(expected.as_str()) {
+            if bearer != Some(expected.as_str()) && x_api_key != Some(expected.as_str()) {
                 return Err(ApiError::new(
                     StatusCode::UNAUTHORIZED,
                     "missing or invalid bearer token",
@@ -508,363 +554,378 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     })
 }
 
-async fn list_conversations(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<ConversationsQuery>,
-) -> Result<Json<Value>, ApiError> {
-    let limit = query.limit.map(cli::clamp_limit);
+async fn whoami(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    let tokens = state.graph.auth().current_tokens().await;
+    let auth_source = cli::auth_source_label(tokens.as_ref(), &state.config);
+    let Some(tok) = tokens else {
+        return Ok(Json(json!({
+            "authenticated": false,
+            "auth_source": auth_source,
+        })));
+    };
+    let scope_diag = diagnose_access_token_scopes(&tok.access_token);
+    Ok(Json(json!({
+        "authenticated": true,
+        "user_id": tok.user_id,
+        "display_name": tok.user_display_name,
+        "email": tok.user_email,
+        "client_id": tok.client_id,
+        "tenant_id": tok.tenant_id,
+        "auth_mode": tok.auth_mode,
+        "auth_source": auth_source,
+        "expires_at": tok.expires_at,
+        "expired": tok.is_expired_soon(0),
+        "scopes": scope_diag.scopes,
+        "roles": scope_diag.roles,
+    })))
+}
 
-    if query.refresh {
-        if let Some(chat_limit) = limit {
-            let (chats_res, teams_res) = tokio::join!(
-                state.graph.list_chats(chat_limit),
-                state.graph.list_joined_teams_with_channels(),
-            );
-            let chats = match chats_res {
-                Ok(c) => c,
-                Err(err) => return Err(map_graph_error(&state.graph, err).await),
-            };
-            with_storage(&state.storage, move |s| {
-                s.upsert_conversations(&chats)?;
-                if let Ok(teams) = teams_res {
-                    s.upsert_teams(&teams)?;
-                }
-                Ok(())
-            })
-            .await?;
-        } else if let Err(err) = sync::bootstrap_conversations(&state.graph, &state.storage).await {
+// ---------------------------------------------------------------------------
+// Mail handlers
+// ---------------------------------------------------------------------------
+
+async fn list_mail_folders(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<RefreshOfflineQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let cached = with_storage(&state.storage, |s| s.list_mail_folders()).await?;
+    let folders = if !query.offline && (query.refresh || cached.is_empty()) {
+        let fetched = match state.graph.list_mail_folders().await {
+            Ok(f) => f,
+            Err(err) => return Err(map_graph_error(&state.graph, err).await),
+        };
+        let fetched_clone = fetched.clone();
+        let stored = with_storage(&state.storage, move |s| {
+            s.upsert_mail_folders(&fetched_clone)?;
+            s.list_mail_folders()
+        })
+        .await?;
+        if stored.is_empty() {
+            fetched
+        } else {
+            stored
+        }
+    } else {
+        cached
+    };
+    Ok(Json(json!({ "folders": folders })))
+}
+
+async fn list_mail_messages(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<MailMessagesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = cli::clamp_limit(query.limit.unwrap_or(30));
+    let fetch_limit = if query.unread || query.flagged || query.focused {
+        (limit.saturating_mul(3)).clamp(limit, 500)
+    } else {
+        limit
+    };
+    let folder_arg = query
+        .folder
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("inbox");
+    let resolved_folder = resolve_mail_folder_for_api(&state, folder_arg, query.offline).await?;
+    let folder_id = resolved_folder.id.clone();
+
+    let fid_for_read = folder_id.clone();
+    let cached = with_storage(&state.storage, move |s| {
+        s.list_mail_messages(Some(&fid_for_read), false, false, false, fetch_limit)
+    })
+    .await?;
+
+    let messages = if !query.offline && (query.refresh || cached.is_empty()) {
+        let fetched = match state
+            .graph
+            .list_mail_messages(&folder_id, fetch_limit, false)
+            .await
+        {
+            Ok(m) => m,
+            Err(err) => return Err(map_graph_error(&state.graph, err).await),
+        };
+        let fetched_clone = fetched.clone();
+        let fid_for_store = folder_id.clone();
+        let stored = with_storage(&state.storage, move |s| {
+            s.upsert_mail_messages(&fetched_clone)?;
+            s.list_mail_messages(Some(&fid_for_store), false, false, false, fetch_limit)
+        })
+        .await?;
+        if stored.is_empty() {
+            fetched
+        } else {
+            stored
+        }
+    } else {
+        cached
+    };
+
+    let filtered = cli::filter_mail_messages(
+        messages,
+        query.unread,
+        query.flagged,
+        query.focused,
+        limit,
+    );
+
+    Ok(Json(json!({
+        "folder": resolved_folder,
+        "messages": filtered,
+    })))
+}
+
+async fn get_mail_message(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<OfflineQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let msg: MailMessage = if query.offline {
+        let id_owned = id.clone();
+        with_storage(&state.storage, move |s| s.get_mail_message(&id_owned))
+            .await?
+            .ok_or_else(|| ApiError::not_found(format!("mail message not found in cache: {id}")))?
+    } else {
+        let fetched = match state.graph.get_mail_message(&id).await {
+            Ok(m) => m,
+            Err(err) => return Err(map_graph_error(&state.graph, err).await),
+        };
+        let fetched_clone = fetched.clone();
+        let _ = with_storage(&state.storage, move |s| {
+            s.upsert_mail_messages(std::slice::from_ref(&fetched_clone))?;
+            Ok(())
+        })
+        .await;
+        fetched
+    };
+    Ok(Json(json!({ "message": msg })))
+}
+
+async fn send_mail(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SendMailBody>,
+) -> Result<Json<Value>, ApiError> {
+    let to: Vec<String> = body
+        .to
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if to.is_empty() {
+        return Err(ApiError::bad_request("to must not be empty"));
+    }
+    if body.subject.trim().is_empty() {
+        return Err(ApiError::bad_request("subject must not be empty"));
+    }
+    if body.markdown.trim().is_empty() {
+        return Err(ApiError::bad_request("markdown/body must not be empty"));
+    }
+
+    let importance = body
+        .importance
+        .as_deref()
+        .map(|v| {
+            cli::normalize_mail_importance(v)
+                .map(str::to_string)
+                .map_err(|e| ApiError::bad_request(format!("{e:#}")))
+        })
+        .transpose()?;
+
+    let mut attachments = Vec::with_capacity(body.attachments.len());
+    for raw in &body.attachments {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let p = PathBuf::from(trimmed);
+        if !p.exists() || !p.is_file() {
+            return Err(ApiError::bad_request(format!(
+                "attachment file does not exist on host: {}",
+                p.display()
+            )));
+        }
+        attachments.push(p);
+    }
+
+    let body_html = crate::parser::compile_outgoing_mail_html(&body.markdown, &[], None);
+    let mail = OutgoingMail {
+        subject: body.subject.clone(),
+        body_html,
+        body_markdown: Some(body.markdown),
+        to: to.clone(),
+        cc: body.cc,
+        bcc: body.bcc,
+        importance,
+        attachments,
+        inline_images: Vec::new(),
+        in_reply_to_id: None,
+        reply_all: false,
+        forward_of_id: None,
+        draft_id: None,
+        save_to_sent_items: body.save_to_sent_items,
+    };
+    if let Err(err) = state.graph.send_mail(&mail).await {
+        return Err(map_graph_error(&state.graph, err).await);
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "to": to,
+        "subject": body.subject,
+    })))
+}
+
+async fn reply_mail(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ReplyMailBody>,
+) -> Result<Json<Value>, ApiError> {
+    if body.markdown.trim().is_empty() {
+        return Err(ApiError::bad_request("markdown/body must not be empty"));
+    }
+    let html = crate::parser::compile_outgoing_mail_html(&body.markdown, &[], None);
+    if let Err(err) = state.graph.reply_mail(&id, &html, body.reply_all).await {
+        return Err(map_graph_error(&state.graph, err).await);
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "message_id": id,
+        "reply_all": body.reply_all,
+    })))
+}
+
+async fn forward_mail(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ForwardMailBody>,
+) -> Result<Json<Value>, ApiError> {
+    let to: Vec<String> = body
+        .to
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if to.is_empty() {
+        return Err(ApiError::bad_request("to must not be empty"));
+    }
+    let html = if body.markdown.trim().is_empty() {
+        String::new()
+    } else {
+        crate::parser::compile_outgoing_mail_html(&body.markdown, &[], None)
+    };
+    if let Err(err) = state.graph.forward_mail(&id, &to, &html).await {
+        return Err(map_graph_error(&state.graph, err).await);
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "message_id": id,
+        "to": to,
+    })))
+}
+
+async fn patch_mail_message(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<PatchMailBody>,
+) -> Result<Json<Value>, ApiError> {
+    let dest_query = body
+        .destination_folder_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if body.is_read.is_none() && body.flagged.is_none() && dest_query.is_none() {
+        return Err(ApiError::bad_request(
+            "at least one of is_read, flagged, or destination_folder_id must be provided",
+        ));
+    }
+
+    if let Some(is_read) = body.is_read {
+        if let Err(err) = state.graph.set_mail_read(&id, is_read).await {
+            return Err(map_graph_error(&state.graph, err).await);
+        }
+    }
+    if let Some(flagged) = body.flagged {
+        if let Err(err) = state.graph.set_mail_flag(&id, flagged).await {
             return Err(map_graph_error(&state.graph, err).await);
         }
     }
 
-    let kind_filter = match query.kind.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        None => None,
-        Some(raw) => Some(parse_kind_filter(raw)?),
-    };
-
-    let conversations = with_storage(&state.storage, move |s| {
-        let mut items = s.list_conversations()?;
-        if let Some(kind) = kind_filter {
-            items.retain(|c| c.kind == kind);
+    let id_for_cache = id.clone();
+    let is_read_val = body.is_read;
+    let flagged_val = body.flagged;
+    let _ = with_storage(&state.storage, move |s| {
+        if let Some(mut cached) = s.get_mail_message(&id_for_cache)? {
+            if let Some(r) = is_read_val {
+                cached.is_read = r;
+            }
+            if let Some(f) = flagged_val {
+                cached.flagged = f;
+            }
+            s.upsert_mail_messages(&[cached])?;
         }
-        if let Some(max_items) = limit {
-            items.truncate(max_items);
-        }
-        Ok(items)
-    })
-    .await?;
-
-    Ok(Json(json!({ "conversations": conversations })))
-}
-
-async fn create_chat(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<CreateChatBody>,
-) -> Result<Json<Value>, ApiError> {
-    let members: Vec<String> = body
-        .members
-        .into_iter()
-        .map(|m| m.trim().to_string())
-        .filter(|m| !m.is_empty())
-        .collect();
-    if members.is_empty() {
-        return Err(ApiError::bad_request("members must not be empty"));
-    }
-
-    let chat = match state
-        .graph
-        .create_chat(&members, body.topic.as_deref())
-        .await
-    {
-        Ok(c) => c,
-        Err(err) => return Err(map_graph_error(&state.graph, err).await),
-    };
-    let chat_to_store = chat.clone();
-    with_storage(&state.storage, move |s| {
-        s.upsert_conversations(std::slice::from_ref(&chat_to_store))?;
         Ok(())
     })
-    .await?;
-
-    Ok(Json(json!({ "ok": true, "conversation": chat })))
-}
-
-async fn list_teams(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<TeamsQuery>,
-) -> Result<Json<Value>, ApiError> {
-    let teams = if query.refresh {
-        let fetched = match state.graph.list_joined_teams_with_channels().await {
-            Ok(t) => t,
-            Err(err) => return Err(map_graph_error(&state.graph, err).await),
-        };
-        with_storage(&state.storage, move |s| {
-            s.upsert_teams(&fetched)?;
-            let stored = s.list_teams()?;
-            Ok(if stored.is_empty() { fetched } else { stored })
-        })
-        .await?
-    } else {
-        with_storage(&state.storage, |s| s.list_teams()).await?
-    };
-
-    Ok(Json(json!({ "teams": teams })))
-}
-
-async fn get_messages(
-    State(state): State<Arc<AppState>>,
-    Path(key): Path<String>,
-    Query(query): Query<MessagesQuery>,
-) -> Result<Json<Value>, ApiError> {
-    let limit = cli::clamp_limit(query.limit.unwrap_or(50));
-    let conv = resolve_target_for_api(&state, &key, query.offline).await?;
-
-    let before_owned = query
-        .before
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    if let Some(ref raw_before) = before_owned {
-        let conv_key = conv.conv_key.clone();
-        let before_val = raw_before.clone();
-        with_storage(&state.storage, move |s| {
-            cli::resolve_before_cursor(s, &conv_key, &before_val)
-        })
-        .await
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
-    }
-
-    if query.offline {
-        let conv_clone = conv.clone();
-        let res = with_storage(&state.storage, move |s| {
-            cli::read_conversation_messages_offline(s, &conv_clone, limit, before_owned.as_deref())
-        })
-        .await?;
-        return Ok(Json(json!({
-            "conversation": conv,
-            "messages": res.messages,
-            "has_more": res.has_more,
-            "next_before": res.next_before,
-        })));
-    }
-
-    let fetch_older = query.fetch_older.unwrap_or(before_owned.is_some());
-    let res = match cli::read_conversation_messages(
-        &state.storage,
-        &state.graph,
-        &conv,
-        limit,
-        before_owned.as_deref(),
-        false,
-        fetch_older,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(err) => return Err(map_graph_error(&state.graph, err).await),
-    };
-
-    Ok(Json(json!({
-        "conversation": conv,
-        "messages": res.messages,
-        "has_more": res.has_more,
-        "next_before": res.next_before,
-    })))
-}
-
-async fn send_message(
-    State(state): State<Arc<AppState>>,
-    Path(key): Path<String>,
-    Json(body): Json<SendMessageBody>,
-) -> Result<Json<Value>, ApiError> {
-    if body.markdown.trim().is_empty() {
-        return Err(ApiError::bad_request("markdown must not be empty"));
-    }
-
-    let mentions = parse_mention_inputs(&body.mentions)?;
-    let conv = resolve_target_for_api(&state, &key, false).await?;
-
-    let mut outgoing = parser::compile_outgoing_markdown(
-        &body.markdown,
-        body.subject,
-        mentions,
-        vec![],
-        vec![],
-        None,
-    );
-    if body.important {
-        outgoing.importance = Some("high".to_string());
-    }
-
-    let mut sent = match state.graph.send_message(&conv.target, &outgoing).await {
-        Ok(m) => m,
-        Err(err) => return Err(map_graph_error(&state.graph, err).await),
-    };
-    let sent_clone = sent.clone();
-    let _ = with_storage(&state.storage, move |s| {
-        s.upsert_messages(std::slice::from_ref(&sent_clone))
-    })
     .await;
-    cli::hydrate_message_attachments(&mut sent);
 
-    Ok(Json(json!({
-        "ok": true,
-        "conversation": conv,
-        "message": sent,
-    })))
-}
-
-async fn get_thread(
-    State(state): State<Arc<AppState>>,
-    Path((key, root_id)): Path<(String, String)>,
-    Query(query): Query<ThreadQuery>,
-) -> Result<Json<Value>, ApiError> {
-    let limit = cli::clamp_limit(query.limit.unwrap_or(50));
-    let conv = resolve_target_for_api(&state, &key, query.offline).await?;
-
-    let ConversationTarget::Channel {
-        ref team_id,
-        ref channel_id,
-    } = conv.target
-    else {
-        return Err(ApiError::bad_request(format!(
-            "threads are only supported on team channels: {}",
-            conv.conv_key
-        )));
-    };
-
-    let mut thread = if query.offline {
-        let conv_key = conv.conv_key.clone();
-        let root_id_clone = root_id.clone();
-        with_storage(&state.storage, move |s| s.get_thread(&conv_key, &root_id_clone, limit))
-            .await?
-            .ok_or_else(|| ApiError::not_found(format!("thread not found in cache: {root_id}")))?
-    } else {
-        let view = match state
-            .graph
-            .get_thread(team_id, channel_id, &root_id, limit)
-            .await
-        {
-            Ok(v) => v,
+    let moved_message = if let Some(dest) = dest_query {
+        let folder = resolve_mail_folder_for_api(&state, dest, false).await?;
+        let moved = match state.graph.move_mail_message(&id, &folder.id).await {
+            Ok(m) => m,
             Err(err) => return Err(map_graph_error(&state.graph, err).await),
         };
-        let mut all = Vec::with_capacity(1 + view.replies.len());
-        all.push(view.root.clone());
-        all.extend(view.replies.iter().cloned());
-        with_storage(&state.storage, move |s| {
-            s.upsert_messages(&all)?;
+        let moved_clone = moved.clone();
+        let _ = with_storage(&state.storage, move |s| {
+            s.upsert_mail_messages(std::slice::from_ref(&moved_clone))?;
             Ok(())
         })
-        .await?;
-        view
+        .await;
+        Some(moved)
+    } else {
+        None
     };
-    cli::hydrate_thread_attachments(&mut thread);
 
-    Ok(Json(json!({ "thread": thread })))
+    Ok(Json(json!({
+        "ok": true,
+        "message_id": moved_message.as_ref().map(|m| m.id.as_str()).unwrap_or(&id),
+        "is_read": body.is_read,
+        "flagged": body.flagged,
+        "moved": moved_message,
+    })))
 }
 
-async fn reply_message(
+async fn delete_mail_message(
     State(state): State<Arc<AppState>>,
-    Path((key, msg_id)): Path<(String, String)>,
-    Json(body): Json<ReplyBody>,
+    Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    if body.markdown.trim().is_empty() {
-        return Err(ApiError::bad_request("markdown must not be empty"));
+    if let Err(err) = state.graph.delete_mail_message(&id).await {
+        return Err(map_graph_error(&state.graph, err).await);
     }
-
-    let mentions = parse_mention_inputs(&body.mentions)?;
-    let conv = resolve_target_for_api(&state, &key, false).await?;
-
-    let quote = cli::build_quote_reply(&state.storage, &state.graph, &conv, &msg_id).await;
-    let mut outgoing =
-        parser::compile_outgoing_markdown(&body.markdown, None, mentions, vec![], vec![], quote);
-    if body.important {
-        outgoing.importance = Some("high".to_string());
-    }
-
-    let mut sent = match state
-        .graph
-        .reply_message(&conv.target, &msg_id, &outgoing)
-        .await
-    {
-        Ok(m) => m,
-        Err(err) => return Err(map_graph_error(&state.graph, err).await),
-    };
-    let sent_clone = sent.clone();
+    let id_clone = id.clone();
     let _ = with_storage(&state.storage, move |s| {
-        s.upsert_messages(std::slice::from_ref(&sent_clone))
+        s.delete_mail_messages_by_ids(&[id_clone])?;
+        Ok(())
     })
     .await;
-    cli::hydrate_message_attachments(&mut sent);
-
     Ok(Json(json!({
         "ok": true,
-        "conversation": conv,
-        "reply_to": msg_id,
-        "message": sent,
+        "message_id": id,
     })))
 }
 
-async fn send_file(
+async fn download_mail_attachment(
     State(state): State<Arc<AppState>>,
-    Path(key): Path<String>,
-    Json(body): Json<SendFileBody>,
-) -> Result<Json<Value>, ApiError> {
-    let trimmed_path = body.path.trim();
-    if trimmed_path.is_empty() {
-        return Err(ApiError::bad_request("path must not be empty"));
-    }
-    let path = std::path::Path::new(trimmed_path);
-    if !path.exists() || !path.is_file() {
-        return Err(ApiError::bad_request(format!(
-            "file does not exist on host: {}",
-            path.display()
-        )));
-    }
-    if body.inline && cli::image_mime_for_path(path).is_none() {
-        return Err(ApiError::bad_request(
-            "inline=true requires an image file (png, jpg, jpeg, gif, webp, bmp)",
-        ));
-    }
-
-    let conv = resolve_target_for_api(&state, &key, false).await?;
-
-    let sent = match cli::send_file_or_inline(
-        &state.graph,
-        &state.storage,
-        &conv,
-        path,
-        body.caption.as_deref(),
-        body.thread_root_id.as_deref(),
-        body.inline,
-    )
-    .await
-    {
-        Ok(m) => m,
-        Err(err) => return Err(map_graph_error(&state.graph, err).await),
-    };
-
-    Ok(Json(json!({
-        "ok": true,
-        "conversation": conv,
-        "message": sent,
-    })))
-}
-
-async fn download_attachment(
-    State(state): State<Arc<AppState>>,
-    Path((key, msg_id)): Path<(String, String)>,
+    Path((id, att_id)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
-    let parsed: DownloadBody = if body.iter().all(u8::is_ascii_whitespace) {
-        DownloadBody::default()
+    let parsed: AttachmentDownloadBody = if body.iter().all(u8::is_ascii_whitespace) {
+        AttachmentDownloadBody::default()
     } else {
         serde_json::from_slice(&body)
             .map_err(|e| ApiError::bad_request(format!("invalid JSON body: {e}")))?
     };
-
-    let conv = resolve_target_for_api(&state, &key, false).await?;
 
     let dest_dir = parsed
         .out_dir
@@ -874,19 +935,13 @@ async fn download_attachment(
         .map(PathBuf::from)
         .unwrap_or_else(|| state.config.resolved_download_dir());
 
-    let downloaded = match cli::download_message_attachment(
-        &state.graph,
-        &state.storage,
-        &conv,
-        &msg_id,
-        parsed.index.unwrap_or(0),
-        parsed.thread_root_id.as_deref(),
-        &dest_dir,
-    )
-    .await
+    let downloaded = match state
+        .graph
+        .download_mail_attachment_by_id(&id, &att_id, &dest_dir)
+        .await
     {
         Ok(d) => d,
-        Err(err) => return Err(map_download_error(&state.graph, err).await),
+        Err(err) => return Err(map_graph_error(&state.graph, err).await),
     };
 
     Ok(Json(json!({
@@ -897,245 +952,183 @@ async fn download_attachment(
     })))
 }
 
-async fn react_message(
+async fn search_mail(
     State(state): State<Arc<AppState>>,
-    Path((key, msg_id)): Path<(String, String)>,
-    Json(body): Json<ReactionBody>,
-) -> Result<Json<Value>, ApiError> {
-    let normalized = cli::normalize_reaction(&body.reaction)
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
-    let conv = resolve_target_for_api(&state, &key, false).await?;
-
-    if let Err(err) = state
-        .graph
-        .set_reaction(
-            &conv.target,
-            &msg_id,
-            body.thread_root_id.as_deref(),
-            &normalized,
-            body.enable,
-        )
-        .await
-    {
-        return Err(map_graph_error(&state.graph, err).await);
-    }
-
-    Ok(Json(json!({
-        "ok": true,
-        "conv_key": conv.conv_key,
-        "msg_id": msg_id,
-        "reaction": normalized,
-        "enable": body.enable,
-    })))
-}
-
-async fn edit_message(
-    State(state): State<Arc<AppState>>,
-    Path((key, msg_id)): Path<(String, String)>,
-    Json(body): Json<EditMessageBody>,
-) -> Result<Json<Value>, ApiError> {
-    if body.markdown.trim().is_empty() {
-        return Err(ApiError::bad_request("markdown must not be empty"));
-    }
-
-    let conv = resolve_target_for_api(&state, &key, false).await?;
-    let compiled =
-        parser::compile_outgoing_markdown(&body.markdown, None, vec![], vec![], vec![], None);
-
-    if let Err(err) = state
-        .graph
-        .edit_message(
-            &conv.target,
-            &msg_id,
-            body.thread_root_id.as_deref(),
-            &compiled.body_html,
-        )
-        .await
-    {
-        return Err(map_graph_error(&state.graph, err).await);
-    }
-
-    Ok(Json(json!({
-        "ok": true,
-        "conv_key": conv.conv_key,
-        "msg_id": msg_id,
-    })))
-}
-
-async fn delete_message(
-    State(state): State<Arc<AppState>>,
-    Path((key, msg_id)): Path<(String, String)>,
-    Query(query): Query<DeleteMessageParams>,
-    body: Bytes,
-) -> Result<Json<Value>, ApiError> {
-    let body_params: DeleteMessageParams = if body.iter().all(u8::is_ascii_whitespace) {
-        DeleteMessageParams::default()
-    } else {
-        serde_json::from_slice(&body)
-            .map_err(|e| ApiError::bad_request(format!("invalid JSON body: {e}")))?
-    };
-
-    let thread_root_id = body_params
-        .thread_root_id
-        .or(query.thread_root_id)
-        .filter(|s| !s.trim().is_empty());
-
-    let conv = resolve_target_for_api(&state, &key, false).await?;
-
-    if let Err(err) = state
-        .graph
-        .delete_message(&conv.target, &msg_id, thread_root_id.as_deref())
-        .await
-    {
-        return Err(map_graph_error(&state.graph, err).await);
-    }
-
-    Ok(Json(json!({
-        "ok": true,
-        "conv_key": conv.conv_key,
-        "msg_id": msg_id,
-    })))
-}
-
-async fn mark_read(
-    State(state): State<Arc<AppState>>,
-    Path(key): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let conv = resolve_target_for_api(&state, &key, false).await?;
-
-    if let ConversationTarget::Chat { ref chat_id } = conv.target {
-        if let Err(err) = state.graph.mark_chat_read(chat_id).await {
-            return Err(map_graph_error(&state.graph, err).await);
-        }
-    }
-    let now = chrono::Utc::now().to_rfc3339();
-    let conv_key = conv.conv_key.clone();
-    with_storage(&state.storage, move |s| {
-        s.mark_conversation_read(&conv_key, &now)
-    })
-    .await?;
-
-    Ok(Json(json!({
-        "ok": true,
-        "conv_key": conv.conv_key,
-    })))
-}
-
-async fn list_members(
-    State(state): State<Arc<AppState>>,
-    Path(key): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let conv = resolve_target_for_api(&state, &key, false).await?;
-
-    let members = match state.graph.list_members(&conv.target).await {
-        Ok(m) => m,
-        Err(err) => return Err(map_graph_error(&state.graph, err).await),
-    };
-    let conv_key = conv.conv_key.clone();
-    let members_clone = members.clone();
-    let _ = with_storage(&state.storage, move |s| {
-        s.upsert_members(&conv_key, &members_clone)
-    })
-    .await;
-
-    Ok(Json(json!({
-        "conv_key": conv.conv_key,
-        "title": conv.title,
-        "members": members,
-    })))
-}
-
-async fn search(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<SearchQuery>,
+    Query(query): Query<MailSearchQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let q = query.q.trim().to_string();
     if q.is_empty() {
         return Err(ApiError::bad_request("q must not be empty"));
     }
-    let limit = cli::clamp_limit(query.limit.unwrap_or(50));
-    let target_opt = query
-        .target
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+    let limit = cli::clamp_limit(query.limit.unwrap_or(30));
+    let folder_filter = match query.folder.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(f) => Some(resolve_mail_folder_for_api(&state, f, !query.remote).await?.id),
+        None => None,
+    };
 
     let q_clone = q.clone();
+    let folder_clone = folder_filter.clone();
     let hits = with_storage(&state.storage, move |s| {
-        let conv_key_filter = match target_opt {
-            Some(ref target) => {
-                let cached = s.list_conversations()?;
-                Some(resolver::resolve_from_slice(&cached, target)?.conv_key)
-            }
-            None => None,
-        };
-        s.search_messages(&q_clone, conv_key_filter.as_deref(), limit)
+        s.search_mail(&q_clone, folder_clone.as_deref(), limit)
     })
-    .await
-    .map_err(|err| {
-        let msg = format!("{err:#}");
-        let lower = msg.to_ascii_lowercase();
-        if lower.contains("conversation/channel not found")
-            || lower.contains("ambiguous target")
-            || lower.starts_with("multiple ")
-        {
-            ApiError::not_found(msg)
-        } else {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, msg)
+    .await?;
+
+    let remote = if query.remote {
+        let mut msgs = match state.graph.search_mail_remote(&q, limit).await {
+            Ok(m) => m,
+            Err(err) => return Err(map_graph_error(&state.graph, err).await),
+        };
+        let msgs_clone = msgs.clone();
+        let _ = with_storage(&state.storage, move |s| {
+            s.upsert_mail_messages(&msgs_clone)?;
+            Ok(())
+        })
+        .await;
+        if let Some(ref fid) = folder_filter {
+            msgs.retain(|m| m.folder_id.as_deref() == Some(fid.as_str()));
         }
-    })?;
+        msgs
+    } else {
+        Vec::new()
+    };
 
     Ok(Json(json!({
         "query": q,
         "hits": hits,
+        "remote": remote,
     })))
 }
 
-async fn get_presence(
+// ---------------------------------------------------------------------------
+// Calendar handlers
+// ---------------------------------------------------------------------------
+
+async fn list_calendar_events(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<PresenceQuery>,
+    Query(query): Query<CalendarEventsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    if let Some(raw_ids) = query.user_ids.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        let ids: Vec<String> = raw_ids
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToString::to_string)
-            .collect();
-        if ids.is_empty() {
-            return Err(ApiError::bad_request("user_ids must contain at least one ID"));
-        }
-        let presences = match state.graph.get_presences_by_user_ids(&ids).await {
-            Ok(p) => p,
-            Err(err) => return Err(map_graph_error(&state.graph, err).await),
-        };
-        Ok(Json(json!({ "presences": presences })))
+    let limit = cli::clamp_limit(query.limit.unwrap_or(50));
+    let (start_iso, end_iso) = cli::default_calendar_window(
+        query.from.as_deref(),
+        query.to.as_deref(),
+        query.days.unwrap_or(7),
+    )
+    .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+
+    let events = if query.offline {
+        let start_filter = query.from.as_ref().map(|_| start_iso.clone());
+        let end_filter = query.to.as_ref().map(|_| end_iso.clone());
+        with_storage(&state.storage, move |s| {
+            s.list_calendar_events(start_filter.as_deref(), end_filter.as_deref(), limit)
+        })
+        .await?
     } else {
-        let presence = match state.graph.get_my_presence().await {
-            Ok(p) => p,
+        let fetched = match state
+            .graph
+            .list_calendar_view(&start_iso, &end_iso, limit)
+            .await
+        {
+            Ok(ev) => ev,
             Err(err) => return Err(map_graph_error(&state.graph, err).await),
         };
-        Ok(Json(json!({ "presence": presence })))
-    }
+        let fetched_clone = fetched.clone();
+        let _ = with_storage(&state.storage, move |s| {
+            s.upsert_calendar_events(&fetched_clone)
+        })
+        .await;
+        fetched
+    };
+
+    Ok(Json(json!({
+        "start": start_iso,
+        "end": end_iso,
+        "events": events,
+    })))
 }
 
-async fn set_presence(
+async fn get_calendar_event(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<SetPresenceBody>,
+    Path(id): Path<String>,
+    Query(query): Query<OfflineQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let availability = cli::normalize_presence_availability(&body.availability)
+    let event = if query.offline {
+        let id_owned = id.clone();
+        let events = with_storage(&state.storage, |s| {
+            s.list_calendar_events(None, None, 10_000)
+        })
+        .await?;
+        resolver::resolve_calendar_event_from_slice(&events, &id_owned)
+            .map_err(map_resolve_error)?
+    } else {
+        let fetched = match state.graph.get_calendar_event(&id).await {
+            Ok(ev) => ev,
+            Err(err) => return Err(map_graph_error(&state.graph, err).await),
+        };
+        let fetched_clone = fetched.clone();
+        let _ = with_storage(&state.storage, move |s| {
+            s.upsert_calendar_events(std::slice::from_ref(&fetched_clone))
+        })
+        .await;
+        fetched
+    };
+    Ok(Json(json!({ "event": event })))
+}
+
+async fn create_calendar_event(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateCalendarEventBody>,
+) -> Result<Json<Value>, ApiError> {
+    if body.subject.trim().is_empty() {
+        return Err(ApiError::bad_request("subject must not be empty"));
+    }
+    let start_iso = cli::normalize_datetime_iso(&body.start_iso)
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
-    let activity = body
-        .activity
+    let end_iso = cli::normalize_datetime_iso(&body.end_iso)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    let body_html = body
+        .markdown
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or(&availability);
+        .map(|md| crate::parser::compile_outgoing_mail_html(md, &[], None));
 
+    let outgoing = OutgoingEvent {
+        subject: body.subject,
+        start_iso,
+        end_iso,
+        time_zone: body.time_zone,
+        is_all_day: body.is_all_day,
+        location: body.location,
+        body_html,
+        attendees: body.attendees,
+        is_online_meeting: body.is_online_meeting,
+    };
+    let created = match state.graph.create_calendar_event(&outgoing).await {
+        Ok(ev) => ev,
+        Err(err) => return Err(map_graph_error(&state.graph, err).await),
+    };
+    let created_clone = created.clone();
+    let _ = with_storage(&state.storage, move |s| {
+        s.upsert_calendar_events(std::slice::from_ref(&created_clone))
+    })
+    .await;
+
+    Ok(Json(json!({
+        "ok": true,
+        "event": created,
+    })))
+}
+
+async fn rsvp_calendar_event(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<RsvpEventBody>,
+) -> Result<Json<Value>, ApiError> {
+    let normalized = cli::normalize_rsvp_response(&body.response)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     if let Err(err) = state
         .graph
-        .set_my_presence(&availability, activity, body.expiration_mins)
+        .respond_calendar_event(&id, normalized, body.comment.as_deref())
         .await
     {
         return Err(map_graph_error(&state.graph, err).await);
@@ -1143,32 +1136,288 @@ async fn set_presence(
 
     Ok(Json(json!({
         "ok": true,
-        "availability": availability,
-        "activity": activity,
-        "expiration_mins": body.expiration_mins,
+        "event_id": id,
+        "response": normalized,
     })))
 }
 
+async fn delete_calendar_event(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if let Err(err) = state.graph.delete_calendar_event(&id).await {
+        return Err(map_graph_error(&state.graph, err).await);
+    }
+    let id_clone = id.clone();
+    let _ = with_storage(&state.storage, move |s| s.delete_calendar_event(&id_clone)).await;
+    Ok(Json(json!({
+        "ok": true,
+        "event_id": id,
+    })))
+}
 
-/// Minimal OpenAPI 3.0 description of every route exposed by `build_router`.
+// ---------------------------------------------------------------------------
+// To Do handlers
+// ---------------------------------------------------------------------------
+
+async fn list_todo_lists(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<RefreshOfflineQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let cached = with_storage(&state.storage, |s| s.list_todo_lists()).await?;
+    let lists = if !query.offline && (query.refresh || cached.is_empty()) {
+        let fetched = match state.graph.list_todo_lists().await {
+            Ok(l) => l,
+            Err(err) => return Err(map_graph_error(&state.graph, err).await),
+        };
+        let fetched_clone = fetched.clone();
+        let stored = with_storage(&state.storage, move |s| {
+            s.upsert_todo_lists(&fetched_clone)?;
+            s.list_todo_lists()
+        })
+        .await?;
+        if stored.is_empty() {
+            fetched
+        } else {
+            stored
+        }
+    } else {
+        cached
+    };
+    Ok(Json(json!({ "lists": lists })))
+}
+
+async fn list_todo_tasks(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<TodoTasksQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = cli::clamp_limit(query.limit.unwrap_or(50));
+    let list_query = query
+        .list
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("tasks");
+
+    let resolved = resolve_todo_list_for_api(&state, list_query, query.offline).await?;
+    let list_id = resolved.id.clone();
+
+    let lid_for_read = list_id.clone();
+    let include_completed = query.all;
+    let cached = with_storage(&state.storage, move |s| {
+        s.list_todo_tasks(Some(&lid_for_read), include_completed)
+    })
+    .await?;
+
+    let mut tasks = if !query.offline && (query.refresh || cached.is_empty()) {
+        let fetched = match state
+            .graph
+            .list_todo_tasks(&list_id, include_completed, limit)
+            .await
+        {
+            Ok(t) => t,
+            Err(err) => return Err(map_graph_error(&state.graph, err).await),
+        };
+        let fetched_clone = fetched.clone();
+        let lid_for_store = list_id.clone();
+        let stored = with_storage(&state.storage, move |s| {
+            s.upsert_todo_tasks(&fetched_clone)?;
+            s.list_todo_tasks(Some(&lid_for_store), include_completed)
+        })
+        .await?;
+        if stored.is_empty() {
+            fetched
+        } else {
+            stored
+        }
+    } else {
+        cached
+    };
+    tasks.truncate(limit);
+
+    Ok(Json(json!({
+        "list": resolved,
+        "list_id": list_id,
+        "tasks": tasks,
+    })))
+}
+
+async fn create_todo_task(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateTodoTaskBody>,
+) -> Result<Json<Value>, ApiError> {
+    if body.title.trim().is_empty() {
+        return Err(ApiError::bad_request("title must not be empty"));
+    }
+    let due_date_iso = body
+        .due_date_iso
+        .as_deref()
+        .map(cli::normalize_todo_due_iso)
+        .transpose()
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    let importance = body
+        .importance
+        .as_deref()
+        .map(cli::normalize_todo_importance)
+        .transpose()
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?
+        .map(str::to_string);
+
+    let list_query = body
+        .list
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("tasks");
+    let resolved = resolve_todo_list_for_api(&state, list_query, false).await?;
+
+    let outgoing = OutgoingTodoTask {
+        title: body.title,
+        body_plain: body.body_plain,
+        due_date_iso,
+        importance,
+    };
+    let created = match state.graph.create_todo_task(&resolved.id, &outgoing).await {
+        Ok(t) => t,
+        Err(err) => return Err(map_graph_error(&state.graph, err).await),
+    };
+    let created_clone = created.clone();
+    let _ = with_storage(&state.storage, move |s| {
+        s.upsert_todo_tasks(std::slice::from_ref(&created_clone))
+    })
+    .await;
+
+    Ok(Json(json!({
+        "ok": true,
+        "task": created,
+    })))
+}
+
+async fn patch_todo_task(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<String>,
+    Json(body): Json<PatchTodoTaskBody>,
+) -> Result<Json<Value>, ApiError> {
+    let list_query = body
+        .list
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("tasks");
+    let resolved = resolve_todo_list_for_api(&state, list_query, false).await?;
+    let updated = match state
+        .graph
+        .set_todo_task_completed(&resolved.id, &task_id, body.completed)
+        .await
+    {
+        Ok(t) => t,
+        Err(err) => return Err(map_graph_error(&state.graph, err).await),
+    };
+    let updated_clone = updated.clone();
+    let _ = with_storage(&state.storage, move |s| {
+        s.upsert_todo_tasks(std::slice::from_ref(&updated_clone))
+    })
+    .await;
+
+    Ok(Json(json!({
+        "ok": true,
+        "task": updated,
+    })))
+}
+
+async fn delete_todo_task(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<String>,
+    Query(query): Query<DeleteTodoTaskQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let list_query = query
+        .list
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("tasks");
+    let resolved = resolve_todo_list_for_api(&state, list_query, false).await?;
+    if let Err(err) = state.graph.delete_todo_task(&resolved.id, &task_id).await {
+        return Err(map_graph_error(&state.graph, err).await);
+    }
+    let tid_clone = task_id.clone();
+    let _ = with_storage(&state.storage, move |s| s.delete_todo_task(&tid_clone)).await;
+
+    Ok(Json(json!({
+        "ok": true,
+        "list_id": resolved.id,
+        "task_id": task_id,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Contacts handler
+// ---------------------------------------------------------------------------
+
+async fn list_contacts(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ContactsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = cli::clamp_limit(query.limit.unwrap_or(50));
+    let q = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let contacts = if query.offline {
+        let q_clone = q.clone();
+        with_storage(&state.storage, move |s| {
+            s.list_contacts(q_clone.as_deref(), limit)
+        })
+        .await?
+    } else if let Some(ref q_str) = q {
+        let fetched = match state.graph.search_contacts_and_directory(q_str, limit).await {
+            Ok(c) => c,
+            Err(err) => return Err(map_graph_error(&state.graph, err).await),
+        };
+        let fetched_clone = fetched.clone();
+        let _ = with_storage(&state.storage, move |s| s.upsert_contacts(&fetched_clone)).await;
+        fetched
+    } else {
+        let fetched = match state.graph.list_contacts(limit).await {
+            Ok(c) => c,
+            Err(err) => return Err(map_graph_error(&state.graph, err).await),
+        };
+        let fetched_clone = fetched.clone();
+        let _ = with_storage(&state.storage, move |s| s.upsert_contacts(&fetched_clone)).await;
+        fetched
+    };
+
+    Ok(Json(json!({ "contacts": contacts })))
+}
+
+// ---------------------------------------------------------------------------
+// OpenAPI 3.1 Specification
+// ---------------------------------------------------------------------------
+
+/// OpenAPI 3.1.0 description of every route exposed by `build_router`.
 pub fn openapi_document() -> Value {
     let ops: &[(&str, &str, &str)] = &[
         ("/health", "get", "Health check (public)"),
-        ("/conversations", "get", "List chats & channels (supports ?limit=100&refresh=true)"),
-        ("/chats", "post", "Create a chat"),
-        ("/teams", "get", "List joined teams"),
-        ("/conversations/{key}/messages", "get post", "Read (supports ?limit=&before=&fetch_older=&offline=) / send messages"),
-        ("/conversations/{key}/threads/{root_id}", "get", "Read a channel thread"),
-        ("/conversations/{key}/messages/{msg_id}/replies", "post", "Reply to a message"),
-        ("/conversations/{key}/files", "post", "Send a file"),
-        ("/conversations/{key}/messages/{msg_id}/attachments/download", "post", "Download attachment"),
-        ("/conversations/{key}/messages/{msg_id}/reactions", "post", "React to a message"),
-        ("/conversations/{key}/messages/{msg_id}", "patch delete", "Edit / delete a message"),
-        ("/conversations/{key}/read", "post", "Mark conversation read"),
-        ("/conversations/{key}/members", "get", "List members"),
-        ("/search", "get", "Search Teams messages"),
-        ("/presence", "get post", "Get / set presence"),
-        ("/openapi.json", "get", "This OpenAPI document"),
+        ("/openapi.json", "get", "OpenAPI 3.1 specification"),
+        ("/v1/whoami", "get", "Current user profile, auth source, and token status"),
+        ("/v1/mail/folders", "get", "List Outlook mail folders"),
+        ("/v1/mail/messages", "get", "List messages in a folder"),
+        ("/v1/mail/messages/{id}", "get patch delete", "Read, update (read/flag/move), or delete a mail message"),
+        ("/v1/mail/send", "post", "Send a new email"),
+        ("/v1/mail/messages/{id}/reply", "post", "Reply to a mail message"),
+        ("/v1/mail/messages/{id}/forward", "post", "Forward a mail message"),
+        ("/v1/mail/messages/{id}/attachments/{att_id}/download", "post", "Download a mail attachment to disk"),
+        ("/v1/mail/search", "get", "Search mail messages locally (SQLite FTS5) or remotely (Graph KQL)"),
+        ("/v1/calendar/events", "get post", "List calendar events or create a new event"),
+        ("/v1/calendar/events/{id}", "get delete", "Read or delete a calendar event"),
+        ("/v1/calendar/events/{id}/rsvp", "post", "Respond (accept/tentative/decline) to a calendar event"),
+        ("/v1/todo/lists", "get", "List Microsoft To Do task lists"),
+        ("/v1/todo/tasks", "get post", "List or create To Do tasks"),
+        ("/v1/todo/tasks/{id}", "patch delete", "Complete/reopen or delete a To Do task"),
+        ("/v1/contacts", "get", "List or search Outlook contacts and directory"),
     ];
 
     let mut paths = serde_json::Map::new();
@@ -1187,9 +1436,9 @@ pub fn openapi_document() -> Value {
     }
 
     json!({
-        "openapi": "3.0.3",
+        "openapi": "3.1.0",
         "info": {
-            "title": "teams-cli local HTTP API (Microsoft Teams)",
+            "title": "outlook-cli local HTTP API (Mail · Calendar · To Do · Contacts)",
             "version": env!("CARGO_PKG_VERSION"),
         },
         "components": {
@@ -1206,63 +1455,22 @@ async fn openapi_spec() -> Json<Value> {
     Json(openapi_document())
 }
 
-fn parse_kind_filter(raw: &str) -> Result<ConversationKind, ApiError> {
-    match raw.to_ascii_lowercase().as_str() {
-        "oneonone" | "one_on_one" | "1:1" => Ok(ConversationKind::OneOnOne),
-        "group" => Ok(ConversationKind::Group),
-        "meeting" => Ok(ConversationKind::Meeting),
-        "channel" => Ok(ConversationKind::Channel),
-        _ => Err(ApiError::bad_request(format!(
-            "invalid kind '{raw}' (expected oneOnOne, group, meeting, or channel)"
-        ))),
-    }
-}
-
-fn parse_mention_inputs(inputs: &[MentionInput]) -> Result<Vec<MentionInfo>, ApiError> {
-    let mut out = Vec::with_capacity(inputs.len());
-    for (idx, item) in inputs.iter().enumerate() {
-        match item {
-            MentionInput::Spec(spec) => {
-                let parsed = cli::parse_mention_spec(spec, idx as i32)
-                    .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
-                out.push(parsed);
-            }
-            MentionInput::Object {
-                id,
-                user_id,
-                display_name,
-            } => {
-                let uid = user_id.trim();
-                let name = display_name.trim();
-                if uid.is_empty() || name.is_empty() {
-                    return Err(ApiError::bad_request(
-                        "mention user_id and display_name must not be empty",
-                    ));
-                }
-                out.push(MentionInfo {
-                    id: id.unwrap_or(idx as i32),
-                    user_id: uid.to_string(),
-                    display_name: name.to_string(),
-                });
-            }
-        }
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::AuthManager;
+    use crate::{
+        auth::AuthManager,
+        models::{CalendarEvent, ContactItem, MailFolder, MailMessage, TodoList, TodoTask},
+    };
 
-    async fn spawn_test_server(token: Option<String>) -> String {
+    async fn spawn_test_server(api_key: Option<String>) -> String {
         let cfg = AppConfig::default();
         let auth = AuthManager::new(cfg.clone()).unwrap();
         let graph = GraphClient::new(cfg.clone(), auth)
             .unwrap()
             .with_my_user_id("me-123");
         let storage = Storage::open_in_memory().unwrap();
-        let router = build_router(cfg, graph, storage, token);
+        let router = build_router(cfg, graph, storage, api_key);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1274,7 +1482,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_is_public_and_protected_routes_require_bearer_token() {
-        let base = spawn_test_server(Some("secret-token".to_string())).await;
+        let base = spawn_test_server(Some("secret-key".to_string())).await;
         let client = reqwest::Client::new();
 
         // /health must succeed without Authorization header
@@ -1285,154 +1493,143 @@ mod tests {
         assert_eq!(body.user_id.as_deref(), Some("me-123"));
         assert_eq!(body.version, env!("CARGO_PKG_VERSION"));
 
-        // Protected route without token -> 401 JSON error
+        // Protected route without token -> 401
         let res = client
-            .get(format!("{base}/conversations"))
+            .get(format!("{base}/v1/mail/folders?offline=true"))
             .send()
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-        let err: Value = res.json().await.unwrap();
-        assert!(err["error"].as_str().is_some());
 
         // Protected route with wrong token -> 401
         let res = client
-            .get(format!("{base}/conversations"))
-            .bearer_auth("wrong-token")
+            .get(format!("{base}/v1/mail/folders?offline=true"))
+            .bearer_auth("wrong-key")
             .send()
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
-        // Protected route with valid token -> 200
+        // Protected route with valid Bearer token -> 200
         let res = client
-            .get(format!("{base}/conversations"))
-            .bearer_auth("secret-token")
+            .get(format!("{base}/v1/mail/folders?offline=true"))
+            .bearer_auth("secret-key")
             .send()
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let data: Value = res.json().await.unwrap();
-        assert!(data["conversations"].is_array());
+        assert!(data["folders"].is_array());
     }
 
     #[tokio::test]
-    async fn validation_rejects_empty_bodies_and_bad_queries() {
-        let base = spawn_test_server(None).await;
-        let client = reqwest::Client::new();
-
-        let res = client
-            .post(format!("{base}/chats"))
-            .json(&json!({ "members": [] }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-
-        let res = client
-            .get(format!("{base}/search?q=%20%20"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-
-        let res = client
-            .get(format!("{base}/conversations?kind=bogus"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-
-        let res = client
-            .post(format!("{base}/presence"))
-            .json(&json!({ "availability": "InvalidState" }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-
-        let res = client
-            .post(format!("{base}/conversations/chat%3A1/messages"))
-            .json(&json!({ "markdown": "  " }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn parses_mention_inputs_both_formats() {
-        let parsed = parse_mention_inputs(&[
-            MentionInput::Spec("u1:Alice".to_string()),
-            MentionInput::Object {
-                id: Some(5),
-                user_id: "u2".to_string(),
-                display_name: "Bob".to_string(),
-            },
-        ])
-        .unwrap();
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].id, 0);
-        assert_eq!(parsed[0].user_id, "u1");
-        assert_eq!(parsed[1].id, 5);
-        assert_eq!(parsed[1].display_name, "Bob");
-    }
-
-    #[tokio::test]
-    async fn offline_routes_resolve_url_encoded_conv_key_and_search() {
-        use crate::models::MessageItem;
-
+    async fn offline_sqlite_routes_and_openapi_3_1_work() {
         let cfg = AppConfig::default();
         let auth = AuthManager::new(cfg.clone()).unwrap();
-        let graph = GraphClient::new(cfg.clone(), auth).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth)
+            .unwrap()
+            .with_my_user_id("me-123");
         let storage = Storage::open_in_memory().unwrap();
 
-        let conv = crate::models::ConversationSummary {
-            conv_key: "chat:19:room1@thread.v2".to_string(),
-            target: ConversationTarget::Chat {
-                chat_id: "19:room1@thread.v2".to_string(),
-            },
-            kind: ConversationKind::OneOnOne,
-            team_id: None,
-            team_name: None,
-            title: "Alice".to_string(),
-            topic: None,
-            unread_count: 1,
-            last_read_at: None,
-            last_msg_id: Some("m1".to_string()),
-            last_msg_author: Some("Alice".to_string()),
-            last_msg_preview: Some("Deploy complete".to_string()),
-            last_updated_at: Some("2026-11-15T06:00:00Z".to_string()),
-            pinned: false,
-            peer_user_id: Some("u-alice".to_string()),
-            web_url: None,
-        };
-        storage.upsert_conversations(&[conv]).unwrap();
         storage
-            .upsert_messages(&[MessageItem {
-                msg_key: "chat:19:room1@thread.v2|m1".to_string(),
-                conv_key: "chat:19:room1@thread.v2".to_string(),
-                msg_id: "m1".to_string(),
-                parent_msg_id: None,
-                reply_to_id: None,
-                reply_to_author: None,
-                reply_to_preview: None,
-                subject: None,
-                author_id: Some("u-alice".to_string()),
-                author_name: "Alice".to_string(),
-                is_me: false,
-                created_at: "2026-11-15T06:00:00Z".to_string(),
-                last_modified_at: None,
-                deleted: false,
-                importance: "normal".to_string(),
-                message_type: "message".to_string(),
-                body_html: "<p>Deployment completed</p>".to_string(),
-                body_plain: "Deployment completed".to_string(),
-                attachments: vec![],
-                mentions: vec![],
-                reactions: vec![],
-                reply_count: 0,
-                web_url: None,
+            .upsert_mail_folders(&[MailFolder {
+                id: "folder-inbox".to_string(),
+                display_name: "Inbox".to_string(),
+                well_known_name: Some("inbox".to_string()),
+                parent_folder_id: None,
+                child_folder_count: 0,
+                unread_item_count: 1,
+                total_item_count: 1,
+            }])
+            .unwrap();
+        storage
+            .upsert_mail_messages(&[MailMessage {
+                id: "mail-1".to_string(),
+                internet_message_id: None,
+                conversation_id: Some("conv-1".to_string()),
+                folder_id: Some("folder-inbox".to_string()),
+                subject: "Quarterly Release Plan".to_string(),
+                from: None,
+                to_recipients: Vec::new(),
+                cc_recipients: Vec::new(),
+                bcc_recipients: Vec::new(),
+                reply_to: Vec::new(),
+                received_at: "2026-11-18T10:00:00Z".to_string(),
+                sent_at: None,
+                is_read: false,
+                is_draft: false,
+                flagged: true,
+                importance: "high".to_string(),
+                inference_classification: Some("focused".to_string()),
+                has_attachments: false,
+                body_loaded: true,
+                preview: "Release checklist ready".to_string(),
+                body_html: "<p>Release checklist ready</p>".to_string(),
+                body_plain: "Release checklist ready".to_string(),
+                attachments: Vec::new(),
+                meeting_request: None,
+                web_link: None,
+            }])
+            .unwrap();
+        storage
+            .upsert_calendar_events(&[CalendarEvent {
+                id: "ev-1".to_string(),
+                subject: "Architecture Review".to_string(),
+                start_iso: "2026-11-20T09:00:00Z".to_string(),
+                end_iso: "2026-11-20T10:00:00Z".to_string(),
+                time_zone: "UTC".to_string(),
+                is_all_day: false,
+                location: Some("Room 4B".to_string()),
+                organizer_name: Some("Alice".to_string()),
+                organizer_email: Some("alice@example.com".to_string()),
+                attendees: Vec::new(),
+                response_status: "accepted".to_string(),
+                is_online_meeting: true,
+                online_meeting_url: Some("https://teams.microsoft.com/l/meetup/1".to_string()),
+                body_html: String::new(),
+                body_plain: String::new(),
+                is_cancelled: false,
+                web_link: None,
+            }])
+            .unwrap();
+        storage
+            .upsert_todo_lists(&[TodoList {
+                id: "list-default".to_string(),
+                display_name: "Tasks".to_string(),
+                wellknown_list_name: Some("defaultList".to_string()),
+                is_owner: true,
+                is_shared: false,
+            }])
+            .unwrap();
+        storage
+            .upsert_todo_tasks(&[TodoTask {
+                id: "task-1".to_string(),
+                list_id: "list-default".to_string(),
+                title: "Verify release checksums".to_string(),
+                status: "notStarted".to_string(),
+                importance: "high".to_string(),
+                body_plain: None,
+                due_date_iso: Some("2026-11-21T00:00:00Z".to_string()),
+                reminder_iso: None,
+                completed_at: None,
+                created_at: None,
+                updated_at: None,
+            }])
+            .unwrap();
+        storage
+            .upsert_contacts(&[ContactItem {
+                id: "c-1".to_string(),
+                display_name: "Alice Smith".to_string(),
+                given_name: Some("Alice".to_string()),
+                surname: Some("Smith".to_string()),
+                email_addresses: vec!["alice@example.com".to_string()],
+                mobile_phone: None,
+                business_phones: Vec::new(),
+                company_name: Some("Contoso".to_string()),
+                job_title: None,
+                department: None,
+                notes: None,
+                source: "contact".to_string(),
             }])
             .unwrap();
 
@@ -1445,169 +1642,171 @@ mod tests {
         let base = format!("http://{addr}");
         let client = reqwest::Client::new();
 
-        // URL-encoded conv_key resolves cleanly in offline mode
+        // Mail list offline via well-known alias
         let res = client
-            .get(format!(
-                "{base}/conversations/chat%3A19%3Aroom1%40thread.v2/messages?offline=true"
-            ))
+            .get(format!("{base}/v1/mail/messages?folder=inbox&offline=true"))
             .send()
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let body: Value = res.json().await.unwrap();
-        assert_eq!(body["conversation"]["title"], "Alice");
-        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
-        assert_eq!(body["messages"][0]["body_plain"], "Deployment completed");
+        assert_eq!(body["folder"]["id"], "folder-inbox");
+        assert_eq!(body["messages"][0]["id"], "mail-1");
 
-        // Search finds cached message
+        // Mail get offline
         let res = client
-            .get(format!("{base}/search?q=Deployment&target=Alice"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let search_body: Value = res.json().await.unwrap();
-        assert_eq!(search_body["hits"].as_array().unwrap().len(), 1);
-        assert_eq!(search_body["hits"][0]["msg_id"], "m1");
-    }
-
-    #[tokio::test]
-    async fn conversations_limit_messages_before_pagination_and_pure_teams_openapi() {
-        use crate::models::MessageItem;
-
-        let cfg = AppConfig::default();
-        let auth = AuthManager::new(cfg.clone()).unwrap();
-        let graph = GraphClient::new(cfg.clone(), auth).unwrap();
-        let storage = Storage::open_in_memory().unwrap();
-
-        let mk_conv = |id: &str, title: &str, updated: &str| crate::models::ConversationSummary {
-            conv_key: format!("chat:{id}"),
-            target: ConversationTarget::Chat {
-                chat_id: id.to_string(),
-            },
-            kind: ConversationKind::OneOnOne,
-            team_id: None,
-            team_name: None,
-            title: title.to_string(),
-            topic: None,
-            unread_count: 0,
-            last_read_at: None,
-            last_msg_id: None,
-            last_msg_author: None,
-            last_msg_preview: None,
-            last_updated_at: Some(updated.to_string()),
-            pinned: false,
-            peer_user_id: None,
-            web_url: None,
-        };
-        storage
-            .upsert_conversations(&[
-                mk_conv("c1", "First Room", "2026-11-15T06:00:00Z"),
-                mk_conv("c2", "Second Room", "2026-11-15T05:00:00Z"),
-            ])
-            .unwrap();
-
-        let mk_msg = |id: &str, ts: &str| MessageItem {
-            msg_key: format!("chat:c1|{id}"),
-            conv_key: "chat:c1".to_string(),
-            msg_id: id.to_string(),
-            parent_msg_id: None,
-            reply_to_id: None,
-            reply_to_author: None,
-            reply_to_preview: None,
-            subject: None,
-            author_id: Some("u1".to_string()),
-            author_name: "Bob".to_string(),
-            is_me: false,
-            created_at: ts.to_string(),
-            last_modified_at: None,
-            deleted: false,
-            importance: "normal".to_string(),
-            message_type: "message".to_string(),
-            body_html: format!("<p>{id}</p>"),
-            body_plain: id.to_string(),
-            attachments: vec![],
-            mentions: vec![],
-            reactions: vec![],
-            reply_count: 0,
-            web_url: None,
-        };
-        storage
-            .upsert_messages(&[
-                mk_msg("m1", "2026-10-30T10:00:00Z"),
-                mk_msg("m2", "2026-10-31T10:00:00Z"),
-                mk_msg("m3", "2026-11-01T10:00:00Z"),
-            ])
-            .unwrap();
-
-        let router = build_router(cfg, graph, storage, None);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        let base = format!("http://{addr}");
-        let client = reqwest::Client::new();
-
-        // `GET /conversations?limit=1` truncates to 1
-        let res = client
-            .get(format!("{base}/conversations?limit=1"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let conv_body: Value = res.json().await.unwrap();
-        assert_eq!(conv_body["conversations"].as_array().unwrap().len(), 1);
-
-        // `GET /conversations/{key}/messages?before=m3&limit=1&offline=true`
-        let res = client
-            .get(format!(
-                "{base}/conversations/chat%3Ac1/messages?before=m3&limit=1&offline=true"
-            ))
+            .get(format!("{base}/v1/mail/messages/mail-1?offline=true"))
             .send()
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let msg_body: Value = res.json().await.unwrap();
-        assert_eq!(msg_body["messages"].as_array().unwrap().len(), 1);
-        assert_eq!(msg_body["messages"][0]["msg_id"], "m2");
-        assert_eq!(msg_body["has_more"], true);
-        assert_eq!(msg_body["next_before"], "m2");
+        assert_eq!(msg_body["message"]["subject"], "Quarterly Release Plan");
 
-        // Invalid `before` -> 400 BAD_REQUEST
+        // Mail search offline
         let res = client
-            .get(format!(
-                "{base}/conversations/chat%3Ac1/messages?before=not-a-date&offline=true"
-            ))
+            .get(format!("{base}/v1/mail/search?q=checklist"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let search_body: Value = res.json().await.unwrap();
+        assert_eq!(search_body["hits"][0]["id"], "mail-1");
+
+        // Calendar list & get offline
+        let res = client
+            .get(format!("{base}/v1/calendar/events?offline=true"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let cal_body: Value = res.json().await.unwrap();
+        assert_eq!(cal_body["events"][0]["id"], "ev-1");
+
+        let res = client
+            .get(format!("{base}/v1/calendar/events/ev-1?offline=true"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let ev_body: Value = res.json().await.unwrap();
+        assert_eq!(ev_body["event"]["subject"], "Architecture Review");
+
+        // To Do lists & tasks offline
+        let res = client
+            .get(format!("{base}/v1/todo/lists?offline=true"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = client
+            .get(format!("{base}/v1/todo/tasks?list=tasks&offline=true"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let tasks_body: Value = res.json().await.unwrap();
+        assert_eq!(tasks_body["tasks"][0]["id"], "task-1");
+
+        // Contacts offline
+        let res = client
+            .get(format!("{base}/v1/contacts?q=Alice&offline=true"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let contacts_body: Value = res.json().await.unwrap();
+        assert_eq!(contacts_body["contacts"][0]["id"], "c-1");
+
+        // OpenAPI 3.1 spec lists all Outlook v1 routes
+        let res = client.get(format!("{base}/openapi.json")).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let spec: Value = res.json().await.unwrap();
+        assert_eq!(spec["openapi"], "3.1.0");
+        let paths = spec["paths"].as_object().unwrap();
+        for expected in [
+            "/health",
+            "/openapi.json",
+            "/v1/whoami",
+            "/v1/mail/folders",
+            "/v1/mail/messages",
+            "/v1/mail/messages/{id}",
+            "/v1/mail/send",
+            "/v1/mail/messages/{id}/reply",
+            "/v1/mail/messages/{id}/forward",
+            "/v1/mail/messages/{id}/attachments/{att_id}/download",
+            "/v1/mail/search",
+            "/v1/calendar/events",
+            "/v1/calendar/events/{id}",
+            "/v1/calendar/events/{id}/rsvp",
+            "/v1/todo/lists",
+            "/v1/todo/tasks",
+            "/v1/todo/tasks/{id}",
+            "/v1/contacts",
+        ] {
+            assert!(paths.contains_key(expected), "OpenAPI missing {expected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_empty_bodies_and_bad_queries() {
+        let base = spawn_test_server(None).await;
+        let client = reqwest::Client::new();
+
+        let res = client
+            .post(format!("{base}/v1/mail/send"))
+            .json(&json!({ "to": [], "subject": "Hi", "markdown": "Body" }))
             .send()
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
-        // `/openapi.json` advertises only pure Teams endpoints
-        let res = client.get(format!("{base}/openapi.json")).send().await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let spec: Value = res.json().await.unwrap();
-        let paths = spec["paths"].as_object().unwrap();
-        assert!(paths.contains_key("/conversations"));
-        assert!(paths.contains_key("/conversations/{key}/messages"));
-        for p in paths.keys() {
-            assert!(
-                !p.starts_with("/mail")
-                    && !p.starts_with("/calendar")
-                    && !p.starts_with("/contacts")
-                    && !p.starts_with("/todo")
-                    && !p.contains("onenote"),
-                "unexpected non-Teams route in openapi: {p}"
-            );
-        }
+        let res = client
+            .patch(format!("{base}/v1/mail/messages/m1"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let res = client
+            .get(format!("{base}/v1/mail/search?q=%20%20"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let res = client
+            .post(format!("{base}/v1/calendar/events/ev1/rsvp"))
+            .json(&json!({ "response": "maybe" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let res = client
+            .post(format!("{base}/v1/calendar/events"))
+            .json(&json!({ "subject": " ", "start_iso": "2026-11-20T09:00:00Z", "end_iso": "2026-11-20T10:00:00Z" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let res = client
+            .post(format!("{base}/v1/todo/tasks"))
+            .json(&json!({ "title": "  " }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
-    fn non_loopback_bind_requires_token_or_env_override() {
-        let loopback: SocketAddr = "127.0.0.1:8788".parse().unwrap();
-        let any_v4: SocketAddr = "0.0.0.0:8788".parse().unwrap();
-        let lan_v4: SocketAddr = "192.168.1.10:8788".parse().unwrap();
+    fn non_loopback_bind_requires_api_key_or_env_override() {
+        let loopback: SocketAddr = "127.0.0.1:3939".parse().unwrap();
+        let any_v4: SocketAddr = "0.0.0.0:3939".parse().unwrap();
+        let lan_v4: SocketAddr = "192.168.1.10:3939".parse().unwrap();
 
         assert!(check_bind_security(loopback, None, None).is_ok());
         assert!(check_bind_security(any_v4, None, None).is_err());
@@ -1622,24 +1821,20 @@ mod tests {
         let base_no_tok = spawn_test_server(None).await;
         let client = reqwest::Client::new();
 
-        // Remote origin must not receive Access-Control-Allow-Origin when --token is None
         let res = client
-            .get(format!("{base_no_tok}/conversations"))
+            .get(format!("{base_no_tok}/v1/mail/folders?offline=true"))
             .header(header::ORIGIN, "https://evil.example.com")
             .send()
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        assert!(
-            res.headers()
-                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-                .is_none(),
-            "unexpected ACAO header for remote origin without token"
-        );
+        assert!(res
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
 
-        // Localhost origin IS allowed when --token is None
         let res = client
-            .get(format!("{base_no_tok}/conversations"))
+            .get(format!("{base_no_tok}/v1/mail/folders?offline=true"))
             .header(header::ORIGIN, "http://localhost:3000")
             .send()
             .await
@@ -1652,324 +1847,7 @@ mod tests {
             Some("http://localhost:3000")
         );
 
-        // Loopback IPv6 origin IS allowed
         assert!(is_loopback_origin("http://[::1]:5173"));
         assert!(!is_loopback_origin("https://localhost.evil.com"));
-    }
-
-    #[tokio::test]
-    async fn download_and_target_resolution_preserve_403_and_500_status_codes() {
-        use crate::auth::StoredTokens;
-
-        let mock_app = Router::new()
-            .route(
-                "/v1.0/me/chats",
-                get(|| async {
-                    (
-                        StatusCode::FORBIDDEN,
-                        Json(json!({
-                            "error": {
-                                "code": "Authorization_RequestDenied",
-                                "message": "Insufficient privileges"
-                            }
-                        })),
-                    )
-                }),
-            )
-            .route(
-                "/v1.0/me/joinedTeams",
-                get(|| async {
-                    (
-                        StatusCode::FORBIDDEN,
-                        Json(json!({
-                            "error": {
-                                "code": "Authorization_RequestDenied",
-                                "message": "Insufficient privileges"
-                            }
-                        })),
-                    )
-                }),
-            )
-            .route(
-                "/v1.0/chats/{chat_id}/messages",
-                get(|| async {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "error": { "code": "InternalServerError", "message": "boom" } })),
-                    )
-                }),
-            );
-        let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mock_addr = mock_listener.local_addr().unwrap();
-        let mock_server = tokio::spawn(async move {
-            axum::serve(mock_listener, mock_app).await.unwrap();
-        });
-
-        let cfg = AppConfig {
-            graph_base_url: format!("http://{mock_addr}/v1.0"),
-            ..AppConfig::default()
-        };
-        let tokens = StoredTokens {
-            access_token: "tok".to_string(),
-            refresh_token: None,
-            expires_at: chrono::Utc::now().timestamp() + 3600,
-            client_id: cfg.client_id.clone(),
-            tenant_id: cfg.tenant_id.clone(),
-            user_id: Some("me-1".to_string()),
-            user_display_name: None,
-            user_email: None,
-            auth_mode: "pkce".to_string(),
-        };
-        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
-        let graph = GraphClient::new(cfg.clone(), auth)
-            .unwrap()
-            .with_my_user_id("me-1");
-        let storage = Storage::open_in_memory().unwrap();
-        storage
-            .upsert_conversations(&[crate::models::ConversationSummary {
-                conv_key: "chat:c-err".to_string(),
-                target: ConversationTarget::Chat {
-                    chat_id: "c-err".to_string(),
-                },
-                kind: ConversationKind::OneOnOne,
-                team_id: None,
-                team_name: None,
-                title: "ErrRoom".to_string(),
-                topic: None,
-                unread_count: 0,
-                last_read_at: None,
-                last_msg_id: None,
-                last_msg_author: None,
-                last_msg_preview: None,
-                last_updated_at: None,
-                pinned: false,
-                peer_user_id: None,
-                web_url: None,
-            }])
-            .unwrap();
-
-        let router = build_router(cfg, graph, storage, None);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let api_server = tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        let base = format!("http://{addr}");
-        let client = reqwest::Client::new();
-
-        // Target resolution encountering 403 from Graph returns 403 Forbidden (not 404)
-        let res = client
-            .get(format!("{base}/conversations/UnknownChat/messages"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
-
-        // download_attachment encountering Graph 500 returns 500 (not 400)
-        let res = client
-            .post(format!(
-                "{base}/conversations/chat%3Ac-err/messages/m999/attachments/download"
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
-
-        api_server.abort();
-        mock_server.abort();
-    }
-
-    #[tokio::test]
-    async fn cached_inline_hosted_image_exposed_in_messages_threads_and_download() {
-        use crate::auth::StoredTokens;
-        use crate::models::{ConversationSummary, MessageItem};
-
-        let png_bytes = b"\x89PNG\r\n\x1a\nhttp-inline-shot".to_vec();
-        let served_bytes = png_bytes.clone();
-        let mock_app = Router::new().route(
-            "/v1.0/chats/c1/messages/m2/hostedContents/1/$value",
-            get(move || {
-                let bytes = served_bytes.clone();
-                async move { (StatusCode::OK, bytes) }
-            }),
-        );
-        let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mock_addr = mock_listener.local_addr().unwrap();
-        let mock_server = tokio::spawn(async move {
-            axum::serve(mock_listener, mock_app).await.unwrap();
-        });
-
-        let dl_dir = tempfile::tempdir().unwrap();
-        let cfg = AppConfig {
-            graph_base_url: format!("http://{mock_addr}/v1.0"),
-            download_dir: dl_dir.path().display().to_string(),
-            ..AppConfig::default()
-        };
-        let tokens = StoredTokens {
-            access_token: "tok".to_string(),
-            refresh_token: None,
-            expires_at: chrono::Utc::now().timestamp() + 3600,
-            client_id: cfg.client_id.clone(),
-            tenant_id: cfg.tenant_id.clone(),
-            user_id: Some("me-1".to_string()),
-            user_display_name: None,
-            user_email: None,
-            auth_mode: "pkce".to_string(),
-        };
-        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
-        let graph = GraphClient::new(cfg.clone(), auth)
-            .unwrap()
-            .with_my_user_id("me-1");
-        let storage = Storage::open_in_memory().unwrap();
-
-        storage
-            .upsert_conversations(&[
-                ConversationSummary {
-                    conv_key: "chat:c1".to_string(),
-                    target: ConversationTarget::Chat {
-                        chat_id: "c1".to_string(),
-                    },
-                    kind: ConversationKind::OneOnOne,
-                    team_id: None,
-                    team_name: None,
-                    title: "Inline Chat".to_string(),
-                    topic: None,
-                    unread_count: 0,
-                    last_read_at: None,
-                    last_msg_id: None,
-                    last_msg_author: None,
-                    last_msg_preview: None,
-                    last_updated_at: None,
-                    pinned: false,
-                    peer_user_id: None,
-                    web_url: None,
-                },
-                ConversationSummary {
-                    conv_key: "chan:t1:ch1".to_string(),
-                    target: ConversationTarget::Channel {
-                        team_id: "t1".to_string(),
-                        channel_id: "ch1".to_string(),
-                    },
-                    kind: ConversationKind::Channel,
-                    team_id: Some("t1".to_string()),
-                    team_name: Some("Eng".to_string()),
-                    title: "General".to_string(),
-                    topic: None,
-                    unread_count: 0,
-                    last_read_at: None,
-                    last_msg_id: None,
-                    last_msg_author: None,
-                    last_msg_preview: None,
-                    last_updated_at: None,
-                    pinned: false,
-                    peer_user_id: None,
-                    web_url: None,
-                },
-            ])
-            .unwrap();
-
-        let graph_hosted_url =
-            "https://graph.microsoft.com/v1.0/chats/c1/messages/m1/hostedContents/1/$value";
-        let local_hosted_url =
-            format!("http://{mock_addr}/v1.0/chats/c1/messages/m2/hostedContents/1/$value");
-
-        let mk_cached = |conv_key: &str, msg_id: &str, parent: Option<&str>, ts: &str, url: &str| {
-            MessageItem {
-                msg_key: format!("{conv_key}|{msg_id}"),
-                conv_key: conv_key.to_string(),
-                msg_id: msg_id.to_string(),
-                parent_msg_id: parent.map(str::to_string),
-                reply_to_id: None,
-                reply_to_author: None,
-                reply_to_preview: None,
-                subject: None,
-                author_id: Some("u1".to_string()),
-                author_name: "Alice".to_string(),
-                is_me: false,
-                created_at: ts.to_string(),
-                last_modified_at: None,
-                deleted: false,
-                importance: "normal".to_string(),
-                message_type: "message".to_string(),
-                body_html: format!(r#"<p>Inline</p><img src="{url}">"#),
-                body_plain: "Inline".to_string(),
-                attachments: vec![],
-                mentions: vec![],
-                reactions: vec![],
-                reply_count: 0,
-                web_url: None,
-            }
-        };
-
-        storage
-            .upsert_messages(&[
-                mk_cached("chat:c1", "m1", None, "2026-11-18T10:00:00Z", graph_hosted_url),
-                mk_cached("chat:c1", "m2", None, "2026-11-18T10:01:00Z", &local_hosted_url),
-                mk_cached(
-                    "chan:t1:ch1",
-                    "root-1",
-                    None,
-                    "2026-11-18T10:02:00Z",
-                    graph_hosted_url,
-                ),
-            ])
-            .unwrap();
-
-        let router = build_router(cfg, graph, storage, None);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let api_server = tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        let base = format!("http://{addr}");
-        let client = reqwest::Client::new();
-
-        // GET /conversations/{key}/messages?offline=true exposes hosted:1
-        let res = client
-            .get(format!("{base}/conversations/chat%3Ac1/messages?offline=true"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let body: Value = res.json().await.unwrap();
-        assert_eq!(body["messages"][0]["attachments"][0]["id"], "hosted:1");
-        assert_eq!(
-            body["messages"][0]["attachments"][0]["content_url"],
-            graph_hosted_url
-        );
-
-        // GET /conversations/{key}/threads/{root_id}?offline=true exposes hosted:1
-        let res = client
-            .get(format!(
-                "{base}/conversations/chan%3At1%3Ach1/threads/root-1?offline=true"
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let thread_body: Value = res.json().await.unwrap();
-        assert_eq!(
-            thread_body["thread"]["root"]["attachments"][0]["id"],
-            "hosted:1"
-        );
-
-        // POST /conversations/{key}/messages/{msg_id}/attachments/download downloads hosted:1
-        let res = client
-            .post(format!(
-                "{base}/conversations/chat%3Ac1/messages/m2/attachments/download"
-            ))
-            .json(&json!({ "index": 0 }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let dl_body: Value = res.json().await.unwrap();
-        assert_eq!(dl_body["ok"], true);
-        assert_eq!(dl_body["bytes_written"], png_bytes.len());
-        let saved_path = dl_body["path"].as_str().unwrap();
-        assert_eq!(std::fs::read(saved_path).unwrap(), png_bytes);
-
-        api_server.abort();
-        mock_server.abort();
     }
 }

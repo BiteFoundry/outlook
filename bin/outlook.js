@@ -16,7 +16,7 @@ const SUPPORTED = [
 ];
 
 function fail(message) {
-  process.stderr.write(`teams: ${message}\n`);
+  process.stderr.write(`outlook: ${message}\n`);
   process.exit(1);
 }
 
@@ -25,7 +25,7 @@ function formatLinuxGlibcHint() {
     'Prebuilt Linux binaries target GLIBC >= 2.28 (AlmaLinux 8 / RHEL 8 / Rocky Linux 8 / Ubuntu 20.04+ / Debian 10+).',
     'If you are on an older glibc distribution (such as CentOS 7 with GLIBC < 2.28) or Alpine/musl,',
     'build from source with Cargo instead:',
-    '  cargo install --git https://github.com/shinick-dev/teams --locked',
+    '  cargo install --git https://github.com/shinick-dev/outlook --locked',
     'or clone the repository and run:',
     '  cargo build --release',
   ].join('\n');
@@ -34,8 +34,8 @@ function formatLinuxGlibcHint() {
 const platform = process.platform;
 const arch = process.arch;
 const platformKey = `${platform}-${arch}`;
-const packageName = `@shinick/teams-${platformKey}`;
-const binaryName = platform === 'win32' ? 'teams.exe' : 'teams';
+const packageName = `@shinick/outlook-${platformKey}`;
+const binaryName = platform === 'win32' ? 'outlook.exe' : 'outlook';
 
 let packageDir = null;
 try {
@@ -56,9 +56,9 @@ if (!binaryPath || !fs.existsSync(binaryPath)) {
     `Supported platforms: ${SUPPORTED.join(', ')}`,
     '',
     'Try one of:',
-    '  npm install -g @shinick/teams --include=optional',
-    '  npm install @shinick/teams --include=optional',
-    '  npx --yes @shinick/teams',
+    '  npm install -g @shinick/outlook --include=optional',
+    '  npm install @shinick/outlook --include=optional',
+    '  npx --yes @shinick/outlook',
     '',
     'If you are on an unsupported platform (for example Alpine/musl Linux),',
     'build from source with Cargo:',
@@ -123,7 +123,7 @@ child.on('exit', (code, signal) => {
   }
   if (platform === 'linux' && code === 127) {
     process.stderr.write(
-      `teams: binary exited with code 127 (missing shared library, dynamic linker, or GLIBC symbol version).\n${formatLinuxGlibcHint()}\n`,
+      `outlook: binary exited with code 127 (missing shared library, dynamic linker, or GLIBC symbol version).\n${formatLinuxGlibcHint()}\n`,
     );
   }
   process.exit(code === null ? 1 : code);

@@ -1,4 +1,4 @@
-//! Local file path + caption input overlay (`Ctrl+O` or `[Send File]`).
+//! Local file path input overlay (`Ctrl+A` in Mail Compose or `[+ Attach]`).
 
 use std::path::{Path, PathBuf};
 
@@ -42,8 +42,6 @@ fn home_dir() -> PathBuf {
 #[derive(Debug, Clone, Default)]
 pub struct PathInputState {
     pub path: String,
-    pub caption: String,
-    pub field: usize,
     pub error: Option<String>,
 }
 
@@ -52,75 +50,39 @@ impl PathInputState {
         Self::default()
     }
 
-    pub fn set_field(&mut self, field: usize) {
-        self.field = field % 2;
-        self.error = None;
-    }
-
-    pub fn next_field(&mut self) {
-        self.set_field(self.field + 1);
-    }
-
-    pub fn prev_field(&mut self) {
-        self.set_field(self.field + 1);
-    }
-
-    fn active_mut(&mut self) -> &mut String {
-        if self.field == 0 {
-            &mut self.path
-        } else {
-            &mut self.caption
-        }
-    }
-
     pub fn handle(&mut self, action: &Action) -> OverlayOutcome {
         match action {
             Action::Input(ch) => {
-                self.active_mut().push(*ch);
+                self.path.push(*ch);
                 self.error = None;
                 OverlayOutcome::Handled
             }
             Action::Paste(text) => {
-                self.active_mut().push_str(text);
+                self.path.push_str(&text.replace(['\r', '\n'], ""));
                 self.error = None;
                 OverlayOutcome::Handled
             }
             Action::Backspace => {
-                self.active_mut().pop();
+                self.path.pop();
                 self.error = None;
                 OverlayOutcome::Handled
             }
-            Action::MoveDown | Action::Tab => {
-                self.next_field();
-                OverlayOutcome::Handled
-            }
-            Action::MoveUp | Action::PrevFocus => {
-                self.prev_field();
-                OverlayOutcome::Handled
-            }
-            Action::Activate => {
-                let path = self.path.trim().to_string();
-                if path.is_empty() {
-                    self.field = 0;
+            Action::Activate | Action::OverlaySubmit => {
+                let raw = self.path.trim().to_string();
+                if raw.is_empty() {
                     self.error = Some("Enter a file path".to_string());
                     return OverlayOutcome::Handled;
                 }
-                let expanded = expand_path(&path);
+                let expanded = expand_path(&raw);
                 if !expanded.exists() {
-                    self.field = 0;
                     self.error = Some(format!("File not found: {}", expanded.display()));
                     return OverlayOutcome::Handled;
                 }
                 if !expanded.is_file() {
-                    self.field = 0;
                     self.error = Some(format!("Not a file: {}", expanded.display()));
                     return OverlayOutcome::Handled;
                 }
-                let caption = self.caption.trim().to_string();
-                OverlayOutcome::CloseAndDispatch(Action::SendAttachmentPath {
-                    path: expanded.to_string_lossy().into_owned(),
-                    caption,
-                })
+                OverlayOutcome::CloseAndDispatch(Action::AttachComposeFile(expanded))
             }
             Action::CloseOverlay => OverlayOutcome::Close,
             Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
@@ -132,8 +94,8 @@ impl PathInputState {
         let theme = &ui.theme;
         let rect = centered_rect(
             area,
-            area.width.saturating_sub(8).min(78),
-            area.height.saturating_sub(4).min(11),
+            area.width.saturating_sub(8).min(76),
+            area.height.saturating_sub(4).min(8),
         );
         frame.render_widget(Clear, rect);
         hitmap.add(rect, HitTarget::OverlayBody);
@@ -142,7 +104,7 @@ impl PathInputState {
             .border_type(BorderType::Rounded)
             .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
             .title(Line::from(Span::styled(
-                " Send File · Tab Field · Enter Send · Esc Cancel ",
+                " Attach File · Enter Attach · Esc Cancel ",
                 theme.title(true),
             )))
             .border_style(theme.border_style(true));
@@ -152,36 +114,15 @@ impl PathInputState {
             return;
         }
 
-        let path_style = if self.field == 0 {
-            theme.accent_style()
-        } else {
-            theme.muted_style()
-        };
-        let caption_style = if self.field == 1 {
-            theme.accent_style()
-        } else {
-            theme.muted_style()
-        };
-
         let mut lines = vec![
             Line::from(Span::styled(
                 " Local file path (~ expands to home directory)",
                 theme.muted_style(),
             )),
             Line::from(vec![
-                Span::styled(" > ", path_style),
+                Span::styled(" > ", theme.accent_style()),
                 Span::raw(self.path.clone()),
-                Span::styled("▏", path_style),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                " Message / caption (optional · Tab to switch)",
-                theme.muted_style(),
-            )),
-            Line::from(vec![
-                Span::styled(" > ", caption_style),
-                Span::raw(self.caption.clone()),
-                Span::styled("▏", caption_style),
+                Span::styled("▏", theme.accent_style()),
             ]),
         ];
         match &self.error {
@@ -190,7 +131,7 @@ impl PathInputState {
                 Style::default().fg(theme.error),
             ))),
             None => lines.push(Line::from(Span::styled(
-                " Uploads to OneDrive/SharePoint and sends to active chat/channel/thread",
+                " File will be attached to the current email draft",
                 theme.muted_style(),
             ))),
         }

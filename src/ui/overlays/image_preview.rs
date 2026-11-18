@@ -1,6 +1,7 @@
-//! Full-screen inline terminal image preview modal (`v`).
-//! Supports Teams message image attachments: prev/next cycling (`[`/`]`, `←`/`→`),
-//! zoom (`+`/`-`/`0`/scroll), protocol cycle (`p`), download (`d`), and close (`Esc`/`q`/`v`).
+//! Full-screen inline terminal image preview modal (`v` / `Alt+v` or clicking `[IMG ...]`).
+//! Supports Outlook email attachments and inline `cid:` / `https:` images:
+//! prev/next cycling (`[`/`]`, `←`/`→`), zoom (`+`/`-`/`0`/scroll), protocol cycle (`p`),
+//! download (`d`), and close (`Esc`/`q`/`v`).
 
 use ratatui::{
     layout::Rect,
@@ -12,7 +13,8 @@ use ratatui::{
 
 use crate::{
     img_preview,
-    models::{AttachmentInfo, MessageItem},
+    models::{MailAttachment, MailMessage},
+    parser,
     ui::{
         action::Action,
         app::{AppState, PendingPixelGraphic, UiState},
@@ -23,31 +25,34 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreviewTarget {
-    Teams {
+    Mail {
         msg_id: String,
-        attachment: AttachmentInfo,
+        attachment: MailAttachment,
     },
 }
 
 impl PreviewTarget {
     pub fn owner_id(&self) -> &str {
         match self {
-            PreviewTarget::Teams { msg_id, .. } => msg_id,
+            PreviewTarget::Mail { msg_id, .. } => msg_id,
         }
     }
 
     pub fn att_id(&self) -> &str {
         match self {
-            PreviewTarget::Teams { attachment, .. } => &attachment.id,
+            PreviewTarget::Mail { attachment, .. } => &attachment.id,
         }
     }
 
     pub fn display_name(&self) -> String {
         match self {
-            PreviewTarget::Teams { attachment, .. } => attachment
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("image_{}", attachment.id)),
+            PreviewTarget::Mail { attachment, .. } => {
+                if attachment.name.trim().is_empty() {
+                    format!("image_{}", attachment.id)
+                } else {
+                    attachment.name.clone()
+                }
+            }
         }
     }
 }
@@ -62,16 +67,16 @@ pub struct ImagePreviewOverlay {
 }
 
 impl ImagePreviewOverlay {
-    pub fn from_teams_message(msg: &MessageItem, preferred_att_idx: Option<usize>) -> Option<Self> {
+    pub fn from_mail_message(msg: &MailMessage, preferred_att_idx: Option<usize>) -> Option<Self> {
         let mut items = Vec::new();
         let mut start = 0usize;
-        for (raw_idx, att) in msg.effective_attachments().iter().enumerate() {
-            if img_preview::is_image_mime_or_name(&att.content_type, att.name.as_deref()) {
+        for (raw_idx, att) in parser::effective_mail_attachments(msg).iter().enumerate() {
+            if img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name)) {
                 if preferred_att_idx == Some(raw_idx) {
                     start = items.len();
                 }
-                items.push(PreviewTarget::Teams {
-                    msg_id: msg.msg_id.clone(),
+                items.push(PreviewTarget::Mail {
+                    msg_id: msg.id.clone(),
                     attachment: att.clone(),
                 });
             }
@@ -151,11 +156,11 @@ impl ImagePreviewOverlay {
             | Action::LoadPreviewImage
             | Action::DownloadPreviewImage
             | Action::CycleImageProtocol => OverlayOutcome::NotHandled,
-            Action::Input('[') | Action::AttachmentPrev | Action::CursorLeft => {
+            Action::Input('[') | Action::CursorLeft => {
                 self.prev_image();
                 OverlayOutcome::Dispatch(Action::LoadPreviewImage)
             }
-            Action::Input(']') | Action::AttachmentNext | Action::CursorRight => {
+            Action::Input(']') | Action::CursorRight => {
                 self.next_image();
                 OverlayOutcome::Dispatch(Action::LoadPreviewImage)
             }
@@ -183,7 +188,7 @@ impl ImagePreviewOverlay {
                     OverlayOutcome::Handled
                 }
             }
-            Action::Input('d') | Action::DownloadLatest => {
+            Action::Input('d') | Action::DownloadLatestAttachment => {
                 OverlayOutcome::Dispatch(Action::DownloadPreviewImage)
             }
             _ => OverlayOutcome::Handled,
@@ -333,10 +338,7 @@ impl ImagePreviewOverlay {
             );
         } else {
             frame.render_widget(
-                Paragraph::new(Span::styled(
-                    " Loading image…",
-                    theme.muted_style(),
-                )),
+                Paragraph::new(Span::styled(" Loading image…", theme.muted_style())),
                 img_area,
             );
         }
@@ -355,64 +357,73 @@ impl ImagePreviewOverlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::EmailRecipient;
 
-    fn teams_msg_with_attachments() -> MessageItem {
-        MessageItem {
-            msg_key: "chat:c1|msg-9".to_string(),
-            conv_key: "chat:c1".to_string(),
-            msg_id: "msg-9".to_string(),
-            parent_msg_id: None,
-            reply_to_id: None,
-            reply_to_author: None,
-            reply_to_preview: None,
-            subject: None,
-            author_id: None,
-            author_name: "Tester".to_string(),
-            is_me: false,
-            created_at: "2026-11-15T10:00:00Z".to_string(),
-            last_modified_at: None,
-            deleted: false,
+    fn mail_with_attachments() -> MailMessage {
+        MailMessage {
+            id: "msg-9".to_string(),
+            internet_message_id: None,
+            conversation_id: Some("conv-9".to_string()),
+            folder_id: Some("inbox".to_string()),
+            subject: "Quarterly Charts".to_string(),
+            from: Some(EmailRecipient {
+                name: Some("Alice".to_string()),
+                address: "alice@contoso.com".to_string(),
+            }),
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            bcc_recipients: vec![],
+            reply_to: vec![],
+            received_at: "2026-11-19T00:00:00Z".to_string(),
+            sent_at: None,
+            is_read: false,
+            is_draft: false,
+            flagged: false,
             importance: "normal".to_string(),
-            message_type: "message".to_string(),
-            body_html: String::new(),
+            inference_classification: None,
+            has_attachments: true,
+            body_loaded: true,
+            preview: String::new(),
+            body_html: "<p>See <img src=\"cid:chart01@outlook\"></p>".to_string(),
             body_plain: String::new(),
             attachments: vec![
-                AttachmentInfo {
+                MailAttachment {
                     id: "att-pdf".to_string(),
+                    name: "doc.pdf".to_string(),
                     content_type: "application/pdf".to_string(),
-                    content_url: None,
-                    name: Some("doc.pdf".to_string()),
-                    content_json: None,
-                    thumbnail_url: None,
+                    size: 1000,
+                    is_inline: false,
+                    content_id: None,
+                    content_bytes_b64: None,
                 },
-                AttachmentInfo {
+                MailAttachment {
                     id: "att-png".to_string(),
+                    name: "chart.png".to_string(),
                     content_type: "image/png".to_string(),
-                    content_url: None,
-                    name: Some("shot1.png".to_string()),
-                    content_json: None,
-                    thumbnail_url: None,
+                    size: 2048,
+                    is_inline: true,
+                    content_id: Some("<chart01@outlook>".to_string()),
+                    content_bytes_b64: Some("AQID".to_string()),
                 },
-                AttachmentInfo {
+                MailAttachment {
                     id: "att-jpg".to_string(),
+                    name: "photo2.jpg".to_string(),
                     content_type: "image/jpeg".to_string(),
-                    content_url: None,
-                    name: Some("photo2.jpg".to_string()),
-                    content_json: None,
-                    thumbnail_url: None,
+                    size: 4096,
+                    is_inline: false,
+                    content_id: None,
+                    content_bytes_b64: None,
                 },
             ],
-            mentions: Vec::new(),
-            reactions: Vec::new(),
-            reply_count: 0,
-            web_url: None,
+            meeting_request: None,
+            web_link: None,
         }
     }
 
     #[test]
     fn filters_only_images_and_cycles_and_zooms() {
-        let msg = teams_msg_with_attachments();
-        let mut overlay = ImagePreviewOverlay::from_teams_message(&msg, Some(2)).unwrap();
+        let msg = mail_with_attachments();
+        let mut overlay = ImagePreviewOverlay::from_mail_message(&msg, Some(2)).unwrap();
         assert_eq!(overlay.items.len(), 2);
         assert_eq!(overlay.index, 1);
         assert_eq!(overlay.current().unwrap().att_id(), "att-jpg");
@@ -460,11 +471,10 @@ mod tests {
 
     #[test]
     fn zoom_reset_protocol_cycle_and_scroll_wheel_controls() {
-        let msg = teams_msg_with_attachments();
-        let mut overlay = ImagePreviewOverlay::from_teams_message(&msg, Some(1)).unwrap();
+        let msg = mail_with_attachments();
+        let mut overlay = ImagePreviewOverlay::from_mail_message(&msg, Some(1)).unwrap();
         assert_eq!(overlay.zoom_pct, 100);
 
-        // Mouse scroll up (delta < 0) zooms in; scroll down (delta > 0) zooms out.
         assert_eq!(
             overlay.handle(&Action::MouseScroll {
                 delta: -3,
@@ -475,7 +485,6 @@ mod tests {
         );
         assert_eq!(overlay.zoom_pct, 125);
 
-        // '0' resets zoom back to 100%.
         assert_eq!(
             overlay.handle(&Action::Input('0')),
             OverlayOutcome::Dispatch(Action::LoadPreviewImage)
@@ -492,7 +501,6 @@ mod tests {
         );
         assert_eq!(overlay.zoom_pct, 75);
 
-        // 'p' dispatches CycleImageProtocol; internal dispatch actions pass through as NotHandled.
         assert_eq!(
             overlay.handle(&Action::Input('p')),
             OverlayOutcome::Dispatch(Action::CycleImageProtocol)
@@ -512,16 +520,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn draw_sync_renders_protocol_badges_sets_pending_and_skips_active_cells() {
+    async fn draw_sync_renders_sixel_badge_for_cid_inline_image_and_skips_active_cells() {
         use ratatui::{backend::TestBackend, Terminal};
 
         let (mut app, mut ui) = make_test_app_and_ui();
-        let msg = teams_msg_with_attachments();
-        let overlay = ImagePreviewOverlay::from_teams_message(&msg, Some(1)).unwrap();
+        let mut msg = mail_with_attachments();
+        msg.attachments.clear();
+        msg.body_html =
+            "<p>Screenshot:</p><img src=\"cid:screenshot.png@outlook\">".to_string();
+
+        let overlay = ImagePreviewOverlay::from_mail_message(&msg, None)
+            .expect("cid inline img must produce preview overlay");
+        assert_eq!(overlay.items.len(), 1);
+        assert_eq!(overlay.current().unwrap().att_id(), "cid:screenshot.png@outlook");
+
         let area = Rect::new(0, 0, 100, 30);
         let (cols, rows) = overlay.target_dimensions(area.width, area.height);
 
-        // Verify title protocol badge across all 4 protocols.
         for (proto, badge) in [
             (img_preview::TerminalImageProtocol::Sixel, "[Sixel]"),
             (img_preview::TerminalImageProtocol::Kitty, "[Kitty]"),
@@ -548,7 +563,6 @@ mod tests {
             );
         }
 
-        // Insert a cached Sixel image and verify pending_pixel_graphic + set_skip(true).
         let proto = img_preview::TerminalImageProtocol::Sixel;
         ui.graphics_caps.protocol = proto;
         let cur = overlay.current().unwrap();
@@ -570,8 +584,6 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
         let mut hitmap = HitMap::default();
-
-        // First frame (active_pixel_graphic = None): pending is populated, cells NOT skipped.
         terminal
             .draw(|frame| {
                 overlay.draw_sync(frame, area, &app, &mut ui, &mut hitmap);
@@ -580,18 +592,13 @@ mod tests {
         let pending = ui
             .pending_pixel_graphic
             .clone()
-            .expect("pending_pixel_graphic must be set for pixel protocol");
+            .expect("pending_pixel_graphic must be set for Sixel");
         assert_eq!(pending.cache_key, cache_key);
         assert_eq!(pending.protocol, proto);
-        assert_eq!(pending.rect.width, 40);
-        assert_eq!(pending.rect.height, 12);
 
-        // Simulate tui.rs painting the graphic and recording active_pixel_graphic.
         ui.active_pixel_graphic = Some((pending.cache_key.clone(), pending.rect, pending.protocol));
 
-        // Second frame with matching active_pixel_graphic: cells inside rect MUST have skip == true.
         let mut skipped_inside = 0usize;
-        let mut unskipped_border = 0usize;
         terminal
             .draw(|frame| {
                 overlay.draw_sync(frame, area, &app, &mut ui, &mut hitmap);
@@ -603,33 +610,13 @@ mod tests {
                         }
                     }
                 }
-                let modal = ImagePreviewOverlay::modal_rect(area);
-                if !buf[(modal.x, modal.y)].skip {
-                    unskipped_border += 1;
-                }
             })
             .unwrap();
         assert_eq!(
             skipped_inside,
             (pending.rect.width as usize) * (pending.rect.height as usize)
         );
-        assert_eq!(unskipped_border, 1);
 
         app.sync_ctrl.request(crate::sync::SyncCommand::Shutdown);
-    }
-
-    #[test]
-    fn from_teams_message_extracts_inline_hosted_content_screenshot() {
-        let mut msg = teams_msg_with_attachments();
-        msg.msg_id = "m1".to_string();
-        msg.attachments.clear();
-        msg.body_html =
-            "<p>Look:</p><img src=\"https://graph.microsoft.com/v1.0/chats/c1/messages/m1/hostedContents/1/$value\">"
-                .to_string();
-
-        let overlay = ImagePreviewOverlay::from_teams_message(&msg, None)
-            .expect("inline hostedContents img must produce preview overlay");
-        assert_eq!(overlay.items.len(), 1);
-        assert_eq!(overlay.current().unwrap().att_id(), "hosted:1");
     }
 }

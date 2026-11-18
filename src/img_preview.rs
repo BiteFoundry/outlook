@@ -141,7 +141,9 @@ fn resolve_protocol_with<F>(pref: ImageProtocolPreference, get_env: F) -> Termin
 where
     F: Fn(&str) -> Option<String>,
 {
-    if let Some(raw) = non_empty_env(&get_env, "TEAMS_IMAGE_PROTOCOL") {
+    if let Some(raw) = non_empty_env(&get_env, "OUTLOOK_IMAGE_PROTOCOL")
+        .or_else(|| non_empty_env(&get_env, "TEAMS_IMAGE_PROTOCOL"))
+    {
         if let Some(parsed) = ImageProtocolPreference::parse_str(&raw) {
             if parsed != ImageProtocolPreference::Auto {
                 return protocol_from_pref(parsed);
@@ -237,10 +239,8 @@ where
 }
 
 fn detect_cell_pixel_size() -> ((u16, u16), bool) {
-    if let Ok(raw) = std::env::var("TEAMS_CELL_PIXEL_SIZE") {
-        if let Some(parsed) = parse_cell_pixel_size(&raw) {
-            return (parsed, true);
-        }
+    if let Some(parsed) = resolve_cell_pixel_size_with(|k| std::env::var(k).ok()) {
+        return (parsed, true);
     }
     if let Ok(ws) = crossterm::terminal::window_size() {
         if ws.width > 0 && ws.height > 0 && ws.columns > 0 && ws.rows > 0 {
@@ -250,6 +250,20 @@ fn detect_cell_pixel_size() -> ((u16, u16), bool) {
         }
     }
     ((8, 16), false)
+}
+
+fn resolve_cell_pixel_size_with<F>(get_env: F) -> Option<(u16, u16)>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    for key in ["OUTLOOK_CELL_PIXEL_SIZE", "TEAMS_CELL_PIXEL_SIZE"] {
+        if let Some(raw) = non_empty_env(&get_env, key) {
+            if let Some(parsed) = parse_cell_pixel_size(&raw) {
+                return Some(parsed);
+            }
+        }
+    }
+    None
 }
 
 fn parse_cell_pixel_size(raw: &str) -> Option<(u16, u16)> {
@@ -1068,7 +1082,7 @@ mod tests {
             TerminalImageProtocol::Halfblock
         );
 
-        // TEAMS_IMAGE_PROTOCOL overrides everything including TMUX and explicit pref
+        // OUTLOOK_IMAGE_PROTOCOL takes precedence over TEAMS_IMAGE_PROTOCOL and overrides TMUX/explicit pref
         let mut env_override = HashMap::new();
         env_override.insert("TMUX", "/tmp/tmux-1000/default,1,0");
         env_override.insert("TEAMS_IMAGE_PROTOCOL", "sixel");
@@ -1076,7 +1090,12 @@ mod tests {
             resolve_protocol_from_env_map(ImageProtocolPreference::Auto, &env_override),
             TerminalImageProtocol::Sixel
         );
-        env_override.insert("TEAMS_IMAGE_PROTOCOL", "halfblocks");
+        env_override.insert("OUTLOOK_IMAGE_PROTOCOL", "kitty");
+        assert_eq!(
+            resolve_protocol_from_env_map(ImageProtocolPreference::Auto, &env_override),
+            TerminalImageProtocol::Kitty
+        );
+        env_override.insert("OUTLOOK_IMAGE_PROTOCOL", "halfblocks");
         assert_eq!(
             resolve_protocol_from_env_map(ImageProtocolPreference::Kitty, &env_override),
             TerminalImageProtocol::Halfblock
@@ -1387,5 +1406,17 @@ mod tests {
         assert_eq!(parse_cell_pixel_size(" 9X18 "), Some((9, 18)));
         assert_eq!(parse_cell_pixel_size("0x16"), None);
         assert_eq!(parse_cell_pixel_size("bad"), None);
+
+        let mut cell_env = HashMap::new();
+        cell_env.insert("TEAMS_CELL_PIXEL_SIZE", "9x18");
+        assert_eq!(
+            resolve_cell_pixel_size_with(|k| cell_env.get(k).map(|v| (*v).to_string())),
+            Some((9, 18))
+        );
+        cell_env.insert("OUTLOOK_CELL_PIXEL_SIZE", "12x24");
+        assert_eq!(
+            resolve_cell_pixel_size_with(|k| cell_env.get(k).map(|v| (*v).to_string())),
+            Some((12, 24))
+        );
     }
 }

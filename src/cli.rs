@@ -1,8 +1,7 @@
-//! `teams` CLI parser, command dispatcher, and shared domain helpers for CLI/HTTP/MCP.
+//! `outlook` CLI parser, command dispatcher, and shared domain helpers for CLI/HTTP/MCP.
 
 use std::{
-    collections::HashMap,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -10,52 +9,52 @@ use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc};
 use clap::{Parser, Subcommand};
-use futures::stream::{self, StreamExt};
 use serde_json::json;
 
 use crate::{
     auth::{
-        diagnose_access_token_scopes, explain_graph_permission_error, AuthManager, LoginOptions,
-        StoredTokens,
+        diagnose_access_token_scopes, explain_graph_permission_error, read_external_token_file,
+        AuthManager, LoginOptions, StoredTokens,
     },
     config::{self, AppConfig, Persona},
     graph::GraphClient,
     img_preview,
     models::{
-        AttachmentInfo, ConversationKind, ConversationSummary, ConversationTarget, DownloadedFile,
-        InlineImageUpload, MentionInfo, MessageItem, QuotedReply, SyncCursor, TeamSummary,
+        CalendarEvent, ContactItem, InlineImageUpload, MailAttachment, MailFolder, MailMessage,
+        OutgoingEvent, OutgoingMail, OutgoingTodoTask, SyncCursor, TodoList, TodoTask,
     },
-    parser, resolver,
+    resolver,
     serve::{self, ServeOptions},
     storage::Storage,
-    sync, tui, updater,
+    tui, updater,
 };
 
 const DELETE_JSON_REQUIRES_YES: &str = "Deleting with --json requires passing --yes.";
 
 const ENV_AFTER_HELP: &str = "\
 Environment Variables:
-  TEAMS_TOKEN_FILE=<PATH>               Load an external token file (JWT or JSON) directly (skips OS keyring)
-  TEAMS_TOKEN_REFRESH_CMD=<CMD>         Command hook to run automatically when the token is about to expire
-  TEAMS_TOKEN_REFRESH_MINS=<MINS>       Minutes remaining before triggering refresh hook [default: 5]
-  TEAMS_ACCESS_TOKEN=<JWT>              Inject a Bearer access token directly (skips OS keyring)
-  TEAMS_DISABLE_KEYRING=1               Disable the OS keyring (use credentials.json file only)
-  TEAMS_CLIENT_ID / TEAMS_TENANT_ID     Override Entra app Client ID / Tenant ID
-  TEAMS_CONFIG_DIR / TEAMS_DATA_DIR     Override config and local SQLite cache directories
-  TEAMS_CLI_CACHE_SECS=<SECS>           Local cache TTL in seconds for CLI read commands [default: 0; --cached/--fast prefers cache]
-  TEAMS_AUTO_DAEMON=1                   Auto-start/connect to background sync daemon (config.toml: auto_daemon = true) [default: false]
-  TEAMS_IMAGE_PROTOCOL=<PROTO>          Terminal image protocol (auto, kitty, iterm2, sixel, halfblock)
+  OUTLOOK_TOKEN_FILE=<PATH>             Load an external token file (JWT or JSON) directly (skips OS keyring)
+  OUTLOOK_TOKEN_REFRESH_CMD=<CMD>       Command hook to run automatically when the token is about to expire
+  OUTLOOK_TOKEN_REFRESH_MINS=<MINS>     Minutes remaining before triggering refresh hook [default: 5]
+  OUTLOOK_ACCESS_TOKEN=<JWT>            Inject a Bearer access token directly (skips OS keyring)
+  OUTLOOK_SHARE_M365_AUTH=<1|0>         Reuse stored teams-cli / TEAMS_TOKEN_FILE session when no outlook-cli token exists [default: 1]
+  OUTLOOK_DISABLE_KEYRING=1             Disable the OS keyring (use credentials.json file only)
+  OUTLOOK_CLIENT_ID / OUTLOOK_TENANT_ID Override Entra app Client ID / Tenant ID
+  OUTLOOK_CONFIG_DIR / OUTLOOK_DATA_DIR Override config and local SQLite cache directories
+  OUTLOOK_CLI_CACHE_SECS=<SECS>         Local cache TTL in seconds for CLI read commands [default: 0; --cached/--fast prefers cache]
+  OUTLOOK_AUTO_DAEMON=1                 Auto-start/connect to background sync daemon (config.toml: auto_daemon = true) [default: false]
+  OUTLOOK_IMAGE_PROTOCOL=<PROTO>        Terminal image protocol (auto, kitty, iterm2, sixel, halfblock)
 
 Background Sync Daemon:
-  teams daemon start | status | stop | restart";
+  outlook daemon start | status | stop | restart";
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "teams",
+    name = "outlook",
     version,
-    about = "Microsoft Teams terminal client (CLI · TUI · HTTP API · MCP)",
-    long_about = "Terminal client for Microsoft Teams powered by Microsoft Graph v1.0.\n\
-                  Running without a subcommand checks authentication and launches the TUI.",
+    about = "Microsoft Outlook terminal client (CLI · TUI · HTTP API · MCP)",
+    long_about = "Terminal client for Microsoft Outlook (Mail, Calendar, To Do, Contacts) powered by Microsoft Graph v1.0.\n\
+                  Running without a subcommand checks authentication and launches the interactive TUI.",
     after_help = ENV_AFTER_HELP
 )]
 pub struct Cli {
@@ -76,8 +75,10 @@ pub enum Command {
         device_code: bool,
         #[arg(long)]
         client_secret: Option<String>,
-        #[arg(long)]
-        token: Option<String>,
+        #[arg(long, visible_alias = "token")]
+        access_token: Option<String>,
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<PathBuf>,
         #[arg(long)]
         port: Option<u16>,
         #[arg(long)]
@@ -89,276 +90,385 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Display the currently signed-in user profile and token status
+    /// Display the currently signed-in user profile, token expiry, scopes, and auth source
     Whoami {
         #[arg(long)]
         json: bool,
     },
-    /// Show config/DB/keyring paths and optional Graph connectivity diagnostics
+    /// Show config/DB/keyring paths, image protocol, and optional live Graph diagnostics
     Doctor {
-        /// Probe live connectivity via Graph `/me` and `/me/presence`
-        #[arg(long)]
-        probe: bool,
+        /// Probe live Graph connectivity across Mail, Calendar, Contacts, and To Do
+        #[arg(long, visible_alias = "probe")]
+        online: bool,
         #[arg(long)]
         json: bool,
     },
-    /// List 1:1, group, and meeting chats
-    #[command(visible_alias = "ls")]
-    Chats {
-        /// Maximum number of chats to fetch [default: 50]
-        #[arg(long, visible_alias = "top", default_value_t = 50)]
-        limit: usize,
+    /// List Outlook mail folders with unread and total item counts
+    Folders {
         #[arg(long)]
         refresh: bool,
-        /// Read from local SQLite cache first (skips network requests)
+        #[arg(long)]
+        offline: bool,
+        /// Read from local SQLite cache first (skips network requests when populated)
         #[arg(long, visible_alias = "fast")]
         cached: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Create a new 1:1 or group chat
-    #[command(name = "new-chat")]
-    NewChat {
-        /// User email or Entra user ID to invite (repeatable)
-        #[arg(long = "to", required = true, value_name = "email_or_id")]
-        to: Vec<String>,
-        #[arg(long)]
-        topic: Option<String>,
-        #[arg(long)]
-        message: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// List joined teams and channels
-    Teams {
-        #[arg(long)]
-        refresh: bool,
-        /// Read from local SQLite cache first (skips network requests)
-        #[arg(long, visible_alias = "fast")]
-        cached: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// List channels for a specific team
-    Channels {
-        team_query: String,
-        #[arg(long)]
-        refresh: bool,
-        /// Read from local SQLite cache first (skips network requests)
-        #[arg(long, visible_alias = "fast")]
-        cached: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Read recent messages from a chat or channel
-    #[command(visible_alias = "cat")]
-    Read {
-        target: String,
-        /// Maximum number of messages to fetch [default: 30]
+    /// List messages in Inbox or a specified mail folder
+    #[command(visible_aliases = ["ls", "inbox"])]
+    Mail {
+        /// Folder name, well-known alias (inbox/sent/drafts/archive/trash/junk), or ID
+        #[arg(long, default_value = "inbox")]
+        folder: String,
+        /// Maximum number of messages to fetch
         #[arg(long, visible_alias = "top", default_value_t = 30)]
         limit: usize,
-        /// Fetch messages older than this timestamp (ISO-8601 / YYYY-MM-DD) or message ID
-        #[arg(long, value_name = "TIMESTAMP_OR_MSG_ID")]
-        before: Option<String>,
-        /// Read a specific channel thread by root message ID
         #[arg(long)]
-        thread: Option<String>,
+        unread: bool,
+        #[arg(long)]
+        flagged: bool,
+        #[arg(long)]
+        focused: bool,
+        #[arg(long)]
+        refresh: bool,
         #[arg(long)]
         offline: bool,
-        /// Read from local SQLite cache first (falls back to network if empty or insufficient)
+        /// Read from local SQLite cache first (falls back to network if empty)
         #[arg(long, visible_alias = "fast")]
         cached: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Read a team channel root post and its thread replies
-    Thread {
-        channel_target: String,
-        root_msg_id: String,
-        /// Maximum number of replies to fetch [default: 50]
-        #[arg(long, visible_alias = "top", default_value_t = 50)]
-        limit: usize,
+    /// Read a mail message with full headers, body, and attachments
+    #[command(visible_alias = "cat")]
+    Read {
+        message_id: String,
+        /// Print raw HTML body instead of plain text / Markdown
+        #[arg(long = "raw-html")]
+        raw_html: bool,
+        /// Mark the message as read on Microsoft Graph
+        #[arg(long = "mark-read")]
+        mark_read: bool,
+        /// Render image attachments directly in the terminal
+        #[arg(long = "preview-images")]
+        preview_images: bool,
         #[arg(long)]
         offline: bool,
+        /// Read from local SQLite cache first
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Send a Markdown message
-    #[command(visible_alias = "msg")]
+    /// Compose and send a new email (supports Markdown, attachments, and inline images)
+    #[command(visible_alias = "compose")]
     Send {
-        target: String,
-        markdown: String,
-        #[arg(long)]
-        subject: Option<String>,
-        /// Add a mention: <user_id:DisplayName> (repeatable)
-        #[arg(long = "mention", value_name = "user_id:DisplayName")]
-        mention: Vec<String>,
-        #[arg(long)]
-        important: bool,
+        /// Recipient email address (repeatable)
+        #[arg(long = "to", required = true, value_name = "ADDR")]
+        to: Vec<String>,
+        /// CC email address (repeatable)
+        #[arg(long = "cc", value_name = "ADDR")]
+        cc: Vec<String>,
+        /// BCC email address (repeatable)
+        #[arg(long = "bcc", value_name = "ADDR")]
+        bcc: Vec<String>,
+        /// Email subject line
+        #[arg(long, required = true, value_name = "SUBJ")]
+        subject: String,
+        /// Markdown email body (reads from stdin when omitted)
+        #[arg(long = "body", value_name = "MD")]
+        body: Option<String>,
+        /// File attachment path (repeatable)
+        #[arg(long = "attach", value_name = "PATH")]
+        attach: Vec<PathBuf>,
+        /// Inline image path embedded via CID (repeatable)
+        #[arg(long = "inline", value_name = "IMG_PATH")]
+        inline: Vec<PathBuf>,
+        /// Message importance (normal, high, low)
+        #[arg(long, default_value = "normal", value_parser = ["normal", "high", "low"])]
+        importance: String,
         #[arg(long)]
         json: bool,
     },
-    /// Reply to a channel thread or quote-reply to a chat message
+    /// Reply to a mail message
     Reply {
-        target: String,
-        msg_id: String,
-        markdown: String,
-        #[arg(long = "mention", value_name = "user_id:DisplayName")]
-        mention: Vec<String>,
+        message_id: String,
+        body_md: String,
+        /// Reply to all recipients
         #[arg(long)]
-        important: bool,
+        all: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Upload and send a file via OneDrive/SharePoint (or inline image with `--inline`)
-    #[command(name = "send-file", visible_alias = "file")]
-    SendFile {
-        target: String,
-        path: PathBuf,
-        #[arg(long)]
-        caption: Option<String>,
-        #[arg(long)]
-        thread: Option<String>,
-        #[arg(long)]
-        inline: bool,
+    /// Forward a mail message to one or more recipients
+    Forward {
+        message_id: String,
+        #[arg(long = "to", required = true, value_name = "ADDR")]
+        to: Vec<String>,
+        #[arg(value_name = "COMMENT_MD")]
+        comment_md: Option<String>,
         #[arg(long)]
         json: bool,
     },
-    /// Download a message attachment
-    #[command(visible_alias = "dl")]
-    Download {
-        target: String,
-        msg_id: String,
-        #[arg(long, default_value_t = 0)]
-        index: usize,
-        #[arg(long)]
-        thread: Option<String>,
-        #[arg(long)]
-        out: Option<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Set or remove a reaction (like, heart, laugh, surprised, sad, angry) on a message
-    React {
-        target: String,
-        msg_id: String,
-        reaction: String,
-        #[arg(long)]
-        off: bool,
-        #[arg(long)]
-        thread: Option<String>,
+    /// Update read/unread or flag status on a mail message
+    Mark {
+        message_id: String,
+        #[arg(long, conflicts_with = "unread")]
+        read: bool,
+        #[arg(long, conflicts_with = "read")]
+        unread: bool,
+        #[arg(long, conflicts_with = "unflag")]
+        flag: bool,
+        #[arg(long, conflicts_with = "flag")]
+        unflag: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Edit a message you sent
-    Edit {
-        target: String,
-        msg_id: String,
-        new_markdown: String,
-        #[arg(long)]
-        thread: Option<String>,
+    /// Move a mail message to another folder (accepts folder name, alias, or ID)
+    Move {
+        message_id: String,
+        dest_folder: String,
         #[arg(long)]
         json: bool,
     },
-    /// Delete a message you sent
+    /// Archive a mail message (shortcut for `outlook move <MESSAGE_ID> archive`)
+    Archive {
+        message_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a mail message
+    #[command(visible_alias = "rm")]
     Delete {
-        target: String,
-        msg_id: String,
-        #[arg(long)]
-        thread: Option<String>,
+        message_id: String,
         #[arg(long)]
         yes: bool,
         #[arg(long)]
         json: bool,
     },
-    /// List members of a chat or channel
-    Members {
-        target: String,
-        #[arg(long)]
-        offline: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Search messages in the local SQLite FTS5 cache
+    /// Search messages in local SQLite FTS5 or remotely via Graph KQL `$search`
     Search {
         query: String,
         #[arg(long)]
-        target: Option<String>,
-        /// Maximum number of results to return [default: 50]
-        #[arg(long, visible_alias = "top", default_value_t = 50)]
+        folder: Option<String>,
+        /// Query Microsoft Graph KQL `$search` in addition to local cache
+        #[arg(long)]
+        remote: bool,
+        /// Maximum number of results to return
+        #[arg(long, visible_alias = "top", default_value_t = 30)]
         limit: usize,
         #[arg(long)]
         json: bool,
     },
-    /// Sync chats, teams, channels, and message history to the local SQLite cache
-    Sync {
-        /// Deep-sync only a specific conversation or channel
-        #[arg(long)]
-        target: Option<String>,
-        /// Number of recent chats to sync [default: 100]
-        #[arg(long, default_value_t = 100)]
-        chats: usize,
-        /// Number of messages per conversation/channel to backfill into local FTS5 cache [default: 50]
-        #[arg(long, visible_aliases = ["limit", "top"], default_value_t = 50)]
-        depth: usize,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Export a conversation to Markdown, JSON, or plain text
-    Export {
-        target: String,
-        #[arg(long, default_value = "md", value_parser = ["md", "json", "txt"])]
-        format: String,
-        #[arg(long)]
-        include_threads: bool,
-        /// Maximum number of messages to export [default: 200]
-        #[arg(long, visible_alias = "top", default_value_t = 200)]
-        limit: usize,
-        #[arg(long)]
-        offline: bool,
-        #[arg(long)]
-        out: Option<PathBuf>,
-    },
-    /// Get or set your presence status
-    Presence {
-        #[arg(long, value_name = "Available|Busy|DoNotDisturb|BeRightBack|Away|Reset")]
-        set: Option<String>,
-        #[arg(long)]
-        activity: Option<String>,
-        #[arg(long)]
-        expiration_mins: Option<u32>,
+    /// Download a mail attachment to disk
+    #[command(visible_alias = "dl")]
+    Download {
+        message_id: String,
+        /// Attachment 0-based index, attachment ID, or filename
+        #[arg(long, value_name = "IDX_OR_NAME")]
+        attachment: Option<String>,
+        /// Output directory (defaults to configured download_dir)
+        #[arg(long, visible_alias = "out", value_name = "DIR")]
+        dir: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
-    /// Render a message image attachment or local image in the terminal
+    /// Render a mail image attachment directly in the terminal
     Preview {
-        target: Option<String>,
-        msg_id: Option<String>,
-        #[arg(long)]
+        message_id: String,
+        /// Attachment 0-based index, attachment ID, or filename
+        #[arg(long, value_name = "IDX_OR_NAME")]
         attachment: Option<String>,
         #[arg(long)]
-        thread: Option<String>,
-        #[arg(long)]
-        file: Option<PathBuf>,
+        offline: bool,
         #[arg(long)]
         cols: Option<u16>,
         #[arg(long)]
         rows: Option<u16>,
         /// Image rendering protocol override (auto, kitty, iterm2, sixel, halfblock)
-        #[arg(long, value_name = "PROTOCOL")]
+        #[arg(long, value_name = "PROTO")]
         protocol: Option<String>,
     },
     /// Render a local image file in the terminal
     #[command(name = "preview-file")]
     PreviewFile {
-        path: PathBuf,
+        image_path: PathBuf,
         #[arg(long)]
         cols: Option<u16>,
         #[arg(long)]
         rows: Option<u16>,
         /// Image rendering protocol override (auto, kitty, iterm2, sixel, halfblock)
-        #[arg(long, value_name = "PROTOCOL")]
+        #[arg(long, value_name = "PROTO")]
         protocol: Option<String>,
+    },
+    /// List upcoming calendar events
+    #[command(visible_aliases = ["cal", "events"])]
+    Calendar {
+        /// Number of days to show starting from `--from` (or today)
+        #[arg(long, default_value_t = 7)]
+        days: i64,
+        /// Window start timestamp (ISO-8601 or YYYY-MM-DD)
+        #[arg(long, visible_alias = "start", value_name = "ISO")]
+        from: Option<String>,
+        /// Window end timestamp (ISO-8601 or YYYY-MM-DD)
+        #[arg(long, visible_alias = "end", value_name = "ISO")]
+        to: Option<String>,
+        /// Maximum number of events to return
+        #[arg(long, visible_alias = "top", default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        offline: bool,
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read full details and attendees of a calendar event
+    Event {
+        event_id: String,
+        #[arg(long)]
+        offline: bool,
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a new calendar event
+    #[command(name = "create-event")]
+    CreateEvent {
+        #[arg(long, required = true)]
+        subject: String,
+        #[arg(long, required = true, value_name = "ISO")]
+        start: String,
+        #[arg(long, required = true, value_name = "ISO")]
+        end: String,
+        #[arg(long)]
+        location: Option<String>,
+        #[arg(long = "attendee", visible_alias = "to", value_name = "EMAIL")]
+        attendee: Vec<String>,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long = "online", visible_alias = "teams-meeting")]
+        online: bool,
+        #[arg(long = "all-day")]
+        all_day: bool,
+        #[arg(long)]
+        time_zone: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Respond (RSVP) to a calendar event invitation (`accept`, `tentative`, `decline`)
+    Rsvp {
+        event_id: String,
+        response: String,
+        #[arg(long, value_name = "TEXT")]
+        comment: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a calendar event
+    #[command(name = "delete-event")]
+    DeleteEvent {
+        event_id: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List Microsoft To Do tasks
+    #[command(visible_alias = "todo")]
+    Tasks {
+        #[arg(long, default_value = "tasks", value_name = "NAME_OR_ID")]
+        list: String,
+        /// Include completed tasks
+        #[arg(long)]
+        all: bool,
+        /// Maximum number of tasks to return
+        #[arg(long, visible_alias = "top", default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        offline: bool,
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List Microsoft To Do task lists
+    #[command(name = "task-lists")]
+    TaskLists {
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        offline: bool,
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add a new Microsoft To Do task
+    #[command(name = "add-task")]
+    AddTask {
+        title: String,
+        #[arg(long, default_value = "tasks", value_name = "NAME_OR_ID")]
+        list: String,
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        due: Option<String>,
+        #[arg(long, default_value = "normal", value_parser = ["normal", "high", "low"])]
+        importance: String,
+        #[arg(long, visible_alias = "body", value_name = "TEXT")]
+        notes: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mark a Microsoft To Do task as completed (or incomplete with `--undo`)
+    Done {
+        task_id: String,
+        #[arg(long, default_value = "tasks", value_name = "NAME_OR_ID")]
+        list: String,
+        #[arg(long)]
+        undo: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a Microsoft To Do task
+    #[command(name = "delete-task")]
+    DeleteTask {
+        task_id: String,
+        #[arg(long, default_value = "tasks", value_name = "NAME_OR_ID")]
+        list: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List or search personal Outlook contacts and org directory
+    Contacts {
+        #[arg(long, visible_alias = "q", value_name = "Q")]
+        query: Option<String>,
+        #[arg(long, visible_alias = "top", default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        offline: bool,
+        #[arg(long, visible_alias = "fast")]
+        cached: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Perform a full sync of mail folders, inbox, calendar, tasks, and contacts to SQLite
+    Sync {
+        /// Calendar lookahead window in days
+        #[arg(long, default_value_t = 14)]
+        days: i64,
+        /// Maximum items per domain to sync
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
     },
     /// Check for or apply updates from GitHub Releases
     Update {
@@ -372,17 +482,17 @@ pub enum Command {
         json: bool,
     },
     /// Launch the interactive terminal UI (TUI)
-    #[command(visible_alias = "chat")]
     Tui,
     /// Start the local HTTP JSON API server for agents
     #[command(visible_alias = "api")]
     Serve {
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
-        #[arg(long, default_value_t = 8788)]
+        #[arg(long, default_value_t = config::DEFAULT_SERVE_PORT)]
         port: u16,
-        #[arg(long)]
-        token: Option<String>,
+        /// Secret Bearer API key (mandatory when binding to a non-loopback address)
+        #[arg(long = "api-key", visible_alias = "token", value_name = "KEY")]
+        api_key: Option<String>,
     },
     /// Start the stdio MCP (JSON-RPC 2.0) server for agents
     #[command(visible_alias = "mcp-server")]
@@ -420,7 +530,6 @@ pub enum DaemonCommand {
     Run,
 }
 
-
 /// Synchronously handles `--help`, `-h`, `--version`, `-V`, and `help` before Tokio/rustls/Keyring/SQLite init.
 pub fn try_fast_help_or_version() -> Option<Result<()>> {
     try_fast_help_or_version_from(std::env::args_os(), Persona::detect())
@@ -445,7 +554,7 @@ where
     }
 
     let err = match persona {
-        Persona::Teams => Cli::try_parse_from(&raw).err()?,
+        Persona::Outlook => Cli::try_parse_from(&raw).err()?,
     };
     if matches!(
         err.kind(),
@@ -476,10 +585,19 @@ async fn dispatch_command(
             tenant_id,
             device_code,
             client_secret,
-            token,
+            access_token,
+            token_file,
             port,
             json,
         }) => {
+            let resolved_access_token = match (access_token, token_file) {
+                (Some(tok), _) => Some(tok),
+                (None, Some(path)) => {
+                    let loaded = read_external_token_file(&path, cfg)?;
+                    Some(loaded.access_token)
+                }
+                (None, None) => None,
+            };
             Box::pin(cmd_login(
                 cfg,
                 LoginOptions {
@@ -487,7 +605,7 @@ async fn dispatch_command(
                     tenant_id,
                     device_code,
                     client_secret,
-                    access_token: token,
+                    access_token: resolved_access_token,
                     port,
                 },
                 json,
@@ -496,255 +614,180 @@ async fn dispatch_command(
         }
         Some(Command::Logout { json }) => Box::pin(cmd_logout(cfg, json)).await,
         Some(Command::Whoami { json }) => Box::pin(cmd_whoami(cfg, persona, json)).await,
-        Some(Command::Doctor { probe, json }) => Box::pin(cmd_doctor(cfg, persona, probe, json)).await,
-        Some(Command::Chats {
+        Some(Command::Doctor { online, json }) => {
+            Box::pin(cmd_doctor(cfg, persona, online, json)).await
+        }
+        Some(Command::Folders {
+            refresh,
+            offline,
+            cached,
+            json,
+        }) => Box::pin(cmd_folders(cfg, refresh, offline, cached, json)).await,
+        Some(Command::Mail {
+            folder,
             limit,
+            unread,
+            flagged,
+            focused,
             refresh,
-            cached,
-            json,
-        }) => Box::pin(cmd_chats(cfg, limit, refresh, cached, json)).await,
-        Some(Command::NewChat {
-            to,
-            topic,
-            message,
-            json,
-        }) => Box::pin(cmd_new_chat(cfg, to, topic, message, json)).await,
-        Some(Command::Teams {
-            refresh,
-            cached,
-            json,
-        }) => Box::pin(cmd_teams(cfg, refresh, cached, json)).await,
-        Some(Command::Channels {
-            team_query,
-            refresh,
-            cached,
-            json,
-        }) => Box::pin(cmd_channels(cfg, &team_query, refresh, cached, json)).await,
-        Some(Command::Read {
-            target,
-            limit,
-            before,
-            thread,
             offline,
             cached,
             json,
         }) => {
-            Box::pin(cmd_read(
+            Box::pin(cmd_mail_list(
+                cfg, &folder, limit, unread, flagged, focused, refresh, offline, cached, json,
+            ))
+            .await
+        }
+        Some(Command::Read {
+            message_id,
+            raw_html,
+            mark_read,
+            preview_images,
+            offline,
+            cached,
+            json,
+        }) => {
+            Box::pin(cmd_mail_read(
                 cfg,
-                &target,
-                limit,
-                before.as_deref(),
-                thread.as_deref(),
+                &message_id,
+                raw_html,
+                mark_read,
+                preview_images,
                 offline,
                 cached,
                 json,
             ))
             .await
         }
-        Some(Command::Thread {
-            channel_target,
-            root_msg_id,
-            limit,
-            offline,
-            json,
-        }) => {
-            Box::pin(cmd_thread(
-                cfg,
-                &channel_target,
-                &root_msg_id,
-                limit,
-                offline,
-                json,
-            ))
-            .await
-        }
         Some(Command::Send {
-            target,
-            markdown,
+            to,
+            cc,
+            bcc,
             subject,
-            mention,
-            important,
+            body,
+            attach,
+            inline,
+            importance,
             json,
         }) => {
-            Box::pin(cmd_send(
+            Box::pin(cmd_mail_send(
                 cfg,
-                &target,
-                &markdown,
-                subject,
-                &mention,
-                important,
+                to,
+                cc,
+                bcc,
+                &subject,
+                body,
+                attach,
+                inline,
+                &importance,
                 json,
             ))
             .await
         }
         Some(Command::Reply {
-            target,
-            msg_id,
-            markdown,
-            mention,
-            important,
+            message_id,
+            body_md,
+            all,
+            json,
+        }) => Box::pin(cmd_mail_reply(cfg, &message_id, &body_md, all, json)).await,
+        Some(Command::Forward {
+            message_id,
+            to,
+            comment_md,
             json,
         }) => {
-            Box::pin(cmd_reply(
+            Box::pin(cmd_mail_forward(
                 cfg,
-                &target,
-                &msg_id,
-                &markdown,
-                &mention,
-                important,
+                &message_id,
+                to,
+                comment_md.as_deref().unwrap_or(""),
                 json,
             ))
             .await
         }
-        Some(Command::SendFile {
-            target,
-            path,
-            caption,
-            thread,
-            inline,
+        Some(Command::Mark {
+            message_id,
+            read,
+            unread,
+            flag,
+            unflag,
             json,
         }) => {
-            Box::pin(cmd_send_file(
+            let is_read = if read {
+                Some(true)
+            } else if unread {
+                Some(false)
+            } else {
+                None
+            };
+            let flagged = if flag {
+                Some(true)
+            } else if unflag {
+                Some(false)
+            } else {
+                None
+            };
+            Box::pin(cmd_mail_mark(cfg, &message_id, is_read, flagged, json)).await
+        }
+        Some(Command::Move {
+            message_id,
+            dest_folder,
+            json,
+        }) => Box::pin(cmd_mail_move(cfg, &message_id, &dest_folder, json)).await,
+        Some(Command::Archive { message_id, json }) => {
+            Box::pin(cmd_mail_move(cfg, &message_id, "archive", json)).await
+        }
+        Some(Command::Delete {
+            message_id,
+            yes,
+            json,
+        }) => Box::pin(cmd_mail_delete(cfg, &message_id, yes, json)).await,
+        Some(Command::Search {
+            query,
+            folder,
+            remote,
+            limit,
+            json,
+        }) => {
+            Box::pin(cmd_mail_search(
                 cfg,
-                &target,
-                &path,
-                caption.as_deref(),
-                thread.as_deref(),
-                inline,
+                &query,
+                folder.as_deref(),
+                remote,
+                limit,
                 json,
             ))
             .await
         }
         Some(Command::Download {
-            target,
-            msg_id,
-            index,
-            thread,
-            out,
+            message_id,
+            attachment,
+            dir,
             json,
         }) => {
-            Box::pin(cmd_download(
+            Box::pin(cmd_mail_download(
                 cfg,
-                &target,
-                &msg_id,
-                index,
-                thread.as_deref(),
-                out.as_deref(),
-                json,
-            ))
-            .await
-        }
-        Some(Command::React {
-            target,
-            msg_id,
-            reaction,
-            off,
-            thread,
-            json,
-        }) => {
-            Box::pin(cmd_react(
-                cfg,
-                &target,
-                &msg_id,
-                &reaction,
-                !off,
-                thread.as_deref(),
-                json,
-            ))
-            .await
-        }
-        Some(Command::Edit {
-            target,
-            msg_id,
-            new_markdown,
-            thread,
-            json,
-        }) => {
-            Box::pin(cmd_edit(
-                cfg,
-                &target,
-                &msg_id,
-                &new_markdown,
-                thread.as_deref(),
-                json,
-            ))
-            .await
-        }
-        Some(Command::Delete {
-            target,
-            msg_id,
-            thread,
-            yes,
-            json,
-        }) => Box::pin(cmd_delete(cfg, &target, &msg_id, thread.as_deref(), yes, json)).await,
-        Some(Command::Members {
-            target,
-            offline,
-            json,
-        }) => Box::pin(cmd_members(cfg, &target, offline, json)).await,
-        Some(Command::Search {
-            query,
-            target,
-            limit,
-            json,
-        }) => Box::pin(cmd_search(cfg, &query, target.as_deref(), limit, json)).await,
-        Some(Command::Sync {
-            target,
-            chats,
-            depth,
-            json,
-        }) => Box::pin(cmd_sync(cfg, target.as_deref(), chats, depth, json)).await,
-        Some(Command::Export {
-            target,
-            format,
-            include_threads,
-            limit,
-            offline,
-            out,
-        }) => {
-            Box::pin(cmd_export(
-                cfg,
-                &target,
-                &format,
-                include_threads,
-                limit,
-                offline,
-                out.as_deref(),
-            ))
-            .await
-        }
-        Some(Command::Presence {
-            set,
-            activity,
-            expiration_mins,
-            json,
-        }) => {
-            Box::pin(cmd_presence(
-                cfg,
-                set.as_deref(),
-                activity.as_deref(),
-                expiration_mins,
+                &message_id,
+                attachment.as_deref(),
+                dir.as_deref(),
                 json,
             ))
             .await
         }
         Some(Command::Preview {
-            target,
-            msg_id,
+            message_id,
             attachment,
-            thread,
-            file,
+            offline,
             cols,
             rows,
             protocol,
         }) => {
-            Box::pin(cmd_preview_teams(
+            Box::pin(cmd_preview_mail(
                 cfg,
-                target.as_deref(),
-                msg_id.as_deref(),
+                &message_id,
                 attachment.as_deref(),
-                thread.as_deref(),
-                file.as_deref(),
+                offline,
                 cols,
                 rows,
                 protocol.as_deref(),
@@ -752,11 +795,149 @@ async fn dispatch_command(
             .await
         }
         Some(Command::PreviewFile {
-            path,
+            image_path,
             cols,
             rows,
             protocol,
-        }) => cmd_preview_local_file(cfg, &path, cols, rows, protocol.as_deref()),
+        }) => cmd_preview_local_file(cfg, &image_path, cols, rows, protocol.as_deref()),
+        Some(Command::Calendar {
+            days,
+            from,
+            to,
+            limit,
+            offline,
+            cached,
+            json,
+        }) => {
+            Box::pin(cmd_calendar_list(
+                cfg,
+                from.as_deref(),
+                to.as_deref(),
+                days,
+                limit,
+                offline,
+                cached,
+                json,
+            ))
+            .await
+        }
+        Some(Command::Event {
+            event_id,
+            offline,
+            cached,
+            json,
+        }) => Box::pin(cmd_event_show(cfg, &event_id, offline, cached, json)).await,
+        Some(Command::CreateEvent {
+            subject,
+            start,
+            end,
+            location,
+            attendee,
+            body,
+            online,
+            all_day,
+            time_zone,
+            json,
+        }) => {
+            Box::pin(cmd_event_create(
+                cfg, &subject, &start, &end, attendee, location, body, online, all_day, time_zone,
+                json,
+            ))
+            .await
+        }
+        Some(Command::Rsvp {
+            event_id,
+            response,
+            comment,
+            json,
+        }) => {
+            Box::pin(cmd_event_rsvp(
+                cfg,
+                &event_id,
+                &response,
+                comment.as_deref(),
+                json,
+            ))
+            .await
+        }
+        Some(Command::DeleteEvent {
+            event_id,
+            yes,
+            json,
+        }) => Box::pin(cmd_event_delete(cfg, &event_id, yes, json)).await,
+        Some(Command::Tasks {
+            list,
+            all,
+            limit,
+            refresh,
+            offline,
+            cached,
+            json,
+        }) => {
+            Box::pin(cmd_todo_tasks(
+                cfg, &list, all, limit, refresh, offline, cached, json,
+            ))
+            .await
+        }
+        Some(Command::TaskLists {
+            refresh,
+            offline,
+            cached,
+            json,
+        }) => Box::pin(cmd_todo_lists(cfg, refresh, offline, cached, json)).await,
+        Some(Command::AddTask {
+            title,
+            list,
+            due,
+            importance,
+            notes,
+            json,
+        }) => {
+            Box::pin(cmd_todo_add(
+                cfg,
+                &title,
+                &list,
+                due.as_deref(),
+                &importance,
+                notes,
+                json,
+            ))
+            .await
+        }
+        Some(Command::Done {
+            task_id,
+            list,
+            undo,
+            json,
+        }) => Box::pin(cmd_todo_done(cfg, &task_id, &list, !undo, json)).await,
+        Some(Command::DeleteTask {
+            task_id,
+            list,
+            yes,
+            json,
+        }) => Box::pin(cmd_todo_delete(cfg, &task_id, &list, yes, json)).await,
+        Some(Command::Contacts {
+            query,
+            limit,
+            refresh,
+            offline,
+            cached,
+            json,
+        }) => {
+            Box::pin(cmd_contacts(
+                cfg,
+                query.as_deref(),
+                limit,
+                refresh,
+                offline,
+                cached,
+                json,
+            ))
+            .await
+        }
+        Some(Command::Sync { days, limit, json }) => {
+            Box::pin(cmd_sync(cfg, days, limit, json)).await
+        }
         Some(Command::Update {
             check,
             force,
@@ -764,13 +945,21 @@ async fn dispatch_command(
             json,
         }) => Box::pin(cmd_update(cfg, check, force, repo.as_deref(), json)).await,
         Some(Command::Tui) => Box::pin(cmd_tui(cfg, persona)).await,
-        Some(Command::Serve { bind, port, token }) => {
+        Some(Command::Serve {
+            bind,
+            port,
+            api_key,
+        }) => {
             let (_auth, graph, storage) = Box::pin(open_runtime(cfg, false)).await?;
             Box::pin(serve::run(
                 cfg.clone(),
                 graph,
                 storage,
-                ServeOptions { bind, port, token },
+                ServeOptions {
+                    bind,
+                    port,
+                    api_key,
+                },
             ))
             .await
         }
@@ -782,6 +971,9 @@ async fn dispatch_command(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Daemon management
+// ---------------------------------------------------------------------------
 
 fn print_daemon_status_text(header: &str, cfg: &AppConfig, status: &crate::daemon::DaemonStatus) {
     println!(
@@ -867,8 +1059,11 @@ async fn dispatch_daemon_command(cfg: &AppConfig, command: DaemonCommand) -> Res
     }
 }
 
+// ---------------------------------------------------------------------------
+// Runtime / Storage fast-open helpers
+// ---------------------------------------------------------------------------
 
-async fn open_runtime(
+pub(crate) async fn open_runtime(
     cfg: &AppConfig,
     require_login: bool,
 ) -> Result<(AuthManager, GraphClient, Storage)> {
@@ -876,7 +1071,7 @@ async fn open_runtime(
     let tokens = auth.current_tokens().await;
     if require_login && tokens.is_none() {
         bail!(
-            "Sign-in required. Run `{} login` first.",
+            "Sign-in required. Run `{} login` first (or enable shared teams-cli auth / set OUTLOOK_ACCESS_TOKEN).",
             Persona::detect().bin_name()
         );
     }
@@ -1046,11 +1241,18 @@ fn infer_user_id_fast_with(
     None
 }
 
+fn env_access_token_value() -> Option<String> {
+    std::env::var("OUTLOOK_ACCESS_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 async fn resolve_daemon_warm(cfg: &AppConfig, refresh: bool, cached: bool) -> bool {
     if refresh || cached {
         return false;
     }
-    let env_tok = std::env::var("TEAMS_ACCESS_TOKEN").ok();
+    let env_tok = env_access_token_value();
     let cred_path = config::credential_fallback_path();
     let inferred_user_id = infer_user_id_fast_with(cfg, env_tok.as_deref(), &cred_path);
     let daemon_warm = crate::daemon::is_daemon_alive_fast(cfg, inferred_user_id.as_deref());
@@ -1061,9 +1263,9 @@ async fn resolve_daemon_warm(cfg: &AppConfig, refresh: bool, cached: bool) -> bo
 }
 
 /// Opens local SQLite `Storage` without touching OS Keyring or initializing `reqwest::Client` TLS roots
-/// whenever `TEAMS_ACCESS_TOKEN`, `TEAMS_TOKEN_FILE`, `credentials.json`, or a single local `cache.db` resolves `user_id`.
+/// whenever `OUTLOOK_ACCESS_TOKEN`, `OUTLOOK_TOKEN_FILE`, `credentials.json`, or a single local `cache.db` resolves `user_id`.
 pub(crate) fn open_storage_only(cfg: &AppConfig) -> Result<Storage> {
-    let env_tok = std::env::var("TEAMS_ACCESS_TOKEN").ok();
+    let env_tok = env_access_token_value();
     if let Some(path) = resolve_storage_db_path_fast(
         cfg,
         env_tok.as_deref(),
@@ -1073,7 +1275,17 @@ pub(crate) fn open_storage_only(cfg: &AppConfig) -> Result<Storage> {
         return Storage::open(&path);
     }
 
-    // Fallback to OS keyring only when disk sources and single-DB lookup are ambiguous.
+    if cfg.share_m365_auth {
+        if let Some(teams_dir) = config::legacy_teams_config_dir() {
+            let teams_cred = teams_dir.join("credentials.json");
+            if teams_cred.is_file() {
+                if let Some(uid) = extract_user_id_from_token_file(&teams_cred) {
+                    return Storage::open(&config::db_path(Some(&uid)));
+                }
+            }
+        }
+    }
+
     let uid = crate::auth::load_stored_tokens()
         .ok()
         .flatten()
@@ -1087,7 +1299,7 @@ fn parse_cli_cache_secs(raw: Option<&str>) -> u64 {
 }
 
 fn cli_cache_ttl_secs(cfg: &AppConfig) -> u64 {
-    if let Ok(raw) = std::env::var("TEAMS_CLI_CACHE_SECS") {
+    if let Ok(raw) = std::env::var("OUTLOOK_CLI_CACHE_SECS") {
         if let Ok(parsed) = raw.trim().parse::<u64>() {
             return parsed;
         }
@@ -1099,11 +1311,11 @@ fn is_cursor_fresh(storage: &Storage, scope_keys: &[&str], ttl_secs: u64) -> boo
     if ttl_secs == 0 {
         return false;
     }
-    let now = chrono::Utc::now();
+    let now = Utc::now();
     for key in scope_keys {
         if let Ok(Some(cursor)) = storage.get_sync_cursor(key) {
-            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&cursor.synced_at) {
-                let age = now.signed_duration_since(dt.with_timezone(&chrono::Utc));
+            if let Ok(dt) = DateTime::parse_from_rfc3339(&cursor.last_synced_at) {
+                let age = now.signed_duration_since(dt.with_timezone(&Utc));
                 if age.num_seconds() >= 0 && (age.num_seconds() as u64) <= ttl_secs {
                     return true;
                 }
@@ -1114,14 +1326,18 @@ fn is_cursor_fresh(storage: &Storage, scope_keys: &[&str], ttl_secs: u64) -> boo
 }
 
 fn record_cli_sync_cursor(storage: &Storage, scope_key: &str) {
-    let cursor = crate::models::SyncCursor {
+    let cursor = SyncCursor {
         scope_key: scope_key.to_string(),
         delta_link: None,
-        oldest_msg_ts: None,
-        synced_at: chrono::Utc::now().to_rfc3339(),
+        history_next_link: None,
+        last_synced_at: Utc::now().to_rfc3339(),
     };
     let _ = storage.save_sync_cursor(&cursor);
 }
+
+// ---------------------------------------------------------------------------
+// Auth & Diagnostics commands
+// ---------------------------------------------------------------------------
 
 async fn cmd_tui(cfg: &mut AppConfig, persona: Persona) -> Result<()> {
     let auth = AuthManager::new(cfg.clone())?;
@@ -1136,9 +1352,6 @@ async fn cmd_tui(cfg: &mut AppConfig, persona: Persona) -> Result<()> {
     }
 
     let (auth, graph, storage) = open_runtime(cfg, true).await?;
-    if storage.list_conversations()?.is_empty() {
-        let _ = sync::bootstrap_conversations(&graph, &storage).await;
-    }
     tui::run(cfg.clone(), auth, graph, storage).await
 }
 
@@ -1166,11 +1379,7 @@ async fn cmd_login(cfg: &mut AppConfig, opts: LoginOptions, json_out: bool) -> R
     let tokens = auth.login(&opts).await?;
     let graph = GraphClient::new(cfg.clone(), auth.clone())?;
     let me = graph.get_me().await?;
-    let email = me
-        .mail
-        .clone()
-        .or_else(|| me.user_principal_name.clone());
-    auth.update_identity(me.id.clone(), me.display_name.clone(), email.clone())
+    auth.update_identity(me.id.clone(), me.display_name.clone(), me.email.clone())
         .await?;
 
     let updated = auth.current_tokens().await.unwrap_or(tokens);
@@ -1191,7 +1400,7 @@ async fn cmd_login(cfg: &mut AppConfig, opts: LoginOptions, json_out: bool) -> R
         println!(
             "Signed in as: {} ({}) [id={}]",
             me.display_name,
-            email.as_deref().unwrap_or("-"),
+            me.email.as_deref().unwrap_or("-"),
             me.id
         );
         println!(
@@ -1210,9 +1419,36 @@ async fn cmd_logout(cfg: &AppConfig, json_out: bool) -> Result<()> {
     if json_out {
         println!("{}", serde_json::to_string_pretty(&json!({ "ok": true }))?);
     } else {
-        println!("Signed out and removed stored tokens.");
+        println!("Signed out and removed stored outlook-cli tokens.");
     }
     Ok(())
+}
+
+pub(crate) fn auth_source_label(tokens: Option<&StoredTokens>, cfg: &AppConfig) -> &'static str {
+    let Some(tok) = tokens else {
+        return "not signed in";
+    };
+    let mode = tok.auth_mode.to_ascii_lowercase();
+    if mode == "shared_teams_token_file" {
+        return "teams-cli (shared token_file)";
+    }
+    if mode.contains("teams") || mode.contains("shared") {
+        return "teams-cli (shared session)";
+    }
+    if mode == "env_token" {
+        return "outlook-cli (OUTLOOK_ACCESS_TOKEN)";
+    }
+    if mode == "token_file" {
+        if cfg.resolved_token_file().is_some() {
+            return "outlook-cli (OUTLOOK_TOKEN_FILE)";
+        }
+        return "teams-cli (TEAMS_TOKEN_FILE)";
+    }
+    let outlook_cred = config::credential_fallback_path();
+    if outlook_cred.exists() {
+        return "outlook-cli (credentials.json)";
+    }
+    "outlook-cli (OS keyring)"
 }
 
 async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result<()> {
@@ -1223,19 +1459,19 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
             if let Some(ref tf) = cfg.resolved_token_file() {
                 if !tf.exists() {
                     bail!(
-                        "Sign-in required. Run `{} login` or set `TEAMS_TOKEN_FILE` / `TEAMS_ACCESS_TOKEN`. (Configured TEAMS_TOKEN_FILE not found: {})",
+                        "Sign-in required. Run `{} login` or set `OUTLOOK_TOKEN_FILE` / `OUTLOOK_ACCESS_TOKEN`. (Configured OUTLOOK_TOKEN_FILE not found: {})",
                         persona.bin_name(),
                         tf.display()
                     );
                 }
                 bail!(
-                    "Sign-in required. Run `{} login` or set a valid `TEAMS_TOKEN_FILE` ({}) / `TEAMS_ACCESS_TOKEN`.",
+                    "Sign-in required. Run `{} login` or set a valid `OUTLOOK_TOKEN_FILE` ({}) / `OUTLOOK_ACCESS_TOKEN`.",
                     persona.bin_name(),
                     tf.display()
                 );
             }
             bail!(
-                "Sign-in required. Run `{} login` or set `TEAMS_TOKEN_FILE` / `TEAMS_ACCESS_TOKEN`.",
+                "Sign-in required. Run `{} login` or set `OUTLOOK_TOKEN_FILE` / `OUTLOOK_ACCESS_TOKEN`.",
                 persona.bin_name()
             );
         }
@@ -1261,19 +1497,22 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
         }
     }
 
+    let auth_source = auth_source_label(Some(&tokens), cfg);
     let scope_diag = diagnose_access_token_scopes(&tokens.access_token);
 
     if tokens.is_expired_soon(0) {
         let err_detail = match refresh_failure {
             Some(ref err) => format!(
-                "Token expired (exp: {}, auth_mode={}) — automatic refresh failed: {err:#}",
+                "Token expired (exp: {}, auth_mode={}, source={}) — automatic refresh failed: {err:#}",
                 format_unix_ts(tokens.expires_at),
-                tokens.auth_mode
+                tokens.auth_mode,
+                auth_source
             ),
             None => format!(
-                "Token expired (exp: {}, auth_mode={}) — refresh the token and retry.",
+                "Token expired (exp: {}, auth_mode={}, source={}) — refresh the token and retry.",
                 format_unix_ts(tokens.expires_at),
-                tokens.auth_mode
+                tokens.auth_mode,
+                auth_source
             ),
         };
         if json_out {
@@ -1287,6 +1526,7 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
                     "client_id": tokens.client_id,
                     "tenant_id": tokens.tenant_id,
                     "auth_mode": tokens.auth_mode,
+                    "auth_source": auth_source,
                     "expires_at": tokens.expires_at,
                     "expires_at_human": format_unix_ts(tokens.expires_at),
                     "expired": true,
@@ -1295,10 +1535,13 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
                     "scopes": scope_diag.scopes,
                     "roles": scope_diag.roles,
                     "scope_warnings": scope_diag.warnings,
-                    "error": format!("Token expired (exp: {}) — refresh and retry", format_unix_ts(tokens.expires_at)),
+                    "error": err_detail,
                 }))?
             );
-            bail!("Token expired (exp: {}) — refresh the token and retry.", format_unix_ts(tokens.expires_at));
+            bail!(
+                "Token expired (exp: {}) — refresh the token and retry.",
+                format_unix_ts(tokens.expires_at)
+            );
         }
         bail!("{err_detail}");
     }
@@ -1325,24 +1568,23 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
         .user_display_name
         .clone()
         .or_else(|| live_profile.as_ref().map(|p| p.display_name.clone()));
-    let email = tokens.user_email.clone().or_else(|| {
-        live_profile
-            .as_ref()
-            .and_then(|p| p.mail.clone().or_else(|| p.user_principal_name.clone()))
-    });
+    let email = tokens
+        .user_email
+        .clone()
+        .or_else(|| live_profile.as_ref().and_then(|p| p.email.clone()));
 
     if display_name.is_none() && user_id.is_none() {
         if let Some(err) = profile_err {
             bail!(
-                "Failed to fetch profile (/me) (auth_mode={}, expires: {}): {err:#}",
+                "Failed to fetch profile (/me) (auth_mode={}, source={}, expires: {}): {err:#}",
                 tokens.auth_mode,
+                auth_source,
                 format_unix_ts(tokens.expires_at)
             );
         }
     }
 
-    let expiring_soon =
-        !tokens.is_expired_soon(0) && tokens.is_expired_soon(refresh_skew_secs);
+    let expiring_soon = !tokens.is_expired_soon(0) && tokens.is_expired_soon(refresh_skew_secs);
 
     if json_out {
         println!(
@@ -1355,6 +1597,8 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
                 "client_id": tokens.client_id,
                 "tenant_id": tokens.tenant_id,
                 "auth_mode": tokens.auth_mode,
+                "auth_source": auth_source,
+                "share_m365_auth": cfg.share_m365_auth,
                 "expires_at": tokens.expires_at,
                 "expires_at_human": format_unix_ts(tokens.expires_at),
                 "expired": false,
@@ -1376,6 +1620,7 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
         println!("client_id: {}", tokens.client_id);
         println!("tenant_id: {}", tokens.tenant_id);
         println!("auth_mode: {}", tokens.auth_mode);
+        println!("auth_source: {auth_source}");
         println!(
             "token_expires: {} ({})",
             format_unix_ts(tokens.expires_at),
@@ -1403,7 +1648,7 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
 async fn cmd_doctor(
     cfg: &AppConfig,
     persona: Persona,
-    probe: bool,
+    online: bool,
     json_out: bool,
 ) -> Result<()> {
     let auth = AuthManager::new(cfg.clone())?;
@@ -1423,53 +1668,88 @@ async fn cmd_doctor(
     let token_file = cfg.resolved_token_file();
     let token_refresh_cmd_configured = !cfg.token_refresh_cmd.trim().is_empty();
     let auth_mode = tokens.as_ref().map(|t| t.auth_mode.clone());
+    let auth_source = auth_source_label(tokens.as_ref(), cfg);
     let token_expires_at = tokens.as_ref().map(|t| format_unix_ts(t.expires_at));
+    let keyring_status = describe_keyring_status(tokens.as_ref(), &cred_path, cfg);
 
-    let keyring_status = describe_keyring_status(tokens.as_ref(), &cred_path);
-
-    let (cached_conversations, cached_teams) = if db.exists() {
-        if let Ok(storage) = Storage::open(&db) {
-            (
-                storage.list_conversations().map(|v| v.len()).unwrap_or(0),
-                storage.list_teams().map(|v| v.len()).unwrap_or(0),
-            )
+    let (cached_folders, cached_messages, cached_events, cached_contacts, cached_todo_lists) =
+        if db.exists() {
+            if let Ok(storage) = Storage::open(&db) {
+                (
+                    storage.list_mail_folders().map(|v| v.len()).unwrap_or(0),
+                    storage
+                        .list_mail_messages(None, false, false, false, 10_000)
+                        .map(|v| v.len())
+                        .unwrap_or(0),
+                    storage
+                        .list_calendar_events(None, None, 10_000)
+                        .map(|v| v.len())
+                        .unwrap_or(0),
+                    storage
+                        .list_contacts(None, 10_000)
+                        .map(|v| v.len())
+                        .unwrap_or(0),
+                    storage.list_todo_lists().map(|v| v.len()).unwrap_or(0),
+                )
+            } else {
+                (0, 0, 0, 0, 0)
+            }
         } else {
-            (0, 0)
-        }
-    } else {
-        (0, 0)
-    };
+            (0, 0, 0, 0, 0)
+        };
 
     let daemon_status = crate::daemon::query_daemon_status(cfg)
         .await
         .unwrap_or_default();
     let graphics_caps = img_preview::detect_graphics_caps(cfg.image_protocol);
 
-    let mut probe_me: Option<serde_json::Value> = None;
-    let mut probe_presence: Option<serde_json::Value> = None;
-    let mut probe_error: Option<String> = None;
-
-    if probe {
+    let mut probe_results: Option<serde_json::Value> = None;
+    if online {
         let mut graph = GraphClient::new(cfg.clone(), auth.clone())?;
         if let Some(uid) = user_id {
             graph = graph.with_my_user_id(uid);
         }
-        match graph.get_me().await {
-            Ok(me) => {
-                probe_me = Some(serde_json::to_value(&me)?);
-                match graph.get_my_presence().await {
-                    Ok(p) => probe_presence = Some(serde_json::to_value(&p)?),
-                    Err(err) => {
-                        let wrapped = wrap_graph_permission_error(&graph, err).await;
-                        probe_error = Some(format!("presence probe failed: {wrapped:#}"));
-                    }
-                }
+        let (start_iso, end_iso) = default_calendar_window(None, None, 1)?;
+        let (me_res, mail_res, cal_res, contacts_res, todo_res) = tokio::join!(
+            graph.get_me(),
+            graph.list_mail_folders(),
+            graph.list_calendar_view(&start_iso, &end_iso, 5),
+            graph.list_contacts(5),
+            graph.list_todo_lists(),
+        );
+
+        let format_probe = |res: Result<usize>| -> serde_json::Value {
+            match res {
+                Ok(count) => json!({ "ok": true, "count": count }),
+                Err(err) => json!({ "ok": false, "error": format!("{err:#}") }),
             }
+        };
+
+        let me_val = match me_res {
+            Ok(me) => json!({ "ok": true, "user": me }),
             Err(err) => {
                 let wrapped = wrap_graph_permission_error(&graph, err).await;
-                probe_error = Some(format!("get_me probe failed: {wrapped:#}"));
+                json!({ "ok": false, "error": format!("{wrapped:#}") })
             }
-        }
+        };
+        let mail_val = format_probe(mail_res.map(|v| v.len()));
+        let cal_val = format_probe(cal_res.map(|v| v.len()));
+        let contacts_val = format_probe(contacts_res.map(|v| v.len()));
+        let todo_val = format_probe(todo_res.map(|v| v.len()));
+        let all_ok = me_val["ok"].as_bool().unwrap_or(false)
+            && mail_val["ok"].as_bool().unwrap_or(false)
+            && cal_val["ok"].as_bool().unwrap_or(false)
+            && contacts_val["ok"].as_bool().unwrap_or(false)
+            && todo_val["ok"].as_bool().unwrap_or(false);
+
+        probe_results = Some(json!({
+            "ok": all_ok,
+            "me": me_val,
+            "mail": mail_val,
+            "calendar": cal_val,
+            "contacts": contacts_val,
+            "todo": todo_val,
+        }));
     }
 
     if json_out {
@@ -1495,6 +1775,8 @@ async fn cmd_doctor(
                 "tenant_id": cfg.tenant_id,
                 "graph_base_url": cfg.graph_base_url,
                 "auth_base_url": cfg.auth_base_url,
+                "auth_source": auth_source,
+                "share_m365_auth": cfg.share_m365_auth,
                 "keyring_status": keyring_status,
                 "token_file": token_file,
                 "token_file_exists": token_file.as_ref().map(|p| p.exists()),
@@ -1504,8 +1786,11 @@ async fn cmd_doctor(
                 "token_expires_at": token_expires_at,
                 "logged_in": tokens.is_some(),
                 "cache_counts": {
-                    "conversations": cached_conversations,
-                    "teams": cached_teams,
+                    "mail_folders": cached_folders,
+                    "mail_messages": cached_messages,
+                    "calendar_events": cached_events,
+                    "contacts": cached_contacts,
+                    "todo_lists": cached_todo_lists,
                 },
                 "daemon": {
                     "running": daemon_status.running,
@@ -1518,21 +1803,21 @@ async fn cmd_doctor(
                 "image_protocol": graphics_caps.protocol.as_str(),
                 "image_protocol_preference": cfg.image_protocol.as_str(),
                 "cell_px": [graphics_caps.cell_px.0, graphics_caps.cell_px.1],
-                "probe": if probe {
-                    Some(json!({
-                        "ok": probe_error.is_none(),
-                        "me": probe_me,
-                        "presence": probe_presence,
-                        "error": probe_error,
-                    }))
-                } else {
-                    None
-                },
+                "online_check": probe_results,
             }))?
         );
     } else {
-        println!("{} v{} (persona={})", persona.bin_name(), env!("CARGO_PKG_VERSION"), persona.bin_name());
-        println!("config.toml: {} (exists={})", cfg_path.display(), cfg_path.exists());
+        println!(
+            "{} v{} (persona={})",
+            persona.bin_name(),
+            env!("CARGO_PKG_VERSION"),
+            persona.bin_name()
+        );
+        println!(
+            "config.toml: {} (exists={})",
+            cfg_path.display(),
+            cfg_path.exists()
+        );
         println!(
             "credentials.json: {} (exists={})",
             cred_path.display(),
@@ -1541,7 +1826,7 @@ async fn cmd_doctor(
         println!("drafts.json: {}", drafts.display());
         println!("cache.db: {} (exists={})", db.display(), db.exists());
         println!(
-            "cache_counts: conversations={cached_conversations}, teams={cached_teams}"
+            "cache_counts: folders={cached_folders}, messages={cached_messages}, events={cached_events}, contacts={cached_contacts}, todo_lists={cached_todo_lists}"
         );
         println!("download_dir: {}", dl_dir.display());
         println!("github_repo: {}", cfg.github_repo);
@@ -1573,6 +1858,7 @@ async fn cmd_doctor(
         println!("tenant_id: {}", cfg.tenant_id);
         println!("graph_base_url: {}", cfg.graph_base_url);
         println!("auth_base_url: {}", cfg.auth_base_url);
+        println!("auth_source: {auth_source}");
         println!("keyring_status: {keyring_status}");
         println!(
             "daemon: running={}, pid={}, endpoint={}, attached_clients={}, auto_daemon={}",
@@ -1614,269 +1900,274 @@ async fn cmd_doctor(
             graphics_caps.cell_px.1,
             cell_suffix,
         );
-        if probe {
-            if let Some(err) = probe_error {
-                println!("probe: failed ({err})");
-            } else {
-                println!(
-                    "probe: ok (me={}, presence={})",
-                    probe_me
-                        .as_ref()
-                        .and_then(|v| v.get("display_name"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("-"),
-                    probe_presence
-                        .as_ref()
-                        .and_then(|v| v.get("availability"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("-"),
-                );
-            }
+        if let Some(ref online_val) = probe_results {
+            println!(
+                "online_check: ok={} (me={}, mail={}, calendar={}, contacts={}, todo={})",
+                online_val["ok"].as_bool().unwrap_or(false),
+                format_probe_status(&online_val["me"]),
+                format_probe_status(&online_val["mail"]),
+                format_probe_status(&online_val["calendar"]),
+                format_probe_status(&online_val["contacts"]),
+                format_probe_status(&online_val["todo"]),
+            );
         }
     }
 
     Ok(())
 }
 
-fn describe_keyring_status(tokens: Option<&StoredTokens>, fallback_path: &Path) -> String {
+fn format_probe_status(val: &serde_json::Value) -> String {
+    if val["ok"].as_bool().unwrap_or(false) {
+        if let Some(cnt) = val.get("count").and_then(|v| v.as_u64()) {
+            format!("ok({cnt})")
+        } else if let Some(name) = val
+            .get("user")
+            .and_then(|u| u.get("display_name"))
+            .and_then(|v| v.as_str())
+        {
+            format!("ok({name})")
+        } else {
+            "ok".to_string()
+        }
+    } else {
+        val.get("error")
+            .and_then(|e| e.as_str())
+            .map(|e| format!("err({})", truncate_single_line(e, 48)))
+            .unwrap_or_else(|| "err".to_string())
+    }
+}
+
+fn describe_keyring_status(
+    tokens: Option<&StoredTokens>,
+    fallback_path: &Path,
+    cfg: &AppConfig,
+) -> String {
     match tokens {
         None => "not signed in (no stored token)".to_string(),
         Some(tok) if tok.auth_mode == "env_token" => {
-            "env_token (using TEAMS_ACCESS_TOKEN)".to_string()
+            "env_token (using OUTLOOK_ACCESS_TOKEN)".to_string()
         }
         Some(tok) if tok.auth_mode == "token_file" => {
-            "token_file (using TEAMS_TOKEN_FILE)".to_string()
+            "token_file (using OUTLOOK_TOKEN_FILE)".to_string()
         }
         Some(_) if fallback_path.exists() => {
-            "using credentials.json file fallback".to_string()
+            "using outlook-cli credentials.json file fallback".to_string()
+        }
+        Some(_) if auth_source_label(tokens, cfg).starts_with("teams-cli") => {
+            "shared teams-cli session active".to_string()
         }
         Some(_) => "OS keyring active (token loaded)".to_string(),
     }
 }
 
-fn print_chats_output(chats: &[ConversationSummary], json_out: bool) -> Result<()> {
+// ---------------------------------------------------------------------------
+// Mail commands
+// ---------------------------------------------------------------------------
+
+fn print_mail_folders_output(folders: &[MailFolder], json_out: bool) -> Result<()> {
     if json_out {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "chats": chats }))?
+            serde_json::to_string_pretty(&json!({ "folders": folders }))?
         );
-    } else if chats.is_empty() {
-        println!("No chats to display.");
+    } else if folders.is_empty() {
+        println!("No mail folders found.");
     } else {
-        for c in chats {
-            let unread = if c.unread_count > 0 {
-                format!(" [unread:{}]", c.unread_count)
-            } else {
-                String::new()
-            };
-            let preview = c.last_msg_preview.as_deref().unwrap_or("");
+        for f in folders {
+            let wk = f
+                .well_known_name
+                .as_deref()
+                .map(|w| format!(" [{w}]"))
+                .unwrap_or_default();
             println!(
-                "{}  [{}] {}{}  {}",
-                c.conv_key,
-                c.kind.as_str(),
-                c.title,
-                unread,
-                truncate_single_line(preview, 60)
+                "{}{}  unread={}/{}  ({})",
+                f.display_name, wk, f.unread_item_count, f.total_item_count, f.id
             );
         }
     }
     Ok(())
 }
 
-async fn cmd_chats(
+async fn cmd_folders(
     cfg: &AppConfig,
-    limit: usize,
     refresh: bool,
+    offline: bool,
     cached: bool,
     json_out: bool,
 ) -> Result<()> {
-    let limit = clamp_limit(limit);
+    if offline {
+        let storage = open_storage_only(cfg)?;
+        let folders = storage.list_mail_folders()?;
+        return print_mail_folders_output(&folders, json_out);
+    }
+
     let ttl = cli_cache_ttl_secs(cfg);
     let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
     if !refresh && (cached || daemon_warm || ttl > 0) {
         if let Ok(storage) = open_storage_only(cfg) {
-            if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:chats"], ttl) {
-                let mut chats: Vec<ConversationSummary> = storage
-                    .list_conversations()?
-                    .into_iter()
-                    .filter(|c| !c.kind.is_channel())
-                    .collect();
-                if !chats.is_empty() && (cached || chats.len() >= limit) {
-                    chats.truncate(limit);
-                    return print_chats_output(&chats, json_out);
+            if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:mail_folders"], ttl) {
+                let folders = storage.list_mail_folders()?;
+                if !folders.is_empty() {
+                    return print_mail_folders_output(&folders, json_out);
                 }
             }
         }
     }
 
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-
-    let cached_chats: Vec<ConversationSummary> = storage
-        .list_conversations()?
-        .into_iter()
-        .filter(|c| !c.kind.is_channel())
-        .collect();
-
-    let mut chats = if refresh || (!cached && cached_chats.len() < limit) || cached_chats.is_empty() {
-        let fetched = match graph.list_chats(limit).await {
+    let cached_folders = storage.list_mail_folders()?;
+    let folders = if refresh || cached_folders.is_empty() {
+        let fetched = match graph.list_mail_folders().await {
             Ok(items) => items,
             Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
         };
-        storage.upsert_conversations(&fetched)?;
-        record_cli_sync_cursor(&storage, "cli:chats");
-        let stored: Vec<ConversationSummary> = storage
-            .list_conversations()?
-            .into_iter()
-            .filter(|c| !c.kind.is_channel())
-            .collect();
+        storage.upsert_mail_folders(&fetched)?;
+        record_cli_sync_cursor(&storage, "cli:mail_folders");
+        let stored = storage.list_mail_folders()?;
         if stored.is_empty() {
             fetched
         } else {
             stored
         }
     } else {
-        cached_chats
+        cached_folders
     };
 
-    chats.truncate(limit);
-    print_chats_output(&chats, json_out)
+    print_mail_folders_output(&folders, json_out)
 }
 
-async fn cmd_new_chat(
-    cfg: &AppConfig,
-    to: Vec<String>,
-    topic: Option<String>,
-    message: Option<String>,
+fn load_cached_mail_list(
+    storage: &Storage,
+    folder_id: &str,
+    limit: usize,
+    json_out: bool,
+) -> Result<Vec<MailMessage>> {
+    if json_out {
+        storage.list_mail_messages(Some(folder_id), false, false, false, limit)
+    } else {
+        storage.list_mail_summaries(Some(folder_id), limit)
+    }
+}
+
+pub(crate) fn filter_mail_messages(
+    mut messages: Vec<MailMessage>,
+    unread_only: bool,
+    flagged_only: bool,
+    focused_only: bool,
+    limit: usize,
+) -> Vec<MailMessage> {
+    if unread_only {
+        messages.retain(|m| !m.is_read);
+    }
+    if flagged_only {
+        messages.retain(|m| m.flagged);
+    }
+    if focused_only {
+        messages.retain(MailMessage::is_focused);
+    }
+    messages.truncate(limit);
+    messages
+}
+
+fn print_mail_list_output(
+    folder: &str,
+    folder_id: &str,
+    messages: Vec<MailMessage>,
+    unread_only: bool,
+    flagged_only: bool,
+    focused_only: bool,
+    limit: usize,
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let members: Vec<String> = to
-        .into_iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if members.is_empty() {
-        bail!("At least one recipient (--to) must be specified.");
-    }
-
-    let chat = graph.create_chat(&members, topic.as_deref()).await?;
-    storage.upsert_conversations(std::slice::from_ref(&chat))?;
-
-    let mut sent_msg: Option<MessageItem> = None;
-    if let Some(md) = message {
-        if !md.trim().is_empty() {
-            let outgoing =
-                parser::compile_outgoing_markdown(&md, None, vec![], vec![], vec![], None);
-            let sent = graph.send_message(&chat.target, &outgoing).await?;
-            let _ = storage.upsert_messages(std::slice::from_ref(&sent));
-            sent_msg = Some(sent);
-        }
-    }
+    let messages = filter_mail_messages(messages, unread_only, flagged_only, focused_only, limit);
 
     if json_out {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "chat": chat,
-                "message": sent_msg,
+                "folder": folder_id,
+                "messages": messages,
             }))?
         );
+    } else if messages.is_empty() {
+        println!("No messages found in '{folder}'.");
     } else {
-        println!("Chat created: {} ({})", chat.title, chat.conv_key);
-        if let Some(msg) = sent_msg {
-            println!("Initial message sent: msg_id={}", msg.msg_id);
-        }
-    }
-    Ok(())
-}
-
-fn print_teams_output(teams: &[TeamSummary], json_out: bool) -> Result<()> {
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({ "teams": teams }))?
-        );
-    } else if teams.is_empty() {
-        println!("No joined teams found.");
-    } else {
-        for team in teams {
-            println!("{} ({})", team.display_name, team.id);
-            for ch in &team.channels {
-                println!(
-                    "  - {} [{}] ({})",
-                    ch.display_name,
-                    ch.membership_type,
-                    ch.conv_key()
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn print_channels_output(
-    team: &TeamSummary,
-    channels: &[crate::models::ChannelSummary],
-    json_out: bool,
-) -> Result<()> {
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "team": { "id": team.id, "display_name": team.display_name },
-                "channels": channels,
-            }))?
-        );
-    } else {
-        println!("# {} ({})", team.display_name, team.id);
-        for ch in channels {
+        for m in &messages {
+            let unread_mark = if m.is_read { " " } else { "*" };
+            let flag_mark = if m.flagged { "!" } else { " " };
+            let att_mark = if m.has_attachments { "@" } else { " " };
             println!(
-                "  {}  [{}]  {}",
-                ch.conv_key(),
-                ch.membership_type,
-                ch.display_name
+                "{unread_mark}{flag_mark}{att_mark} [{}] {} | {} ({})",
+                m.received_at,
+                m.from_display(),
+                truncate_single_line(m.effective_subject(), 60),
+                m.id
             );
         }
     }
     Ok(())
 }
 
-async fn cmd_teams(cfg: &AppConfig, refresh: bool, cached: bool, json_out: bool) -> Result<()> {
-    let ttl = cli_cache_ttl_secs(cfg);
-    let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
-    if !refresh && (cached || daemon_warm || ttl > 0) {
-        if let Ok(storage) = open_storage_only(cfg) {
-            if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:teams"], ttl) {
-                let teams = storage.list_teams()?;
-                if !teams.is_empty() {
-                    return print_teams_output(&teams, json_out);
-                }
-            }
-        }
-    }
-
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let teams = load_teams_with_refresh(&graph, &storage, refresh).await?;
-    print_teams_output(&teams, json_out)
-}
-
-async fn cmd_channels(
+#[allow(clippy::too_many_arguments)]
+async fn cmd_mail_list(
     cfg: &AppConfig,
-    team_query: &str,
+    folder: &str,
+    limit: usize,
+    unread_only: bool,
+    flagged_only: bool,
+    focused_only: bool,
     refresh: bool,
+    offline: bool,
     cached: bool,
     json_out: bool,
 ) -> Result<()> {
+    let limit = clamp_limit(limit);
+    let fetch_limit = if unread_only || flagged_only || focused_only {
+        (limit.saturating_mul(3)).clamp(limit, 500)
+    } else {
+        limit
+    };
+
+    if offline {
+        let storage = open_storage_only(cfg)?;
+        let resolved = resolver::resolve_mail_folder_cached(&storage, folder)?;
+        let messages = load_cached_mail_list(&storage, &resolved.id, fetch_limit, json_out)?;
+        return print_mail_list_output(
+            folder,
+            &resolved.id,
+            messages,
+            unread_only,
+            flagged_only,
+            focused_only,
+            limit,
+            json_out,
+        );
+    }
+
     let ttl = cli_cache_ttl_secs(cfg);
     let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
     if !refresh && (cached || daemon_warm || ttl > 0) {
         if let Ok(storage) = open_storage_only(cfg) {
-            if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:teams"], ttl) {
-                let teams = storage.list_teams()?;
-                if !teams.is_empty() {
-                    if let Ok(team) = resolve_team_from_slice(&teams, team_query) {
-                        return print_channels_output(&team, &team.channels, json_out);
+            if let Ok(resolved) = resolver::resolve_mail_folder_cached(&storage, folder) {
+                let cli_key = format!("cli:mail:{}", resolved.id);
+                let delta_key = format!("mail_delta:{}", resolved.id);
+                if cached
+                    || daemon_warm
+                    || is_cursor_fresh(&storage, &[cli_key.as_str(), delta_key.as_str()], ttl)
+                {
+                    let messages =
+                        load_cached_mail_list(&storage, &resolved.id, fetch_limit, json_out)?;
+                    if !messages.is_empty() {
+                        return print_mail_list_output(
+                            folder,
+                            &resolved.id,
+                            messages,
+                            unread_only,
+                            flagged_only,
+                            focused_only,
+                            limit,
+                            json_out,
+                        );
                     }
                 }
             }
@@ -1884,501 +2175,524 @@ async fn cmd_channels(
     }
 
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let teams = load_teams_with_refresh(&graph, &storage, refresh).await?;
-    let team = resolve_team_from_slice(&teams, team_query)?;
-
-    let channels = if refresh && team.channels.is_empty() {
-        graph.list_team_channels(&team.id, &team.display_name).await?
-    } else {
-        team.channels.clone()
+    let resolved = match resolver::resolve_mail_folder(&graph, &storage, folder, false).await {
+        Ok(f) => f,
+        Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
     };
 
-    print_channels_output(&team, &channels, json_out)
-}
-
-async fn load_teams_with_refresh(
-    graph: &GraphClient,
-    storage: &Storage,
-    refresh: bool,
-) -> Result<Vec<TeamSummary>> {
-    let cached = storage.list_teams()?;
-    if refresh || cached.is_empty() {
-        let fetched = graph.list_joined_teams_with_channels().await?;
-        storage.upsert_teams(&fetched)?;
-        record_cli_sync_cursor(storage, "cli:teams");
-        let stored = storage.list_teams()?;
+    let cached_msgs = load_cached_mail_list(&storage, &resolved.id, fetch_limit, json_out)?;
+    let messages = if refresh || cached_msgs.is_empty() {
+        let fetched = match graph
+            .list_mail_messages(&resolved.id, fetch_limit, !json_out)
+            .await
+        {
+            Ok(items) => items,
+            Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+        };
+        storage.upsert_mail_messages(&fetched)?;
+        record_cli_sync_cursor(&storage, &format!("cli:mail:{}", resolved.id));
+        let stored = load_cached_mail_list(&storage, &resolved.id, fetch_limit, json_out)?;
         if stored.is_empty() {
-            Ok(fetched)
+            fetched
         } else {
-            Ok(stored)
+            stored
         }
     } else {
-        Ok(cached)
+        cached_msgs
+    };
+
+    print_mail_list_output(
+        folder,
+        &resolved.id,
+        messages,
+        unread_only,
+        flagged_only,
+        focused_only,
+        limit,
+        json_out,
+    )
+}
+
+fn print_mail_read_text(msg: &MailMessage, raw_html: bool) {
+    println!("Subject: {}", msg.effective_subject());
+    println!("From: {}", msg.from_display());
+    if !msg.to_recipients.is_empty() {
+        let to_list: Vec<String> = msg.to_recipients.iter().map(|r| r.display()).collect();
+        println!("To: {}", to_list.join(", "));
+    }
+    if !msg.cc_recipients.is_empty() {
+        let cc_list: Vec<String> = msg.cc_recipients.iter().map(|r| r.display()).collect();
+        println!("Cc: {}", cc_list.join(", "));
+    }
+    if !msg.bcc_recipients.is_empty() {
+        let bcc_list: Vec<String> = msg.bcc_recipients.iter().map(|r| r.display()).collect();
+        println!("Bcc: {}", bcc_list.join(", "));
+    }
+    println!(
+        "Date: {} | read={} | flagged={} | importance={}",
+        msg.received_at, msg.is_read, msg.flagged, msg.importance
+    );
+    if !msg.attachments.is_empty() {
+        println!("Attachments ({}):", msg.attachments.len());
+        for (idx, att) in msg.attachments.iter().enumerate() {
+            println!(
+                "  [{idx}] {} ({}, {} bytes, id={})",
+                att.name, att.content_type, att.size, att.id
+            );
+        }
+    }
+    println!("---");
+    if raw_html {
+        println!("{}", msg.body_html);
+    } else {
+        let body = if !msg.body_plain.trim().is_empty() {
+            msg.body_plain.trim().to_string()
+        } else {
+            let blocks = crate::parser::parse_message_blocks(&msg.body_html, &msg.attachments);
+            crate::parser::blocks_to_plain(&blocks)
+        };
+        println!("{body}");
     }
 }
 
-fn resolve_team_from_slice(teams: &[TeamSummary], query: &str) -> Result<TeamSummary> {
-    let q = query.trim();
-    if q.is_empty() {
-        bail!("Team name or ID is required.");
-    }
-    if let Some(exact_id) = teams.iter().find(|t| t.id == q) {
-        return Ok(exact_id.clone());
-    }
-    let q_lower = q.to_lowercase();
-    let exact_name: Vec<&TeamSummary> = teams
-        .iter()
-        .filter(|t| t.display_name.to_lowercase() == q_lower)
-        .collect();
-    if exact_name.len() == 1 {
-        return Ok(exact_name[0].clone());
-    }
-    let matches: Vec<&TeamSummary> = teams
-        .iter()
-        .filter(|t| t.display_name.to_lowercase().contains(&q_lower))
-        .collect();
-    match matches.len() {
-        0 => bail!("Team not found: {q}"),
-        1 => Ok(matches[0].clone()),
-        _ => {
-            let names: Vec<String> = matches
-                .iter()
-                .map(|t| format!("{} ({})", t.display_name, t.id))
-                .collect();
-            bail!("Multiple teams match ({q}): {}", names.join(", "))
+async fn load_mail_message(
+    storage: &Storage,
+    graph: &GraphClient,
+    mail_id: &str,
+    offline: bool,
+) -> Result<MailMessage> {
+    if offline {
+        if let Some(exact) = storage.get_mail_message(mail_id)? {
+            return Ok(exact);
         }
+        let cached = storage.list_mail_messages(None, false, false, false, 2_000)?;
+        return resolver::resolve_mail_message_from_slice(&cached, mail_id);
     }
-}
-
-fn print_read_output(
-    conv: &ConversationSummary,
-    res: &ReadMessagesResult,
-    json_out: bool,
-) -> Result<()> {
-    if json_out {
-        let mut messages = res.messages.clone();
-        hydrate_messages_attachments(&mut messages);
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "conversation": conv,
-                "messages": messages,
-                "has_more": res.has_more,
-                "next_before": res.next_before,
-            }))?
-        );
-    } else {
-        println!("# {} ({})", conv.title, conv.conv_key);
-        if res.messages.is_empty() {
-            println!("(No messages)");
-        } else {
-            for msg in &res.messages {
-                print_message_line(msg, "");
-            }
-            if res.has_more {
-                if let Some(ref next_before) = res.next_before {
-                    println!(
-                        "--- Load older messages: teams read \"{}\" --before {} ---",
-                        conv.conv_key, next_before
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
+    let msg = match graph.get_mail_message(mail_id).await {
+        Ok(m) => m,
+        Err(err) => return Err(wrap_graph_permission_error(graph, err).await),
+    };
+    let _ = storage.upsert_mail_messages(std::slice::from_ref(&msg));
+    Ok(msg)
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn cmd_read(
+async fn cmd_mail_read(
     cfg: &AppConfig,
-    target: &str,
-    limit: usize,
-    before: Option<&str>,
-    thread: Option<&str>,
+    mail_id: &str,
+    raw_html: bool,
+    mark_read: bool,
+    preview_images: bool,
     offline: bool,
     cached: bool,
     json_out: bool,
 ) -> Result<()> {
-    if let Some(root_msg_id) = thread.map(str::trim).filter(|s| !s.is_empty()) {
-        return cmd_thread_with_cache(cfg, target, root_msg_id, limit, offline, cached, json_out)
-            .await;
-    }
-
-    let limit = clamp_limit(limit);
-    if offline {
+    if offline && !preview_images {
         let storage = open_storage_only(cfg)?;
-        let cached_convs = storage.list_conversations()?;
-        let conv = resolver::resolve_from_slice(&cached_convs, target)?;
-        let res = read_conversation_messages_offline(&storage, &conv, limit, before)?;
-        return print_read_output(&conv, &res, json_out);
+        let msg = if let Some(exact) = storage.get_mail_message(mail_id)? {
+            exact
+        } else {
+            let all = storage.list_mail_messages(None, false, false, false, 2_000)?;
+            resolver::resolve_mail_message_from_slice(&all, mail_id)?
+        };
+        if json_out {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({ "message": msg }))?
+            );
+        } else {
+            print_mail_read_text(&msg, raw_html);
+        }
+        return Ok(());
     }
 
-    let ttl = cli_cache_ttl_secs(cfg);
-    if cached || (before.is_none() && ttl > 0) {
+    if !offline && cached && !mark_read && !preview_images {
         if let Ok(storage) = open_storage_only(cfg) {
-            if let Ok(cached_convs) = storage.list_conversations() {
-                if let Ok(conv) = resolver::resolve_from_slice(&cached_convs, target) {
-                    if before.is_some() {
-                        let res = read_conversation_messages_offline(&storage, &conv, limit, before)?;
-                        let is_eof = storage
-                            .get_sync_cursor(&SyncCursor::history_scope(&conv.conv_key))
-                            .ok()
-                            .flatten()
-                            .is_some_and(|c| c.is_history_eof());
-                        if res.messages.len() >= limit || is_eof {
-                            return print_read_output(&conv, &res, json_out);
-                        }
+            if let Some(msg) = storage.get_mail_message(mail_id)? {
+                if msg.body_loaded
+                    || !msg.body_html.trim().is_empty()
+                    || !msg.body_plain.trim().is_empty()
+                {
+                    if json_out {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({ "message": msg }))?
+                        );
                     } else {
-                        let cursor_key = format!("cli:read:{}", conv.conv_key);
-                        if cached
-                            || is_cursor_fresh(
-                                &storage,
-                                &[cursor_key.as_str(), conv.conv_key.as_str()],
-                                ttl,
-                            )
-                        {
-                            let res = read_conversation_messages_offline(&storage, &conv, limit, None)?;
-                            if !res.messages.is_empty() && (cached || res.messages.len() >= limit) {
-                                return print_read_output(&conv, &res, json_out);
-                            }
-                        }
+                        print_mail_read_text(&msg, raw_html);
                     }
+                    return Ok(());
                 }
             }
-        }
-    }
-
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let conv = resolve_target(&storage, &graph, target, false).await?;
-    let res = read_conversation_messages(&storage, &graph, &conv, limit, before, false, true).await?;
-    if before.is_none() {
-        record_cli_sync_cursor(&storage, &format!("cli:read:{}", conv.conv_key));
-    }
-
-    print_read_output(&conv, &res, json_out)
-}
-
-async fn cmd_thread(
-    cfg: &AppConfig,
-    channel_target: &str,
-    root_msg_id: &str,
-    limit: usize,
-    offline: bool,
-    json_out: bool,
-) -> Result<()> {
-    cmd_thread_with_cache(cfg, channel_target, root_msg_id, limit, offline, false, json_out).await
-}
-
-async fn cmd_thread_with_cache(
-    cfg: &AppConfig,
-    channel_target: &str,
-    root_msg_id: &str,
-    limit: usize,
-    offline: bool,
-    cached: bool,
-    json_out: bool,
-) -> Result<()> {
-    let limit = clamp_limit(limit);
-    if offline || cached {
-        if let Ok(storage) = open_storage_only(cfg) {
-            if let Ok(cached_convs) = storage.list_conversations() {
-                if let Ok(conv) = resolver::resolve_from_slice(&cached_convs, channel_target) {
-                    if let Some(mut thread) = storage.get_thread(&conv.conv_key, root_msg_id, limit)? {
-                        hydrate_thread_attachments(&mut thread);
-                        return print_thread_output(&conv, &thread, json_out);
-                    }
-                }
-            }
-        }
-        if offline {
-            bail!("Thread not found in local cache: {root_msg_id}");
         }
     }
 
     let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let conv = resolve_target(&storage, &graph, channel_target, offline).await?;
+    let mut msg = load_mail_message(&storage, &graph, mail_id, offline).await?;
 
-    let ConversationTarget::Channel {
-        ref team_id,
-        ref channel_id,
-    } = conv.target
-    else {
-        bail!("The `thread` command can only be used in team channels: {}", conv.conv_key);
-    };
+    if !offline && mark_read && !msg.is_read {
+        if graph.set_mail_read(&msg.id, true).await.is_ok() {
+            msg.is_read = true;
+            let _ = storage.upsert_mail_messages(std::slice::from_ref(&msg));
+        }
+    }
 
-    let mut thread = if offline {
-        storage
-            .get_thread(&conv.conv_key, root_msg_id, limit)?
-            .with_context(|| format!("Thread not found in local cache: {root_msg_id}"))?
-    } else {
-        let view = match graph
-            .get_thread(team_id, channel_id, root_msg_id, limit)
-            .await
-        {
-            Ok(v) => v,
-            Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
-        };
-        let mut all = Vec::with_capacity(1 + view.replies.len());
-        all.push(view.root.clone());
-        all.extend(view.replies.iter().cloned());
-        storage.upsert_messages(&all)?;
-        view
-    };
-    hydrate_thread_attachments(&mut thread);
-
-    print_thread_output(&conv, &thread, json_out)
-}
-
-fn print_thread_output(
-    conv: &ConversationSummary,
-    thread: &crate::models::ThreadView,
-    json_out: bool,
-) -> Result<()> {
     if json_out {
-        let mut hydrated = thread.clone();
-        hydrate_thread_attachments(&mut hydrated);
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
-                "conversation": conv,
-                "thread": hydrated,
-            }))?
+            serde_json::to_string_pretty(&json!({ "message": msg }))?
         );
-    } else {
-        println!("# {} ({}) — Thread {}", conv.title, conv.conv_key, thread.root.msg_id);
-        print_message_line(&thread.root, "");
-        if thread.replies.is_empty() {
-            println!("  (No replies)");
-        } else {
-            for reply in &thread.replies {
-                print_message_line(reply, "  ↳ ");
+        return Ok(());
+    }
+
+    print_mail_read_text(&msg, raw_html);
+
+    if preview_images {
+        let (cols, rows) = default_preview_dimensions(None, None);
+        for att in &msg.attachments {
+            if img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name)) {
+                match load_mail_attachment_bytes(&graph, &msg.id, att, offline).await {
+                    Ok((_name, _ct, bytes)) => {
+                        match img_preview::render_ansi_stdout_with_pref(
+                            &bytes,
+                            cols,
+                            rows,
+                            cfg.image_protocol,
+                        ) {
+                            Ok(rendered) => {
+                                println!("\n[Image preview: {}]", att.name);
+                                print_rendered_preview(&rendered)?;
+                            }
+                            Err(err) => {
+                                eprintln!("Image render failed ({}): {err:#}", att.name);
+                            }
+                        }
+                    }
+                    Err(err) => eprintln!("Attachment fetch failed ({}): {err:#}", att.name),
+                }
             }
         }
     }
+
     Ok(())
 }
 
-fn format_message_line(msg: &MessageItem, indent: &str) -> String {
-    let attachments = msg.effective_attachments();
-    let mut tags = Vec::new();
-    if let Some(ref subj) = msg.subject {
-        if !subj.trim().is_empty() {
-            tags.push(format!("[Subject: {}]", subj.trim()));
+#[allow(clippy::too_many_arguments)]
+async fn cmd_mail_send(
+    cfg: &AppConfig,
+    to: Vec<String>,
+    cc: Vec<String>,
+    bcc: Vec<String>,
+    subject: &str,
+    body_opt: Option<String>,
+    attach: Vec<PathBuf>,
+    inline: Vec<PathBuf>,
+    importance: &str,
+    json_out: bool,
+) -> Result<()> {
+    let markdown_body = match body_opt {
+        Some(b) => b,
+        None => {
+            let mut buf = String::new();
+            io::stdin()
+                .read_to_string(&mut buf)
+                .context("Failed to read email body from stdin")?;
+            buf
+        }
+    };
+    if markdown_body.trim().is_empty() {
+        bail!("Email body is empty. Pass `--body <MD>` or pipe Markdown via stdin.");
+    }
+    let normalized_importance = normalize_mail_importance(importance)?;
+
+    for path in &attach {
+        if !path.exists() || !path.is_file() {
+            bail!("Attachment file not found: {}", path.display());
         }
     }
-    if msg.importance.eq_ignore_ascii_case("high") || msg.importance.eq_ignore_ascii_case("urgent") {
-        tags.push(format!("[Importance:{}]", msg.importance));
-    }
-    if msg.reply_count > 0 {
-        tags.push(format!("[💬 {}]", msg.reply_count));
-    }
-    if !attachments.is_empty() {
-        let names: Vec<String> = attachments
-            .iter()
-            .map(|a| {
-                a.name
-                    .clone()
-                    .unwrap_or_else(|| a.content_type.clone())
-            })
-            .collect();
-        tags.push(format!("[📎 {}]", names.join(", ")));
-    }
-    if !msg.reactions.is_empty() {
-        let reacts: Vec<String> = msg
-            .reactions
-            .iter()
-            .map(|r| format!("{} {}", reaction_symbol(&r.reaction_type), r.count))
-            .collect();
-        tags.push(format!("[{}]", reacts.join(" ")));
+
+    let mut inline_images = Vec::with_capacity(inline.len());
+    for (idx, path) in inline.iter().enumerate() {
+        if !path.exists() || !path.is_file() {
+            bail!("Inline image file not found: {}", path.display());
+        }
+        let content_type = image_mime_for_path(path).with_context(|| {
+            format!(
+                "Unsupported inline image format (expected png/jpg/jpeg/gif/webp/bmp): {}",
+                path.display()
+            )
+        })?;
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("Failed to read inline image: {}", path.display()))?;
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("inline.png")
+            .to_string();
+        let temp_id = format!("{}", idx + 1);
+        let content_id = format!("inline-img-{}", idx + 1);
+        inline_images.push(InlineImageUpload {
+            temp_id,
+            content_id,
+            file_name,
+            content_type: content_type.to_string(),
+            bytes,
+        });
     }
 
-    let body = if msg.deleted {
-        "(deleted message)".to_string()
-    } else if !msg.body_plain.trim().is_empty() {
-        msg.body_plain.trim().to_string()
-    } else {
-        parser::html_and_cards_to_plain(&msg.body_html, &attachments)
-            .trim()
-            .to_string()
+    let body_html = crate::parser::compile_outgoing_mail_html(&markdown_body, &inline_images, None);
+
+    let (_auth, graph, _storage) = open_runtime(cfg, true).await?;
+    let mail = OutgoingMail {
+        subject: subject.to_string(),
+        body_html,
+        body_markdown: Some(markdown_body),
+        to: to.clone(),
+        cc,
+        bcc,
+        importance: Some(normalized_importance.to_string()),
+        attachments: attach,
+        inline_images,
+        in_reply_to_id: None,
+        reply_all: false,
+        forward_of_id: None,
+        draft_id: None,
+        save_to_sent_items: true,
     };
-
-    let quote = match (&msg.reply_to_author, &msg.reply_to_preview) {
-        (Some(author), Some(prev)) => format!(" ↩ {author}: {}", truncate_single_line(prev, 40)),
-        _ => String::new(),
-    };
-
-    let tag_str = if tags.is_empty() {
-        String::new()
-    } else {
-        format!(" {}", tags.join(" "))
-    };
-
-    format!(
-        "{indent}[{}] {} ({}){quote}{tag_str}: {}",
-        msg.created_at, msg.author_name, msg.msg_id, body
-    )
-}
-
-fn print_message_line(msg: &MessageItem, indent: &str) {
-    println!("{}", format_message_line(msg, indent));
-}
-
-fn reaction_symbol(reaction_type: &str) -> &str {
-    match reaction_type {
-        "like" => "👍",
-        "heart" => "❤️",
-        "laugh" => "😄",
-        "surprised" => "😮",
-        "sad" => "😢",
-        "angry" => "😡",
-        other => other,
+    if let Err(err) = graph.send_mail(&mail).await {
+        return Err(wrap_graph_permission_error(&graph, err).await);
     }
-}
-
-async fn cmd_send(
-    cfg: &AppConfig,
-    target: &str,
-    markdown: &str,
-    subject: Option<String>,
-    mentions_raw: &[String],
-    important: bool,
-    json_out: bool,
-) -> Result<()> {
-    if markdown.trim().is_empty() {
-        bail!("Message body is empty.");
-    }
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let conv = resolve_target(&storage, &graph, target, false).await?;
-    let mentions = parse_mentions_cli(mentions_raw)?;
-
-    let mut outgoing =
-        parser::compile_outgoing_markdown(markdown, subject, mentions, vec![], vec![], None);
-    if important {
-        outgoing.importance = Some("high".to_string());
-    }
-
-    let sent = graph.send_message(&conv.target, &outgoing).await?;
-    let _ = storage.upsert_messages(std::slice::from_ref(&sent));
 
     if json_out {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "ok": true,
-                "conversation": conv,
-                "message": sent,
+                "to": to,
+                "subject": subject,
+                "importance": normalized_importance,
             }))?
         );
     } else {
-        println!("Sent: {} ({}) msg_id={}", conv.title, conv.conv_key, sent.msg_id);
+        println!("Email sent: '{}' -> {}", subject, to.join(", "));
     }
     Ok(())
 }
 
-async fn cmd_reply(
+async fn cmd_mail_reply(
     cfg: &AppConfig,
-    target: &str,
-    msg_id: &str,
-    markdown: &str,
-    mentions_raw: &[String],
-    important: bool,
+    mail_id: &str,
+    body_md: &str,
+    reply_all: bool,
     json_out: bool,
 ) -> Result<()> {
-    if markdown.trim().is_empty() {
+    if body_md.trim().is_empty() {
         bail!("Reply body is empty.");
     }
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let conv = resolve_target(&storage, &graph, target, false).await?;
-    let mentions = parse_mentions_cli(mentions_raw)?;
-
-    let quote = build_quote_reply(&storage, &graph, &conv, msg_id).await;
-    let mut outgoing =
-        parser::compile_outgoing_markdown(markdown, None, mentions, vec![], vec![], quote);
-    if important {
-        outgoing.importance = Some("high".to_string());
+    let (_auth, graph, _storage) = open_runtime(cfg, true).await?;
+    let comment_html = crate::parser::compile_outgoing_mail_html(body_md, &[], None);
+    if let Err(err) = graph.reply_mail(mail_id, &comment_html, reply_all).await {
+        return Err(wrap_graph_permission_error(&graph, err).await);
     }
-
-    let sent = graph.reply_message(&conv.target, msg_id, &outgoing).await?;
-    let _ = storage.upsert_messages(std::slice::from_ref(&sent));
 
     if json_out {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "ok": true,
-                "conversation": conv,
-                "reply_to": msg_id,
-                "message": sent,
+                "message_id": mail_id,
+                "reply_all": reply_all,
             }))?
         );
     } else {
         println!(
-            "Replied: {} ({}) msg_id={} (to {})",
-            conv.title, conv.conv_key, sent.msg_id, msg_id
+            "{} sent for message {mail_id}.",
+            if reply_all { "Reply All" } else { "Reply" }
         );
     }
     Ok(())
 }
 
-async fn cmd_send_file(
+async fn cmd_mail_forward(
     cfg: &AppConfig,
-    target: &str,
-    path: &Path,
-    caption: Option<&str>,
-    thread: Option<&str>,
-    inline: bool,
+    mail_id: &str,
+    to: Vec<String>,
+    comment_md: &str,
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let conv = resolve_target(&storage, &graph, target, false).await?;
-    let sent = send_file_or_inline(&graph, &storage, &conv, path, caption, thread, inline).await?;
+    if to.is_empty() {
+        bail!("At least one recipient (--to) must be specified.");
+    }
+    let (_auth, graph, _storage) = open_runtime(cfg, true).await?;
+    let comment_html = if comment_md.trim().is_empty() {
+        String::new()
+    } else {
+        crate::parser::compile_outgoing_mail_html(comment_md, &[], None)
+    };
+    if let Err(err) = graph.forward_mail(mail_id, &to, &comment_html).await {
+        return Err(wrap_graph_permission_error(&graph, err).await);
+    }
 
     if json_out {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "ok": true,
-                "conversation": conv,
-                "path": path,
-                "inline": inline,
-                "message": sent,
+                "message_id": mail_id,
+                "to": to,
+            }))?
+        );
+    } else {
+        println!("Forwarded message {mail_id} -> {}", to.join(", "));
+    }
+    Ok(())
+}
+
+async fn cmd_mail_mark(
+    cfg: &AppConfig,
+    mail_id: &str,
+    is_read: Option<bool>,
+    flagged: Option<bool>,
+    json_out: bool,
+) -> Result<()> {
+    if is_read.is_none() && flagged.is_none() {
+        bail!("Specify at least one of --read, --unread, --flag, or --unflag.");
+    }
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    if let Some(read_val) = is_read {
+        if let Err(err) = graph.set_mail_read(mail_id, read_val).await {
+            return Err(wrap_graph_permission_error(&graph, err).await);
+        }
+    }
+    if let Some(flag_val) = flagged {
+        if let Err(err) = graph.set_mail_flag(mail_id, flag_val).await {
+            return Err(wrap_graph_permission_error(&graph, err).await);
+        }
+    }
+    if let Ok(Some(mut msg)) = storage.get_mail_message(mail_id) {
+        if let Some(read_val) = is_read {
+            msg.is_read = read_val;
+        }
+        if let Some(flag_val) = flagged {
+            msg.flagged = flag_val;
+        }
+        let _ = storage.upsert_mail_messages(&[msg]);
+    }
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "message_id": mail_id,
+                "is_read": is_read,
+                "flagged": flagged,
             }))?
         );
     } else {
         println!(
-            "File sent: {} ({}) msg_id={} ({})",
-            conv.title,
-            conv.conv_key,
-            sent.msg_id,
-            path.display()
+            "Updated message {mail_id}: is_read={:?}, flagged={:?}",
+            is_read, flagged
         );
     }
     Ok(())
 }
 
-async fn cmd_download(
+async fn cmd_mail_move(
     cfg: &AppConfig,
-    target: &str,
-    msg_id: &str,
-    index: usize,
-    thread: Option<&str>,
-    out: Option<&Path>,
+    mail_id: &str,
+    dest_folder: &str,
     json_out: bool,
 ) -> Result<()> {
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let conv = resolve_target(&storage, &graph, target, false).await?;
-    let out_dir = out
+    let folder = resolver::resolve_mail_folder(&graph, &storage, dest_folder, false).await?;
+    let moved = match graph.move_mail_message(mail_id, &folder.id).await {
+        Ok(m) => m,
+        Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+    };
+    let _ = storage.upsert_mail_messages(std::slice::from_ref(&moved));
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "destination_folder": folder,
+                "message": moved,
+            }))?
+        );
+    } else {
+        println!(
+            "Moved message {} -> {} ({})",
+            moved.id, folder.display_name, folder.id
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_mail_delete(
+    cfg: &AppConfig,
+    mail_id: &str,
+    yes: bool,
+    json_out: bool,
+) -> Result<()> {
+    if json_out && !yes {
+        bail!("{DELETE_JSON_REQUIRES_YES}");
+    }
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let answer = if yes {
+        None
+    } else {
+        Some(prompt(&format!(
+            "Delete mail message {mail_id}? Type 'yes' to confirm: "
+        ))?)
+    };
+    delete_gate(yes, json_out, answer.as_deref())?;
+
+    if let Err(err) = graph.delete_mail_message(mail_id).await {
+        return Err(wrap_graph_permission_error(&graph, err).await);
+    }
+    let _ = storage.delete_mail_messages_by_ids(&[mail_id.to_string()]);
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "message_id": mail_id,
+            }))?
+        );
+    } else {
+        println!("Deleted message: {mail_id}");
+    }
+    Ok(())
+}
+
+async fn cmd_mail_download(
+    cfg: &AppConfig,
+    mail_id: &str,
+    attachment_selector: Option<&str>,
+    dir: Option<&Path>,
+    json_out: bool,
+) -> Result<()> {
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let mail = load_mail_message(&storage, &graph, mail_id, false).await?;
+    let att = select_mail_attachment(&mail, None, attachment_selector)?;
+
+    let out_dir = dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| cfg.resolved_download_dir());
-    let downloaded =
-        download_message_attachment(&graph, &storage, &conv, msg_id, index, thread, &out_dir)
-            .await?;
+    let downloaded = graph
+        .download_mail_attachment(&mail.id, att, &out_dir)
+        .await?;
 
     if json_out {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "ok": true,
+                "message_id": mail.id,
+                "attachment_id": att.id,
                 "path": downloaded.path,
                 "file_name": downloaded.file_name,
                 "bytes_written": downloaded.bytes_written,
@@ -2386,7 +2700,7 @@ async fn cmd_download(
         );
     } else {
         println!(
-            "Downloaded: {} ({} bytes)",
+            "Downloaded attachment: {} ({} bytes)",
             downloaded.path.display(),
             downloaded.bytes_written
         );
@@ -2394,205 +2708,43 @@ async fn cmd_download(
     Ok(())
 }
 
-async fn cmd_react(
-    cfg: &AppConfig,
-    target: &str,
-    msg_id: &str,
-    reaction: &str,
-    enable: bool,
-    thread: Option<&str>,
-    json_out: bool,
-) -> Result<()> {
-    let normalized = normalize_reaction(reaction)?;
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let conv = resolve_target(&storage, &graph, target, false).await?;
-    graph
-        .set_reaction(&conv.target, msg_id, thread, &normalized, enable)
-        .await?;
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "conv_key": conv.conv_key,
-                "msg_id": msg_id,
-                "reaction": normalized,
-                "enable": enable,
-            }))?
-        );
-    } else {
-        println!(
-            "Reaction {}: {} ({}) msg_id={}",
-            if enable { "set" } else { "removed" },
-            normalized,
-            conv.conv_key,
-            msg_id
-        );
-    }
-    Ok(())
-}
-
-async fn cmd_edit(
-    cfg: &AppConfig,
-    target: &str,
-    msg_id: &str,
-    new_markdown: &str,
-    thread: Option<&str>,
-    json_out: bool,
-) -> Result<()> {
-    if new_markdown.trim().is_empty() {
-        bail!("Edited message body is empty.");
-    }
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let conv = resolve_target(&storage, &graph, target, false).await?;
-    let compiled =
-        parser::compile_outgoing_markdown(new_markdown, None, vec![], vec![], vec![], None);
-    graph
-        .edit_message(&conv.target, msg_id, thread, &compiled.body_html)
-        .await?;
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "conv_key": conv.conv_key,
-                "msg_id": msg_id,
-            }))?
-        );
-    } else {
-        println!("Message edited: {} msg_id={}", conv.conv_key, msg_id);
-    }
-    Ok(())
-}
-
-async fn cmd_delete(
-    cfg: &AppConfig,
-    target: &str,
-    msg_id: &str,
-    thread: Option<&str>,
-    yes: bool,
-    json_out: bool,
-) -> Result<()> {
-    if json_out && !yes {
-        bail!("{DELETE_JSON_REQUIRES_YES}");
-    }
-
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let conv = resolve_target(&storage, &graph, target, false).await?;
-
-    let answer = if yes {
-        None
-    } else {
-        Some(prompt(&format!(
-            "Delete message {msg_id} in '{}' ({})? Type 'yes' to continue: ",
-            conv.title, conv.conv_key
-        ))?)
-    };
-    delete_gate(yes, json_out, answer.as_deref())?;
-
-    graph.delete_message(&conv.target, msg_id, thread).await?;
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "conv_key": conv.conv_key,
-                "msg_id": msg_id,
-            }))?
-        );
-    } else {
-        println!("Message deleted: {} msg_id={}", conv.conv_key, msg_id);
-    }
-    Ok(())
-}
-
-fn delete_gate(yes: bool, json: bool, answer: Option<&str>) -> Result<()> {
-    if yes {
-        return Ok(());
-    }
-    if json {
-        bail!("{DELETE_JSON_REQUIRES_YES}");
-    }
-    let answer = answer.context("No confirmation input received. Message was not deleted.")?;
-    if !answer.trim().eq_ignore_ascii_case("yes") {
-        bail!("Cancelled. Message was not deleted.");
-    }
-    Ok(())
-}
-
-async fn cmd_members(cfg: &AppConfig, target: &str, offline: bool, json_out: bool) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let conv = resolve_target(&storage, &graph, target, offline).await?;
-
-    let members = if offline {
-        storage.list_members(&conv.conv_key)?
-    } else {
-        let fetched = graph.list_members(&conv.target).await?;
-        let _ = storage.upsert_members(&conv.conv_key, &fetched);
-        fetched
-    };
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "conv_key": conv.conv_key,
-                "title": conv.title,
-                "members": members,
-            }))?
-        );
-    } else if members.is_empty() {
-        println!("No member information available.");
-    } else {
-        println!("# {} ({}) Members ({})", conv.title, conv.conv_key, members.len());
-        for m in &members {
-            let role = if m.roles.is_empty() {
-                String::new()
-            } else {
-                format!(" [{}]", m.roles.join(","))
-            };
-            let pres = m
-                .presence
-                .as_ref()
-                .map(|p| format!(" ({})", p.availability))
-                .unwrap_or_default();
-            println!(
-                "  {}  <{}>{}{}",
-                m.display_name,
-                m.email.as_deref().unwrap_or(&m.user_id),
-                role,
-                pres
-            );
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_search(
+async fn cmd_mail_search(
     cfg: &AppConfig,
     query: &str,
-    target: Option<&str>,
+    folder: Option<&str>,
+    remote: bool,
     limit: usize,
     json_out: bool,
 ) -> Result<()> {
     if query.trim().is_empty() {
         bail!("Search query is empty.");
     }
-    let storage = open_storage_only(cfg)?;
     let limit = clamp_limit(limit);
-
-    let conv_key_filter = match target {
-        Some(t) => {
-            let cached = storage.list_conversations()?;
-            Some(resolver::resolve_from_slice(&cached, t)?.conv_key)
+    let (hits, remote_messages) = if !remote {
+        let storage = open_storage_only(cfg)?;
+        let folder_filter = match folder.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(f) => Some(resolver::resolve_mail_folder_cached(&storage, f)?.id),
+            None => None,
+        };
+        let hits = storage.search_mail(query, folder_filter.as_deref(), limit)?;
+        (hits, Vec::new())
+    } else {
+        let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+        let folder_filter = match folder.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(f) => Some(resolver::resolve_mail_folder(&graph, &storage, f, false).await?.id),
+            None => None,
+        };
+        let hits = storage.search_mail(query, folder_filter.as_deref(), limit)?;
+        let mut msgs = match graph.search_mail_remote(query, limit).await {
+            Ok(m) => m,
+            Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+        };
+        let _ = storage.upsert_mail_messages(&msgs);
+        if let Some(ref fid) = folder_filter {
+            msgs.retain(|m| m.folder_id.as_deref() == Some(fid.as_str()));
         }
-        None => None,
+        (hits, msgs)
     };
-
-    let hits = storage.search_messages(query, conv_key_filter.as_deref(), limit)?;
 
     if json_out {
         println!(
@@ -2600,179 +2752,812 @@ async fn cmd_search(
             serde_json::to_string_pretty(&json!({
                 "query": query,
                 "hits": hits,
+                "remote": remote_messages,
             }))?
         );
-    } else if hits.is_empty() {
-        println!("No messages matching '{query}'.");
+    } else if hits.is_empty() && remote_messages.is_empty() {
+        println!("No mail messages matching '{query}'.");
     } else {
         for hit in &hits {
             println!(
-                "[{}] {} | {}: {}",
-                hit.created_at, hit.conv_title, hit.author_name, hit.snippet
+                "[local][{}] {} | {}: {} ({})",
+                hit.received_at, hit.from_display, hit.subject, hit.snippet, hit.id
+            );
+        }
+        for msg in &remote_messages {
+            println!(
+                "[remote][{}] {} | {} ({})",
+                msg.received_at,
+                msg.from_display(),
+                msg.effective_subject(),
+                msg.id
             );
         }
     }
     Ok(())
 }
 
-async fn sync_conversation_depth(
-    storage: &Storage,
-    graph: &GraphClient,
-    conv: &ConversationSummary,
-    depth: usize,
-) -> Result<usize> {
-    let first_page_top = depth.min(50);
-    let (latest_msgs, first_next_link) = match graph
-        .list_messages_page(&conv.target, first_page_top, None)
-        .await
-    {
-        Ok(res) => res,
-        Err(err) => return Err(wrap_graph_permission_error(graph, err).await),
-    };
-    let mut synced_count = if latest_msgs.is_empty() {
-        0
+// ---------------------------------------------------------------------------
+// Calendar commands
+// ---------------------------------------------------------------------------
+
+fn print_cal_events_output(
+    start_iso: &str,
+    end_iso: &str,
+    events: &[CalendarEvent],
+    json_out: bool,
+) -> Result<()> {
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "start": start_iso,
+                "end": end_iso,
+                "events": events,
+            }))?
+        );
+    } else if events.is_empty() {
+        println!("No calendar events found.");
     } else {
-        storage.upsert_messages(&latest_msgs).unwrap_or(latest_msgs.len())
-    };
-
-    let scope_key = SyncCursor::history_scope(&conv.conv_key);
-    if storage.get_sync_cursor(&scope_key)?.is_none() {
-        let oldest_ts = if first_next_link.is_none() {
-            Some(SyncCursor::HISTORY_EOF.to_string())
-        } else {
-            latest_msgs.first().map(|m| m.created_at.clone())
-        };
-        let _ = storage.save_sync_cursor(&SyncCursor {
-            scope_key: scope_key.clone(),
-            delta_link: first_next_link,
-            oldest_msg_ts: oldest_ts,
-            synced_at: Utc::now().to_rfc3339(),
-        });
-    }
-
-    let mut local_count = storage
-        .list_root_messages(&conv.conv_key, depth, None)
-        .map(|v| v.len())
-        .unwrap_or(0);
-
-    while local_count < depth {
-        let cursor = storage.get_sync_cursor(&scope_key)?;
-        if cursor.as_ref().is_some_and(SyncCursor::is_history_eof) {
-            break;
-        }
-        let saved_link = cursor.as_ref().and_then(|c| c.delta_link.clone());
-        let (older_msgs, new_next_link) = match graph
-            .fetch_older_messages(&conv.target, saved_link.as_deref(), None, depth - local_count)
-            .await
-        {
-            Ok(res) => res,
-            Err(err) => return Err(wrap_graph_permission_error(graph, err).await),
-        };
-        if !older_msgs.is_empty() {
-            synced_count += storage.upsert_messages(&older_msgs).unwrap_or(older_msgs.len());
-        }
-        let oldest_ts = if new_next_link.is_none() {
-            Some(SyncCursor::HISTORY_EOF.to_string())
-        } else {
-            older_msgs
-                .first()
-                .map(|m| m.created_at.clone())
-                .or_else(|| cursor.as_ref().and_then(|c| c.oldest_msg_ts.clone()))
-        };
-        let _ = storage.save_sync_cursor(&SyncCursor {
-            scope_key: scope_key.clone(),
-            delta_link: new_next_link.clone(),
-            oldest_msg_ts: oldest_ts,
-            synced_at: Utc::now().to_rfc3339(),
-        });
-
-        local_count = storage
-            .list_root_messages(&conv.conv_key, depth, None)
-            .map(|v| v.len())
-            .unwrap_or(local_count);
-
-        if new_next_link.is_none() || (older_msgs.is_empty() && new_next_link == saved_link) {
-            break;
+        for ev in events {
+            let loc = ev
+                .location
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| format!(" @ {s}"))
+                .unwrap_or_default();
+            let meet = if ev.is_online_meeting { " [Online]" } else { "" };
+            println!(
+                "[{} ~ {}] {}{}{} ({})",
+                ev.start_iso, ev.end_iso, ev.subject, loc, meet, ev.id
+            );
         }
     }
-
-    Ok(synced_count.max(local_count))
+    Ok(())
 }
 
-async fn cmd_sync(
+async fn cmd_calendar_list(
     cfg: &AppConfig,
-    target: Option<&str>,
-    chats: usize,
-    depth: usize,
+    from: Option<&str>,
+    to: Option<&str>,
+    days: i64,
+    limit: usize,
+    offline: bool,
+    cached: bool,
+    json_out: bool,
+) -> Result<()> {
+    let limit = clamp_limit(limit);
+    let (start_iso, end_iso) = default_calendar_window(from, to, days)?;
+    let start_filter = from.map(|_| start_iso.as_str());
+    let end_filter = to.map(|_| end_iso.as_str());
+
+    if offline {
+        let storage = open_storage_only(cfg)?;
+        let events = storage.list_calendar_events(start_filter, end_filter, limit)?;
+        return print_cal_events_output(&start_iso, &end_iso, &events, json_out);
+    }
+
+    let ttl = cli_cache_ttl_secs(cfg);
+    let daemon_warm = resolve_daemon_warm(cfg, false, cached).await;
+    if cached || daemon_warm || ttl > 0 {
+        if let Ok(storage) = open_storage_only(cfg) {
+            if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:cal"], ttl) {
+                let events = storage.list_calendar_events(start_filter, end_filter, limit)?;
+                if !events.is_empty() {
+                    return print_cal_events_output(&start_iso, &end_iso, &events, json_out);
+                }
+            }
+        }
+    }
+
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let events = match graph.list_calendar_view(&start_iso, &end_iso, limit).await {
+        Ok(ev) => ev,
+        Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+    };
+    let _ = storage.upsert_calendar_events(&events);
+    record_cli_sync_cursor(&storage, "cli:cal");
+
+    print_cal_events_output(&start_iso, &end_iso, &events, json_out)
+}
+
+fn print_event_show_output(ev: &CalendarEvent, json_out: bool) -> Result<()> {
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&json!({ "event": ev }))?);
+    } else {
+        println!("Subject: {}", ev.subject);
+        println!("Time: {} ~ {} ({})", ev.start_iso, ev.end_iso, ev.time_zone);
+        if let Some(ref loc) = ev.location {
+            println!("Location: {loc}");
+        }
+        if let Some(org) = ev.organizer_name.as_deref().or(ev.organizer_email.as_deref()) {
+            println!("Organizer: {org}");
+        }
+        println!("Response: {}", ev.response_status);
+        if let Some(ref url) = ev.online_meeting_url {
+            println!("Online Meeting: {url}");
+        }
+        if !ev.attendees.is_empty() {
+            println!("Attendees ({}):", ev.attendees.len());
+            for a in &ev.attendees {
+                println!(
+                    "  - {} <{}> [{} / {}]",
+                    a.name.as_deref().unwrap_or(&a.address),
+                    a.address,
+                    a.attendee_type,
+                    a.response_status
+                );
+            }
+        }
+        if !ev.body_plain.trim().is_empty() {
+            println!("---\n{}", ev.body_plain.trim());
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_event_show(
+    cfg: &AppConfig,
+    event_id: &str,
+    offline: bool,
+    cached: bool,
+    json_out: bool,
+) -> Result<()> {
+    if offline {
+        let storage = open_storage_only(cfg)?;
+        let events = storage.list_calendar_events(None, None, 10_000)?;
+        let ev = resolver::resolve_calendar_event_from_slice(&events, event_id)?;
+        return print_event_show_output(&ev, json_out);
+    }
+
+    if cached {
+        if let Ok(storage) = open_storage_only(cfg) {
+            let events = storage.list_calendar_events(None, None, 10_000)?;
+            if let Ok(ev) = resolver::resolve_calendar_event_from_slice(&events, event_id) {
+                return print_event_show_output(&ev, json_out);
+            }
+        }
+    }
+
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let ev = match graph.get_calendar_event(event_id).await {
+        Ok(e) => e,
+        Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+    };
+    let _ = storage.upsert_calendar_events(std::slice::from_ref(&ev));
+    print_event_show_output(&ev, json_out)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_event_create(
+    cfg: &AppConfig,
+    subject: &str,
+    start: &str,
+    end: &str,
+    attendees: Vec<String>,
+    location: Option<String>,
+    body: Option<String>,
+    is_online_meeting: bool,
+    is_all_day: bool,
+    time_zone: Option<String>,
+    json_out: bool,
+) -> Result<()> {
+    if subject.trim().is_empty() {
+        bail!("Event subject is empty.");
+    }
+    let start_iso = normalize_datetime_iso(start)?;
+    let end_iso = normalize_datetime_iso(end)?;
+    let body_html = body
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|md| crate::parser::compile_outgoing_mail_html(md, &[], None));
+
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let outgoing = OutgoingEvent {
+        subject: subject.to_string(),
+        start_iso,
+        end_iso,
+        time_zone,
+        is_all_day,
+        location,
+        body_html,
+        attendees,
+        is_online_meeting,
+    };
+    let created = match graph.create_calendar_event(&outgoing).await {
+        Ok(ev) => ev,
+        Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+    };
+    let _ = storage.upsert_calendar_events(std::slice::from_ref(&created));
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "event": created,
+            }))?
+        );
+    } else {
+        println!(
+            "Created event: {} ({} ~ {}) id={}",
+            created.subject, created.start_iso, created.end_iso, created.id
+        );
+        if let Some(ref url) = created.online_meeting_url {
+            println!("Online meeting link: {url}");
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_event_rsvp(
+    cfg: &AppConfig,
+    event_id: &str,
+    response: &str,
+    comment: Option<&str>,
+    json_out: bool,
+) -> Result<()> {
+    let normalized = normalize_rsvp_response(response)?;
+    let (_auth, graph, _storage) = open_runtime(cfg, true).await?;
+    if let Err(err) = graph
+        .respond_calendar_event(event_id, normalized, comment)
+        .await
+    {
+        return Err(wrap_graph_permission_error(&graph, err).await);
+    }
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "event_id": event_id,
+                "response": normalized,
+            }))?
+        );
+    } else {
+        println!("Event RSVP sent: {event_id} -> {normalized}");
+    }
+    Ok(())
+}
+
+async fn cmd_event_delete(
+    cfg: &AppConfig,
+    event_id: &str,
+    yes: bool,
+    json_out: bool,
+) -> Result<()> {
+    if json_out && !yes {
+        bail!("{DELETE_JSON_REQUIRES_YES}");
+    }
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let answer = if yes {
+        None
+    } else {
+        Some(prompt(&format!(
+            "Delete event {event_id}? Type 'yes' to confirm: "
+        ))?)
+    };
+    delete_gate(yes, json_out, answer.as_deref())?;
+
+    if let Err(err) = graph.delete_calendar_event(event_id).await {
+        return Err(wrap_graph_permission_error(&graph, err).await);
+    }
+    let _ = storage.delete_calendar_event(event_id);
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "event_id": event_id,
+            }))?
+        );
+    } else {
+        println!("Deleted event: {event_id}");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// To Do & Contacts commands
+// ---------------------------------------------------------------------------
+
+fn print_todo_lists_output(lists: &[TodoList], json_out: bool) -> Result<()> {
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "lists": lists }))?
+        );
+    } else if lists.is_empty() {
+        println!("No To Do lists found.");
+    } else {
+        for l in lists {
+            let wk = l
+                .wellknown_list_name
+                .as_deref()
+                .map(|w| format!(" [{w}]"))
+                .unwrap_or_default();
+            println!("{}{} ({})", l.display_name, wk, l.id);
+        }
+    }
+    Ok(())
+}
+
+fn print_todo_tasks_output(list_id: &str, tasks: &[TodoTask], json_out: bool) -> Result<()> {
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "list_id": list_id,
+                "tasks": tasks,
+            }))?
+        );
+    } else if tasks.is_empty() {
+        println!("No tasks found.");
+    } else {
+        for t in tasks {
+            let check = if t.is_completed() { "x" } else { " " };
+            let imp = if t.importance.eq_ignore_ascii_case("high") {
+                "!"
+            } else {
+                " "
+            };
+            let due = t
+                .due_date_iso
+                .as_deref()
+                .map(|d| format!(" (due {d})"))
+                .unwrap_or_default();
+            println!("[{check}]{imp} {}{}  ({})", t.title, due, t.id);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_todo_lists(
+    cfg: &AppConfig,
+    refresh: bool,
+    offline: bool,
+    cached: bool,
+    json_out: bool,
+) -> Result<()> {
+    if offline {
+        let storage = open_storage_only(cfg)?;
+        let lists = storage.list_todo_lists()?;
+        return print_todo_lists_output(&lists, json_out);
+    }
+
+    let ttl = cli_cache_ttl_secs(cfg);
+    let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
+    if !refresh && (cached || daemon_warm || ttl > 0) {
+        if let Ok(storage) = open_storage_only(cfg) {
+            if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:todo_lists"], ttl) {
+                let lists = storage.list_todo_lists()?;
+                if !lists.is_empty() {
+                    return print_todo_lists_output(&lists, json_out);
+                }
+            }
+        }
+    }
+
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let cached_lists = storage.list_todo_lists()?;
+    let lists = if refresh || cached_lists.is_empty() {
+        let fetched = match graph.list_todo_lists().await {
+            Ok(l) => l,
+            Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+        };
+        storage.upsert_todo_lists(&fetched)?;
+        record_cli_sync_cursor(&storage, "cli:todo_lists");
+        let stored = storage.list_todo_lists()?;
+        if stored.is_empty() {
+            fetched
+        } else {
+            stored
+        }
+    } else {
+        cached_lists
+    };
+
+    print_todo_lists_output(&lists, json_out)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_todo_tasks(
+    cfg: &AppConfig,
+    list: &str,
+    include_completed: bool,
+    limit: usize,
+    refresh: bool,
+    offline: bool,
+    cached: bool,
+    json_out: bool,
+) -> Result<()> {
+    let limit = clamp_limit(limit);
+    if offline {
+        let storage = open_storage_only(cfg)?;
+        let resolved = resolver::resolve_todo_list_cached(&storage, list)?;
+        let mut tasks = storage.list_todo_tasks(Some(&resolved.id), include_completed)?;
+        tasks.truncate(limit);
+        return print_todo_tasks_output(&resolved.id, &tasks, json_out);
+    }
+
+    let ttl = cli_cache_ttl_secs(cfg);
+    let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
+    if !refresh && (cached || daemon_warm || ttl > 0) {
+        if let Ok(storage) = open_storage_only(cfg) {
+            if let Ok(resolved) = resolver::resolve_todo_list_cached(&storage, list) {
+                let cursor_key = format!("cli:todo_tasks:{}", resolved.id);
+                if cached || daemon_warm || is_cursor_fresh(&storage, &[cursor_key.as_str()], ttl)
+                {
+                    let mut tasks =
+                        storage.list_todo_tasks(Some(&resolved.id), include_completed)?;
+                    if !tasks.is_empty() {
+                        tasks.truncate(limit);
+                        return print_todo_tasks_output(&resolved.id, &tasks, json_out);
+                    }
+                }
+            }
+        }
+    }
+
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let resolved = resolver::resolve_todo_list(&graph, &storage, list, false).await?;
+    let cached_tasks = storage.list_todo_tasks(Some(&resolved.id), include_completed)?;
+    let mut tasks = if refresh || cached_tasks.is_empty() {
+        let fetched = match graph
+            .list_todo_tasks(&resolved.id, include_completed, limit)
+            .await
+        {
+            Ok(t) => t,
+            Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+        };
+        storage.upsert_todo_tasks(&fetched)?;
+        record_cli_sync_cursor(&storage, &format!("cli:todo_tasks:{}", resolved.id));
+        let stored = storage.list_todo_tasks(Some(&resolved.id), include_completed)?;
+        if stored.is_empty() {
+            fetched
+        } else {
+            stored
+        }
+    } else {
+        cached_tasks
+    };
+    tasks.truncate(limit);
+
+    print_todo_tasks_output(&resolved.id, &tasks, json_out)
+}
+
+async fn cmd_todo_add(
+    cfg: &AppConfig,
+    title: &str,
+    list: &str,
+    due: Option<&str>,
+    importance: &str,
+    notes: Option<String>,
+    json_out: bool,
+) -> Result<()> {
+    if title.trim().is_empty() {
+        bail!("Task title is empty.");
+    }
+    let due_date_iso = due.map(normalize_todo_due_iso).transpose()?;
+    let norm_importance = normalize_todo_importance(importance)?;
+
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let resolved = resolver::resolve_todo_list(&graph, &storage, list, false).await?;
+
+    let outgoing = OutgoingTodoTask {
+        title: title.to_string(),
+        body_plain: notes,
+        due_date_iso,
+        importance: Some(norm_importance.to_string()),
+    };
+    let created = match graph.create_todo_task(&resolved.id, &outgoing).await {
+        Ok(t) => t,
+        Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+    };
+    let _ = storage.upsert_todo_tasks(std::slice::from_ref(&created));
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "task": created,
+            }))?
+        );
+    } else {
+        println!("Task added: {} ({})", created.title, created.id);
+    }
+    Ok(())
+}
+
+async fn cmd_todo_done(
+    cfg: &AppConfig,
+    task_id: &str,
+    list: &str,
+    completed: bool,
     json_out: bool,
 ) -> Result<()> {
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let chats_limit = clamp_limit(chats);
-    let depth = clamp_limit(depth);
+    let resolved = resolver::resolve_todo_list(&graph, &storage, list, false).await?;
+    let updated = match graph
+        .set_todo_task_completed(&resolved.id, task_id, completed)
+        .await
+    {
+        Ok(t) => t,
+        Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+    };
+    let _ = storage.upsert_todo_tasks(std::slice::from_ref(&updated));
 
-    let targets: Vec<ConversationSummary> = match target {
-        Some(t) => vec![resolve_target(&storage, &graph, t, false).await?],
-        None => {
-            let (chats_res, teams_res) = tokio::join!(
-                graph.list_chats(chats_limit),
-                graph.list_joined_teams_with_channels(),
-            );
-            let fetched_chats = match chats_res {
-                Ok(c) => c,
-                Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
-            };
-            storage.upsert_conversations(&fetched_chats)?;
-            if let Ok(teams) = teams_res {
-                storage.upsert_teams(&teams)?;
-            }
-            let all_convs = storage.list_conversations()?;
-            let mut chat_count = 0usize;
-            let mut selected = Vec::new();
-            for conv in all_convs {
-                if conv.kind.is_channel() {
-                    selected.push(conv);
-                } else if chat_count < chats_limit {
-                    chat_count += 1;
-                    selected.push(conv);
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "task": updated,
+            }))?
+        );
+    } else {
+        println!(
+            "Task marked {}: {} ({})",
+            if completed { "completed" } else { "incomplete" },
+            updated.title,
+            updated.id
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_todo_delete(
+    cfg: &AppConfig,
+    task_id: &str,
+    list: &str,
+    yes: bool,
+    json_out: bool,
+) -> Result<()> {
+    if json_out && !yes {
+        bail!("{DELETE_JSON_REQUIRES_YES}");
+    }
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let resolved = resolver::resolve_todo_list(&graph, &storage, list, false).await?;
+    let answer = if yes {
+        None
+    } else {
+        Some(prompt(&format!(
+            "Delete task {task_id}? Type 'yes' to confirm: "
+        ))?)
+    };
+    delete_gate(yes, json_out, answer.as_deref())?;
+
+    if let Err(err) = graph.delete_todo_task(&resolved.id, task_id).await {
+        return Err(wrap_graph_permission_error(&graph, err).await);
+    }
+    let _ = storage.delete_todo_task(task_id);
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "list_id": resolved.id,
+                "task_id": task_id,
+            }))?
+        );
+    } else {
+        println!("Deleted task: {task_id}");
+    }
+    Ok(())
+}
+
+fn print_contact_line(c: &ContactItem) {
+    let email = c.primary_email().unwrap_or("-");
+    let org = c
+        .company_name
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| format!(" · {s}"))
+        .unwrap_or_default();
+    let phone = c
+        .mobile_phone
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| format!(" · {s}"))
+        .unwrap_or_default();
+    println!(
+        "[{}] {} <{}>{}{} ({})",
+        c.source, c.display_name, email, org, phone, c.id
+    );
+}
+
+fn print_contacts_output(contacts: &[ContactItem], json_out: bool) -> Result<()> {
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "contacts": contacts }))?
+        );
+    } else if contacts.is_empty() {
+        println!("No contacts found.");
+    } else {
+        for c in contacts {
+            print_contact_line(c);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_contacts(
+    cfg: &AppConfig,
+    query: Option<&str>,
+    limit: usize,
+    refresh: bool,
+    offline: bool,
+    cached: bool,
+    json_out: bool,
+) -> Result<()> {
+    let limit = clamp_limit(limit);
+    let trimmed_q = query.map(str::trim).filter(|s| !s.is_empty());
+
+    if offline {
+        let storage = open_storage_only(cfg)?;
+        let contacts = storage.list_contacts(trimmed_q, limit)?;
+        return print_contacts_output(&contacts, json_out);
+    }
+
+    if trimmed_q.is_none() {
+        let ttl = cli_cache_ttl_secs(cfg);
+        let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
+        if !refresh && (cached || daemon_warm || ttl > 0) {
+            if let Ok(storage) = open_storage_only(cfg) {
+                if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:contacts"], ttl) {
+                    let contacts = storage.list_contacts(None, limit)?;
+                    if !contacts.is_empty() {
+                        return print_contacts_output(&contacts, json_out);
+                    }
                 }
             }
-            selected
-        }
-    };
-
-    if !json_out && target.is_some() {
-        for conv in &targets {
-            println!("Syncing: {} ({}, target depth {})...", conv.title, conv.conv_key, depth);
         }
     }
 
-    let mut total_messages = 0usize;
-    let mut synced_convs = 0usize;
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let contacts = if let Some(q) = trimmed_q {
+        if cached && !refresh {
+            let local = storage.list_contacts(Some(q), limit)?;
+            if !local.is_empty() {
+                local
+            } else {
+                let fetched = match graph.search_contacts_and_directory(q, limit).await {
+                    Ok(c) => c,
+                    Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+                };
+                let _ = storage.upsert_contacts(&fetched);
+                fetched
+            }
+        } else {
+            let fetched = match graph.search_contacts_and_directory(q, limit).await {
+                Ok(c) => c,
+                Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+            };
+            let _ = storage.upsert_contacts(&fetched);
+            fetched
+        }
+    } else {
+        let cached_contacts = storage.list_contacts(None, limit)?;
+        if refresh || cached_contacts.is_empty() {
+            let fetched = match graph.list_contacts(limit).await {
+                Ok(c) => c,
+                Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+            };
+            storage.upsert_contacts(&fetched)?;
+            record_cli_sync_cursor(&storage, "cli:contacts");
+            let stored = storage.list_contacts(None, limit)?;
+            if stored.is_empty() {
+                fetched
+            } else {
+                stored
+            }
+        } else {
+            cached_contacts
+        }
+    };
+
+    print_contacts_output(&contacts, json_out)
+}
+
+// ---------------------------------------------------------------------------
+// Sync, Update, Preview
+// ---------------------------------------------------------------------------
+
+async fn cmd_sync(cfg: &AppConfig, days: i64, limit: usize, json_out: bool) -> Result<()> {
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let limit = clamp_limit(limit);
+    let (start_iso, end_iso) = default_calendar_window(None, None, days)?;
+
+    let (folders_res, inbox_res, cal_res, lists_res, contacts_res) = tokio::join!(
+        graph.list_mail_folders(),
+        graph.list_mail_messages("inbox", limit, false),
+        graph.list_calendar_view(&start_iso, &end_iso, limit),
+        graph.list_todo_lists(),
+        graph.list_contacts(limit),
+    );
+
     let mut errors = Vec::new();
+    let mut folder_count = 0usize;
+    let mut message_count = 0usize;
+    let mut event_count = 0usize;
+    let mut todo_list_count = 0usize;
+    let mut todo_task_count = 0usize;
+    let mut contact_count = 0usize;
 
-    let results: Vec<(String, Result<usize>)> = stream::iter(targets.iter())
-        .map(|conv| {
-            let storage = &storage;
-            let graph = &graph;
-            async move {
-                let res = sync_conversation_depth(storage, graph, conv, depth).await;
-                (conv.conv_key.clone(), res)
-            }
-        })
-        .buffer_unordered(6)
-        .collect()
-        .await;
+    match folders_res {
+        Ok(folders) => {
+            folder_count = folders.len();
+            storage.upsert_mail_folders(&folders)?;
+            record_cli_sync_cursor(&storage, "cli:mail_folders");
+        }
+        Err(err) => errors.push(format!(
+            "mail_folders: {:#}",
+            wrap_graph_permission_error(&graph, err).await
+        )),
+    }
 
-    for (conv_key, res) in results {
-        match res {
-            Ok(count) => {
-                total_messages += count;
-                synced_convs += 1;
-            }
-            Err(err) => {
-                errors.push(format!("{conv_key}: {err:#}"));
+    match inbox_res {
+        Ok(messages) => {
+            message_count = messages.len();
+            storage.upsert_mail_messages(&messages)?;
+            record_cli_sync_cursor(&storage, "cli:mail:inbox");
+        }
+        Err(err) => errors.push(format!(
+            "inbox: {:#}",
+            wrap_graph_permission_error(&graph, err).await
+        )),
+    }
+
+    match cal_res {
+        Ok(events) => {
+            event_count = events.len();
+            storage.upsert_calendar_events(&events)?;
+            record_cli_sync_cursor(&storage, "cli:cal");
+        }
+        Err(err) => errors.push(format!(
+            "calendar: {:#}",
+            wrap_graph_permission_error(&graph, err).await
+        )),
+    }
+
+    match lists_res {
+        Ok(lists) => {
+            todo_list_count = lists.len();
+            storage.upsert_todo_lists(&lists)?;
+            record_cli_sync_cursor(&storage, "cli:todo_lists");
+            for list in &lists {
+                match graph.list_todo_tasks(&list.id, true, limit).await {
+                    Ok(tasks) => {
+                        todo_task_count += tasks.len();
+                        let _ = storage.upsert_todo_tasks(&tasks);
+                        record_cli_sync_cursor(&storage, &format!("cli:todo_tasks:{}", list.id));
+                    }
+                    Err(err) => errors.push(format!("todo_tasks({}): {err:#}", list.display_name)),
+                }
             }
         }
+        Err(err) => errors.push(format!(
+            "todo_lists: {:#}",
+            wrap_graph_permission_error(&graph, err).await
+        )),
+    }
+
+    match contacts_res {
+        Ok(contacts) => {
+            contact_count = contacts.len();
+            storage.upsert_contacts(&contacts)?;
+            record_cli_sync_cursor(&storage, "cli:contacts");
+        }
+        Err(err) => errors.push(format!(
+            "contacts: {:#}",
+            wrap_graph_permission_error(&graph, err).await
+        )),
     }
 
     if json_out {
@@ -2780,20 +3565,18 @@ async fn cmd_sync(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "ok": errors.is_empty(),
-                "chats_limit": chats_limit,
-                "depth": depth,
-                "conversations_total": targets.len(),
-                "conversations_synced": synced_convs,
-                "messages_synced": total_messages,
+                "folders": folder_count,
+                "messages": message_count,
+                "events": event_count,
+                "todo_lists": todo_list_count,
+                "todo_tasks": todo_task_count,
+                "contacts": contact_count,
                 "errors": errors,
             }))?
         );
     } else {
         println!(
-            "Sync complete: {synced_convs}/{} conversations · {total_messages} messages (chats={}, depth={})",
-            targets.len(),
-            chats_limit,
-            depth
+            "Sync complete: folders={folder_count}, inbox={message_count}, events={event_count}, todo_lists={todo_list_count}, tasks={todo_task_count}, contacts={contact_count}"
         );
         for err in &errors {
             eprintln!("Warning: {err}");
@@ -2801,788 +3584,6 @@ async fn cmd_sync(
     }
     Ok(())
 }
-
-async fn cmd_export(
-    cfg: &AppConfig,
-    target: &str,
-    format: &str,
-    include_threads: bool,
-    limit: usize,
-    offline: bool,
-    out: Option<&Path>,
-) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let limit = clamp_limit(limit);
-    let conv = resolve_target(&storage, &graph, target, offline).await?;
-
-    let fetched = if !offline {
-        let msgs = graph.list_messages(&conv.target, limit).await?;
-        storage.upsert_messages(&msgs)?;
-        Some(msgs)
-    } else {
-        None
-    };
-
-    let mut messages = storage.list_root_messages(&conv.conv_key, limit, None)?;
-    if messages.is_empty() {
-        if let Some(f) = fetched {
-            messages = f;
-        }
-    }
-
-    let mut threads_by_root: HashMap<String, Vec<MessageItem>> = HashMap::new();
-    if include_threads {
-        if let ConversationTarget::Channel {
-            ref team_id,
-            ref channel_id,
-        } = conv.target
-        {
-            let root_ids: Vec<&str> = messages
-                .iter()
-                .filter(|m| m.reply_count > 0)
-                .map(|m| m.msg_id.as_str())
-                .collect();
-
-            if offline {
-                for msg_id in root_ids {
-                    let replies = storage.list_thread_replies(&conv.conv_key, msg_id, limit)?;
-                    if !replies.is_empty() {
-                        threads_by_root.insert(msg_id.to_string(), replies);
-                    }
-                }
-            } else {
-                let fetched: Vec<(String, Vec<MessageItem>)> = stream::iter(root_ids)
-                    .map(|msg_id| {
-                        let graph = &graph;
-                        let storage = &storage;
-                        async move {
-                            let r = graph
-                                .list_thread_replies(team_id, channel_id, msg_id, limit)
-                                .await
-                                .unwrap_or_default();
-                            if !r.is_empty() {
-                                let _ = storage.upsert_messages(&r);
-                            }
-                            (msg_id.to_string(), r)
-                        }
-                    })
-                    .buffer_unordered(6)
-                    .collect()
-                    .await;
-
-                for (msg_id, replies) in fetched {
-                    if !replies.is_empty() {
-                        threads_by_root.insert(msg_id, replies);
-                    }
-                }
-            }
-        }
-    }
-
-    hydrate_messages_attachments(&mut messages);
-    for replies in threads_by_root.values_mut() {
-        hydrate_messages_attachments(replies);
-    }
-
-    let body = match format {
-        "json" => {
-            if include_threads {
-                let entries: Vec<serde_json::Value> = messages
-                    .iter()
-                    .map(|m| {
-                        let replies = threads_by_root
-                            .get(&m.msg_id)
-                            .cloned()
-                            .unwrap_or_default();
-                        json!({
-                            "message": m,
-                            "replies": replies,
-                        })
-                    })
-                    .collect();
-                serde_json::to_string_pretty(&json!({
-                    "conversation": conv,
-                    "items": entries,
-                }))?
-            } else {
-                serde_json::to_string_pretty(&json!({
-                    "conversation": conv,
-                    "messages": messages,
-                }))?
-            }
-        }
-        "txt" => {
-            let mut out_str = format!("# {} ({})\n\n", conv.title, conv.conv_key);
-            for m in &messages {
-                let plain = if !m.body_plain.trim().is_empty() {
-                    m.body_plain.trim().to_string()
-                } else {
-                    parser::html_and_cards_to_plain(&m.body_html, &m.attachments)
-                };
-                out_str.push_str(&format!("[{}] {}: {}\n", m.created_at, m.author_name, plain));
-                if let Some(replies) = threads_by_root.get(&m.msg_id) {
-                    for r in replies {
-                        let rplain = if !r.body_plain.trim().is_empty() {
-                            r.body_plain.trim().to_string()
-                        } else {
-                            parser::html_and_cards_to_plain(&r.body_html, &r.attachments)
-                        };
-                        out_str.push_str(&format!(
-                            "  ↳ [{}] {}: {}\n",
-                            r.created_at, r.author_name, rplain
-                        ));
-                    }
-                }
-            }
-            out_str
-        }
-        _ => {
-            let mut out_str = format!("# {}\n\n", conv.title);
-            for m in &messages {
-                if let Some(ref subj) = m.subject {
-                    if !subj.trim().is_empty() {
-                        out_str.push_str(&format!("## {}\n\n", subj.trim()));
-                    }
-                }
-                let md = parser::html_and_cards_to_markdown(&m.body_html, &m.attachments);
-                let text = if md.trim().is_empty() {
-                    m.body_plain.trim().to_string()
-                } else {
-                    md.trim().to_string()
-                };
-                out_str.push_str(&format!(
-                    "- **{}** `{}`\n\n  {}\n\n",
-                    m.author_name,
-                    m.created_at,
-                    text.replace('\n', "\n  ")
-                ));
-                if let Some(replies) = threads_by_root.get(&m.msg_id) {
-                    for r in replies {
-                        let rmd = parser::html_and_cards_to_markdown(&r.body_html, &r.attachments);
-                        let rtext = if rmd.trim().is_empty() {
-                            r.body_plain.trim().to_string()
-                        } else {
-                            rmd.trim().to_string()
-                        };
-                        out_str.push_str(&format!(
-                            "  - ↳ **{}** `{}`: {}\n",
-                            r.author_name, r.created_at, rtext
-                        ));
-                    }
-                    out_str.push('\n');
-                }
-            }
-            out_str
-        }
-    };
-
-    match out {
-        Some(path) => {
-            config::ensure_parent(path)?;
-            std::fs::write(path, body)
-                .with_context(|| format!("Failed to write export file: {}", path.display()))?;
-            println!("Exported: {}", path.display());
-        }
-        None => print!("{body}"),
-    }
-    Ok(())
-}
-
-async fn cmd_presence(
-    cfg: &AppConfig,
-    set: Option<&str>,
-    activity: Option<&str>,
-    expiration_mins: Option<u32>,
-    json_out: bool,
-) -> Result<()> {
-    let (_auth, graph, _storage) = open_runtime(cfg, true).await?;
-
-    if let Some(raw_avail) = set {
-        let availability = normalize_presence_availability(raw_avail)?;
-        let act = activity
-            .map(|a| a.trim())
-            .filter(|a| !a.is_empty())
-            .unwrap_or(&availability);
-        graph
-            .set_my_presence(&availability, act, expiration_mins)
-            .await?;
-
-        let latest = graph.get_my_presence().await.ok();
-        if json_out {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "ok": true,
-                    "availability": availability,
-                    "activity": act,
-                    "expiration_mins": expiration_mins,
-                    "presence": latest,
-                }))?
-            );
-        } else {
-            println!("Presence updated: {availability} ({act})");
-        }
-    } else {
-        let status = graph.get_my_presence().await?;
-        if json_out {
-            println!("{}", serde_json::to_string_pretty(&status)?);
-        } else {
-            println!("Current presence: {} ({})", status.availability, status.activity);
-        }
-    }
-    Ok(())
-}
-
-fn prompt(label: &str) -> Result<String> {
-    print!("{label}");
-    io::stdout().flush()?;
-    let mut buf = String::new();
-    io::stdin().read_line(&mut buf)?;
-    Ok(buf.trim_end_matches(&['\r', '\n'][..]).to_string())
-}
-
-// ---------------------------------------------------------------------------
-// Shared `pub(crate)` helpers reused by `serve.rs` and `mcp.rs`
-// ---------------------------------------------------------------------------
-
-pub(crate) fn clamp_limit(limit: usize) -> usize {
-    limit.clamp(1, 1_000)
-}
-
-pub(crate) struct ReadMessagesResult {
-    pub messages: Vec<MessageItem>,
-    pub has_more: bool,
-    pub next_before: Option<String>,
-}
-
-pub(crate) fn is_forbidden_error(err: &anyhow::Error) -> bool {
-    let lower = format!("{err:#}").to_ascii_lowercase();
-    lower.contains("403")
-        || lower.contains("forbidden")
-        || lower.contains("authorization_requestdenied")
-        || lower.contains("insufficient privileges")
-        || lower.contains("missing scope")
-        || lower.contains("aclcheckfailed")
-        || lower.contains("insufficient graph permissions")
-        || lower.contains("insufficient permissions")
-}
-
-pub(crate) async fn wrap_graph_permission_error(
-    graph: &GraphClient,
-    err: anyhow::Error,
-) -> anyhow::Error {
-    let raw = format!("{err:#}");
-    let token = graph.auth().current_tokens().await.map(|t| t.access_token);
-    if let Some(explained) = explain_graph_permission_error(&raw, token.as_deref()) {
-        anyhow::anyhow!("{explained}\nRaw error: {raw}")
-    } else {
-        err
-    }
-}
-
-/// Resolves `--before` (`TIMESTAMP_OR_MSG_ID`) into `(before_created_at, Option<before_msg_id>)`.
-pub(crate) fn resolve_before_cursor(
-    storage: &Storage,
-    conv_key: &str,
-    before_input: &str,
-) -> Result<(String, Option<String>)> {
-    let trimmed = before_input.trim();
-    if trimmed.is_empty() {
-        bail!("--before value is empty.");
-    }
-
-    if let Some(msg) = storage.get_message(conv_key, trimmed)? {
-        return Ok((msg.created_at, Some(msg.msg_id)));
-    }
-
-    let ts = normalize_before_timestamp(trimmed)?;
-    Ok((ts, None))
-}
-
-fn normalize_before_timestamp(raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
-        return Ok(dt
-            .with_timezone(&Utc)
-            .to_rfc3339_opts(SecondsFormat::AutoSi, true));
-    }
-    if NaiveDate::parse_from_str(trimmed, "%Y-%m-%d").is_ok() {
-        return Ok(format!("{trimmed}T00:00:00Z"));
-    }
-    for fmt in [
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d_%H:%M:%S",
-        "%Y-%m-%d_%H:%M",
-    ] {
-        if let Ok(ndt) = NaiveDateTime::parse_from_str(trimmed, fmt) {
-            let local_dt = Local
-                .from_local_datetime(&ndt)
-                .single()
-                .or_else(|| Local.from_local_datetime(&ndt).earliest())
-                .context("Failed to convert local timestamp")?;
-            return Ok(local_dt
-                .with_timezone(&Utc)
-                .to_rfc3339_opts(SecondsFormat::Secs, true));
-        }
-    }
-    bail!(
-        "Invalid --before value: '{trimmed}' (expected ISO-8601 timestamp, YYYY-MM-DD, or cached message ID)"
-    )
-}
-
-fn trim_older_window(mut rows: Vec<MessageItem>, limit: usize) -> (Vec<MessageItem>, bool) {
-    if rows.len() > limit {
-        let excess = rows.len() - limit;
-        rows.drain(..excess);
-        (rows, true)
-    } else {
-        (rows, false)
-    }
-}
-
-pub(crate) fn hydrate_message_attachments(msg: &mut MessageItem) {
-    if let std::borrow::Cow::Owned(effective) = msg.effective_attachments() {
-        msg.attachments = effective;
-    }
-}
-
-pub(crate) fn hydrate_messages_attachments(messages: &mut [MessageItem]) {
-    for msg in messages {
-        hydrate_message_attachments(msg);
-    }
-}
-
-pub(crate) fn hydrate_thread_attachments(thread: &mut crate::models::ThreadView) {
-    hydrate_message_attachments(&mut thread.root);
-    hydrate_messages_attachments(&mut thread.replies);
-}
-
-pub(crate) fn read_conversation_messages_offline(
-    storage: &Storage,
-    conv: &ConversationSummary,
-    limit: usize,
-    before: Option<&str>,
-) -> Result<ReadMessagesResult> {
-    let limit = clamp_limit(limit);
-    let (mut messages, has_more) = match before {
-        None => {
-            let rows = storage.list_root_messages(&conv.conv_key, limit + 1, None)?;
-            trim_older_window(rows, limit)
-        }
-        Some(raw_before) => {
-            let (before_ts, before_id) = resolve_before_cursor(storage, &conv.conv_key, raw_before)?;
-            let rows = storage.list_older_root_messages(
-                &conv.conv_key,
-                limit + 1,
-                &before_ts,
-                before_id.as_deref(),
-            )?;
-            trim_older_window(rows, limit)
-        }
-    };
-    hydrate_messages_attachments(&mut messages);
-    let next_before = messages.first().map(|m| m.msg_id.clone());
-    Ok(ReadMessagesResult {
-        messages,
-        has_more,
-        next_before,
-    })
-}
-
-pub(crate) async fn read_conversation_messages(
-    storage: &Storage,
-    graph: &GraphClient,
-    conv: &ConversationSummary,
-    limit: usize,
-    before: Option<&str>,
-    offline: bool,
-    fetch_older: bool,
-) -> Result<ReadMessagesResult> {
-    let limit = clamp_limit(limit);
-    if offline {
-        return read_conversation_messages_offline(storage, conv, limit, before);
-    }
-
-    let scope_key = SyncCursor::history_scope(&conv.conv_key);
-    match before {
-        None => {
-            let fetched = if limit <= 50 {
-                let (msgs, next_link) = match graph.list_messages_page(&conv.target, limit, None).await {
-                    Ok(res) => res,
-                    Err(err) => return Err(wrap_graph_permission_error(graph, err).await),
-                };
-                storage.upsert_messages(&msgs)?;
-                if storage.get_sync_cursor(&scope_key)?.is_none() {
-                    let oldest_ts = if next_link.is_none() {
-                        Some(SyncCursor::HISTORY_EOF.to_string())
-                    } else {
-                        msgs.first().map(|m| m.created_at.clone())
-                    };
-                    let _ = storage.save_sync_cursor(&SyncCursor {
-                        scope_key: scope_key.clone(),
-                        delta_link: next_link,
-                        oldest_msg_ts: oldest_ts,
-                        synced_at: Utc::now().to_rfc3339(),
-                    });
-                }
-                msgs
-            } else {
-                let msgs = match graph.list_messages(&conv.target, limit).await {
-                    Ok(res) => res,
-                    Err(err) => return Err(wrap_graph_permission_error(graph, err).await),
-                };
-                storage.upsert_messages(&msgs)?;
-                msgs
-            };
-
-            let rows = storage.list_root_messages(&conv.conv_key, limit + 1, None)?;
-            let (mut messages, mut has_more) = trim_older_window(rows, limit);
-            if messages.is_empty() {
-                messages = fetched;
-            }
-            if !has_more {
-                has_more = storage
-                    .get_sync_cursor(&scope_key)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|c| !c.is_history_eof() && c.delta_link.is_some());
-            }
-            hydrate_messages_attachments(&mut messages);
-            let next_before = messages.first().map(|m| m.msg_id.clone());
-            Ok(ReadMessagesResult {
-                messages,
-                has_more,
-                next_before,
-            })
-        }
-        Some(raw_before) => {
-            let (before_ts, before_id) = resolve_before_cursor(storage, &conv.conv_key, raw_before)?;
-            if fetch_older {
-                let mut local = storage.list_older_root_messages(
-                    &conv.conv_key,
-                    limit,
-                    &before_ts,
-                    before_id.as_deref(),
-                )?;
-                while local.len() < limit {
-                    let cursor = storage.get_sync_cursor(&scope_key)?;
-                    if cursor.as_ref().is_some_and(SyncCursor::is_history_eof) {
-                        break;
-                    }
-                    let saved_link = cursor.as_ref().and_then(|c| c.delta_link.clone());
-                    let (fetched, new_next_link) = match graph
-                        .fetch_older_messages(
-                            &conv.target,
-                            saved_link.as_deref(),
-                            Some(&before_ts),
-                            limit - local.len(),
-                        )
-                        .await
-                    {
-                        Ok(res) => res,
-                        Err(err) => return Err(wrap_graph_permission_error(graph, err).await),
-                    };
-
-                    if !fetched.is_empty() {
-                        storage.upsert_messages(&fetched)?;
-                    }
-                    let oldest_ts = if new_next_link.is_none() {
-                        Some(SyncCursor::HISTORY_EOF.to_string())
-                    } else {
-                        fetched
-                            .first()
-                            .map(|m| m.created_at.clone())
-                            .or_else(|| cursor.as_ref().and_then(|c| c.oldest_msg_ts.clone()))
-                    };
-                    let _ = storage.save_sync_cursor(&SyncCursor {
-                        scope_key: scope_key.clone(),
-                        delta_link: new_next_link.clone(),
-                        oldest_msg_ts: oldest_ts,
-                        synced_at: Utc::now().to_rfc3339(),
-                    });
-
-                    local = storage.list_older_root_messages(
-                        &conv.conv_key,
-                        limit,
-                        &before_ts,
-                        before_id.as_deref(),
-                    )?;
-                    if new_next_link.is_none()
-                        || (fetched.is_empty() && new_next_link == saved_link)
-                    {
-                        break;
-                    }
-                }
-            }
-
-            let rows = storage.list_older_root_messages(
-                &conv.conv_key,
-                limit + 1,
-                &before_ts,
-                before_id.as_deref(),
-            )?;
-            let (mut messages, mut has_more) = trim_older_window(rows, limit);
-            if !has_more {
-                has_more = storage
-                    .get_sync_cursor(&scope_key)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|c| !c.is_history_eof() && c.delta_link.is_some());
-            }
-            hydrate_messages_attachments(&mut messages);
-            let next_before = messages.first().map(|m| m.msg_id.clone());
-            Ok(ReadMessagesResult {
-                messages,
-                has_more,
-                next_before,
-            })
-        }
-    }
-}
-
-pub(crate) async fn resolve_target(
-    storage: &Storage,
-    graph: &GraphClient,
-    query: &str,
-    offline: bool,
-) -> Result<ConversationSummary> {
-    if offline {
-        let cached = storage.list_conversations()?;
-        resolver::resolve_from_slice(&cached, query)
-    } else {
-        resolver::resolve_conversation(storage, graph, query).await
-    }
-}
-
-pub(crate) fn parse_mentions_cli(values: &[String]) -> Result<Vec<MentionInfo>> {
-    values
-        .iter()
-        .enumerate()
-        .map(|(idx, raw)| parse_mention_spec(raw, idx as i32))
-        .collect()
-}
-
-pub(crate) fn parse_mention_spec(spec: &str, id: i32) -> Result<MentionInfo> {
-    let Some((uid, name)) = spec.split_once(':') else {
-        bail!("Invalid mention format: '{spec}' (expected user_id:DisplayName)");
-    };
-    let user_id = uid.trim();
-    let display_name = name.trim();
-    if user_id.is_empty() || display_name.is_empty() {
-        bail!("Mention user_id and DisplayName cannot be empty: '{spec}'");
-    }
-    Ok(MentionInfo {
-        id,
-        user_id: user_id.to_string(),
-        display_name: display_name.to_string(),
-    })
-}
-
-pub(crate) fn normalize_reaction(raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        bail!("Reaction name is empty.");
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    match lower.as_str() {
-        "like" | "heart" | "laugh" | "surprised" | "sad" | "angry" => Ok(lower),
-        _ if !trimmed.is_ascii() => Ok(trimmed.to_string()),
-        _ => bail!(
-            "Unsupported reaction: '{trimmed}' (use like, heart, laugh, surprised, sad, angry, or an emoji)"
-        ),
-    }
-}
-
-pub(crate) fn normalize_presence_availability(raw: &str) -> Result<String> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "available" => Ok("Available".to_string()),
-        "busy" => Ok("Busy".to_string()),
-        "donotdisturb" | "do_not_disturb" | "dnd" => Ok("DoNotDisturb".to_string()),
-        "berightback" | "be_right_back" | "brb" => Ok("BeRightBack".to_string()),
-        "away" => Ok("Away".to_string()),
-        "reset" => Ok("Reset".to_string()),
-        other => bail!(
-            "Unsupported presence availability: '{other}' (Available|Busy|DoNotDisturb|BeRightBack|Away|Reset)"
-        ),
-    }
-}
-
-pub(crate) fn image_mime_for_path(path: &Path) -> Option<&'static str> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    match ext.as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "bmp" => Some("image/bmp"),
-        _ => None,
-    }
-}
-
-pub(crate) async fn build_quote_reply(
-    storage: &Storage,
-    graph: &GraphClient,
-    conv: &ConversationSummary,
-    msg_id: &str,
-) -> Option<QuotedReply> {
-    if conv.kind == ConversationKind::Channel {
-        return None;
-    }
-    let msg = match storage.get_message(&conv.conv_key, msg_id).ok().flatten() {
-        Some(m) => Some(m),
-        None => {
-            if let Ok(msgs) = graph.list_messages(&conv.target, 50).await {
-                let _ = storage.upsert_messages(&msgs);
-                msgs.into_iter().find(|m| m.msg_id == msg_id)
-            } else {
-                None
-            }
-        }
-    };
-    msg.map(|m| QuotedReply {
-        msg_id: m.msg_id,
-        author_name: m.author_name,
-        preview_plain: truncate_single_line(&m.body_plain, 120),
-    })
-}
-
-pub(crate) async fn send_file_or_inline(
-    graph: &GraphClient,
-    storage: &Storage,
-    conv: &ConversationSummary,
-    path: &Path,
-    caption: Option<&str>,
-    thread_root_id: Option<&str>,
-    inline: bool,
-) -> Result<MessageItem> {
-    if !path.exists() || !path.is_file() {
-        bail!("File not found: {}", path.display());
-    }
-
-    let mut sent = if inline {
-        let mime_type = image_mime_for_path(path).with_context(|| {
-            format!(
-                "--inline only supports image files (png/jpg/jpeg/gif/webp/bmp): {}",
-                path.display()
-            )
-        })?;
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("Failed to read image file: {}", path.display()))?;
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(ToString::to_string);
-        let temp_id = "1".to_string();
-        let inline_upload = InlineImageUpload {
-            temp_id: temp_id.clone(),
-            mime_type: mime_type.to_string(),
-            bytes,
-            file_name: file_name.clone(),
-        };
-        let mut outgoing = parser::compile_outgoing_markdown(
-            caption.unwrap_or(""),
-            None,
-            vec![],
-            vec![],
-            vec![inline_upload],
-            None,
-        );
-        let marker = format!("hostedContents/{temp_id}/$value");
-        if !outgoing.body_html.contains(&marker) {
-            let alt = file_name.as_deref().unwrap_or("image");
-            outgoing.body_html.push_str(&format!(
-                "<p><img src=\"../{marker}\" alt=\"{alt}\" /></p>"
-            ));
-        }
-        if let Some(root_id) = thread_root_id {
-            graph.reply_message(&conv.target, root_id, &outgoing).await?
-        } else {
-            graph.send_message(&conv.target, &outgoing).await?
-        }
-    } else {
-        let caption_html = caption
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
-            .map(|c| {
-                parser::compile_outgoing_markdown(c, None, vec![], vec![], vec![], None).body_html
-            });
-        graph
-            .send_file(&conv.target, path, caption_html.as_deref(), thread_root_id)
-            .await?
-    };
-
-    let _ = storage.upsert_messages(std::slice::from_ref(&sent));
-    hydrate_message_attachments(&mut sent);
-    Ok(sent)
-}
-
-pub(crate) async fn find_message_with_fallback(
-    graph: &GraphClient,
-    storage: &Storage,
-    conv: &ConversationSummary,
-    msg_id: &str,
-    thread_root_id: Option<&str>,
-) -> Result<MessageItem> {
-    if let Some(msg) = storage.get_message(&conv.conv_key, msg_id)? {
-        return Ok(msg);
-    }
-
-    if let (
-        Some(root_id),
-        ConversationTarget::Channel {
-            team_id,
-            channel_id,
-        },
-    ) = (thread_root_id, &conv.target)
-    {
-        let thread = graph
-            .get_thread(team_id, channel_id, root_id, 50)
-            .await?;
-        let mut all = Vec::with_capacity(1 + thread.replies.len());
-        all.push(thread.root);
-        all.extend(thread.replies);
-        let _ = storage.upsert_messages(&all);
-        if let Some(found) = all.into_iter().find(|m| m.msg_id == msg_id) {
-            return Ok(found);
-        }
-    }
-
-    let msgs = graph.list_messages(&conv.target, 50).await?;
-    let _ = storage.upsert_messages(&msgs);
-    msgs.into_iter()
-        .find(|m| m.msg_id == msg_id)
-        .with_context(|| format!("Message not found: {msg_id}"))
-}
-
-pub(crate) async fn download_message_attachment(
-    graph: &GraphClient,
-    storage: &Storage,
-    conv: &ConversationSummary,
-    msg_id: &str,
-    index: usize,
-    thread_root_id: Option<&str>,
-    dest_dir: &Path,
-) -> Result<DownloadedFile> {
-    let msg = find_message_with_fallback(graph, storage, conv, msg_id, thread_root_id).await?;
-    let attachments = msg.effective_attachments();
-    if attachments.is_empty() {
-        bail!("Message has no attachments: {msg_id}");
-    }
-    let att = attachments.get(index).with_context(|| {
-        format!(
-            "Attachment index {index} is out of range (total {})",
-            attachments.len()
-        )
-    })?;
-    graph.download_attachment(att, dest_dir).await
-}
-
-// ---------------------------------------------------------------------------
-// Update & Terminal Image Preview commands
-// ---------------------------------------------------------------------------
 
 async fn cmd_update(
     cfg: &AppConfig,
@@ -3664,81 +3665,275 @@ fn cmd_preview_local_file(
     if !path.exists() || !path.is_file() {
         bail!("Image file not found: {}", path.display());
     }
-    let bytes =
-        std::fs::read(path).with_context(|| format!("Failed to read image file: {}", path.display()))?;
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("Failed to read image file: {}", path.display()))?;
     let (c, r) = default_preview_dimensions(cols, rows);
     let rendered = img_preview::render_ansi_stdout_with_pref(&bytes, c, r, effective_pref)?;
     print_rendered_preview(&rendered)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn cmd_preview_teams(
+async fn cmd_preview_mail(
     cfg: &AppConfig,
-    target: Option<&str>,
-    msg_id: Option<&str>,
+    mail_id: &str,
     attachment: Option<&str>,
-    thread: Option<&str>,
-    file: Option<&Path>,
+    offline: bool,
     cols: Option<u16>,
     rows: Option<u16>,
     protocol: Option<&str>,
 ) -> Result<()> {
-    if let Some(path) = file {
-        return cmd_preview_local_file(cfg, path, cols, rows, protocol);
-    }
     let effective_pref = resolve_image_protocol_preference(cfg, protocol)?;
-    let target = target.context("Specify a target conversation (<target>) or --file <path>.")?;
-    let msg_id = msg_id.context("Specify a message ID (<msg_id>) or --file <path>.")?;
-
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let conv = resolve_target(&storage, &graph, target, false).await?;
-    let msg = find_message_with_fallback(&graph, &storage, &conv, msg_id, thread).await?;
-    let att = select_teams_attachment(&msg, attachment)?;
-    let (_name, _ct, bytes) = graph.fetch_attachment_bytes(&att).await?;
+    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
+    let mail = load_mail_message(&storage, &graph, mail_id, offline).await?;
+    let att = select_mail_attachment(&mail, None, attachment)?;
+    let (_name, _ct, bytes) = load_mail_attachment_bytes(&graph, &mail.id, att, offline).await?;
     let (c, r) = default_preview_dimensions(cols, rows);
     let rendered = img_preview::render_ansi_stdout_with_pref(&bytes, c, r, effective_pref)?;
     print_rendered_preview(&rendered)
 }
 
+// ---------------------------------------------------------------------------
+// Shared `pub(crate)` helpers reused by `serve.rs` and `mcp.rs`
+// ---------------------------------------------------------------------------
 
-pub(crate) fn select_teams_attachment(
-    msg: &MessageItem,
+pub(crate) fn clamp_limit(limit: usize) -> usize {
+    limit.clamp(1, 1_000)
+}
+
+pub(crate) fn is_forbidden_error(err: &anyhow::Error) -> bool {
+    let lower = format!("{err:#}").to_ascii_lowercase();
+    lower.contains("403")
+        || lower.contains("forbidden")
+        || lower.contains("authorization_requestdenied")
+        || lower.contains("insufficient privileges")
+        || lower.contains("missing scope")
+        || lower.contains("aclcheckfailed")
+        || lower.contains("insufficient graph permissions")
+        || lower.contains("insufficient permissions")
+}
+
+pub(crate) async fn wrap_graph_permission_error(
+    graph: &GraphClient,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    let raw = format!("{err:#}");
+    let token = graph.auth().current_tokens().await.map(|t| t.access_token);
+    if let Some(explained) = explain_graph_permission_error(&raw, token.as_deref()) {
+        anyhow::anyhow!("{explained}\nRaw error: {raw}")
+    } else {
+        err
+    }
+}
+
+pub(crate) fn delete_gate(yes: bool, json: bool, answer: Option<&str>) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if json {
+        bail!("{DELETE_JSON_REQUIRES_YES}");
+    }
+    let answer = answer.context("No confirmation input received. Item was not deleted.")?;
+    if !answer.trim().eq_ignore_ascii_case("yes") {
+        bail!("Cancelled. Item was not deleted.");
+    }
+    Ok(())
+}
+
+fn prompt(label: &str) -> Result<String> {
+    print!("{label}");
+    io::stdout().flush()?;
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf)?;
+    Ok(buf.trim_end_matches(&['\r', '\n'][..]).to_string())
+}
+
+pub(crate) fn image_mime_for_path(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+pub(crate) fn select_mail_attachment<'a>(
+    mail: &'a MailMessage,
+    index: Option<usize>,
     selector: Option<&str>,
-) -> Result<AttachmentInfo> {
-    let attachments = msg.effective_attachments();
-    if attachments.is_empty() {
-        bail!("Message has no attachments: {}", msg.msg_id);
+) -> Result<&'a MailAttachment> {
+    if mail.attachments.is_empty() {
+        bail!("Message has no attachments: {}", mail.id);
     }
     if let Some(sel) = selector.map(str::trim).filter(|s| !s.is_empty()) {
         if let Ok(idx) = sel.parse::<usize>() {
-            return attachments.get(idx).cloned().with_context(|| {
+            return mail.attachments.get(idx).with_context(|| {
                 format!(
                     "Attachment index {idx} is out of range (total {})",
-                    attachments.len()
+                    mail.attachments.len()
                 )
             });
         }
-        if let Some(found) = attachments.iter().find(|a| {
-            a.id == sel
-                || a.name
-                    .as_deref()
-                    .is_some_and(|n| n.eq_ignore_ascii_case(sel))
-        }) {
-            return Ok(found.clone());
+        if let Some(found) = mail
+            .attachments
+            .iter()
+            .find(|a| a.id == sel || a.name.eq_ignore_ascii_case(sel))
+        {
+            return Ok(found);
         }
         bail!("Matching attachment not found: {sel}");
     }
-    Ok(attachments
+    if let Some(idx) = index {
+        return mail.attachments.get(idx).with_context(|| {
+            format!(
+                "Attachment index {idx} is out of range (total {})",
+                mail.attachments.len()
+            )
+        });
+    }
+    Ok(mail
+        .attachments
         .iter()
-        .find(|a| img_preview::is_image_mime_or_name(&a.content_type, a.name.as_deref()))
-        .unwrap_or(&attachments[0])
-        .clone())
+        .find(|a| img_preview::is_image_mime_or_name(&a.content_type, Some(&a.name)))
+        .unwrap_or(&mail.attachments[0]))
 }
 
+pub(crate) async fn load_mail_attachment_bytes(
+    graph: &GraphClient,
+    mail_id: &str,
+    att: &MailAttachment,
+    offline: bool,
+) -> Result<(String, String, Vec<u8>)> {
+    if let Some(ref b64) = att.content_bytes_b64 {
+        let cleaned: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(cleaned)
+            .with_context(|| format!("Failed to decode base64 attachment: {}", att.name))?;
+        return Ok((att.name.clone(), att.content_type.clone(), bytes));
+    }
+    if offline {
+        bail!(
+            "Cannot fetch uncached attachment bytes in offline mode: {}",
+            att.name
+        );
+    }
+    graph.fetch_mail_attachment_bytes(mail_id, &att.id).await
+}
+
+pub(crate) fn normalize_mail_importance(raw: &str) -> Result<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "low" => Ok("low"),
+        "normal" => Ok("normal"),
+        "high" => Ok("high"),
+        other => bail!("Unsupported mail importance: '{other}' (low | normal | high)"),
+    }
+}
+
+pub(crate) fn normalize_datetime_iso(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("Timestamp string is empty.");
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        return Ok(dt
+            .with_timezone(&Utc)
+            .to_rfc3339_opts(SecondsFormat::AutoSi, true));
+    }
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d_%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d_%H:%M",
+        "%Y-%m-%dT%H:%M",
+    ] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(trimmed, fmt) {
+            let dt = Local
+                .from_local_datetime(&naive)
+                .earliest()
+                .or_else(|| Local.from_local_datetime(&naive).latest())
+                .context("Failed to convert local timestamp")?;
+            return Ok(dt.with_timezone(&Utc).to_rfc3339_opts(SecondsFormat::Secs, true));
+        }
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        let naive = date.and_hms_opt(0, 0, 0).context("Invalid date")?;
+        let dt = Local
+            .from_local_datetime(&naive)
+            .earliest()
+            .or_else(|| Local.from_local_datetime(&naive).latest())
+            .context("Failed to convert local date")?;
+        return Ok(dt.with_timezone(&Utc).to_rfc3339_opts(SecondsFormat::Secs, true));
+    }
+    bail!("Invalid timestamp '{trimmed}' (expected ISO-8601 or YYYY-MM-DD HH:MM)")
+}
+
+pub(crate) fn default_calendar_window(
+    from: Option<&str>,
+    to: Option<&str>,
+    days: i64,
+) -> Result<(String, String)> {
+    let clamped_days = days.clamp(1, 365);
+    let start_iso = match from.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => normalize_datetime_iso(s)?,
+        None => {
+            let today = Local::now().date_naive();
+            let naive = today.and_hms_opt(0, 0, 0).context("Invalid start of day")?;
+            Local
+                .from_local_datetime(&naive)
+                .earliest()
+                .unwrap_or_else(Local::now)
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(SecondsFormat::Secs, true)
+        }
+    };
+    let end_iso = match to.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(e) => normalize_datetime_iso(e)?,
+        None => {
+            let start_dt = DateTime::parse_from_rfc3339(&start_iso)?;
+            (start_dt + chrono::Duration::days(clamped_days))
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(SecondsFormat::Secs, true)
+        }
+    };
+    Ok((start_iso, end_iso))
+}
+
+pub(crate) fn normalize_rsvp_response(raw: &str) -> Result<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "accept" | "accepted" => Ok("accept"),
+        "tentative" | "tentativelyaccept" | "tentatively_accept" | "tentativelyaccepted" => {
+            Ok("tentativelyAccept")
+        }
+        "decline" | "declined" => Ok("decline"),
+        other => bail!("Unsupported RSVP response: '{other}' (accept | tentative | decline)"),
+    }
+}
+
+pub(crate) fn normalize_todo_due_iso(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("Due date is empty.");
+    }
+    if NaiveDate::parse_from_str(trimmed, "%Y-%m-%d").is_ok() {
+        return Ok(format!("{trimmed}T00:00:00Z"));
+    }
+    normalize_datetime_iso(trimmed)
+}
+
+pub(crate) fn normalize_todo_importance(raw: &str) -> Result<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "low" => Ok("low"),
+        "normal" => Ok("normal"),
+        "high" => Ok("high"),
+        other => bail!("Unsupported To Do importance: '{other}' (low | normal | high)"),
+    }
+}
 
 fn format_unix_ts(ts: i64) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
-        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+    DateTime::<Utc>::from_timestamp(ts, 0)
+        .map(|dt| dt.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string())
         .unwrap_or_else(|| ts.to_string())
 }
 
@@ -3759,337 +3954,333 @@ mod tests {
 
     #[test]
     fn parses_default_tui_without_subcommand() {
-        let cli = Cli::try_parse_from(["teams"]).unwrap();
+        let cli = Cli::try_parse_from(["outlook"]).unwrap();
         assert!(cli.command.is_none());
     }
 
     #[test]
-    fn parses_aliases_and_flags() {
-        let cli = Cli::try_parse_from(["teams", "ls", "--limit", "200", "--refresh", "--json"])
-            .unwrap();
-        assert!(matches!(
-            cli.command.unwrap(),
-            Command::Chats {
-                limit: 200,
-                refresh: true,
-                cached: false,
-                json: true
-            }
-        ));
-
-        // Default `teams read` limit is 30, supports `--before` and `--thread`
-        let cli = Cli::try_parse_from(["teams", "read", "Engineering/General"]).unwrap();
-        match cli.command.unwrap() {
-            Command::Read {
-                target,
-                limit,
-                before,
-                thread,
-                offline,
-                cached,
-                json,
-            } => {
-                assert_eq!(target, "Engineering/General");
-                assert_eq!(limit, 30);
-                assert!(before.is_none());
-                assert!(thread.is_none());
-                assert!(!offline);
-                assert!(!cached);
-                assert!(!json);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-
+    fn parses_mail_aliases_flags_and_archive() {
         let cli = Cli::try_parse_from([
-            "teams",
-            "read",
-            "chat:1",
-            "--before",
-            "2026-11-01",
+            "outlook",
+            "ls",
+            "--folder",
+            "sent",
             "--limit",
-            "100",
-            "--thread",
-            "root-1",
+            "50",
+            "--unread",
+            "--flagged",
+            "--focused",
+            "--cached",
             "--json",
         ])
         .unwrap();
         match cli.command.unwrap() {
-            Command::Read {
-                target,
+            Command::Mail {
+                folder,
                 limit,
-                before,
-                thread,
+                unread,
+                flagged,
+                focused,
+                cached,
+                json,
                 ..
             } => {
-                assert_eq!(target, "chat:1");
-                assert_eq!(limit, 100);
-                assert_eq!(before.as_deref(), Some("2026-11-01"));
-                assert_eq!(thread.as_deref(), Some("root-1"));
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-
-        // `teams sync --chats --depth --target`
-        let cli = Cli::try_parse_from(["teams", "sync"]).unwrap();
-        assert!(matches!(
-            cli.command.unwrap(),
-            Command::Sync {
-                target: None,
-                chats: 100,
-                depth: 50,
-                json: false
-            }
-        ));
-        let cli = Cli::try_parse_from([
-            "teams", "sync", "--target", "Engineering/General", "--chats", "250", "--depth", "500", "--json",
-        ])
-        .unwrap();
-        match cli.command.unwrap() {
-            Command::Sync {
-                target,
-                chats,
-                depth,
-                json,
-            } => {
-                assert_eq!(target.as_deref(), Some("Engineering/General"));
-                assert_eq!(chats, 250);
-                assert_eq!(depth, 500);
+                assert_eq!(folder, "sent");
+                assert_eq!(limit, 50);
+                assert!(unread);
+                assert!(flagged);
+                assert!(focused);
+                assert!(cached);
                 assert!(json);
             }
             other => panic!("unexpected command: {other:?}"),
         }
 
         let cli = Cli::try_parse_from([
-            "teams",
-            "msg",
-            "Engineering/General",
-            "Hello",
+            "outlook",
+            "cat",
+            "msg-42",
+            "--raw-html",
+            "--mark-read",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Read {
+                message_id,
+                raw_html,
+                mark_read,
+                json,
+                ..
+            } => {
+                assert_eq!(message_id, "msg-42");
+                assert!(raw_html);
+                assert!(mark_read);
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "outlook",
+            "compose",
+            "--to",
+            "alice@example.com",
+            "--cc",
+            "bob@example.com",
             "--subject",
-            "Notice",
-            "--mention",
-            "u1:Alice",
-            "--important",
+            "Q4 Plan",
+            "--body",
+            "Hello **team**",
+            "--attach",
+            "report.pdf",
+            "--inline",
+            "chart.png",
+            "--importance",
+            "high",
             "--json",
         ])
         .unwrap();
         match cli.command.unwrap() {
             Command::Send {
-                target,
-                markdown,
+                to,
+                cc,
                 subject,
-                mention,
-                important,
+                body,
+                attach,
+                inline,
+                importance,
                 json,
+                ..
             } => {
-                assert_eq!(target, "Engineering/General");
-                assert_eq!(markdown, "Hello");
-                assert_eq!(subject.as_deref(), Some("Notice"));
-                assert_eq!(mention, vec!["u1:Alice"]);
-                assert!(important);
+                assert_eq!(to, vec!["alice@example.com"]);
+                assert_eq!(cc, vec!["bob@example.com"]);
+                assert_eq!(subject, "Q4 Plan");
+                assert_eq!(body.as_deref(), Some("Hello **team**"));
+                assert_eq!(attach, vec![PathBuf::from("report.pdf")]);
+                assert_eq!(inline, vec![PathBuf::from("chart.png")]);
+                assert_eq!(importance, "high");
                 assert!(json);
             }
             other => panic!("unexpected command: {other:?}"),
         }
 
+        let cli = Cli::try_parse_from(["outlook", "archive", "msg-99", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Archive {
+                message_id,
+                json: true
+            } if message_id == "msg-99"
+        ));
+
+        let cli = Cli::try_parse_from(["outlook", "mark", "m1", "--read", "--unflag"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Mark {
+                read: true,
+                unread: false,
+                flag: false,
+                unflag: true,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["outlook", "mark", "m1", "--read", "--unread"]).is_err());
+    }
+
+    #[test]
+    fn parses_calendar_tasks_contacts_serve_mcp_and_daemon() {
         let cli = Cli::try_parse_from([
-            "teams",
-            "file",
-            "Alice",
-            "C:\\tmp\\shot.png",
-            "--caption",
-            "Screenshot",
-            "--thread",
-            "root1",
-            "--inline",
+            "outlook",
+            "cal",
+            "--days",
+            "14",
+            "--from",
+            "2026-11-20",
+            "--to",
+            "2026-12-01",
             "--json",
         ])
         .unwrap();
         match cli.command.unwrap() {
-            Command::SendFile {
-                target,
-                path,
-                caption,
-                thread,
-                inline,
+            Command::Calendar {
+                days,
+                from,
+                to,
                 json,
+                ..
             } => {
-                assert_eq!(target, "Alice");
-                assert_eq!(path, PathBuf::from("C:\\tmp\\shot.png"));
-                assert_eq!(caption.as_deref(), Some("Screenshot"));
-                assert_eq!(thread.as_deref(), Some("root1"));
-                assert!(inline);
+                assert_eq!(days, 14);
+                assert_eq!(from.as_deref(), Some("2026-11-20"));
+                assert_eq!(to.as_deref(), Some("2026-12-01"));
                 assert!(json);
             }
             other => panic!("unexpected command: {other:?}"),
         }
-    }
 
-    #[test]
-    fn parses_serve_and_mcp_aliases() {
         let cli = Cli::try_parse_from([
-            "teams",
+            "outlook",
+            "create-event",
+            "--subject",
+            "Sync",
+            "--start",
+            "2026-11-20T10:00:00Z",
+            "--end",
+            "2026-11-20T11:00:00Z",
+            "--attendee",
+            "a@b.com",
+            "--online",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::CreateEvent { online: true, .. }
+        ));
+
+        let cli =
+            Cli::try_parse_from(["outlook", "todo", "--list", "Work", "--all", "--fast"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Tasks {
+                list,
+                all: true,
+                cached: true,
+                ..
+            } if list == "Work"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "outlook",
+            "add-task",
+            "Ship v1",
+            "--due",
+            "2026-11-25",
+            "--importance",
+            "high",
+            "--notes",
+            "Final check",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command.unwrap(), Command::AddTask { .. }));
+
+        let cli = Cli::try_parse_from(["outlook", "done", "t1", "--undo"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Done { undo: true, .. }
+        ));
+
+        let cli = Cli::try_parse_from(["outlook", "serve"]).unwrap();
+        match cli.command.unwrap() {
+            Command::Serve {
+                bind,
+                port,
+                api_key,
+            } => {
+                assert_eq!(bind, "127.0.0.1");
+                assert_eq!(port, 3939);
+                assert!(api_key.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "outlook",
             "api",
             "--bind",
             "0.0.0.0",
             "--port",
-            "9000",
-            "--token",
-            "sec",
+            "4040",
+            "--api-key",
+            "secret-key",
         ])
         .unwrap();
         match cli.command.unwrap() {
-            Command::Serve { bind, port, token } => {
+            Command::Serve {
+                bind,
+                port,
+                api_key,
+            } => {
                 assert_eq!(bind, "0.0.0.0");
-                assert_eq!(port, 9000);
-                assert_eq!(token.as_deref(), Some("sec"));
+                assert_eq!(port, 4040);
+                assert_eq!(api_key.as_deref(), Some("secret-key"));
             }
             other => panic!("unexpected command: {other:?}"),
         }
 
-        let cli = Cli::try_parse_from(["teams", "mcp-server"]).unwrap();
-        assert!(matches!(cli.command.unwrap(), Command::Mcp));
-    }
-
-    #[test]
-    fn parses_update_and_preview_commands() {
-        let cli = Cli::try_parse_from([
-            "teams",
-            "update",
-            "--check",
-            "--force",
-            "--repo",
-            "org/repo",
-            "--json",
-        ])
-        .unwrap();
-        match cli.command.unwrap() {
-            Command::Update {
-                check,
-                force,
-                repo,
-                json,
-            } => {
-                assert!(check);
-                assert!(force);
-                assert_eq!(repo.as_deref(), Some("org/repo"));
-                assert!(json);
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-
-        let cli = Cli::try_parse_from(["teams", "preview-file", "shot.png", "--cols", "80"]).unwrap();
         assert!(matches!(
-            cli.command.unwrap(),
-            Command::PreviewFile {
-                cols: Some(80),
-                protocol: None,
-                ..
+            Cli::try_parse_from(["outlook", "mcp-server"])
+                .unwrap()
+                .command
+                .unwrap(),
+            Command::Mcp
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["outlook", "daemon", "run"])
+                .unwrap()
+                .command
+                .unwrap(),
+            Command::Daemon {
+                command: DaemonCommand::Run
             }
         ));
+    }
 
-        let cli = Cli::try_parse_from([
-            "teams",
-            "preview",
-            "chat:1",
-            "msg-1",
-            "--protocol",
-            "sixel",
-            "--cols",
-            "100",
-            "--rows",
-            "30",
-        ])
-        .unwrap();
-        match cli.command.unwrap() {
-            Command::Preview {
-                target,
-                msg_id,
-                cols,
-                rows,
-                protocol,
-                ..
-            } => {
-                assert_eq!(target.as_deref(), Some("chat:1"));
-                assert_eq!(msg_id.as_deref(), Some("msg-1"));
-                assert_eq!(cols, Some(100));
-                assert_eq!(rows, Some(30));
-                assert_eq!(protocol.as_deref(), Some("sixel"));
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-
-        let cli = Cli::try_parse_from([
-            "teams",
-            "preview-file",
-            "shot.png",
-            "--protocol",
-            "iterm2",
-        ])
-        .unwrap();
-        match cli.command.unwrap() {
-            Command::PreviewFile { path, protocol, .. } => {
-                assert_eq!(path, Path::new("shot.png"));
-                assert_eq!(protocol.as_deref(), Some("iterm2"));
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-
-        let mut cfg = AppConfig::default();
-        cfg.image_protocol = config::ImageProtocolPreference::Kitty;
-        assert_eq!(
-            resolve_image_protocol_preference(&cfg, None).unwrap(),
-            config::ImageProtocolPreference::Kitty
-        );
-        assert_eq!(
-            resolve_image_protocol_preference(&cfg, Some("sixel")).unwrap(),
-            config::ImageProtocolPreference::Sixel
-        );
-        assert_eq!(
-            resolve_image_protocol_preference(&cfg, Some("iterm2")).unwrap(),
-            config::ImageProtocolPreference::Iterm2
-        );
-        let invalid_err = resolve_image_protocol_preference(&cfg, Some("invalid-proto"))
-            .unwrap_err()
+    #[test]
+    fn env_help_documents_all_outlook_vars() {
+        let help = <Cli as clap::CommandFactory>::command()
+            .render_help()
             .to_string();
-        assert!(
-            invalid_err.contains("auto, kitty, iterm2, sixel, halfblock"),
-            "unexpected error message: {invalid_err}"
-        );
-    }
-
-    #[test]
-    fn parses_mentions_and_rejects_malformed() {
-        let parsed =
-            parse_mentions_cli(&["user-1:Alice".to_string(), " user-2 : Bob Kim ".to_string()])
-                .unwrap();
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].id, 0);
-        assert_eq!(parsed[0].user_id, "user-1");
-        assert_eq!(parsed[0].display_name, "Alice");
-        assert_eq!(parsed[1].id, 1);
-        assert_eq!(parsed[1].user_id, "user-2");
-        assert_eq!(parsed[1].display_name, "Bob Kim");
-
-        for bad in ["nocolon", ":noname", "nouid:", "  :  "] {
-            assert!(parse_mention_spec(bad, 0).is_err(), "{bad}");
+        for var in [
+            "OUTLOOK_TOKEN_FILE",
+            "OUTLOOK_TOKEN_REFRESH_CMD",
+            "OUTLOOK_ACCESS_TOKEN",
+            "OUTLOOK_SHARE_M365_AUTH",
+            "OUTLOOK_IMAGE_PROTOCOL",
+            "OUTLOOK_CONFIG_DIR",
+            "OUTLOOK_DATA_DIR",
+        ] {
+            assert!(help.contains(var), "help output missing {var}");
         }
     }
 
     #[test]
-    fn normalizes_reactions_and_presence() {
-        assert_eq!(normalize_reaction("LIKE").unwrap(), "like");
-        assert_eq!(normalize_reaction("Heart").unwrap(), "heart");
-        assert_eq!(normalize_reaction("👍").unwrap(), "👍");
-        assert!(normalize_reaction("  ").is_err());
-        assert!(normalize_reaction("bogus").is_err());
+    fn fast_help_version_and_normalizers_work() {
+        assert!(
+            try_fast_help_or_version_from(["outlook", "--help"], Persona::Outlook).is_some()
+        );
+        assert!(try_fast_help_or_version_from(["outlook", "-V"], Persona::Outlook).is_some());
+        assert!(try_fast_help_or_version_from(["outlook", "mail"], Persona::Outlook).is_none());
+
+        assert_eq!(normalize_rsvp_response("ACCEPT").unwrap(), "accept");
+        assert_eq!(
+            normalize_rsvp_response("tentative").unwrap(),
+            "tentativelyAccept"
+        );
+        assert_eq!(normalize_rsvp_response("Decline").unwrap(), "decline");
+        assert!(normalize_rsvp_response("maybe").is_err());
 
         assert_eq!(
-            normalize_presence_availability("donotdisturb").unwrap(),
-            "DoNotDisturb"
+            normalize_todo_due_iso("2026-11-25").unwrap(),
+            "2026-11-25T00:00:00Z"
         );
-        assert_eq!(normalize_presence_availability("brb").unwrap(), "BeRightBack");
-        assert_eq!(normalize_presence_availability("reset").unwrap(), "Reset");
-        assert!(normalize_presence_availability("unknown").is_err());
+        assert_eq!(normalize_todo_importance("HIGH").unwrap(), "high");
+        assert!(normalize_todo_importance("urgent").is_err());
+
+        let html = crate::parser::compile_outgoing_mail_html(
+            "# Title\n\nHello **world** `code` [link](https://example.com)",
+            &[],
+            None,
+        );
+        assert!(html.contains("<h1>Title</h1>"));
+        assert!(html.contains("<strong>world</strong>"));
+        assert!(html.contains("<code>code</code>"));
+        assert!(html.contains("<a href=\"https://example.com\">link</a>"));
+
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"oid":"user-123","sub":"sub-1"}"#);
+        let jwt = format!("Bearer header.{payload}.sig");
+        assert_eq!(extract_user_id_from_jwt(&jwt).as_deref(), Some("user-123"));
+        assert_eq!(parse_cli_cache_secs(Some(" 60 ")), 60);
     }
 
     #[test]
@@ -4100,407 +4291,5 @@ mod tests {
         delete_gate(false, false, Some("YES")).unwrap();
         assert!(delete_gate(false, false, Some("no")).is_err());
         assert!(delete_gate(false, false, None).is_err());
-    }
-
-    #[test]
-    fn resolves_before_cursor_and_offline_pagination() {
-        let storage = Storage::open_in_memory().unwrap();
-        let conv = ConversationSummary {
-            conv_key: "chat:19:hist".to_string(),
-            target: ConversationTarget::Chat {
-                chat_id: "19:hist".to_string(),
-            },
-            kind: ConversationKind::OneOnOne,
-            team_id: None,
-            team_name: None,
-            title: "History Test".to_string(),
-            topic: None,
-            unread_count: 0,
-            last_read_at: None,
-            last_msg_id: None,
-            last_msg_author: None,
-            last_msg_preview: None,
-            last_updated_at: None,
-            pinned: false,
-            peer_user_id: None,
-            web_url: None,
-        };
-        storage.upsert_conversations(std::slice::from_ref(&conv)).unwrap();
-
-        let mk_msg = |id: &str, ts: &str| MessageItem {
-            msg_key: format!("chat:19:hist|{id}"),
-            conv_key: "chat:19:hist".to_string(),
-            msg_id: id.to_string(),
-            parent_msg_id: None,
-            reply_to_id: None,
-            reply_to_author: None,
-            reply_to_preview: None,
-            subject: None,
-            author_id: Some("u1".to_string()),
-            author_name: "Bob".to_string(),
-            is_me: false,
-            created_at: ts.to_string(),
-            last_modified_at: None,
-            deleted: false,
-            importance: "normal".to_string(),
-            message_type: "message".to_string(),
-            body_html: format!("<p>{id}</p>"),
-            body_plain: id.to_string(),
-            attachments: vec![],
-            mentions: vec![],
-            reactions: vec![],
-            reply_count: 0,
-            web_url: None,
-        };
-
-        storage
-            .upsert_messages(&[
-                mk_msg("m1", "2026-10-30T10:00:00Z"),
-                mk_msg("m2", "2026-10-31T12:00:00Z"),
-                mk_msg("m3", "2026-11-01T09:00:00Z"),
-                mk_msg("m4", "2026-11-02T09:00:00Z"),
-            ])
-            .unwrap();
-
-        // Date-only `YYYY-MM-DD` normalizes to `YYYY-MM-DDT00:00:00Z`
-        let (ts, id) = resolve_before_cursor(&storage, &conv.conv_key, "2026-11-01").unwrap();
-        assert_eq!(ts, "2026-11-01T00:00:00Z");
-        assert!(id.is_none());
-
-        // Cached msg_id resolves to its timestamp and msg_id
-        let (ts, id) = resolve_before_cursor(&storage, &conv.conv_key, "m3").unwrap();
-        assert_eq!(ts, "2026-11-01T09:00:00Z");
-        assert_eq!(id.as_deref(), Some("m3"));
-
-        // Invalid input returns an error
-        assert!(resolve_before_cursor(&storage, &conv.conv_key, "not-a-timestamp").is_err());
-
-        // Offline pagination before `2026-11-01` yields m1, m2 in chronological order
-        let res = read_conversation_messages_offline(&storage, &conv, 1, Some("2026-11-01"))
-            .unwrap();
-        assert_eq!(res.messages.len(), 1);
-        assert_eq!(res.messages[0].msg_id, "m2");
-        assert!(res.has_more);
-        assert_eq!(res.next_before.as_deref(), Some("m2"));
-
-        let res2 = read_conversation_messages_offline(&storage, &conv, 10, Some("m2")).unwrap();
-        assert_eq!(res2.messages.len(), 1);
-        assert_eq!(res2.messages[0].msg_id, "m1");
-        assert!(!res2.has_more);
-    }
-
-    #[test]
-    fn pure_teams_top_aliases_and_env_help() {
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "chats", "--top", "7"]).unwrap().command.unwrap(),
-            Command::Chats { limit: 7, .. }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "read", "c1", "--top", "7"]).unwrap().command.unwrap(),
-            Command::Read { limit: 7, .. }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "thread", "c1", "m1", "--top", "7"]).unwrap().command.unwrap(),
-            Command::Thread { limit: 7, .. }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "search", "q", "--top", "7"]).unwrap().command.unwrap(),
-            Command::Search { limit: 7, .. }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "sync", "--top", "7"]).unwrap().command.unwrap(),
-            Command::Sync { depth: 7, .. }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "sync", "--limit", "77"]).unwrap().command.unwrap(),
-            Command::Sync { depth: 77, .. }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "export", "c1", "--top", "7"]).unwrap().command.unwrap(),
-            Command::Export { limit: 7, .. }
-        ));
-
-        let required_envs = [
-            "TEAMS_TOKEN_FILE",
-            "TEAMS_TOKEN_REFRESH_CMD",
-            "TEAMS_ACCESS_TOKEN",
-            "TEAMS_DISABLE_KEYRING",
-            "TEAMS_IMAGE_PROTOCOL",
-        ];
-        let teams_help = <Cli as clap::CommandFactory>::command().render_help().to_string();
-        for env_name in required_envs {
-            assert!(teams_help.contains(env_name), "teams help missing {env_name}");
-        }
-        assert!(!teams_help.contains("TEAMS_PERSONA"));
-        assert!(Cli::try_parse_from(["teams", "mail"]).is_err());
-        assert!(Cli::try_parse_from(["teams", "notes"]).is_err());
-    }
-
-    #[test]
-    fn parses_cached_and_fast_flags() {
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "chats", "--cached"]).unwrap().command.unwrap(),
-            Command::Chats { cached: true, .. }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "chats", "--fast"]).unwrap().command.unwrap(),
-            Command::Chats { cached: true, .. }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "teams", "--fast"]).unwrap().command.unwrap(),
-            Command::Teams { cached: true, .. }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "channels", "dev", "--cached"]).unwrap().command.unwrap(),
-            Command::Channels { cached: true, .. }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "read", "c1", "--fast"]).unwrap().command.unwrap(),
-            Command::Read { cached: true, .. }
-        ));
-    }
-
-    #[test]
-    fn fast_help_version_and_cache_cursor_helpers_work() {
-        assert!(try_fast_help_or_version_from(["teams", "--help"], Persona::Teams).is_some());
-        assert!(try_fast_help_or_version_from(["teams", "-V"], Persona::Teams).is_some());
-        assert!(try_fast_help_or_version_from(["teams", "read", "--help"], Persona::Teams).is_some());
-        assert!(try_fast_help_or_version_from(["teams", "chats"], Persona::Teams).is_none());
-        assert!(try_fast_help_or_version_from(["teams", "send", "a", "--", "--help"], Persona::Teams).is_none());
-
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(r#"{"oid":"user-123","sub":"sub-1"}"#);
-        let jwt = format!("Bearer header.{payload}.sig");
-        assert_eq!(extract_user_id_from_jwt(&jwt).as_deref(), Some("user-123"));
-
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        let cred_path = tmp.path().join("credentials.json");
-        std::fs::create_dir_all(data_dir.join("solo-user")).unwrap();
-        std::fs::write(data_dir.join("solo-user").join("cache.db"), b"").unwrap();
-
-        let cfg = AppConfig::default();
-        assert_eq!(
-            resolve_storage_db_path_fast(&cfg, None, &data_dir, &cred_path).unwrap(),
-            data_dir.join("solo-user").join("cache.db")
-        );
-
-        std::fs::create_dir_all(data_dir.join("second-user")).unwrap();
-        std::fs::write(data_dir.join("second-user").join("cache.db"), b"").unwrap();
-        assert!(resolve_storage_db_path_fast(&cfg, None, &data_dir, &cred_path).is_none());
-
-        std::fs::write(&cred_path, r#"{"user_id":"second-user"}"#).unwrap();
-        assert_eq!(
-            resolve_storage_db_path_fast(&cfg, None, &data_dir, &cred_path).unwrap(),
-            data_dir.join("second-user").join("cache.db")
-        );
-
-        assert_eq!(
-            resolve_storage_db_path_fast(&cfg, Some(&jwt), &data_dir, &cred_path).unwrap(),
-            data_dir.join("user-123").join("cache.db")
-        );
-
-        assert_eq!(parse_cli_cache_secs(None), 0);
-        assert_eq!(parse_cli_cache_secs(Some(" 60 ")), 60);
-        assert_eq!(parse_cli_cache_secs(Some("bad")), 0);
-
-        let storage = Storage::open_in_memory().unwrap();
-        assert!(!is_cursor_fresh(&storage, &["cli:chats"], 60));
-        record_cli_sync_cursor(&storage, "cli:chats");
-        assert!(is_cursor_fresh(&storage, &["cli:chats"], 60));
-        assert!(!is_cursor_fresh(&storage, &["cli:chats"], 0));
-    }
-
-    #[test]
-    fn parses_daemon_subcommands() {
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "daemon", "start"])
-                .unwrap()
-                .command
-                .unwrap(),
-            Command::Daemon {
-                command: DaemonCommand::Start { json: false }
-            }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "daemon", "start", "--json"])
-                .unwrap()
-                .command
-                .unwrap(),
-            Command::Daemon {
-                command: DaemonCommand::Start { json: true }
-            }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "daemon", "stop"])
-                .unwrap()
-                .command
-                .unwrap(),
-            Command::Daemon {
-                command: DaemonCommand::Stop { json: false }
-            }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "daemon", "status"])
-                .unwrap()
-                .command
-                .unwrap(),
-            Command::Daemon {
-                command: DaemonCommand::Status { json: false }
-            }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "daemon", "restart"])
-                .unwrap()
-                .command
-                .unwrap(),
-            Command::Daemon {
-                command: DaemonCommand::Restart { json: false }
-            }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "daemon", "run"])
-                .unwrap()
-                .command
-                .unwrap(),
-            Command::Daemon {
-                command: DaemonCommand::Run
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn cached_inline_hosted_image_exposes_effective_attachment_for_cli_helpers() {
-        use axum::{http::StatusCode, routing::get, Router};
-
-        let storage = Storage::open_in_memory().unwrap();
-        let conv = ConversationSummary {
-            conv_key: "chat:c1".to_string(),
-            target: ConversationTarget::Chat {
-                chat_id: "c1".to_string(),
-            },
-            kind: ConversationKind::OneOnOne,
-            team_id: None,
-            team_name: None,
-            title: "Inline Hosted".to_string(),
-            topic: None,
-            unread_count: 0,
-            last_read_at: None,
-            last_msg_id: Some("m1".to_string()),
-            last_msg_author: Some("Alice".to_string()),
-            last_msg_preview: Some("Screenshot".to_string()),
-            last_updated_at: Some("2026-11-18T10:00:00Z".to_string()),
-            pinned: false,
-            peer_user_id: None,
-            web_url: None,
-        };
-        storage.upsert_conversations(std::slice::from_ref(&conv)).unwrap();
-
-        let graph_hosted_url =
-            "https://graph.microsoft.com/v1.0/chats/c1/messages/m1/hostedContents/1/$value";
-        let cached_msg = MessageItem {
-            msg_key: "chat:c1|m1".to_string(),
-            conv_key: "chat:c1".to_string(),
-            msg_id: "m1".to_string(),
-            parent_msg_id: None,
-            reply_to_id: None,
-            reply_to_author: None,
-            reply_to_preview: None,
-            subject: None,
-            author_id: Some("u1".to_string()),
-            author_name: "Alice".to_string(),
-            is_me: false,
-            created_at: "2026-11-18T10:00:00Z".to_string(),
-            last_modified_at: None,
-            deleted: false,
-            importance: "normal".to_string(),
-            message_type: "message".to_string(),
-            body_html: format!(r#"<p>See screenshot</p><img src="{graph_hosted_url}">"#),
-            body_plain: "See screenshot".to_string(),
-            attachments: vec![],
-            mentions: vec![],
-            reactions: vec![],
-            reply_count: 0,
-            web_url: None,
-        };
-        storage.upsert_messages(std::slice::from_ref(&cached_msg)).unwrap();
-
-        // 1. CLI read helper hydrates attachments for --json & renders [📎 ...] tag in text.
-        let read_res = read_conversation_messages_offline(&storage, &conv, 10, None).unwrap();
-        assert_eq!(read_res.messages.len(), 1);
-        assert_eq!(read_res.messages[0].attachments.len(), 1);
-        assert_eq!(read_res.messages[0].attachments[0].id, "hosted:1");
-        assert_eq!(
-            read_res.messages[0].attachments[0].content_url.as_deref(),
-            Some(graph_hosted_url)
-        );
-        let raw_msg = storage.get_message("chat:c1", "m1").unwrap().unwrap();
-        assert!(raw_msg.attachments.is_empty());
-        let line = format_message_line(&raw_msg, "");
-        assert!(line.contains("[📎 "), "expected attachment tag in line: {line}");
-
-        // 2. CLI preview selector finds hosted:1 even on unhydrated cached MessageItem.
-        for selector in [None, Some("0"), Some("hosted:1")] {
-            let att = select_teams_attachment(&raw_msg, selector).unwrap();
-            assert_eq!(att.id, "hosted:1");
-            assert_eq!(att.content_url.as_deref(), Some(graph_hosted_url));
-            assert!(img_preview::is_image_mime_or_name(
-                &att.content_type,
-                att.name.as_deref()
-            ));
-        }
-
-        // 3. CLI download helper fetches hosted:1 from mock Graph server for cached message.
-        let png_bytes = b"\x89PNG\r\n\x1a\nfake-png-bytes".to_vec();
-        let served_bytes = png_bytes.clone();
-        let mock_app = Router::new().route(
-            "/v1.0/chats/c1/messages/m1/hostedContents/1/$value",
-            get(move || {
-                let bytes = served_bytes.clone();
-                async move { (StatusCode::OK, bytes) }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mock_server = tokio::spawn(async move {
-            axum::serve(listener, mock_app).await.unwrap();
-        });
-
-        let local_hosted_url = format!(
-            "http://{addr}/v1.0/chats/c1/messages/m1/hostedContents/1/$value"
-        );
-        let mut local_msg = cached_msg;
-        local_msg.msg_key = "chat:c1|m2".to_string();
-        local_msg.msg_id = "m2".to_string();
-        local_msg.body_html = format!(r#"<img src="{local_hosted_url}">"#);
-        storage.upsert_messages(&[local_msg]).unwrap();
-
-        let cfg = AppConfig {
-            graph_base_url: format!("http://{addr}/v1.0"),
-            ..AppConfig::default()
-        };
-        let tokens = StoredTokens {
-            access_token: "tok".to_string(),
-            refresh_token: None,
-            expires_at: chrono::Utc::now().timestamp() + 3600,
-            client_id: cfg.client_id.clone(),
-            tenant_id: cfg.tenant_id.clone(),
-            user_id: Some("me-1".to_string()),
-            user_display_name: None,
-            user_email: None,
-            auth_mode: "pkce".to_string(),
-        };
-        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
-        let graph = GraphClient::new(cfg, auth).unwrap();
-        let dl_dir = tempfile::tempdir().unwrap();
-
-        let downloaded =
-            download_message_attachment(&graph, &storage, &conv, "m2", 0, None, dl_dir.path())
-                .await
-                .unwrap();
-        assert_eq!(downloaded.bytes_written, png_bytes.len() as u64);
-        assert_eq!(std::fs::read(&downloaded.path).unwrap(), png_bytes);
-
-        mock_server.abort();
     }
 }

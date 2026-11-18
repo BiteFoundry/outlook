@@ -14,18 +14,18 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
 use crate::{
+    auth::diagnose_access_token_scopes,
     cli,
     config::AppConfig,
     graph::GraphClient,
-    models::{ConversationSummary, ConversationTarget, MentionInfo},
-    parser, resolver,
+    models::{OutgoingEvent, OutgoingMail, OutgoingTodoTask},
+    resolver,
     storage::Storage,
-    sync,
 };
 
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
-const SERVER_NAME: &str = "teams";
+const SERVER_NAME: &str = "outlook";
 const MAX_RPC_LINE_BYTES: usize = 8 * 1024 * 1024;
 
 const PARSE_ERROR: i64 = -32700;
@@ -113,38 +113,66 @@ async fn map_graph_result<T>(graph: &GraphClient, res: Result<T>) -> Result<T, S
     }
 }
 
-async fn resolve_target_mcp(
+async fn resolve_mail_folder_mcp(
     storage: &Storage,
     graph: &GraphClient,
-    target: &str,
+    folder_query: &str,
     offline: bool,
-) -> Result<ConversationSummary, String> {
+) -> Result<crate::models::MailFolder, String> {
     if offline {
-        let target_owned = target.to_string();
-        return with_storage(storage, move |s| {
-            let cached = s.list_conversations()?;
-            resolver::resolve_from_slice(&cached, &target_owned)
-        })
-        .await
-        .map_err(format_error);
+        let q = folder_query.to_string();
+        return with_storage(storage, move |s| resolver::resolve_mail_folder_cached(s, &q))
+            .await
+            .map_err(format_error);
     }
+    map_graph_result(
+        graph,
+        resolver::resolve_mail_folder(graph, storage, folder_query, false).await,
+    )
+    .await
+}
 
-    map_graph_result(graph, cli::resolve_target(storage, graph, target, false).await).await
+async fn resolve_todo_list_mcp(
+    storage: &Storage,
+    graph: &GraphClient,
+    list_query: Option<&str>,
+    offline: bool,
+) -> Result<crate::models::TodoList, String> {
+    let q = list_query
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("tasks")
+        .to_string();
+    if offline {
+        return with_storage(storage, move |s| resolver::resolve_todo_list_cached(s, &q))
+            .await
+            .map_err(format_error);
+    }
+    map_graph_result(
+        graph,
+        resolver::resolve_todo_list(graph, storage, &q, false).await,
+    )
+    .await
 }
 
 /// Run the stdio MCP server until stdin reaches EOF.
 pub async fn run(config: AppConfig, graph: GraphClient, storage: Storage) -> Result<()> {
-    let is_empty = with_storage(&storage, |s| Ok(s.list_conversations()?.is_empty()))
+    let is_empty = with_storage(&storage, |s| Ok(s.list_mail_folders()?.is_empty()))
         .await
         .unwrap_or(false);
     if is_empty {
         let bg_graph = graph.clone();
         let bg_storage = storage.clone();
         tokio::spawn(async move {
-            if let Err(err) = sync::bootstrap_conversations(&bg_graph, &bg_storage).await {
-                eprintln!(
-                    "{SERVER_NAME} MCP warning: initial conversation bootstrap failed: {err:#}"
-                );
+            match bg_graph.list_mail_folders().await {
+                Ok(folders) => {
+                    let _ = with_storage(&bg_storage, move |s| s.upsert_mail_folders(&folders)).await;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "{SERVER_NAME} MCP warning: initial mail folder bootstrap failed: {err:#}"
+                    );
+                }
             }
         });
     }
@@ -254,81 +282,44 @@ async fn call_tool(
     let args = Args::new(arguments);
 
     match name {
-        "list_chats" => {
-            let refresh = args.optional_bool("refresh")?.unwrap_or(false);
-            let limit = bounds(
-                "limit",
-                args.optional_usize("limit")?.unwrap_or(50),
-                1,
-                1_000,
-            )?;
-
-            let cached: Vec<ConversationSummary> = with_storage(storage, |s| {
-                Ok(s.list_conversations()?
-                    .into_iter()
-                    .filter(|c| !c.kind.is_channel())
-                    .collect())
-            })
-            .await
-            .map_err(format_error)?;
-
-            let mut chats = if refresh || cached.is_empty() {
-                let fetched = map_graph_result(graph, graph.list_chats(limit).await).await?;
-                let fetched_clone = fetched.clone();
-                let stored: Vec<ConversationSummary> = with_storage(storage, move |s| {
-                    s.upsert_conversations(&fetched_clone)?;
-                    Ok(s.list_conversations()?
-                        .into_iter()
-                        .filter(|c| !c.kind.is_channel())
-                        .collect())
-                })
-                .await
-                .map_err(format_error)?;
-                if stored.is_empty() {
-                    fetched
-                } else {
-                    stored
-                }
-            } else {
-                cached
+        "whoami" => {
+            let tokens = graph.auth().current_tokens().await;
+            let auth_source = cli::auth_source_label(tokens.as_ref(), config);
+            let Some(tok) = tokens else {
+                return Ok(json!({
+                    "authenticated": false,
+                    "auth_source": auth_source,
+                }));
             };
-            chats.truncate(limit);
-
-            Ok(json!({ "chats": chats }))
-        }
-
-        "create_chat" => {
-            let members = args.required_str_array("members")?;
-            let topic = args.optional_str("topic")?;
-            let chat =
-                map_graph_result(graph, graph.create_chat(&members, topic.as_deref()).await)
-                    .await?;
-            let chat_clone = chat.clone();
-            with_storage(storage, move |s| {
-                s.upsert_conversations(std::slice::from_ref(&chat_clone))?;
-                Ok(())
-            })
-            .await
-            .map_err(format_error)?;
-
+            let diag = diagnose_access_token_scopes(&tok.access_token);
             Ok(json!({
-                "ok": true,
-                "conversation": chat,
+                "authenticated": true,
+                "user_id": tok.user_id,
+                "display_name": tok.user_display_name,
+                "email": tok.user_email,
+                "client_id": tok.client_id,
+                "tenant_id": tok.tenant_id,
+                "auth_mode": tok.auth_mode,
+                "auth_source": auth_source,
+                "expires_at": tok.expires_at,
+                "expired": tok.is_expired_soon(0),
+                "scopes": diag.scopes,
+                "roles": diag.roles,
             }))
         }
 
-        "list_teams_channels" => {
+        "list_mail_folders" => {
+            let offline = args.optional_bool("offline")?.unwrap_or(false);
             let refresh = args.optional_bool("refresh")?.unwrap_or(false);
-            let cached = with_storage(storage, |s| s.list_teams())
+            let cached = with_storage(storage, |s| s.list_mail_folders())
                 .await
                 .map_err(format_error)?;
-            let teams = if refresh || cached.is_empty() {
-                let fetched =
-                    map_graph_result(graph, graph.list_joined_teams_with_channels().await).await?;
+            let folders = if !offline && (refresh || cached.is_empty()) {
+                let fetched = map_graph_result(graph, graph.list_mail_folders().await).await?;
                 let fetched_clone = fetched.clone();
                 let stored = with_storage(storage, move |s| {
-                    s.upsert_teams(&fetched_clone)?;
-                    s.list_teams()
+                    s.upsert_mail_folders(&fetched_clone)?;
+                    s.list_mail_folders()
                 })
                 .await
                 .map_err(format_error)?;
@@ -340,440 +331,629 @@ async fn call_tool(
             } else {
                 cached
             };
-
-            Ok(json!({ "teams": teams }))
+            Ok(json!({ "folders": folders }))
         }
 
-        "get_messages" => {
-            let target = args.required_str("target")?;
-            let limit = bounds(
-                "limit",
-                args.optional_usize("limit")?.unwrap_or(50),
-                1,
-                1_000,
-            )?;
-            let before = args.optional_str("before")?;
+        "list_messages" => {
+            let folder = args
+                .optional_str("folder")?
+                .unwrap_or_else(|| "inbox".to_string());
+            let limit = args
+                .optional_usize("limit")?
+                .map(|v| bounds("limit", v, 1, 200))
+                .transpose()?
+                .map(cli::clamp_limit)
+                .unwrap_or(25);
+            let unread = args.optional_bool("unread")?.unwrap_or(false);
+            let flagged = args.optional_bool("flagged")?.unwrap_or(false);
+            let focused = args.optional_bool("focused")?.unwrap_or(false);
             let offline = args.optional_bool("offline")?.unwrap_or(false);
 
-            let conv = resolve_target_mcp(storage, graph, &target, offline).await?;
+            let resolved = resolve_mail_folder_mcp(storage, graph, &folder, offline).await?;
+            let folder_id = resolved.id.clone();
+            let fetch_limit = if unread || flagged || focused {
+                (limit.saturating_mul(3)).clamp(limit, 500)
+            } else {
+                limit
+            };
 
-            let res = if offline {
-                let conv_clone = conv.clone();
-                let before_clone = before.clone();
+            let messages = if offline {
+                let fid = folder_id.clone();
                 with_storage(storage, move |s| {
-                    cli::read_conversation_messages_offline(
-                        s,
-                        &conv_clone,
-                        limit,
-                        before_clone.as_deref(),
-                    )
+                    s.list_mail_messages(Some(&fid), false, false, false, fetch_limit)
                 })
                 .await
                 .map_err(format_error)?
             } else {
-                map_graph_result(
+                let fetched = map_graph_result(
                     graph,
-                    cli::read_conversation_messages(
-                        storage,
-                        graph,
-                        &conv,
-                        limit,
-                        before.as_deref(),
-                        false,
-                        true,
-                    )
-                    .await,
+                    graph.list_mail_messages(&folder_id, fetch_limit, false).await,
                 )
-                .await?
+                .await?;
+                let fetched_clone = fetched.clone();
+                let _ = with_storage(storage, move |s| s.upsert_mail_messages(&fetched_clone)).await;
+                fetched
             };
 
+            let filtered =
+                cli::filter_mail_messages(messages, unread, flagged, focused, limit);
+
             Ok(json!({
-                "conversation": conv,
-                "messages": res.messages,
-                "has_more": res.has_more,
-                "next_before": res.next_before,
+                "folder": resolved,
+                "messages": filtered,
             }))
         }
 
-        "get_thread" => {
-            let target = args.required_str("target")?;
-            let root_msg_id = args.required_str("root_msg_id")?;
-            let limit = bounds(
-                "limit",
-                args.optional_usize("limit")?.unwrap_or(50),
-                1,
-                1_000,
-            )?;
+        "get_message" => {
+            let message_id = args.required_str("message_id")?;
+            let offline = args.optional_bool("offline")?.unwrap_or(false);
+            let mark_read = args.optional_bool("mark_read")?.unwrap_or(false);
 
-            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
-            let ConversationTarget::Channel {
-                ref team_id,
-                ref channel_id,
-            } = conv.target
-            else {
-                return Err(format!(
-                    "get_thread requires a team channel target, got {}",
-                    conv.conv_key
-                ));
+            let mut msg = if offline {
+                let id_owned = message_id.clone();
+                with_storage(storage, move |s| s.get_mail_message(&id_owned))
+                    .await
+                    .map_err(format_error)?
+                    .ok_or_else(|| format!("mail message not found in cache: {message_id}"))?
+            } else {
+                let fetched =
+                    map_graph_result(graph, graph.get_mail_message(&message_id).await).await?;
+                let fetched_clone = fetched.clone();
+                let _ = with_storage(storage, move |s| {
+                    s.upsert_mail_messages(std::slice::from_ref(&fetched_clone))
+                })
+                .await;
+                fetched
             };
 
-            let mut thread = map_graph_result(
+            if !offline && mark_read && !msg.is_read {
+                if graph.set_mail_read(&msg.id, true).await.is_ok() {
+                    msg.is_read = true;
+                    let msg_clone = msg.clone();
+                    let _ = with_storage(storage, move |s| {
+                        s.upsert_mail_messages(std::slice::from_ref(&msg_clone))
+                    })
+                    .await;
+                }
+            }
+
+            Ok(json!({ "message": msg }))
+        }
+
+        "send_mail" => {
+            let to = args.required_str_array("to")?;
+            let subject = args.required_str("subject")?;
+            let body = args.required_text("body")?;
+            let cc = args.optional_str_array("cc")?.unwrap_or_default();
+            let bcc = args.optional_str_array("bcc")?.unwrap_or_default();
+            let importance = args
+                .optional_str("importance")?
+                .map(|v| cli::normalize_mail_importance(&v).map(str::to_string))
+                .transpose()
+                .map_err(format_error)?;
+            let attachments: Vec<PathBuf> = args
+                .optional_str_array("attachments")?
+                .unwrap_or_default()
+                .into_iter()
+                .map(PathBuf::from)
+                .collect();
+            for path in &attachments {
+                if !path.is_file() {
+                    return Err(format!("attachment file does not exist: {}", path.display()));
+                }
+            }
+            let save_to_sent_items = args.optional_bool("save_to_sent_items")?.unwrap_or(true);
+            let body_html = crate::parser::compile_outgoing_mail_html(&body, &[], None);
+
+            let outgoing = OutgoingMail {
+                subject: subject.clone(),
+                body_html,
+                body_markdown: Some(body),
+                to: to.clone(),
+                cc,
+                bcc,
+                importance,
+                attachments,
+                inline_images: Vec::new(),
+                in_reply_to_id: None,
+                reply_all: false,
+                forward_of_id: None,
+                draft_id: None,
+                save_to_sent_items,
+            };
+            map_graph_result(graph, graph.send_mail(&outgoing).await).await?;
+
+            Ok(json!({
+                "ok": true,
+                "to": to,
+                "subject": subject,
+            }))
+        }
+
+        "reply_mail" => {
+            let message_id = args.required_str("message_id")?;
+            let body = args.required_text("body")?;
+            let reply_all = args.optional_bool("reply_all")?.unwrap_or(false);
+            let body_html = crate::parser::compile_outgoing_mail_html(&body, &[], None);
+            map_graph_result(
                 graph,
-                graph
-                    .get_thread(team_id, channel_id, &root_msg_id, limit)
-                    .await,
+                graph.reply_mail(&message_id, &body_html, reply_all).await,
             )
             .await?;
-            let mut all = Vec::with_capacity(1 + thread.replies.len());
-            all.push(thread.root.clone());
-            all.extend(thread.replies.iter().cloned());
-            with_storage(storage, move |s| {
-                s.upsert_messages(&all)?;
+
+            Ok(json!({
+                "ok": true,
+                "message_id": message_id,
+                "reply_all": reply_all,
+            }))
+        }
+
+        "forward_mail" => {
+            let message_id = args.required_str("message_id")?;
+            let to = args.required_str_array("to")?;
+            let comment_html = match args.optional_str("comment")? {
+                Some(c) => crate::parser::compile_outgoing_mail_html(&c, &[], None),
+                None => String::new(),
+            };
+            map_graph_result(
+                graph,
+                graph.forward_mail(&message_id, &to, &comment_html).await,
+            )
+            .await?;
+
+            Ok(json!({
+                "ok": true,
+                "message_id": message_id,
+                "to": to,
+            }))
+        }
+
+        "update_message" => {
+            let message_id = args.required_str("message_id")?;
+            let is_read = args.optional_bool("is_read")?;
+            let flagged = args.optional_bool("flagged")?;
+            let dest_folder = args
+                .optional_str("destination_folder")?
+                .or(args.optional_str("destination_folder_id")?)
+                .or(args.optional_str("move_to_folder")?);
+            if is_read.is_none() && flagged.is_none() && dest_folder.is_none() {
+                return Err(
+                    "at least one of is_read, flagged, or destination_folder must be provided"
+                        .to_string(),
+                );
+            }
+
+            if let Some(read_val) = is_read {
+                map_graph_result(graph, graph.set_mail_read(&message_id, read_val).await).await?;
+            }
+            if let Some(flag_val) = flagged {
+                map_graph_result(graph, graph.set_mail_flag(&message_id, flag_val).await).await?;
+            }
+
+            let mid_clone = message_id.clone();
+            let _ = with_storage(storage, move |s| {
+                if let Some(mut cached) = s.get_mail_message(&mid_clone)? {
+                    if let Some(r) = is_read {
+                        cached.is_read = r;
+                    }
+                    if let Some(f) = flagged {
+                        cached.flagged = f;
+                    }
+                    s.upsert_mail_messages(&[cached])?;
+                }
                 Ok(())
             })
-            .await
-            .map_err(format_error)?;
-            cli::hydrate_thread_attachments(&mut thread);
-
-            Ok(json!({
-                "conversation": conv,
-                "thread": thread,
-            }))
-        }
-
-        "send_message" => {
-            let target = args.required_str("target")?;
-            let markdown = args.required_text("markdown")?;
-            let subject = args.optional_str("subject")?;
-            let mentions = args.optional_mentions("mentions")?;
-            let important = args.optional_bool("important")?.unwrap_or(false);
-
-            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
-
-            let mut outgoing = parser::compile_outgoing_markdown(
-                &markdown,
-                subject,
-                mentions,
-                vec![],
-                vec![],
-                None,
-            );
-            if important {
-                outgoing.importance = Some("high".to_string());
-            }
-
-            let mut sent =
-                map_graph_result(graph, graph.send_message(&conv.target, &outgoing).await).await?;
-            let sent_clone = sent.clone();
-            let _ = with_storage(storage, move |s| {
-                s.upsert_messages(std::slice::from_ref(&sent_clone))
-            })
             .await;
-            cli::hydrate_message_attachments(&mut sent);
 
-            Ok(json!({
-                "ok": true,
-                "conversation": conv,
-                "message": sent,
-            }))
-        }
-
-        "reply_message" => {
-            let target = args.required_str("target")?;
-            let msg_id = args.required_str("msg_id")?;
-            let markdown = args.required_text("markdown")?;
-            let mentions = args.optional_mentions("mentions")?;
-            let important = args.optional_bool("important")?.unwrap_or(false);
-
-            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
-            let quote = cli::build_quote_reply(storage, graph, &conv, &msg_id).await;
-            let mut outgoing = parser::compile_outgoing_markdown(
-                &markdown,
-                None,
-                mentions,
-                vec![],
-                vec![],
-                quote,
-            );
-            if important {
-                outgoing.importance = Some("high".to_string());
-            }
-
-            let mut sent = map_graph_result(
-                graph,
-                graph.reply_message(&conv.target, &msg_id, &outgoing).await,
-            )
-            .await?;
-            let sent_clone = sent.clone();
-            let _ = with_storage(storage, move |s| {
-                s.upsert_messages(std::slice::from_ref(&sent_clone))
-            })
-            .await;
-            cli::hydrate_message_attachments(&mut sent);
-
-            Ok(json!({
-                "ok": true,
-                "conversation": conv,
-                "reply_to": msg_id,
-                "message": sent,
-            }))
-        }
-
-        "send_file" => {
-            let target = args.required_str("target")?;
-            let path = args.required_str("path")?;
-            let caption = args.optional_str("caption")?;
-            let thread_root_id = args.optional_str("thread_root_id")?;
-            let inline = args.optional_bool("inline")?.unwrap_or(false);
-
-            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
-            let sent = map_graph_result(
-                graph,
-                cli::send_file_or_inline(
+            let moved_message = if let Some(dest) = dest_folder.as_deref() {
+                let folder = resolve_mail_folder_mcp(storage, graph, dest, false).await?;
+                let moved = map_graph_result(
                     graph,
-                    storage,
-                    &conv,
-                    std::path::Path::new(&path),
-                    caption.as_deref(),
-                    thread_root_id.as_deref(),
-                    inline,
+                    graph.move_mail_message(&message_id, &folder.id).await,
                 )
-                .await,
-            )
-            .await?;
+                .await?;
+                let moved_clone = moved.clone();
+                let _ = with_storage(storage, move |s| {
+                    s.upsert_mail_messages(std::slice::from_ref(&moved_clone))
+                })
+                .await;
+                Some(moved)
+            } else {
+                None
+            };
 
             Ok(json!({
                 "ok": true,
-                "conversation": conv,
-                "path": path,
-                "message": sent,
-            }))
-        }
-
-        "download_attachment" => {
-            let target = args.required_str("target")?;
-            let msg_id = args.required_str("msg_id")?;
-            let index = args.optional_usize("index")?.unwrap_or(0);
-            let thread_root_id = args.optional_str("thread_root_id")?;
-            let out_dir = args
-                .optional_str("out_dir")?
-                .map(PathBuf::from)
-                .unwrap_or_else(|| config.resolved_download_dir());
-
-            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
-            let downloaded = map_graph_result(
-                graph,
-                cli::download_message_attachment(
-                    graph,
-                    storage,
-                    &conv,
-                    &msg_id,
-                    index,
-                    thread_root_id.as_deref(),
-                    &out_dir,
-                )
-                .await,
-            )
-            .await?;
-
-            Ok(json!({
-                "ok": true,
-                "path": downloaded.path,
-                "file_name": downloaded.file_name,
-                "bytes_written": downloaded.bytes_written,
-            }))
-        }
-
-        "react_message" => {
-            let target = args.required_str("target")?;
-            let msg_id = args.required_str("msg_id")?;
-            let reaction = cli::normalize_reaction(&args.required_str("reaction")?)
-                .map_err(format_error)?;
-            let enable = args.optional_bool("enable")?.unwrap_or(true);
-            let thread_root_id = args.optional_str("thread_root_id")?;
-
-            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
-            map_graph_result(
-                graph,
-                graph
-                    .set_reaction(
-                        &conv.target,
-                        &msg_id,
-                        thread_root_id.as_deref(),
-                        &reaction,
-                        enable,
-                    )
-                    .await,
-            )
-            .await?;
-
-            Ok(json!({
-                "ok": true,
-                "conv_key": conv.conv_key,
-                "msg_id": msg_id,
-                "reaction": reaction,
-                "enable": enable,
-            }))
-        }
-
-        "edit_message" => {
-            let target = args.required_str("target")?;
-            let msg_id = args.required_str("msg_id")?;
-            let markdown = args.required_text("markdown")?;
-            let thread_root_id = args.optional_str("thread_root_id")?;
-
-            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
-            let compiled = parser::compile_outgoing_markdown(
-                &markdown,
-                None,
-                vec![],
-                vec![],
-                vec![],
-                None,
-            );
-            map_graph_result(
-                graph,
-                graph
-                    .edit_message(
-                        &conv.target,
-                        &msg_id,
-                        thread_root_id.as_deref(),
-                        &compiled.body_html,
-                    )
-                    .await,
-            )
-            .await?;
-
-            Ok(json!({
-                "ok": true,
-                "conv_key": conv.conv_key,
-                "msg_id": msg_id,
+                "message_id": moved_message
+                    .as_ref()
+                    .map(|m| m.id.as_str())
+                    .unwrap_or(message_id.as_str()),
+                "is_read": is_read,
+                "flagged": flagged,
+                "moved": moved_message,
             }))
         }
 
         "delete_message" => {
-            let target = args.required_str("target")?;
-            let msg_id = args.required_str("msg_id")?;
+            let message_id = args.required_str("message_id")?;
             args.required_true("confirm")?;
-            let thread_root_id = args.optional_str("thread_root_id")?;
+            map_graph_result(graph, graph.delete_mail_message(&message_id).await).await?;
+            let id_clone = message_id.clone();
+            let _ = with_storage(storage, move |s| s.delete_mail_messages_by_ids(&[id_clone])).await;
+            Ok(json!({
+                "ok": true,
+                "message_id": message_id,
+            }))
+        }
 
-            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
-            map_graph_result(
+        "download_attachment" => {
+            let message_id = args.required_str("message_id")?;
+            let attachment_index = args.optional_usize("attachment_index")?;
+            let attachment = args.optional_str("attachment")?;
+            let output_dir = args
+                .optional_str("output_dir")?
+                .map(PathBuf::from)
+                .unwrap_or_else(|| config.resolved_download_dir());
+
+            let mail =
+                map_graph_result(graph, graph.get_mail_message(&message_id).await).await?;
+            let mail_clone = mail.clone();
+            let _ = with_storage(storage, move |s| {
+                s.upsert_mail_messages(std::slice::from_ref(&mail_clone))
+            })
+            .await;
+
+            let selected =
+                cli::select_mail_attachment(&mail, attachment_index, attachment.as_deref())
+                    .map_err(format_error)?;
+            let downloaded = map_graph_result(
                 graph,
                 graph
-                    .delete_message(&conv.target, &msg_id, thread_root_id.as_deref())
+                    .download_mail_attachment(&message_id, selected, &output_dir)
                     .await,
             )
             .await?;
 
             Ok(json!({
                 "ok": true,
-                "conv_key": conv.conv_key,
-                "msg_id": msg_id,
+                "attachment": {
+                    "id": selected.id,
+                    "name": selected.name,
+                    "content_type": selected.content_type,
+                    "size": selected.size,
+                },
+                "file": {
+                    "path": downloaded.path,
+                    "file_name": downloaded.file_name,
+                    "bytes_written": downloaded.bytes_written,
+                }
             }))
         }
 
-        "search_messages" => {
+        "search_mail" => {
             let query = args.required_str("query")?;
-            let limit = bounds(
-                "limit",
-                args.optional_usize("limit")?.unwrap_or(50),
-                1,
-                1_000,
-            )?;
-            let target_opt = args.optional_str("target")?;
-            let query_clone = query.clone();
-            let hits = with_storage(storage, move |s| {
-                let conv_key_filter = match target_opt {
-                    Some(ref t) => {
-                        let cached = s.list_conversations()?;
-                        Some(resolver::resolve_from_slice(&cached, t)?.conv_key)
-                    }
-                    None => None,
-                };
-                s.search_messages(&query_clone, conv_key_filter.as_deref(), limit)
-            })
-            .await
-            .map_err(format_error)?;
+            let folder = args.optional_str("folder")?;
+            let limit = args
+                .optional_usize("limit")?
+                .map(|v| bounds("limit", v, 1, 200))
+                .transpose()?
+                .map(cli::clamp_limit)
+                .unwrap_or(25);
+            let offline = args.optional_bool("offline")?.unwrap_or(false);
+
+            let folder_id = match folder.as_deref() {
+                Some(f) => Some(resolve_mail_folder_mcp(storage, graph, f, offline).await?.id),
+                None => None,
+            };
+
+            if offline {
+                let q_clone = query.clone();
+                let fid_clone = folder_id.clone();
+                let hits = with_storage(storage, move |s| {
+                    s.search_mail(&q_clone, fid_clone.as_deref(), limit)
+                })
+                .await
+                .map_err(format_error)?;
+                Ok(json!({ "query": query, "hits": hits }))
+            } else {
+                let mut messages =
+                    map_graph_result(graph, graph.search_mail_remote(&query, limit).await).await?;
+                let msgs_clone = messages.clone();
+                let _ = with_storage(storage, move |s| s.upsert_mail_messages(&msgs_clone)).await;
+                if let Some(ref fid) = folder_id {
+                    messages.retain(|m| m.folder_id.as_deref() == Some(fid.as_str()));
+                }
+                Ok(json!({ "query": query, "messages": messages }))
+            }
+        }
+
+        "list_events" => {
+            let from = args.optional_str("from")?.or(args.optional_str("start")?);
+            let to = args.optional_str("to")?.or(args.optional_str("end")?);
+            let days = args
+                .optional_i64("days")?
+                .map(|v| bounds("days", usize::try_from(v).unwrap_or(0), 1, 365))
+                .transpose()?
+                .unwrap_or(7) as i64;
+            let limit = args
+                .optional_usize("limit")?
+                .map(|v| bounds("limit", v, 1, 200))
+                .transpose()?
+                .map(cli::clamp_limit)
+                .unwrap_or(50);
+            let offline = args.optional_bool("offline")?.unwrap_or(false);
+
+            let (start_iso, end_iso) =
+                cli::default_calendar_window(from.as_deref(), to.as_deref(), days)
+                    .map_err(format_error)?;
+
+            let events = if offline {
+                let s_filter = from.as_ref().map(|_| start_iso.clone());
+                let e_filter = to.as_ref().map(|_| end_iso.clone());
+                with_storage(storage, move |s| {
+                    s.list_calendar_events(s_filter.as_deref(), e_filter.as_deref(), limit)
+                })
+                .await
+                .map_err(format_error)?
+            } else {
+                let fetched = map_graph_result(
+                    graph,
+                    graph.list_calendar_view(&start_iso, &end_iso, limit).await,
+                )
+                .await?;
+                let fetched_clone = fetched.clone();
+                let _ =
+                    with_storage(storage, move |s| s.upsert_calendar_events(&fetched_clone)).await;
+                fetched
+            };
 
             Ok(json!({
-                "query": query,
-                "hits": hits,
+                "start": start_iso,
+                "end": end_iso,
+                "events": events,
             }))
         }
 
-        "list_members" => {
-            let target = args.required_str("target")?;
-            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
-            let members = map_graph_result(graph, graph.list_members(&conv.target).await).await?;
-            let conv_key = conv.conv_key.clone();
-            let members_clone = members.clone();
+        "create_event" => {
+            let subject = args.required_str("subject")?;
+            let start_raw = args.required_str("start")?;
+            let end_raw = args.required_str("end")?;
+            let start_iso = cli::normalize_datetime_iso(&start_raw).map_err(format_error)?;
+            let end_iso = cli::normalize_datetime_iso(&end_raw).map_err(format_error)?;
+            let time_zone = args.optional_str("time_zone")?;
+            let is_all_day = args.optional_bool("is_all_day")?.unwrap_or(false);
+            let location = args.optional_str("location")?;
+            let body_html = args
+                .optional_str("body")?
+                .map(|md| crate::parser::compile_outgoing_mail_html(&md, &[], None));
+            let attendees = args.optional_str_array("attendees")?.unwrap_or_default();
+            let is_online_meeting = args.optional_bool("is_online_meeting")?.unwrap_or(false);
+
+            let outgoing = OutgoingEvent {
+                subject,
+                start_iso,
+                end_iso,
+                time_zone,
+                is_all_day,
+                location,
+                body_html,
+                attendees,
+                is_online_meeting,
+            };
+            let created =
+                map_graph_result(graph, graph.create_calendar_event(&outgoing).await).await?;
+            let created_clone = created.clone();
             let _ = with_storage(storage, move |s| {
-                s.upsert_members(&conv_key, &members_clone)
+                s.upsert_calendar_events(std::slice::from_ref(&created_clone))
             })
             .await;
 
             Ok(json!({
-                "conv_key": conv.conv_key,
-                "title": conv.title,
-                "members": members,
-            }))
-        }
-
-        "mark_read" => {
-            let target = args.required_str("target")?;
-            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
-
-            if let ConversationTarget::Chat { ref chat_id } = conv.target {
-                map_graph_result(graph, graph.mark_chat_read(chat_id).await).await?;
-            }
-            let now = chrono::Utc::now().to_rfc3339();
-            let conv_key = conv.conv_key.clone();
-            with_storage(storage, move |s| s.mark_conversation_read(&conv_key, &now))
-                .await
-                .map_err(format_error)?;
-
-            Ok(json!({
                 "ok": true,
-                "conv_key": conv.conv_key,
+                "event": created,
             }))
         }
 
-        "get_presence" => {
-            let user_ids = args.optional_str_array("user_ids")?;
-            if let Some(ids) = user_ids {
-                let presences =
-                    map_graph_result(graph, graph.get_presences_by_user_ids(&ids).await).await?;
-                Ok(json!({ "presences": presences }))
-            } else {
-                let presence = map_graph_result(graph, graph.get_my_presence().await).await?;
-                Ok(json!({ "presence": presence }))
-            }
-        }
-
-        "set_presence" => {
-            let availability =
-                cli::normalize_presence_availability(&args.required_str("availability")?)
-                    .map_err(format_error)?;
-            let activity = args
-                .optional_str("activity")?
-                .unwrap_or_else(|| availability.clone());
-            let expiration_mins = args.optional_u32("expiration_mins")?;
-
+        "respond_event" => {
+            let event_id = args.required_str("event_id")?;
+            let response_raw = args.required_str("response")?;
+            let normalized =
+                cli::normalize_rsvp_response(&response_raw).map_err(format_error)?;
+            let comment = args.optional_str("comment")?;
             map_graph_result(
                 graph,
                 graph
-                    .set_my_presence(&availability, &activity, expiration_mins)
+                    .respond_calendar_event(&event_id, normalized, comment.as_deref())
                     .await,
             )
             .await?;
 
             Ok(json!({
                 "ok": true,
-                "availability": availability,
-                "activity": activity,
-                "expiration_mins": expiration_mins,
+                "event_id": event_id,
+                "response": normalized,
             }))
+        }
+
+        "delete_event" => {
+            let event_id = args.required_str("event_id")?;
+            args.required_true("confirm")?;
+            map_graph_result(graph, graph.delete_calendar_event(&event_id).await).await?;
+            let id_clone = event_id.clone();
+            let _ = with_storage(storage, move |s| s.delete_calendar_event(&id_clone)).await;
+
+            Ok(json!({
+                "ok": true,
+                "event_id": event_id,
+            }))
+        }
+
+        "list_todo_lists" => {
+            let offline = args.optional_bool("offline")?.unwrap_or(false);
+            let refresh = args.optional_bool("refresh")?.unwrap_or(false);
+            let cached = with_storage(storage, |s| s.list_todo_lists())
+                .await
+                .map_err(format_error)?;
+            let lists = if !offline && (refresh || cached.is_empty()) {
+                let fetched = map_graph_result(graph, graph.list_todo_lists().await).await?;
+                let fetched_clone = fetched.clone();
+                let stored = with_storage(storage, move |s| {
+                    s.upsert_todo_lists(&fetched_clone)?;
+                    s.list_todo_lists()
+                })
+                .await
+                .map_err(format_error)?;
+                if stored.is_empty() {
+                    fetched
+                } else {
+                    stored
+                }
+            } else {
+                cached
+            };
+            Ok(json!({ "lists": lists }))
+        }
+
+        "list_tasks" => {
+            let list_query = args.optional_str("list")?;
+            let include_completed = args.optional_bool("include_completed")?.unwrap_or(false);
+            let limit = args
+                .optional_usize("limit")?
+                .map(|v| bounds("limit", v, 1, 200))
+                .transpose()?
+                .map(cli::clamp_limit)
+                .unwrap_or(50);
+            let offline = args.optional_bool("offline")?.unwrap_or(false);
+
+            let resolved =
+                resolve_todo_list_mcp(storage, graph, list_query.as_deref(), offline).await?;
+            let list_id = resolved.id.clone();
+
+            let mut tasks = if offline {
+                let lid = list_id.clone();
+                with_storage(storage, move |s| {
+                    s.list_todo_tasks(Some(&lid), include_completed)
+                })
+                .await
+                .map_err(format_error)?
+            } else {
+                let fetched = map_graph_result(
+                    graph,
+                    graph
+                        .list_todo_tasks(&list_id, include_completed, limit)
+                        .await,
+                )
+                .await?;
+                let fetched_clone = fetched.clone();
+                let _ = with_storage(storage, move |s| s.upsert_todo_tasks(&fetched_clone)).await;
+                fetched
+            };
+            tasks.truncate(limit);
+
+            Ok(json!({
+                "list": resolved,
+                "list_id": list_id,
+                "tasks": tasks,
+            }))
+        }
+
+        "create_task" => {
+            let list_query = args.optional_str("list")?;
+            let title = args.required_str("title")?;
+            let body_plain = args.optional_str("notes")?.or(args.optional_str("body")?);
+            let due_raw = args.optional_str("due")?.or(args.optional_str("due_date_iso")?);
+            let due_date_iso = due_raw
+                .map(|raw| cli::normalize_todo_due_iso(&raw))
+                .transpose()
+                .map_err(format_error)?;
+            let importance = args
+                .optional_str("importance")?
+                .map(|raw| cli::normalize_todo_importance(&raw).map(str::to_string))
+                .transpose()
+                .map_err(format_error)?;
+
+            let resolved =
+                resolve_todo_list_mcp(storage, graph, list_query.as_deref(), false).await?;
+
+            let outgoing = OutgoingTodoTask {
+                title,
+                body_plain,
+                due_date_iso,
+                importance,
+            };
+            let created =
+                map_graph_result(graph, graph.create_todo_task(&resolved.id, &outgoing).await)
+                    .await?;
+            let created_clone = created.clone();
+            let _ = with_storage(storage, move |s| {
+                s.upsert_todo_tasks(std::slice::from_ref(&created_clone))
+            })
+            .await;
+
+            Ok(json!({
+                "ok": true,
+                "task": created,
+            }))
+        }
+
+        "complete_task" => {
+            let list_query = args.optional_str("list")?;
+            let task_id = args.required_str("task_id")?;
+            let completed = args.optional_bool("completed")?.unwrap_or(true);
+
+            let resolved =
+                resolve_todo_list_mcp(storage, graph, list_query.as_deref(), false).await?;
+            let updated = map_graph_result(
+                graph,
+                graph
+                    .set_todo_task_completed(&resolved.id, &task_id, completed)
+                    .await,
+            )
+            .await?;
+            let updated_clone = updated.clone();
+            let _ = with_storage(storage, move |s| {
+                s.upsert_todo_tasks(std::slice::from_ref(&updated_clone))
+            })
+            .await;
+
+            Ok(json!({
+                "ok": true,
+                "task": updated,
+            }))
+        }
+
+        "search_contacts" => {
+            let query = args.optional_str("query")?;
+            let limit = args
+                .optional_usize("limit")?
+                .map(|v| bounds("limit", v, 1, 200))
+                .transpose()?
+                .map(cli::clamp_limit)
+                .unwrap_or(25);
+            let offline = args.optional_bool("offline")?.unwrap_or(false);
+
+            let contacts = if offline {
+                let q_clone = query.clone();
+                with_storage(storage, move |s| s.list_contacts(q_clone.as_deref(), limit))
+                    .await
+                    .map_err(format_error)?
+            } else if let Some(ref q) = query {
+                let fetched = map_graph_result(
+                    graph,
+                    graph.search_contacts_and_directory(q, limit).await,
+                )
+                .await?;
+                let fetched_clone = fetched.clone();
+                let _ = with_storage(storage, move |s| s.upsert_contacts(&fetched_clone)).await;
+                fetched
+            } else {
+                let fetched = map_graph_result(graph, graph.list_contacts(limit).await).await?;
+                let fetched_clone = fetched.clone();
+                let _ = with_storage(storage, move |s| s.upsert_contacts(&fetched_clone)).await;
+                fetched
+            };
+
+            Ok(json!({ "contacts": contacts }))
         }
 
         other => Err(format!("unknown tool: {other}")),
@@ -801,351 +981,60 @@ fn parse_message(line: &str) -> Result<Value, Value> {
         return Err(error_response(
             Value::Null,
             INVALID_REQUEST,
-            "invalid request: expected a JSON object",
+            "invalid request: expected JSON object",
         ));
     };
 
-    let id = object.get("id").cloned().unwrap_or(Value::Null);
-
     if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        let id = object.get("id").cloned().unwrap_or(Value::Null);
         return Err(error_response(
             id,
             INVALID_REQUEST,
-            "invalid request: jsonrpc must be \"2.0\"",
+            "invalid request: jsonrpc must be '2.0'",
         ));
     }
 
-    if !object.get("method").is_some_and(Value::is_string) {
+    if object
+        .get("method")
+        .and_then(Value::as_str)
+        .is_none_or(|m| m.trim().is_empty())
+    {
+        let id = object.get("id").cloned().unwrap_or(Value::Null);
         return Err(error_response(
             id,
             INVALID_REQUEST,
-            "invalid request: method must be a string",
+            "invalid request: method must be a non-empty string",
         ));
     }
 
     Ok(value)
 }
 
-fn encode_message(value: &Value) -> String {
-    let body = serde_json::to_string(value).unwrap_or_else(|_| {
-        "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"serialization failed\"}}"
-            .to_string()
-    });
-    format!("{body}\n")
-}
-
-fn success_response(id: Value, result: Value) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "result": result })
-}
-
-fn error_response(id: Value, code: i64, message: impl Into<String>) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": { "code": code, "message": message.into() },
-    })
-}
-
-fn initialize_result(message: &Value) -> Value {
-    let requested = message
+fn initialize_result(request: &Value) -> Value {
+    let requested = request
         .pointer("/params/protocolVersion")
-        .and_then(Value::as_str);
-    let protocol_version = requested
-        .filter(|version| SUPPORTED_PROTOCOL_VERSIONS.contains(version))
+        .and_then(Value::as_str)
         .unwrap_or(LATEST_PROTOCOL_VERSION);
+
+    let protocol_version = if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) {
+        requested
+    } else {
+        LATEST_PROTOCOL_VERSION
+    };
 
     json!({
         "protocolVersion": protocol_version,
         "capabilities": {
-            "tools": { "listChanged": false }
+            "tools": {
+                "listChanged": false
+            }
         },
         "serverInfo": {
             "name": SERVER_NAME,
-            "version": env!("CARGO_PKG_VERSION")
+            "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": "Microsoft Teams tools via Microsoft Graph v1.0. Teams targets accept conv_key (chat:... or chan:team:channel), \"Team/Channel\", or a unique conversation title substring. Use get_messages with optional before (ISO-8601 timestamp, YYYY-MM-DD, or msg_id) and limit to paginate older history. Destructive operations require confirm: true."
+        "instructions": "Microsoft Outlook MCP server (Mail, Calendar, To Do, Contacts). Pass `offline: true` on read/search tools to query the local SQLite cache without network calls. `delete_message` and `delete_event` require `confirm: true`.",
     })
-}
-
-// ---------------------------------------------------------------------------
-// Tool catalog (17 Teams tools)
-// ---------------------------------------------------------------------------
-
-fn mentions_schema() -> Value {
-    json!({
-        "type": "array",
-        "description": "Mentions as \"user_id:DisplayName\" strings or {user_id, display_name} objects.",
-        "items": {
-            "oneOf": [
-                { "type": "string" },
-                {
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "integer", "minimum": 0 },
-                        "user_id": { "type": "string", "minLength": 1 },
-                        "display_name": { "type": "string", "minLength": 1 }
-                    },
-                    "required": ["user_id", "display_name"],
-                    "additionalProperties": false
-                }
-            ]
-        }
-    })
-}
-
-fn tool_catalog() -> Vec<Value> {
-    vec![
-        json!({
-            "name": "list_chats",
-            "description": "List 1:1, group, and meeting chats. Set refresh=true to sync from Microsoft Graph first.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "refresh": { "type": "boolean", "description": "Sync chats from Microsoft Graph before returning." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 }
-                },
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "create_chat",
-            "description": "Create a new 1:1 (1 member) or group (2+ members) Microsoft Teams chat.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "members": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": { "type": "string", "minLength": 1 },
-                        "description": "Peer Entra user IDs or email addresses."
-                    },
-                    "topic": { "type": "string", "description": "Optional topic title for group chats." }
-                },
-                "required": ["members"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "list_teams_channels",
-            "description": "List joined Microsoft Teams and their channels. Set refresh=true to sync from Microsoft Graph first.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "refresh": { "type": "boolean", "description": "Sync teams and channels from Microsoft Graph before returning." }
-                },
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "get_messages",
-            "description": "Read messages from a chat or team channel, oldest first. Supports pagination into older history via optional before (ISO-8601 timestamp, YYYY-MM-DD, or msg_id) and limit.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string", "description": "conv_key, \"Team/Channel\", or unique conversation title." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
-                    "before": { "type": "string", "description": "Optional ISO-8601 timestamp, YYYY-MM-DD date, or cached msg_id to read older messages preceding it." },
-                    "offline": { "type": "boolean", "default": false, "description": "Read from local SQLite cache without hitting Graph." }
-                },
-                "required": ["target"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "get_thread",
-            "description": "Fetch a team channel root post and all replies in its thread.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string", "description": "Channel conv_key, \"Team/Channel\", or unique channel title." },
-                    "root_msg_id": { "type": "string", "minLength": 1 },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 }
-                },
-                "required": ["target", "root_msg_id"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "send_message",
-            "description": "Send a Markdown message to a chat or team channel. Irreversible side effect.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string", "description": "conv_key, \"Team/Channel\", or unique conversation title." },
-                    "markdown": { "type": "string", "minLength": 1 },
-                    "subject": { "type": "string", "description": "Optional subject line for team channel root posts." },
-                    "mentions": mentions_schema(),
-                    "important": { "type": "boolean", "default": false }
-                },
-                "required": ["target", "markdown"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "reply_message",
-            "description": "Reply to a team channel thread root post or quote-reply a message in a 1:1/group chat.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string", "description": "conv_key, \"Team/Channel\", or unique conversation title." },
-                    "msg_id": { "type": "string", "minLength": 1 },
-                    "markdown": { "type": "string", "minLength": 1 },
-                    "mentions": mentions_schema(),
-                    "important": { "type": "boolean", "default": false }
-                },
-                "required": ["target", "msg_id", "markdown"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "send_file",
-            "description": "Upload a local file (from the host running teams) to OneDrive/SharePoint and post a reference attachment (or inline image when inline=true).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string", "description": "conv_key, \"Team/Channel\", or unique conversation title." },
-                    "path": { "type": "string", "minLength": 1, "description": "Local file path on the host running teams." },
-                    "caption": { "type": "string" },
-                    "thread_root_id": { "type": "string", "description": "Optional channel thread root post ID." },
-                    "inline": { "type": "boolean", "default": false }
-                },
-                "required": ["target", "path"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "download_attachment",
-            "description": "Download an attachment from a message to disk.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string" },
-                    "msg_id": { "type": "string", "minLength": 1 },
-                    "index": { "type": "integer", "minimum": 0, "default": 0 },
-                    "out_dir": { "type": "string" },
-                    "thread_root_id": { "type": "string" }
-                },
-                "required": ["target", "msg_id"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "react_message",
-            "description": "Set or unset a reaction (like, heart, laugh, surprised, sad, angry) on a message.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string" },
-                    "msg_id": { "type": "string", "minLength": 1 },
-                    "reaction": { "type": "string", "minLength": 1, "description": "like, heart, laugh, surprised, sad, angry, or unicode emoji." },
-                    "enable": { "type": "boolean", "default": true },
-                    "thread_root_id": { "type": "string" }
-                },
-                "required": ["target", "msg_id", "reaction"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "edit_message",
-            "description": "Edit an existing message sent by the current user.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string" },
-                    "msg_id": { "type": "string", "minLength": 1 },
-                    "markdown": { "type": "string", "minLength": 1 },
-                    "thread_root_id": { "type": "string" }
-                },
-                "required": ["target", "msg_id", "markdown"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "delete_message",
-            "description": "Soft-delete a message sent by the current user. Requires confirm=true.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string" },
-                    "msg_id": { "type": "string", "minLength": 1 },
-                    "confirm": { "const": true, "description": "Must be literal boolean true." },
-                    "thread_root_id": { "type": "string" }
-                },
-                "required": ["target", "msg_id", "confirm"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "search_messages",
-            "description": "Search cached messages using local SQLite FTS5.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "minLength": 1 },
-                    "target": { "type": "string", "description": "Optional conversation target to restrict search." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 }
-                },
-                "required": ["query"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "list_members",
-            "description": "List members of a chat or team channel.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string" }
-                },
-                "required": ["target"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "mark_read",
-            "description": "Mark a chat or conversation as read.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string" }
-                },
-                "required": ["target"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "get_presence",
-            "description": "Get presence for the current user or a list of user IDs.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "user_ids": {
-                        "type": "array",
-                        "items": { "type": "string", "minLength": 1 },
-                        "description": "Optional Entra user IDs. Omit to fetch current user's presence."
-                    }
-                },
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "set_presence",
-            "description": "Set the current user's preferred Teams presence (Available, Busy, DoNotDisturb, BeRightBack, Away, Reset).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "availability": {
-                        "type": "string",
-                        "enum": ["Available", "Busy", "DoNotDisturb", "BeRightBack", "Away", "Reset"]
-                    },
-                    "activity": { "type": "string" },
-                    "expiration_mins": { "type": "integer", "minimum": 1, "maximum": 1440 }
-                },
-                "required": ["availability"],
-                "additionalProperties": false
-            }
-        }),
-    ]
 }
 
 fn tool_result(outcome: Result<Value, String>) -> Value {
@@ -1154,158 +1043,514 @@ fn tool_result(outcome: Result<Value, String>) -> Value {
             let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
             json!({
                 "content": [{ "type": "text", "text": text }],
-                "isError": false
+                "isError": false,
             })
         }
-        Err(error) => json!({
-            "content": [{ "type": "text", "text": error }],
-            "isError": true
+        Err(message) => json!({
+            "content": [{ "type": "text", "text": message }],
+            "isError": true,
         }),
     }
 }
 
+fn success_response(id: Value, result: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    })
+}
+
+fn error_response(id: Value, code: i64, message: impl Into<String>) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message.into(),
+        },
+    })
+}
+
+fn encode_message(value: &Value) -> String {
+    let mut line = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+    line.push('\n');
+    line
+}
+
 // ---------------------------------------------------------------------------
-// Argument validation
+// Tool catalog (JSON Schemas)
 // ---------------------------------------------------------------------------
 
-fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
+pub fn tool_catalog() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "whoami",
+            "description": "Display current user identity, token expiry, OAuth scopes, and auth source (outlook-cli vs shared teams-cli).",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "list_mail_folders",
+            "description": "List Outlook mail folders with unread and total item counts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "refresh": { "type": "boolean" },
+                    "offline": { "type": "boolean" }
+                }
+            }
+        }),
+        json!({
+            "name": "list_messages",
+            "description": "List emails in a mail folder (accepts folder ID, display name/prefix, or well-known alias such as 'inbox', 'sent', 'drafts', 'archive', 'trash', 'junk').",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "folder": { "type": "string", "description": "Folder name, alias, or ID (default 'inbox')" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+                    "unread": { "type": "boolean" },
+                    "flagged": { "type": "boolean" },
+                    "focused": { "type": "boolean" },
+                    "offline": { "type": "boolean" }
+                }
+            }
+        }),
+        json!({
+            "name": "get_message",
+            "description": "Read full email headers, body, and attachment metadata by message ID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message_id": { "type": "string" },
+                    "mark_read": { "type": "boolean" },
+                    "offline": { "type": "boolean" }
+                },
+                "required": ["message_id"]
+            }
+        }),
+        json!({
+            "name": "send_mail",
+            "description": "Compose and send an email with Markdown body and optional file attachments.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "to": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                    "subject": { "type": "string" },
+                    "body": { "type": "string", "description": "Markdown body" },
+                    "cc": { "type": "array", "items": { "type": "string" } },
+                    "bcc": { "type": "array", "items": { "type": "string" } },
+                    "importance": { "type": "string", "enum": ["low", "normal", "high"] },
+                    "attachments": { "type": "array", "items": { "type": "string" } },
+                    "save_to_sent_items": { "type": "boolean" }
+                },
+                "required": ["to", "subject", "body"]
+            }
+        }),
+        json!({
+            "name": "reply_mail",
+            "description": "Reply (or reply all) to an email message using Markdown.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message_id": { "type": "string" },
+                    "body": { "type": "string" },
+                    "reply_all": { "type": "boolean" }
+                },
+                "required": ["message_id", "body"]
+            }
+        }),
+        json!({
+            "name": "forward_mail",
+            "description": "Forward an email message to one or more recipients.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message_id": { "type": "string" },
+                    "to": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                    "comment": { "type": "string" }
+                },
+                "required": ["message_id", "to"]
+            }
+        }),
+        json!({
+            "name": "update_message",
+            "description": "Update an email's read/unread status, flag status, or move it to another folder.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message_id": { "type": "string" },
+                    "is_read": { "type": "boolean" },
+                    "flagged": { "type": "boolean" },
+                    "destination_folder": { "type": "string", "description": "Target folder name, alias (e.g. 'archive'), or ID" }
+                },
+                "required": ["message_id"]
+            }
+        }),
+        json!({
+            "name": "delete_message",
+            "description": "Delete an email message. Requires `confirm: true`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message_id": { "type": "string" },
+                    "confirm": { "type": "boolean", "description": "Must be literal boolean true" }
+                },
+                "required": ["message_id", "confirm"]
+            }
+        }),
+        json!({
+            "name": "download_attachment",
+            "description": "Download an email attachment to disk.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message_id": { "type": "string" },
+                    "attachment_index": { "type": "integer", "minimum": 0 },
+                    "attachment": { "type": "string", "description": "Attachment ID, name, or index" },
+                    "output_dir": { "type": "string" }
+                },
+                "required": ["message_id"]
+            }
+        }),
+        json!({
+            "name": "search_mail",
+            "description": "Search emails in local SQLite FTS5 (`offline: true`) or remotely via Microsoft Graph KQL `$search`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "folder": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+                    "offline": { "type": "boolean" }
+                },
+                "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "list_events",
+            "description": "List calendar events within a date/time window (defaults to next 7 days).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string", "description": "Start ISO-8601 or YYYY-MM-DD" },
+                    "to": { "type": "string", "description": "End ISO-8601 or YYYY-MM-DD" },
+                    "days": { "type": "integer", "minimum": 1, "maximum": 365 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+                    "offline": { "type": "boolean" }
+                }
+            }
+        }),
+        json!({
+            "name": "create_event",
+            "description": "Create a new Outlook calendar event (optionally as an online Teams meeting).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "subject": { "type": "string" },
+                    "start": { "type": "string" },
+                    "end": { "type": "string" },
+                    "time_zone": { "type": "string" },
+                    "is_all_day": { "type": "boolean" },
+                    "location": { "type": "string" },
+                    "body": { "type": "string" },
+                    "attendees": { "type": "array", "items": { "type": "string" } },
+                    "is_online_meeting": { "type": "boolean" }
+                },
+                "required": ["subject", "start", "end"]
+            }
+        }),
+        json!({
+            "name": "respond_event",
+            "description": "Respond (accept, tentative, decline) to a calendar event invitation.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "event_id": { "type": "string" },
+                    "response": { "type": "string", "enum": ["accept", "tentative", "decline"] },
+                    "comment": { "type": "string" }
+                },
+                "required": ["event_id", "response"]
+            }
+        }),
+        json!({
+            "name": "delete_event",
+            "description": "Delete a calendar event. Requires `confirm: true`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "event_id": { "type": "string" },
+                    "confirm": { "type": "boolean", "description": "Must be literal boolean true" }
+                },
+                "required": ["event_id", "confirm"]
+            }
+        }),
+        json!({
+            "name": "list_todo_lists",
+            "description": "List Microsoft To Do task lists.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "refresh": { "type": "boolean" },
+                    "offline": { "type": "boolean" }
+                }
+            }
+        }),
+        json!({
+            "name": "list_tasks",
+            "description": "List tasks in a Microsoft To Do list (accepts list name, 'tasks'/'defaultList', or ID).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "list": { "type": "string" },
+                    "include_completed": { "type": "boolean" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+                    "offline": { "type": "boolean" }
+                }
+            }
+        }),
+        json!({
+            "name": "create_task",
+            "description": "Create a new task in a Microsoft To Do list.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string" },
+                    "list": { "type": "string" },
+                    "notes": { "type": "string" },
+                    "due": { "type": "string", "description": "YYYY-MM-DD or ISO-8601" },
+                    "importance": { "type": "string", "enum": ["low", "normal", "high"] }
+                },
+                "required": ["title"]
+            }
+        }),
+        json!({
+            "name": "complete_task",
+            "description": "Mark a Microsoft To Do task as completed (or incomplete when `completed: false`).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "list": { "type": "string" },
+                    "completed": { "type": "boolean" }
+                },
+                "required": ["task_id"]
+            }
+        }),
+        json!({
+            "name": "search_contacts",
+            "description": "List or search personal Outlook contacts and Entra organization directory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+                    "offline": { "type": "boolean" }
+                }
+            }
+        }),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Argument validation & typed extraction
+// ---------------------------------------------------------------------------
+
+pub fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
     let args = Args::new(arguments);
+    args.object()?;
 
     match name {
-        "list_chats" => {
+        "whoami" => Ok(()),
+        "list_mail_folders" => {
             args.optional_bool("refresh")?;
-            bounds(
-                "limit",
-                args.optional_usize("limit")?.unwrap_or(50),
-                1,
-                1_000,
-            )?;
-        }
-        "create_chat" => {
-            args.required_str_array("members")?;
-            args.optional_str("topic")?;
-        }
-        "list_teams_channels" => {
-            args.optional_bool("refresh")?;
-        }
-        "get_messages" => {
-            args.required_str("target")?;
-            bounds(
-                "limit",
-                args.optional_usize("limit")?.unwrap_or(50),
-                1,
-                1_000,
-            )?;
-            args.optional_str("before")?;
             args.optional_bool("offline")?;
+            Ok(())
         }
-        "get_thread" => {
-            args.required_str("target")?;
-            args.required_str("root_msg_id")?;
-            bounds(
-                "limit",
-                args.optional_usize("limit")?.unwrap_or(50),
-                1,
-                1_000,
-            )?;
+        "list_messages" => {
+            args.optional_str("folder")?;
+            if let Some(limit) = args.optional_usize("limit")? {
+                bounds("limit", limit, 1, 200)?;
+            }
+            args.optional_bool("unread")?;
+            args.optional_bool("flagged")?;
+            args.optional_bool("focused")?;
+            args.optional_bool("offline")?;
+            Ok(())
         }
-        "send_message" => {
-            args.required_str("target")?;
-            args.required_text("markdown")?;
-            args.optional_str("subject")?;
-            args.optional_mentions("mentions")?;
-            args.optional_bool("important")?;
+        "get_message" => {
+            args.required_str("message_id")?;
+            args.optional_bool("mark_read")?;
+            args.optional_bool("offline")?;
+            Ok(())
         }
-        "reply_message" => {
-            args.required_str("target")?;
-            args.required_str("msg_id")?;
-            args.required_text("markdown")?;
-            args.optional_mentions("mentions")?;
-            args.optional_bool("important")?;
+        "send_mail" => {
+            args.required_str_array("to")?;
+            args.required_str("subject")?;
+            args.required_text("body")?;
+            args.optional_str_array("cc")?;
+            args.optional_str_array("bcc")?;
+            if let Some(imp) = args.optional_str("importance")? {
+                cli::normalize_mail_importance(&imp).map_err(format_error)?;
+            }
+            args.optional_str_array("attachments")?;
+            args.optional_bool("save_to_sent_items")?;
+            Ok(())
         }
-        "send_file" => {
-            args.required_str("target")?;
-            args.required_str("path")?;
-            args.optional_str("caption")?;
-            args.optional_str("thread_root_id")?;
-            args.optional_bool("inline")?;
+        "reply_mail" => {
+            args.required_str("message_id")?;
+            args.required_text("body")?;
+            args.optional_bool("reply_all")?;
+            Ok(())
         }
-        "download_attachment" => {
-            args.required_str("target")?;
-            args.required_str("msg_id")?;
-            args.optional_usize("index")?;
-            args.optional_str("out_dir")?;
-            args.optional_str("thread_root_id")?;
+        "forward_mail" => {
+            args.required_str("message_id")?;
+            args.required_str_array("to")?;
+            args.optional_str("comment")?;
+            Ok(())
         }
-        "react_message" => {
-            args.required_str("target")?;
-            args.required_str("msg_id")?;
-            let reaction = args.required_str("reaction")?;
-            cli::normalize_reaction(&reaction).map_err(format_error)?;
-            args.optional_bool("enable")?;
-            args.optional_str("thread_root_id")?;
-        }
-        "edit_message" => {
-            args.required_str("target")?;
-            args.required_str("msg_id")?;
-            args.required_text("markdown")?;
-            args.optional_str("thread_root_id")?;
+        "update_message" => {
+            args.required_str("message_id")?;
+            let is_read = args.optional_bool("is_read")?;
+            let flagged = args.optional_bool("flagged")?;
+            let dest = args
+                .optional_str("destination_folder")?
+                .or(args.optional_str("destination_folder_id")?)
+                .or(args.optional_str("move_to_folder")?);
+            if is_read.is_none() && flagged.is_none() && dest.is_none() {
+                return Err(
+                    "at least one of is_read, flagged, or destination_folder must be provided"
+                        .to_string(),
+                );
+            }
+            Ok(())
         }
         "delete_message" => {
-            args.required_str("target")?;
-            args.required_str("msg_id")?;
+            args.required_str("message_id")?;
             args.required_true("confirm")?;
-            args.optional_str("thread_root_id")?;
+            Ok(())
         }
-        "search_messages" => {
+        "download_attachment" => {
+            args.required_str("message_id")?;
+            args.optional_usize("attachment_index")?;
+            args.optional_str("attachment")?;
+            args.optional_str("output_dir")?;
+            Ok(())
+        }
+        "search_mail" => {
             args.required_str("query")?;
-            args.optional_str("target")?;
-            bounds(
-                "limit",
-                args.optional_usize("limit")?.unwrap_or(50),
-                1,
-                1_000,
-            )?;
-        }
-        "list_members" | "mark_read" => {
-            args.required_str("target")?;
-        }
-        "get_presence" => {
-            args.optional_str_array("user_ids")?;
-        }
-        "set_presence" => {
-            let avail = args.required_str("availability")?;
-            cli::normalize_presence_availability(&avail).map_err(format_error)?;
-            args.optional_str("activity")?;
-            if let Some(mins) = args.optional_u32("expiration_mins")? {
-                bounds("expiration_mins", mins as usize, 1, 1440)?;
+            args.optional_str("folder")?;
+            if let Some(limit) = args.optional_usize("limit")? {
+                bounds("limit", limit, 1, 200)?;
             }
+            args.optional_bool("offline")?;
+            Ok(())
         }
-        other => return Err(format!("unknown tool: {other}")),
+        "list_events" => {
+            if let Some(f) = args.optional_str("from")?.or(args.optional_str("start")?) {
+                cli::normalize_datetime_iso(&f).map_err(format_error)?;
+            }
+            if let Some(t) = args.optional_str("to")?.or(args.optional_str("end")?) {
+                cli::normalize_datetime_iso(&t).map_err(format_error)?;
+            }
+            if let Some(days) = args.optional_i64("days")? {
+                let d = usize::try_from(days)
+                    .map_err(|_| "days must be between 1 and 365".to_string())?;
+                bounds("days", d, 1, 365)?;
+            }
+            if let Some(limit) = args.optional_usize("limit")? {
+                bounds("limit", limit, 1, 200)?;
+            }
+            args.optional_bool("offline")?;
+            Ok(())
+        }
+        "create_event" => {
+            args.required_str("subject")?;
+            let start = args.required_str("start")?;
+            let end = args.required_str("end")?;
+            cli::normalize_datetime_iso(&start).map_err(format_error)?;
+            cli::normalize_datetime_iso(&end).map_err(format_error)?;
+            args.optional_str("time_zone")?;
+            args.optional_bool("is_all_day")?;
+            args.optional_str("location")?;
+            args.optional_str("body")?;
+            args.optional_str_array("attendees")?;
+            args.optional_bool("is_online_meeting")?;
+            Ok(())
+        }
+        "respond_event" => {
+            args.required_str("event_id")?;
+            let resp = args.required_str("response")?;
+            cli::normalize_rsvp_response(&resp).map_err(format_error)?;
+            args.optional_str("comment")?;
+            Ok(())
+        }
+        "delete_event" => {
+            args.required_str("event_id")?;
+            args.required_true("confirm")?;
+            Ok(())
+        }
+        "list_todo_lists" => {
+            args.optional_bool("refresh")?;
+            args.optional_bool("offline")?;
+            Ok(())
+        }
+        "list_tasks" => {
+            args.optional_str("list")?;
+            args.optional_bool("include_completed")?;
+            if let Some(limit) = args.optional_usize("limit")? {
+                bounds("limit", limit, 1, 200)?;
+            }
+            args.optional_bool("offline")?;
+            Ok(())
+        }
+        "create_task" => {
+            args.required_str("title")?;
+            args.optional_str("list")?;
+            args.optional_str("notes")?;
+            args.optional_str("body")?;
+            if let Some(due) = args.optional_str("due")?.or(args.optional_str("due_date_iso")?) {
+                cli::normalize_todo_due_iso(&due).map_err(format_error)?;
+            }
+            if let Some(imp) = args.optional_str("importance")? {
+                cli::normalize_todo_importance(&imp).map_err(format_error)?;
+            }
+            Ok(())
+        }
+        "complete_task" => {
+            args.required_str("task_id")?;
+            args.optional_str("list")?;
+            args.optional_bool("completed")?;
+            Ok(())
+        }
+        "search_contacts" => {
+            args.optional_str("query")?;
+            if let Some(limit) = args.optional_usize("limit")? {
+                bounds("limit", limit, 1, 200)?;
+            }
+            args.optional_bool("offline")?;
+            Ok(())
+        }
+        other => Err(format!("unknown tool: {other}")),
     }
-
-    Ok(())
 }
 
 fn bounds(name: &str, value: usize, min: usize, max: usize) -> Result<usize, String> {
-    if (min..=max).contains(&value) {
-        Ok(value)
+    if value < min || value > max {
+        Err(format!("{name} must be between {min} and {max} (got {value})"))
     } else {
-        Err(format!("{name} must be between {min} and {max}"))
+        Ok(value)
     }
 }
 
-struct Args<'a> {
-    value: &'a Value,
-}
+struct Args<'a>(&'a Value);
 
 impl<'a> Args<'a> {
     fn new(value: &'a Value) -> Self {
-        Self { value }
+        Self(value)
     }
 
-    fn object(&self) -> Result<&'a serde_json::Map<String, Value>, String> {
-        self.value
+    fn object(&self) -> Result<&serde_json::Map<String, Value>, String> {
+        self.0
             .as_object()
             .ok_or_else(|| "arguments must be a JSON object".to_string())
     }
@@ -1313,8 +1558,8 @@ impl<'a> Args<'a> {
     fn optional_str(&self, key: &str) -> Result<Option<String>, String> {
         match self.object()?.get(key) {
             None | Some(Value::Null) => Ok(None),
-            Some(Value::String(value)) => {
-                let trimmed = value.trim();
+            Some(Value::String(s)) => {
+                let trimmed = s.trim();
                 if trimmed.is_empty() {
                     Ok(None)
                 } else {
@@ -1326,64 +1571,60 @@ impl<'a> Args<'a> {
     }
 
     fn required_str(&self, key: &str) -> Result<String, String> {
-        self.optional_str(key)?
-            .ok_or_else(|| format!("missing required argument: {key}"))
-    }
-
-    fn required_text(&self, key: &str) -> Result<String, String> {
         match self.object()?.get(key) {
-            None | Some(Value::Null) => Err(format!("missing required argument: {key}")),
-            Some(Value::String(value)) if !value.trim().is_empty() => Ok(value.clone()),
+            Some(Value::String(s)) if !s.trim().is_empty() => Ok(s.trim().to_string()),
             Some(Value::String(_)) => Err(format!("{key} must not be empty")),
+            None | Some(Value::Null) => Err(format!("missing required argument: {key}")),
             Some(_) => Err(format!("{key} must be a string")),
         }
     }
 
-    fn required_true(&self, key: &str) -> Result<(), String> {
+    fn required_text(&self, key: &str) -> Result<String, String> {
         match self.object()?.get(key) {
-            Some(Value::Bool(true)) => Ok(()),
-            Some(Value::Bool(false)) => Err(format!("{key} must be true")),
-            None | Some(Value::Null) => {
-                Err(format!("missing required argument: {key} (must be true)"))
-            }
-            Some(_) => Err(format!("{key} must be a boolean true")),
+            Some(Value::String(s)) if !s.trim().is_empty() => Ok(s.clone()),
+            Some(Value::String(_)) => Err(format!("{key} must not be empty")),
+            None | Some(Value::Null) => Err(format!("missing required argument: {key}")),
+            Some(_) => Err(format!("{key} must be a string")),
         }
     }
 
     fn optional_bool(&self, key: &str) -> Result<Option<bool>, String> {
         match self.object()?.get(key) {
             None | Some(Value::Null) => Ok(None),
-            Some(Value::Bool(value)) => Ok(Some(*value)),
+            Some(Value::Bool(b)) => Ok(Some(*b)),
             Some(_) => Err(format!("{key} must be a boolean")),
+        }
+    }
+
+    fn required_true(&self, key: &str) -> Result<(), String> {
+        match self.object()?.get(key) {
+            Some(Value::Bool(true)) => Ok(()),
+            _ => Err(format!("{key} must be literal boolean true")),
+        }
+    }
+
+    fn optional_usize(&self, key: &str) -> Result<Option<usize>, String> {
+        match self.object()?.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Number(n)) => {
+                let val = n
+                    .as_u64()
+                    .and_then(|u| usize::try_from(u).ok())
+                    .ok_or_else(|| format!("{key} must be a non-negative integer"))?;
+                Ok(Some(val))
+            }
+            Some(_) => Err(format!("{key} must be an integer")),
         }
     }
 
     fn optional_i64(&self, key: &str) -> Result<Option<i64>, String> {
         match self.object()?.get(key) {
             None | Some(Value::Null) => Ok(None),
-            Some(value) => value
+            Some(Value::Number(n)) => n
                 .as_i64()
-                .or_else(|| value.as_u64().and_then(|n| i64::try_from(n).ok()))
-                .map(Some)
-                .ok_or_else(|| format!("{key} must be an integer")),
-        }
-    }
-
-    fn optional_usize(&self, key: &str) -> Result<Option<usize>, String> {
-        match self.optional_i64(key)? {
-            None => Ok(None),
-            Some(v) => usize::try_from(v)
-                .map(Some)
-                .map_err(|_| format!("{key} must be a non-negative integer")),
-        }
-    }
-
-    fn optional_u32(&self, key: &str) -> Result<Option<u32>, String> {
-        match self.optional_i64(key)? {
-            None => Ok(None),
-            Some(v) => u32::try_from(v)
-                .map(Some)
-                .map_err(|_| format!("{key} must be a non-negative 32-bit integer")),
+                .ok_or_else(|| format!("{key} must be an integer"))
+                .map(Some),
+            Some(_) => Err(format!("{key} must be an integer")),
         }
     }
 
@@ -1415,56 +1656,6 @@ impl<'a> Args<'a> {
         }
         Ok(items)
     }
-
-    fn optional_mentions(&self, key: &str) -> Result<Vec<MentionInfo>, String> {
-        match self.object()?.get(key) {
-            None | Some(Value::Null) => Ok(Vec::new()),
-            Some(Value::Array(items)) => items
-                .iter()
-                .enumerate()
-                .map(|(idx, item)| {
-                    parse_mention_value(item, idx as i32)
-                        .map_err(|e| format!("mentions[{idx}]: {e}"))
-                })
-                .collect(),
-            Some(_) => Err(format!("{key} must be an array")),
-        }
-    }
-}
-
-fn parse_mention_value(value: &Value, default_id: i32) -> Result<MentionInfo, String> {
-    if let Some(spec) = value.as_str() {
-        return cli::parse_mention_spec(spec, default_id).map_err(format_error);
-    }
-
-    let obj = value
-        .as_object()
-        .ok_or_else(|| "mention must be a string or object".to_string())?;
-    let user_id = obj
-        .get("user_id")
-        .or_else(|| obj.get("userId"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "mention.user_id must be a non-empty string".to_string())?;
-    let display_name = obj
-        .get("display_name")
-        .or_else(|| obj.get("displayName"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "mention.display_name must be a non-empty string".to_string())?;
-    let id = obj
-        .get("id")
-        .and_then(Value::as_i64)
-        .and_then(|v| i32::try_from(v).ok())
-        .unwrap_or(default_id);
-
-    Ok(MentionInfo {
-        id,
-        user_id: user_id.to_string(),
-        display_name: display_name.to_string(),
-    })
 }
 
 fn format_error(error: anyhow::Error) -> String {
@@ -1474,7 +1665,10 @@ fn format_error(error: anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::AuthManager;
+    use crate::{
+        auth::AuthManager,
+        models::{MailFolder, MailMessage},
+    };
 
     fn test_ctx() -> (AppConfig, GraphClient, Storage) {
         let cfg = AppConfig::default();
@@ -1488,7 +1682,6 @@ mod tests {
     async fn handshake_and_notifications_and_ping() {
         let (cfg, graph, storage) = test_ctx();
 
-        // Supported version echoed back
         let resp = handle_rpc_line(
             &cfg,
             &graph,
@@ -1498,10 +1691,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp["result"]["protocolVersion"], "2025-03-26");
-        assert_eq!(resp["result"]["serverInfo"]["name"], "teams");
+        assert_eq!(resp["result"]["serverInfo"]["name"], "outlook");
         assert_eq!(resp["result"]["capabilities"]["tools"]["listChanged"], false);
 
-        // Unknown protocol version falls back to 2025-06-18
         let resp = handle_rpc_line(
             &cfg,
             &graph,
@@ -1512,7 +1704,6 @@ mod tests {
         .unwrap();
         assert_eq!(resp["result"]["protocolVersion"], "2025-06-18");
 
-        // Notification produces no response
         assert!(handle_rpc_line(
             &cfg,
             &graph,
@@ -1522,7 +1713,6 @@ mod tests {
         .await
         .is_none());
 
-        // Ping returns empty object
         let resp = handle_rpc_line(
             &cfg,
             &graph,
@@ -1533,13 +1723,11 @@ mod tests {
         .unwrap();
         assert_eq!(resp["result"], json!({}));
 
-        // Malformed JSON -> -32700
         let err = handle_rpc_line(&cfg, &graph, &storage, "{not json")
             .await
             .unwrap();
         assert_eq!(err["error"]["code"], PARSE_ERROR);
 
-        // Unknown method -> -32601
         let err = handle_rpc_line(
             &cfg,
             &graph,
@@ -1552,7 +1740,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_exposes_every_cataloged_tool() {
+    async fn tools_list_exposes_exact_20_outlook_tools() {
         let (cfg, graph, storage) = test_ctx();
         let resp = handle_rpc_line(
             &cfg,
@@ -1568,225 +1756,195 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "list_chats",
-                "create_chat",
-                "list_teams_channels",
-                "get_messages",
-                "get_thread",
-                "send_message",
-                "reply_message",
-                "send_file",
-                "download_attachment",
-                "react_message",
-                "edit_message",
+                "whoami",
+                "list_mail_folders",
+                "list_messages",
+                "get_message",
+                "send_mail",
+                "reply_mail",
+                "forward_mail",
+                "update_message",
                 "delete_message",
-                "search_messages",
-                "list_members",
-                "mark_read",
-                "get_presence",
-                "set_presence",
+                "download_attachment",
+                "search_mail",
+                "list_events",
+                "create_event",
+                "respond_event",
+                "delete_event",
+                "list_todo_lists",
+                "list_tasks",
+                "create_task",
+                "complete_task",
+                "search_contacts",
             ]
         );
-        for name in &names {
-            assert!(
-                !name.contains("mail")
-                    && !name.contains("calendar")
-                    && !name.contains("contact")
-                    && !name.contains("todo")
-                    && !name.starts_with("outlook_")
-                    && !name.starts_with("onenote_"),
-                "unexpected non-Teams tool: {name}"
-            );
-        }
 
         for tool in tools {
             assert_eq!(tool["inputSchema"]["type"], "object", "{}", tool["name"]);
             assert!(tool["description"].as_str().is_some_and(|d| !d.is_empty()));
         }
-
-        let get_msgs = tools.iter().find(|t| t["name"] == "get_messages").unwrap();
-        assert!(get_msgs["inputSchema"]["properties"]["before"].is_object());
     }
 
     #[tokio::test]
-    async fn delete_message_rejects_missing_or_non_literal_true_confirm() {
+    async fn delete_tools_reject_missing_or_non_literal_true_confirm() {
         let (cfg, graph, storage) = test_ctx();
 
-        for bad_args in [
-            json!({ "target": "chat:1", "msg_id": "m1" }),
-            json!({ "target": "chat:1", "msg_id": "m1", "confirm": false }),
-            json!({ "target": "chat:1", "msg_id": "m1", "confirm": "true" }),
-            json!({ "target": "chat:1", "msg_id": "m1", "confirm": 1 }),
-            json!({ "target": "chat:1", "msg_id": "m1", "confirm": null }),
+        for (tool, bad_args) in [
+            ("delete_message", json!({ "message_id": "m1" })),
+            (
+                "delete_message",
+                json!({ "message_id": "m1", "confirm": false }),
+            ),
+            (
+                "delete_message",
+                json!({ "message_id": "m1", "confirm": "true" }),
+            ),
+            ("delete_event", json!({ "event_id": "ev1", "confirm": 1 })),
         ] {
             let line = json!({
                 "jsonrpc": "2.0",
                 "id": 99,
                 "method": "tools/call",
                 "params": {
-                    "name": "delete_message",
+                    "name": tool,
                     "arguments": bad_args,
                 }
             })
             .to_string();
             let resp = handle_rpc_line(&cfg, &graph, &storage, &line).await.unwrap();
             assert_eq!(resp["result"]["isError"], true, "{resp}");
-            let msg = resp["result"]["content"][0]["text"].as_str().unwrap();
-            assert!(msg.contains("confirm"), "{msg}");
         }
 
-        // Literal true passes validation
-        validate_tool_args(
+        assert!(validate_tool_args(
             "delete_message",
-            &json!({ "target": "chat:1", "msg_id": "m1", "confirm": true }),
+            &json!({ "message_id": "m1", "confirm": true }),
         )
-        .unwrap();
+        .is_ok());
+        assert!(validate_tool_args(
+            "delete_event",
+            &json!({ "event_id": "ev1", "confirm": true }),
+        )
+        .is_ok());
     }
 
     #[test]
-    fn argument_validation_covers_tools() {
+    fn argument_validation_covers_outlook_tools() {
         assert!(validate_tool_args(
-            "get_messages",
-            &json!({ "target": "chat:1", "limit": 100, "before": "2026-11-01" })
-        )
-        .is_ok());
-        assert!(validate_tool_args(
-            "get_messages",
-            &json!({ "target": "chat:1", "before": 123 })
-        )
-        .is_err());
-
-        assert!(validate_tool_args(
-            "send_message",
+            "send_mail",
             &json!({
-                "target": "Engineering/General",
-                "markdown": "Hello @Alice",
-                "mentions": ["u1:Alice", { "user_id": "u2", "display_name": "Bob" }]
+                "to": ["alice@example.com"],
+                "subject": "Quarterly Review",
+                "body": "Please see notes.",
+                "importance": "high"
             })
         )
         .is_ok());
-
         assert!(validate_tool_args(
-            "send_message",
-            &json!({ "target": "chat:1", "markdown": "   " })
+            "send_mail",
+            &json!({
+                "to": [],
+                "subject": "Quarterly Review",
+                "body": "Body"
+            })
         )
         .is_err());
-
-        assert!(validate_tool_args("create_chat", &json!({ "members": [] })).is_err());
-        assert!(
-            validate_tool_args("create_chat", &json!({ "members": ["a@b.com"] })).is_ok()
-        );
-
+        assert!(validate_tool_args("update_message", &json!({ "message_id": "m1" })).is_err());
         assert!(validate_tool_args(
-            "react_message",
-            &json!({ "target": "chat:1", "msg_id": "m1", "reaction": "like" })
+            "update_message",
+            &json!({ "message_id": "m1", "destination_folder": "archive" })
         )
         .is_ok());
         assert!(validate_tool_args(
-            "react_message",
-            &json!({ "target": "chat:1", "msg_id": "m1", "reaction": "invalid" })
-        )
-        .is_err());
-
-        assert!(validate_tool_args(
-            "set_presence",
-            &json!({ "availability": "Busy", "expiration_mins": 30 })
+            "respond_event",
+            &json!({ "event_id": "e1", "response": "tentative" })
         )
         .is_ok());
         assert!(validate_tool_args(
-            "set_presence",
-            &json!({ "availability": "Busy", "expiration_mins": 2000 })
+            "respond_event",
+            &json!({ "event_id": "e1", "response": "maybe" })
         )
         .is_err());
         assert!(validate_tool_args(
-            "set_presence",
-            &json!({ "availability": "Offline" })
+            "create_task",
+            &json!({ "title": "Ship release", "due": "2026-11-25", "importance": "normal" })
         )
-        .is_err());
+        .is_ok());
     }
 
     #[tokio::test]
-    async fn offline_get_messages_before_and_search_messages_work_against_sqlite() {
-        use crate::models::{ConversationKind, MessageItem};
-
+    async fn offline_list_messages_get_message_and_search_mail_work_against_sqlite() {
         let (cfg, graph, storage) = test_ctx();
         storage
-            .upsert_conversations(&[ConversationSummary {
-                conv_key: "chat:19:c1".to_string(),
-                target: ConversationTarget::Chat {
-                    chat_id: "19:c1".to_string(),
-                },
-                kind: ConversationKind::Group,
-                team_id: None,
-                team_name: None,
-                title: "Engineering Discussion".to_string(),
-                topic: Some("Engineering Discussion".to_string()),
-                unread_count: 0,
-                last_read_at: None,
-                last_msg_id: Some("msg-2".to_string()),
-                last_msg_author: Some("Bob".to_string()),
-                last_msg_preview: Some("Check release tag".to_string()),
-                last_updated_at: Some("2026-11-15T06:00:00Z".to_string()),
-                pinned: false,
-                peer_user_id: None,
-                web_url: None,
+            .upsert_mail_folders(&[MailFolder {
+                id: "folder-inbox".to_string(),
+                display_name: "Inbox".to_string(),
+                well_known_name: Some("inbox".to_string()),
+                parent_folder_id: None,
+                child_folder_count: 0,
+                unread_item_count: 1,
+                total_item_count: 2,
             }])
             .unwrap();
         storage
-            .upsert_messages(&[
-                MessageItem {
-                    msg_key: "chat:19:c1|msg-1".to_string(),
-                    conv_key: "chat:19:c1".to_string(),
-                    msg_id: "msg-1".to_string(),
-                    parent_msg_id: None,
-                    reply_to_id: None,
-                    reply_to_author: None,
-                    reply_to_preview: None,
-                    subject: None,
-                    author_id: Some("u1".to_string()),
-                    author_name: "Bob".to_string(),
-                    is_me: false,
-                    created_at: "2026-11-10T06:00:00Z".to_string(),
-                    last_modified_at: None,
-                    deleted: false,
+            .upsert_mail_messages(&[
+                MailMessage {
+                    id: "msg-1".to_string(),
+                    internet_message_id: None,
+                    conversation_id: Some("conv-1".to_string()),
+                    folder_id: Some("folder-inbox".to_string()),
+                    subject: "Weekly Status".to_string(),
+                    from: None,
+                    to_recipients: Vec::new(),
+                    cc_recipients: Vec::new(),
+                    bcc_recipients: Vec::new(),
+                    reply_to: Vec::new(),
+                    received_at: "2026-11-15T10:00:00Z".to_string(),
+                    sent_at: None,
+                    is_read: true,
+                    is_draft: false,
+                    flagged: false,
                     importance: "normal".to_string(),
-                    message_type: "message".to_string(),
-                    body_html: "<p>Older message</p>".to_string(),
-                    body_plain: "Older message".to_string(),
-                    attachments: vec![],
-                    mentions: vec![],
-                    reactions: vec![],
-                    reply_count: 0,
-                    web_url: None,
+                    inference_classification: Some("focused".to_string()),
+                    has_attachments: false,
+                    body_loaded: true,
+                    preview: "All checks green".to_string(),
+                    body_html: "<p>All checks green</p>".to_string(),
+                    body_plain: "All checks green".to_string(),
+                    attachments: Vec::new(),
+                    meeting_request: None,
+                    web_link: None,
                 },
-                MessageItem {
-                    msg_key: "chat:19:c1|msg-2".to_string(),
-                    conv_key: "chat:19:c1".to_string(),
-                    msg_id: "msg-2".to_string(),
-                    parent_msg_id: None,
-                    reply_to_id: None,
-                    reply_to_author: None,
-                    reply_to_preview: None,
-                    subject: None,
-                    author_id: Some("u1".to_string()),
-                    author_name: "Bob".to_string(),
-                    is_me: false,
-                    created_at: "2026-11-15T06:00:00Z".to_string(),
-                    last_modified_at: None,
-                    deleted: false,
-                    importance: "normal".to_string(),
-                    message_type: "message".to_string(),
-                    body_html: "<p>Please check the release tag</p>".to_string(),
-                    body_plain: "Please check the release tag".to_string(),
-                    attachments: vec![],
-                    mentions: vec![],
-                    reactions: vec![],
-                    reply_count: 0,
-                    web_url: None,
+                MailMessage {
+                    id: "msg-2".to_string(),
+                    internet_message_id: None,
+                    conversation_id: Some("conv-2".to_string()),
+                    folder_id: Some("folder-inbox".to_string()),
+                    subject: "Kubernetes rollout checklist".to_string(),
+                    from: None,
+                    to_recipients: Vec::new(),
+                    cc_recipients: Vec::new(),
+                    bcc_recipients: Vec::new(),
+                    reply_to: Vec::new(),
+                    received_at: "2026-11-16T10:00:00Z".to_string(),
+                    sent_at: None,
+                    is_read: false,
+                    is_draft: false,
+                    flagged: true,
+                    importance: "high".to_string(),
+                    inference_classification: Some("focused".to_string()),
+                    has_attachments: false,
+                    body_loaded: true,
+                    preview: "Deploy v0.1.0 to staging".to_string(),
+                    body_html: "<p>Deploy v0.1.0 to staging</p>".to_string(),
+                    body_plain: "Deploy v0.1.0 to staging".to_string(),
+                    attachments: Vec::new(),
+                    meeting_request: None,
+                    web_link: None,
                 },
             ])
             .unwrap();
 
+        // list_messages (offline, unread=true)
         let resp = handle_rpc_line(
             &cfg,
             &graph,
@@ -1796,8 +1954,8 @@ mod tests {
                 "id": 20,
                 "method": "tools/call",
                 "params": {
-                    "name": "get_messages",
-                    "arguments": { "target": "Engineering Discussion", "offline": true, "before": "msg-2" }
+                    "name": "list_messages",
+                    "arguments": { "folder": "inbox", "unread": true, "offline": true }
                 }
             })
             .to_string(),
@@ -1808,10 +1966,9 @@ mod tests {
         let payload: Value =
             serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(payload["messages"].as_array().unwrap().len(), 1);
-        assert_eq!(payload["messages"][0]["msg_id"], "msg-1");
-        assert_eq!(payload["has_more"], false);
-        assert_eq!(payload["next_before"], "msg-1");
+        assert_eq!(payload["messages"][0]["id"], "msg-2");
 
+        // get_message (offline)
         let resp = handle_rpc_line(
             &cfg,
             &graph,
@@ -1821,8 +1978,31 @@ mod tests {
                 "id": 21,
                 "method": "tools/call",
                 "params": {
-                    "name": "search_messages",
-                    "arguments": { "query": "release", "target": "Engineering Discussion" }
+                    "name": "get_message",
+                    "arguments": { "message_id": "msg-1", "offline": true }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], false, "{resp}");
+        let payload: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["message"]["subject"], "Weekly Status");
+
+        // search_mail (offline)
+        let resp = handle_rpc_line(
+            &cfg,
+            &graph,
+            &storage,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 22,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_mail",
+                    "arguments": { "query": "Kubernetes", "folder": "inbox", "offline": true }
                 }
             })
             .to_string(),
@@ -1833,40 +2013,7 @@ mod tests {
         let payload: Value =
             serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(payload["hits"].as_array().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn reply_message_supports_mentions_and_important() {
-        let catalog = tool_catalog();
-        let reply_tool = catalog
-            .iter()
-            .find(|t| t["name"] == "reply_message")
-            .unwrap();
-        assert!(reply_tool["inputSchema"]["properties"]["mentions"].is_object());
-        assert!(reply_tool["inputSchema"]["properties"]["important"].is_object());
-
-        assert!(validate_tool_args(
-            "reply_message",
-            &json!({
-                "target": "Engineering/General",
-                "msg_id": "m1",
-                "markdown": "Thanks @Alice",
-                "mentions": ["u1:Alice"],
-                "important": true
-            })
-        )
-        .is_ok());
-
-        assert!(validate_tool_args(
-            "reply_message",
-            &json!({
-                "target": "Engineering/General",
-                "msg_id": "m1",
-                "markdown": "Thanks",
-                "important": "yes"
-            })
-        )
-        .is_err());
+        assert_eq!(payload["hits"][0]["id"], "msg-2");
     }
 
     #[tokio::test]
@@ -1890,187 +2037,5 @@ mod tests {
             BoundedLine::Eof => {}
             _ => panic!("expected Eof"),
         }
-    }
-
-    #[tokio::test]
-    async fn cached_inline_hosted_image_exposed_in_mcp_get_messages_and_download() {
-        use crate::auth::StoredTokens;
-        use crate::models::{ConversationKind, MessageItem};
-        use axum::{http::StatusCode, routing::get, Router};
-
-        let png_bytes = b"\x89PNG\r\n\x1a\nmcp-inline-shot".to_vec();
-        let served_bytes = png_bytes.clone();
-        let mock_app = Router::new().route(
-            "/v1.0/chats/c1/messages/m2/hostedContents/1/$value",
-            get(move || {
-                let bytes = served_bytes.clone();
-                async move { (StatusCode::OK, bytes) }
-            }),
-        );
-        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mock_addr = mock_listener.local_addr().unwrap();
-        let mock_server = tokio::spawn(async move {
-            axum::serve(mock_listener, mock_app).await.unwrap();
-        });
-
-        let dl_dir = tempfile::tempdir().unwrap();
-        let cfg = AppConfig {
-            graph_base_url: format!("http://{mock_addr}/v1.0"),
-            download_dir: dl_dir.path().display().to_string(),
-            ..AppConfig::default()
-        };
-        let tokens = StoredTokens {
-            access_token: "tok".to_string(),
-            refresh_token: None,
-            expires_at: chrono::Utc::now().timestamp() + 3600,
-            client_id: cfg.client_id.clone(),
-            tenant_id: cfg.tenant_id.clone(),
-            user_id: Some("me-1".to_string()),
-            user_display_name: None,
-            user_email: None,
-            auth_mode: "pkce".to_string(),
-        };
-        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
-        let graph = GraphClient::new(cfg.clone(), auth).unwrap();
-        let storage = Storage::open_in_memory().unwrap();
-
-        storage
-            .upsert_conversations(&[ConversationSummary {
-                conv_key: "chat:c1".to_string(),
-                target: ConversationTarget::Chat {
-                    chat_id: "c1".to_string(),
-                },
-                kind: ConversationKind::OneOnOne,
-                team_id: None,
-                team_name: None,
-                title: "MCP Inline Chat".to_string(),
-                topic: None,
-                unread_count: 0,
-                last_read_at: None,
-                last_msg_id: Some("m2".to_string()),
-                last_msg_author: Some("Alice".to_string()),
-                last_msg_preview: Some("Inline".to_string()),
-                last_updated_at: Some("2026-11-18T10:01:00Z".to_string()),
-                pinned: false,
-                peer_user_id: None,
-                web_url: None,
-            }])
-            .unwrap();
-
-        let graph_hosted_url =
-            "https://graph.microsoft.com/v1.0/chats/c1/messages/m1/hostedContents/1/$value";
-        let local_hosted_url =
-            format!("http://{mock_addr}/v1.0/chats/c1/messages/m2/hostedContents/1/$value");
-
-        storage
-            .upsert_messages(&[
-                MessageItem {
-                    msg_key: "chat:c1|m1".to_string(),
-                    conv_key: "chat:c1".to_string(),
-                    msg_id: "m1".to_string(),
-                    parent_msg_id: None,
-                    reply_to_id: None,
-                    reply_to_author: None,
-                    reply_to_preview: None,
-                    subject: None,
-                    author_id: Some("u1".to_string()),
-                    author_name: "Alice".to_string(),
-                    is_me: false,
-                    created_at: "2026-11-18T10:00:00Z".to_string(),
-                    last_modified_at: None,
-                    deleted: false,
-                    importance: "normal".to_string(),
-                    message_type: "message".to_string(),
-                    body_html: format!(r#"<p>Inline</p><img src="{graph_hosted_url}">"#),
-                    body_plain: "Inline".to_string(),
-                    attachments: vec![],
-                    mentions: vec![],
-                    reactions: vec![],
-                    reply_count: 0,
-                    web_url: None,
-                },
-                MessageItem {
-                    msg_key: "chat:c1|m2".to_string(),
-                    conv_key: "chat:c1".to_string(),
-                    msg_id: "m2".to_string(),
-                    parent_msg_id: None,
-                    reply_to_id: None,
-                    reply_to_author: None,
-                    reply_to_preview: None,
-                    subject: None,
-                    author_id: Some("u1".to_string()),
-                    author_name: "Alice".to_string(),
-                    is_me: false,
-                    created_at: "2026-11-18T10:01:00Z".to_string(),
-                    last_modified_at: None,
-                    deleted: false,
-                    importance: "normal".to_string(),
-                    message_type: "message".to_string(),
-                    body_html: format!(r#"<img src="{local_hosted_url}">"#),
-                    body_plain: String::new(),
-                    attachments: vec![],
-                    mentions: vec![],
-                    reactions: vec![],
-                    reply_count: 0,
-                    web_url: None,
-                },
-            ])
-            .unwrap();
-
-        // MCP get_messages (offline) hydrates hosted:1 attachment
-        let resp = handle_rpc_line(
-            &cfg,
-            &graph,
-            &storage,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": 30,
-                "method": "tools/call",
-                "params": {
-                    "name": "get_messages",
-                    "arguments": { "target": "chat:c1", "offline": true }
-                }
-            })
-            .to_string(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(resp["result"]["isError"], false, "{resp}");
-        let payload: Value =
-            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(payload["messages"][0]["attachments"][0]["id"], "hosted:1");
-        assert_eq!(
-            payload["messages"][0]["attachments"][0]["content_url"],
-            graph_hosted_url
-        );
-
-        // MCP download_attachment downloads hosted:1 from cached message
-        let dl_resp = handle_rpc_line(
-            &cfg,
-            &graph,
-            &storage,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": 31,
-                "method": "tools/call",
-                "params": {
-                    "name": "download_attachment",
-                    "arguments": { "target": "chat:c1", "msg_id": "m2", "index": 0 }
-                }
-            })
-            .to_string(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(dl_resp["result"]["isError"], false, "{dl_resp}");
-        let dl_payload: Value =
-            serde_json::from_str(dl_resp["result"]["content"][0]["text"].as_str().unwrap())
-                .unwrap();
-        assert_eq!(dl_payload["ok"], true);
-        assert_eq!(dl_payload["bytes_written"], png_bytes.len());
-        let saved_path = dl_payload["path"].as_str().unwrap();
-        assert_eq!(std::fs::read(saved_path).unwrap(), png_bytes);
-
-        mock_server.abort();
     }
 }

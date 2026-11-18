@@ -1,13 +1,11 @@
 //! Unified Omni-Switcher & Command Palette (`Ctrl+K`).
 //!
-//! Supports prefix modes:
-//! - (none): conversations, channels, and commands
-//! - `>`: commands only
-//! - `#`: channels only (with slash-path fuzzy matching such as `eng/gen`)
-//! - `@`: 1:1 / group chats + `Create new chat…`
+//! Prefix modes:
+//! - (none): Mail folders, recent contacts, upcoming meetings, and commands
+//! - `>`: commands only (`>Compose`, `>Sync`, `>Cycle Theme`, ...)
+//! - `#`: mail folders only (`#Inbox`, `#Sent`, ...)
+//! - `@`: contacts (`@alice` -> starts compose to Alice!)
 //! - `/`: hands off query to `SearchOverlay` on Enter
-
-use std::collections::{HashMap, HashSet};
 
 use ratatui::{
     layout::Rect,
@@ -17,27 +15,15 @@ use ratatui::{
     Frame,
 };
 
-use crate::{
-    models::ConversationKind,
-    ui::{
-        action::Action,
-        app::{AppState, UiState},
-        hitmap::{HitMap, HitTarget},
-        overlays::{centered_rect, OverlayKind, OverlayOutcome},
-    },
+use crate::ui::{
+    action::Action,
+    app::{AppState, UiState},
+    hitmap::{HitMap, HitTarget},
+    overlays::{centered_rect, OverlayKind, OverlayOutcome},
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ItemKind {
-    Chat,
-    Channel,
-    Command,
-    Search,
-}
 
 #[derive(Debug, Clone)]
 pub struct PaletteItem {
-    kind: ItemKind,
     pub label: String,
     search_alias: String,
     pub shortcut: String,
@@ -47,98 +33,43 @@ pub struct PaletteItem {
 
 fn palette_commands() -> Vec<PaletteItem> {
     let cmds = [
-        ("Switch to Chats Tab", "1 / Alt+1", Action::SelectNavTab(0)),
-        ("Switch to Teams Tab", "2 / Alt+2", Action::SelectNavTab(1)),
-        (
-            "Switch to Activity Tab",
-            "3 / Alt+3",
-            Action::SelectNavTab(2),
-        ),
-        ("New Chat", "Ctrl+N", Action::OpenOverlay(OverlayKind::NewChat)),
-        ("Search Messages", "Ctrl+F", Action::OpenSearch),
-        ("Jump to Next Unread", "u / Alt+u", Action::JumpNextUnread),
-        ("Jump to Previous Unread", "U", Action::JumpPrevUnread),
-        (
-            "Toggle Last Conversation",
-            "`",
-            Action::ToggleLastConversation,
-        ),
+        ("Compose New Email", "c", Action::OpenMailCompose),
+        ("Sync / Refresh All", "Ctrl+R / F5", Action::RefreshAll),
+        ("Cycle Color Theme", "", Action::CycleTheme),
+        ("Switch to Mail Tab", "1 / Alt+1", Action::SelectNavTab(0)),
+        ("Switch to Calendar Tab", "2 / Alt+2", Action::SelectNavTab(1)),
+        ("Switch to Tasks Tab", "3 / Alt+3", Action::SelectNavTab(2)),
+        ("New Calendar Event", "n", Action::OpenEventForm),
+        ("New To Do Task", "", Action::OpenNewTodoTask),
+        ("Search Mail", "/ / Ctrl+F", Action::OpenSearch),
+        ("Toggle Thread Grouping", "t", Action::ToggleGroupThreads),
+        ("Toggle Focused / All Mail", "F", Action::ToggleFocusedOnly),
+        ("Toggle Unread Filter", "U", Action::ToggleUnreadFilter),
         (
             "Toggle Message Density (Cozy / Compact)",
             "Ctrl+D",
             Action::ToggleDensity,
         ),
-        ("Cycle Color Theme", "", Action::CycleTheme),
-        (
-            "Change Presence",
-            "Ctrl+P",
-            Action::OpenOverlay(OverlayKind::Presence),
-        ),
-        ("Preview Image Attachment", "v", Action::OpenImagePreview),
-        ("Send File", "Ctrl+O", Action::OpenSendFile),
-        (
-            "View Attachments",
-            "Ctrl+T",
-            Action::OpenOverlay(OverlayKind::Attachments),
-        ),
-        (
-            "Room Info & Members",
-            "Ctrl+U",
-            Action::OpenOverlay(OverlayKind::RoomInfo),
-        ),
-        (
-            "Add Reaction to Selected",
-            "+",
-            Action::OpenReactionsForSelected,
-        ),
-        (
-            "Open Thread for Selected",
-            "t",
-            Action::OpenThreadForSelected,
-        ),
-        (
-            "Toggle Composer Target (Thread / Channel)",
-            "Alt+T",
-            Action::ToggleComposerTarget,
-        ),
-        ("Toggle Channel Subject", "Ctrl+S", Action::ToggleSubject),
-        (
-            "Clear Pending Images",
-            "Ctrl+Shift+X",
-            Action::ClearPendingImages,
-        ),
-        ("Refresh Conversations", "F5 / R", Action::RefreshAll),
-        ("Sync Deep History (150)", "H / s", Action::SyncHistory),
-        ("Load Older Messages", "o", Action::LoadOlder),
-        ("Download Latest Attachment", "d", Action::DownloadLatest),
-        ("Focus Composer", "i", Action::OpenComposer),
-        ("Mark Conversation as Read", "", Action::MarkActiveRead),
-        ("Toggle Left Navigation Rail", "Ctrl+B", Action::ToggleNavRail),
-        ("Close Thread Drawer", "Esc", Action::CloseThreadDrawer),
+        ("Preview Image Attachment", "v / Alt+v", Action::OpenImagePreview),
+        ("View Attachments", "A", Action::OpenOverlay(OverlayKind::Attachments)),
+        ("Move Email to Folder", "m", Action::OpenFolderPicker),
+        ("Toggle Left Sidebar", "Ctrl+B", Action::ToggleNavRail),
         ("Toggle Notifications", "", Action::ToggleNotify),
-        (
-            "Toggle Inline Image Previews",
-            "",
-            Action::ToggleInlineImages,
-        ),
+        ("Toggle Inline Image Previews", "", Action::ToggleInlineImages),
+        ("Load Older Mail", "o", Action::LoadOlderMail),
         ("Check for Updates", "", Action::CheckForUpdates),
         ("Install Self-Update", "", Action::ApplySelfUpdate),
-        (
-            "Settings",
-            "Ctrl+,",
-            Action::OpenOverlay(OverlayKind::Settings),
-        ),
+        ("Settings", "Ctrl+,", Action::OpenOverlay(OverlayKind::Settings)),
         (
             "Keyboard Shortcuts Help",
             "?",
             Action::OpenOverlay(OverlayKind::Help),
         ),
-        ("Quit Teams", "Ctrl+Q", Action::QuitConfirm),
+        ("Quit Outlook", "Ctrl+Q", Action::QuitConfirm),
     ];
 
     cmds.into_iter()
         .map(|(label, shortcut, action)| PaletteItem {
-            kind: ItemKind::Command,
             label: label.to_string(),
             search_alias: String::new(),
             shortcut: shortcut.to_string(),
@@ -148,104 +79,106 @@ fn palette_commands() -> Vec<PaletteItem> {
         .collect()
 }
 
-fn conversation_items(app: &AppState, ui: &UiState) -> Vec<PaletteItem> {
-    let mut team_channel_names: HashMap<String, (String, String)> = HashMap::new();
-    for team in &app.teams {
-        for ch in &team.channels {
-            team_channel_names.insert(
-                ch.conv_key(),
-                (team.display_name.clone(), ch.display_name.clone()),
-            );
-        }
-    }
+fn folder_items(app: &AppState) -> Vec<PaletteItem> {
+    let mut items = vec![
+        PaletteItem {
+            label: "Folder: Unread".to_string(),
+            search_alias: "unread".to_string(),
+            shortcut: "Mail".to_string(),
+            action: Action::SelectMailFolder("__virtual_unread__".to_string()),
+            base_priority: 120,
+        },
+        PaletteItem {
+            label: "Folder: Flagged".to_string(),
+            search_alias: "flagged".to_string(),
+            shortcut: "Mail".to_string(),
+            action: Action::SelectMailFolder("__virtual_flagged__".to_string()),
+            base_priority: 115,
+        },
+    ];
 
-    let mut seen = HashSet::new();
-    let mut items = Vec::new();
-
-    for (idx, conv) in app.conversations.iter().enumerate() {
-        seen.insert(conv.conv_key.clone());
-        let is_pinned = conv.pinned || ui.pinned_convs.contains(&conv.conv_key);
-        let unread_bonus = if conv.unread_count > 0 { 250 } else { 0 };
-        let pinned_bonus = if is_pinned { 150 } else { 0 };
-        let recent_bonus = 100i32.saturating_sub(idx.min(100) as i32);
-        let base_priority = unread_bonus + pinned_bonus + recent_bonus;
-
-        let is_channel = conv.kind == ConversationKind::Channel;
-        let (label, search_alias) = if is_channel {
-            if let Some((team_name, ch_name)) = team_channel_names.get(&conv.conv_key) {
-                (
-                    format!("{team_name} › #{ch_name}"),
-                    format!("{team_name}/{ch_name}"),
-                )
-            } else if let Some(team_name) = conv.team_name.as_deref() {
-                (
-                    format!("{team_name} › #{}", conv.title),
-                    format!("{team_name}/{}", conv.title),
-                )
-            } else {
-                (format!("#{}", conv.title), conv.title.clone())
-            }
+    for folder in &app.mail_folders {
+        let unread_bonus = if folder.unread_item_count > 0 { 180 } else { 80 };
+        let shortcut = if folder.unread_item_count > 0 {
+            format!("{} unread", folder.unread_item_count)
         } else {
-            (conv.title.clone(), conv.title.clone())
+            "Folder".to_string()
         };
-
-        let mut tags = Vec::new();
-        if conv.unread_count > 0 {
-            tags.push(format!("{} unread", conv.unread_count));
-        }
-        if is_pinned {
-            tags.push("Pinned".to_string());
-        }
-        if tags.is_empty() {
-            tags.push(AppState::conversation_kind_label(conv.kind).to_string());
-        }
-
         items.push(PaletteItem {
-            kind: if is_channel {
-                ItemKind::Channel
-            } else {
-                ItemKind::Chat
-            },
-            label,
-            search_alias,
-            shortcut: tags.join(" · "),
-            action: Action::OpenConversationKey {
-                conv_key: conv.conv_key.clone(),
-                focus_composer: true,
-            },
-            base_priority,
+            label: format!("Folder: {}", folder.display_name),
+            search_alias: folder
+                .well_known_name
+                .clone()
+                .unwrap_or_else(|| folder.display_name.clone()),
+            shortcut,
+            action: Action::SelectMailFolder(folder.id.clone()),
+            base_priority: unread_bonus,
         });
     }
+    items
+}
 
-    for team in &app.teams {
-        for ch in &team.channels {
-            let conv_key = ch.conv_key();
-            if !seen.insert(conv_key.clone()) {
-                continue;
-            }
-            let is_pinned = ui.pinned_convs.contains(&conv_key);
-            let pinned_bonus = if is_pinned { 150 } else { 0 };
-            let mut tags = Vec::new();
-            if is_pinned {
-                tags.push("Pinned".to_string());
+fn contact_items(app: &AppState) -> Vec<PaletteItem> {
+    let mut seen = std::collections::HashSet::new();
+    let mut items = Vec::new();
+    for c in &app.contacts {
+        let Some(email) = c.primary_email() else {
+            continue;
+        };
+        if !seen.insert(email.to_ascii_lowercase()) {
+            continue;
+        }
+        items.push(PaletteItem {
+            label: format!("Compose to {} <{email}>", c.display_name),
+            search_alias: format!("@{} {email}", c.display_name),
+            shortcut: if c.source == "directory" {
+                "Org".to_string()
             } else {
-                tags.push("Channel".to_string());
+                "Contact".to_string()
+            },
+            action: Action::ComposeTo(email.to_string()),
+            base_priority: 60,
+        });
+    }
+    // Also add recent mail senders not yet in contacts
+    for m in app.mail_messages.iter().take(40) {
+        if let Some(ref from) = m.from {
+            let addr = from.address.trim();
+            if !addr.is_empty() && seen.insert(addr.to_ascii_lowercase()) {
+                items.push(PaletteItem {
+                    label: format!("Compose to {}", from.display()),
+                    search_alias: format!("@{} {addr}", from.short_display()),
+                    shortcut: "Recent".to_string(),
+                    action: Action::ComposeTo(addr.to_string()),
+                    base_priority: 40,
+                });
             }
-            items.push(PaletteItem {
-                kind: ItemKind::Channel,
-                label: format!("{} › #{}", team.display_name, ch.display_name),
-                search_alias: format!("{}/{}", team.display_name, ch.display_name),
-                shortcut: tags.join(" · "),
-                action: Action::OpenConversationKey {
-                    conv_key,
-                    focus_composer: true,
-                },
-                base_priority: 10 + pinned_bonus,
-            });
         }
     }
-
     items
+}
+
+fn event_items(app: &AppState) -> Vec<PaletteItem> {
+    app.calendar_events
+        .iter()
+        .take(25)
+        .map(|ev| {
+            let day = ev.start_iso.get(..10).unwrap_or("");
+            let time = ev.start_iso.get(11..16).unwrap_or("");
+            let badge = if ev.is_online_meeting {
+                format!("{day} {time} · Online")
+            } else {
+                format!("{day} {time}")
+            };
+            PaletteItem {
+                label: format!("Meeting: {}", ev.subject),
+                search_alias: ev.organizer_name.clone().unwrap_or_default(),
+                shortcut: badge,
+                action: Action::JumpToCalendarEvent(ev.id.clone()),
+                base_priority: 50,
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -259,11 +192,7 @@ impl CommandPalette {
         Self::default()
     }
 
-    pub fn new_with_app(_app: &AppState, _ui: &UiState) -> Self {
-        Self::default()
-    }
-
-    pub fn filtered(&self, app: &AppState, ui: &UiState) -> Vec<PaletteItem> {
+    pub fn filtered(&self, app: &AppState, _ui: &UiState) -> Vec<PaletteItem> {
         let raw = self.query.trim();
         let (mode, needle) = if let Some(rest) = raw.strip_prefix('>') {
             ('>', rest.trim().to_lowercase())
@@ -274,12 +203,11 @@ impl CommandPalette {
         } else if let Some(rest) = raw.strip_prefix('/') {
             let search_q = rest.trim().to_string();
             let label = if search_q.is_empty() {
-                "Search all messages…".to_string()
+                "Search all emails…".to_string()
             } else {
-                format!("Search all messages for \"{search_q}\"")
+                format!("Search emails for \"{search_q}\"")
             };
             return vec![PaletteItem {
-                kind: ItemKind::Search,
                 label,
                 search_alias: String::new(),
                 shortcut: "Enter".to_string(),
@@ -293,30 +221,12 @@ impl CommandPalette {
         let mut pool = Vec::new();
         match mode {
             '>' => pool.extend(palette_commands()),
-            '#' => {
-                pool.extend(
-                    conversation_items(app, ui)
-                        .into_iter()
-                        .filter(|i| i.kind == ItemKind::Channel),
-                );
-            }
-            '@' => {
-                pool.extend(
-                    conversation_items(app, ui)
-                        .into_iter()
-                        .filter(|i| i.kind == ItemKind::Chat),
-                );
-                pool.push(PaletteItem {
-                    kind: ItemKind::Command,
-                    label: "Create new chat…".to_string(),
-                    search_alias: "new chat".to_string(),
-                    shortcut: "Ctrl+N".to_string(),
-                    action: Action::OpenOverlay(OverlayKind::NewChat),
-                    base_priority: 5,
-                });
-            }
+            '#' => pool.extend(folder_items(app)),
+            '@' => pool.extend(contact_items(app)),
             _ => {
-                pool.extend(conversation_items(app, ui));
+                pool.extend(folder_items(app));
+                pool.extend(contact_items(app));
+                pool.extend(event_items(app));
                 pool.extend(palette_commands());
             }
         }
@@ -361,7 +271,7 @@ impl CommandPalette {
                 OverlayOutcome::Handled
             }
             Action::Paste(text) => {
-                self.query.push_str(text);
+                self.query.push_str(&text.replace(['\r', '\n'], " "));
                 self.selected = 0;
                 OverlayOutcome::Handled
             }
@@ -386,7 +296,7 @@ impl CommandPalette {
                 }
                 OverlayOutcome::Handled
             }
-            Action::Activate => {
+            Action::Activate | Action::OverlaySubmit => {
                 let items = self.filtered(app, ui);
                 let idx = self.selected.min(items.len().saturating_sub(1));
                 match items.get(idx) {
@@ -411,17 +321,18 @@ impl CommandPalette {
         let theme = &ui.theme;
         let rect = centered_rect(
             area,
-            area.width.saturating_sub(6).min(72),
+            area.width.saturating_sub(6).min(74),
             (area.height.saturating_sub(4)).min(20),
         );
         frame.render_widget(Clear, rect);
         hitmap.add(rect, HitTarget::OverlayBody);
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
             .title(Line::from(Span::styled(
-                " Omni-Switcher · > cmd  # chan  @ chat  / search · Esc Close ",
+                " Omni-Switcher · > cmd  # folder  @ contact  / search · Esc Close ",
                 theme.title(true),
             )))
             .border_style(theme.border_style(true));
@@ -456,7 +367,7 @@ impl CommandPalette {
         if items.is_empty() {
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    " No matching conversations or commands",
+                    " No matching folders, contacts, meetings, or commands",
                     theme.muted_style(),
                 )),
                 Rect::new(inner.x, list_y, inner.width, 1),
@@ -483,17 +394,14 @@ impl CommandPalette {
                 Style::default()
             };
             let right_w = unicode_width::UnicodeWidthStr::width(item.shortcut.as_str())
-                .min(18)
-                .max(10);
+                .min(22)
+                .max(8);
             let label_w = (inner.width as usize).saturating_sub(right_w + 3).max(10);
             let truncated_label = crate::ui::truncate_width(&item.label, label_w);
             let used_w = unicode_width::UnicodeWidthStr::width(truncated_label.as_str());
             let pad = label_w.saturating_sub(used_w);
             let line = Line::from(vec![
-                Span::styled(
-                    format!(" {truncated_label}{}", " ".repeat(pad)),
-                    style,
-                ),
+                Span::styled(format!(" {truncated_label}{}", " ".repeat(pad)), style),
                 Span::styled(
                     crate::ui::truncate_width(&item.shortcut, right_w),
                     theme.muted_style(),
@@ -532,7 +440,7 @@ mod tests {
         auth::AuthManager,
         config::AppConfig,
         graph::GraphClient,
-        models::{ChannelSummary, ConversationSummary, ConversationTarget, TeamSummary},
+        models::{CalendarEvent, ContactItem, MailFolder},
         storage::Storage,
         sync::{self, SyncCommand},
     };
@@ -548,122 +456,86 @@ mod tests {
             sync::spawn_sync_engine(cfg.clone(), graph.clone(), storage.clone(), event_tx);
         let (ui_tx, _) = mpsc::unbounded_channel();
         let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
-        let mut ui = UiState::from_config(&cfg);
-        app.conversations = vec![
-            ConversationSummary {
-                conv_key: "chat:c1".to_string(),
-                target: ConversationTarget::Chat {
-                    chat_id: "c1".to_string(),
-                },
-                kind: ConversationKind::OneOnOne,
-                team_id: None,
-                team_name: None,
-                title: "Alice Cooper".to_string(),
-                topic: None,
-                unread_count: 0,
-                last_read_at: None,
-                last_msg_id: None,
-                last_msg_author: None,
-                last_msg_preview: None,
-                last_updated_at: None,
-                pinned: false,
-                peer_user_id: None,
-                web_url: None,
-            },
-            ConversationSummary {
-                conv_key: "chan:t1:ch1".to_string(),
-                target: ConversationTarget::Channel {
-                    team_id: "t1".to_string(),
-                    channel_id: "ch1".to_string(),
-                },
-                kind: ConversationKind::Channel,
-                team_id: Some("t1".to_string()),
-                team_name: Some("Engineering".to_string()),
-                title: "General".to_string(),
-                topic: None,
-                unread_count: 4,
-                last_read_at: None,
-                last_msg_id: None,
-                last_msg_author: None,
-                last_msg_preview: None,
-                last_updated_at: None,
-                pinned: false,
-                peer_user_id: None,
-                web_url: None,
-            },
-        ];
-        app.teams = vec![TeamSummary {
-            id: "t1".to_string(),
-            display_name: "Engineering".to_string(),
-            description: None,
-            channels: vec![ChannelSummary {
-                id: "ch1".to_string(),
-                team_id: "t1".to_string(),
-                team_name: "Engineering".to_string(),
-                display_name: "General".to_string(),
-                description: None,
-                membership_type: "standard".to_string(),
-                web_url: None,
-            }],
+        let ui = UiState::from_config(&cfg);
+        app.mail_folders = vec![MailFolder {
+            id: "f-inbox".into(),
+            display_name: "Inbox".into(),
+            well_known_name: Some("inbox".into()),
+            parent_folder_id: None,
+            child_folder_count: 0,
+            unread_item_count: 3,
+            total_item_count: 20,
         }];
-        ui.pinned_convs.insert("chat:c1".to_string());
+        app.contacts = vec![ContactItem {
+            id: "c1".into(),
+            display_name: "Alice Cooper".into(),
+            given_name: None,
+            surname: None,
+            email_addresses: vec!["alice@contoso.com".into()],
+            mobile_phone: None,
+            business_phones: vec![],
+            company_name: None,
+            job_title: None,
+            department: None,
+            notes: None,
+            source: "contact".into(),
+        }];
+        app.calendar_events = vec![CalendarEvent {
+            id: "ev1".into(),
+            subject: "Design Sync".into(),
+            start_iso: "2026-11-19T14:00:00Z".into(),
+            end_iso: "2026-11-19T15:00:00Z".into(),
+            time_zone: "UTC".into(),
+            is_all_day: false,
+            location: None,
+            organizer_name: None,
+            organizer_email: None,
+            attendees: vec![],
+            response_status: "accepted".into(),
+            is_online_meeting: true,
+            online_meeting_url: None,
+            body_html: String::new(),
+            body_plain: String::new(),
+            is_cancelled: false,
+            web_link: None,
+        }];
         (app, ui)
     }
 
     #[tokio::test]
-    async fn filters_and_fuzzy_matches() {
+    async fn filters_folders_contacts_commands_and_search() {
         let (app, ui) = make_palette_app();
         let mut palette = CommandPalette::new();
 
-        palette.query = "search".to_string();
+        palette.query = ">theme".to_string();
         let res = palette.filtered(&app, &ui);
-        assert!(res.iter().any(|i| i.label.contains("Search Messages")));
+        assert!(res.iter().all(|i| !matches!(
+            i.action,
+            Action::SelectMailFolder(_)
+                | Action::ComposeTo(_)
+                | Action::JumpToCalendarEvent(_)
+                | Action::OpenSearchWithQuery(_)
+        )));
+        assert!(res.iter().any(|i| i.action == Action::CycleTheme));
 
-        palette.query = "new chat".to_string();
-        let res = palette.filtered(&app, &ui);
-        assert!(res.iter().any(|i| i.label.contains("New Chat")));
-
-        palette.query = "eng/gen".to_string();
+        palette.query = "#inb".to_string();
         let res = palette.filtered(&app, &ui);
         assert!(res
             .iter()
-            .any(|i| matches!(i.action, Action::OpenConversationKey { ref conv_key, .. } if conv_key == "chan:t1:ch1")));
+            .any(|i| matches!(i.action, Action::SelectMailFolder(ref id) if id == "f-inbox")));
 
-        palette.query = ">dens".to_string();
-        let res = palette.filtered(&app, &ui);
-        assert!(res.iter().all(|i| i.kind == ItemKind::Command));
-        assert!(res.iter().any(|i| i.action == Action::ToggleDensity));
-
-        palette.query = "#gen".to_string();
+        palette.query = "@alice".to_string();
         let res = palette.filtered(&app, &ui);
         assert_eq!(res.len(), 1);
-        assert_eq!(res[0].kind, ItemKind::Channel);
+        assert_eq!(res[0].action, Action::ComposeTo("alice@contoso.com".into()));
 
-        palette.query = "@".to_string();
-        let res = palette.filtered(&app, &ui);
-        assert!(res.iter().any(|i| i.label == "Alice Cooper"));
-        assert!(res.iter().any(|i| i.label == "Create new chat…"));
-
-        palette.query = "/deploy".to_string();
+        palette.query = "/quarterly".to_string();
         let outcome = palette.handle(&Action::Activate, &app, &ui);
         assert_eq!(
             outcome,
-            OverlayOutcome::CloseAndDispatch(Action::OpenSearchWithQuery("deploy".to_string()))
+            OverlayOutcome::CloseAndDispatch(Action::OpenSearchWithQuery("quarterly".into()))
         );
 
-        app.sync_ctrl.request(SyncCommand::Shutdown);
-    }
-
-    #[tokio::test]
-    async fn activate_dispatches_quit() {
-        let (app, ui) = make_palette_app();
-        let mut palette = CommandPalette::new();
-        palette.query = "quit".to_string();
-        let outcome = palette.handle(&Action::Activate, &app, &ui);
-        assert!(matches!(
-            outcome,
-            OverlayOutcome::CloseAndDispatch(Action::QuitConfirm)
-        ));
         app.sync_ctrl.request(SyncCommand::Shutdown);
     }
 }

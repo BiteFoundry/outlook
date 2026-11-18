@@ -1,37 +1,49 @@
-//! End-to-end integration tests against an in-process mock Microsoft Graph v1.0 + Entra OAuth server.
+//! End-to-end integration tests for `outlook-cli` against an in-process mock
+//! Microsoft Graph v1.0, Entra OAuth 2.0, and GitHub Releases server.
 
 use std::{
-    collections::HashMap,
     io::Cursor,
-    sync::{Arc, Once, RwLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Once, RwLock,
+    },
 };
 
 use axum::{
-    body::Bytes,
     extract::{Path, RawQuery, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{get, patch, post},
     Json, Router,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD as B64_STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use image::{ImageBuffer, Rgba, RgbaImage};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
-use teams_cli::{
-    auth::{
-        diagnose_access_token_scopes, explain_graph_permission_error, AuthManager, StoredTokens,
-    },
+use outlook_cli::{
+    auth::{AuthManager, StoredTokens},
     config::{AppConfig, ImageProtocolPreference},
     graph::GraphClient,
-    img_preview::{self, TerminalGraphicsCaps, TerminalImageProtocol},
-    mcp,
-    models::{AttachmentInfo, ConversationTarget, MentionInfo, MessageItem, TeamSummary},
-    parser, resolver, serve,
+    img_preview, mcp,
+    models::{
+        CalendarEvent, EventRsvpAction, InlineImageUpload, MailMessage, OutgoingEvent,
+        OutgoingMail, OutgoingTodoTask, RichBlock, SyncCursor, TodoTask,
+    },
+    parser,
+    serve::{self, ServeOptions},
     storage::Storage,
+    sync,
+    ui::{
+        action::{self, Action},
+        app::{AppState as UiAppState, UiState},
+        overlays::{image_preview::ImagePreviewOverlay, Overlay, OverlayKind},
+    },
     updater,
 };
 
@@ -41,73 +53,63 @@ static TEST_CONFIG_DIR: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new(
 fn ensure_isolated_env() {
     INIT_TEST_ENV.call_once(|| {
         let dir = tempfile::tempdir().expect("create shared test config tempdir");
-        // Safety: initialized once before any AuthManager writes fallback credentials.
-        std::env::set_var("TEAMS_DISABLE_KEYRING", "1");
-        std::env::set_var("TEAMS_CONFIG_DIR", dir.path());
-        std::env::remove_var("TEAMS_ACCESS_TOKEN");
+        std::env::set_var("OUTLOOK_DISABLE_KEYRING", "1");
+        std::env::set_var("OUTLOOK_CONFIG_DIR", dir.path());
+        std::env::set_var("OUTLOOK_DATA_DIR", dir.path());
+        std::env::remove_var("OUTLOOK_ACCESS_TOKEN");
+        std::env::remove_var("OUTLOOK_TOKEN_FILE");
+        std::env::remove_var("OUTLOOK_TOKEN_REFRESH_CMD");
+        std::env::remove_var("TEAMS_TOKEN_FILE");
+        std::env::remove_var("TEAMS_CONFIG_DIR");
         let _ = TEST_CONFIG_DIR.set(dir);
     });
 }
 
-#[derive(Debug, Clone)]
-struct StoredChatMsg {
-    id: String,
-    reply_to_id: Option<String>,
-    subject: Option<String>,
-    from_id: String,
-    from_name: String,
-    created_at: String,
-    body_html: String,
-    mentions: Vec<Value>,
-    attachments: Vec<Value>,
+fn make_test_jwt(payload: &Value) -> String {
+    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+    let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap());
+    format!("{header}.{body}.sig")
 }
 
-impl StoredChatMsg {
-    fn to_graph_json(&self, replies: Option<Vec<Value>>) -> Value {
-        let mut obj = json!({
-            "id": self.id,
-            "replyToId": self.reply_to_id,
-            "messageType": "message",
-            "createdDateTime": self.created_at,
-            "subject": self.subject,
-            "importance": "normal",
-            "from": {
-                "user": {
-                    "id": self.from_id,
-                    "displayName": self.from_name
-                }
-            },
-            "body": {
-                "contentType": "html",
-                "content": self.body_html
-            },
-            "mentions": self.mentions,
-            "attachments": self.attachments,
-            "reactions": []
-        });
-        if let Some(r) = replies {
-            obj["replies"] = Value::Array(r);
-        }
-        obj
+fn make_test_png_bytes(width: u32, height: u32) -> Vec<u8> {
+    let mut img: RgbaImage = ImageBuffer::new(width, height);
+    for (x, y, px) in img.enumerate_pixels_mut() {
+        let r = ((x * 255) / width.max(1)) as u8;
+        let g = ((y * 255) / height.max(1)) as u8;
+        *px = Rgba([r, g, 190, 255]);
     }
+    let mut buf = Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::Png)
+        .expect("encode PNG bytes");
+    buf.into_inner()
 }
 
 #[derive(Default)]
-struct MockState {
+struct MockGraphState {
+    base_url: RwLock<String>,
     expected_token: RwLock<String>,
-    refresh_calls: RwLock<usize>,
+    refreshed_token_to_issue: RwLock<String>,
+    refresh_calls: AtomicUsize,
     me_auth_headers: RwLock<Vec<String>>,
-    next_msg_seq: RwLock<u64>,
-    chat_messages: RwLock<HashMap<String, Vec<StoredChatMsg>>>,
-    channel_messages: RwLock<HashMap<(String, String), Vec<StoredChatMsg>>>,
-    channel_replies: RwLock<HashMap<(String, String, String), Vec<StoredChatMsg>>>,
-    uploaded_files: RwLock<HashMap<String, Vec<u8>>>,
-    share_contents: RwLock<HashMap<String, Vec<u8>>>,
-    posted_chat_payloads: RwLock<Vec<Value>>,
-    posted_reply_payloads: RwLock<Vec<Value>>,
+    list_queries: RwLock<Vec<String>>,
+    attachment_fetch_calls: AtomicUsize,
+    delta_calls: AtomicUsize,
+    sent_mail_payloads: RwLock<Vec<Value>>,
+    replied_ids: RwLock<Vec<(String, Value)>>,
+    forwarded_ids: RwLock<Vec<(String, Value)>>,
+    patched_messages: RwLock<Vec<(String, Value)>>,
+    moved_messages: RwLock<Vec<(String, String)>>,
+    created_events: RwLock<Vec<Value>>,
+    rsvp_calls: RwLock<Vec<(String, String, Value)>>,
+    deleted_event_ids: RwLock<Vec<String>>,
+    created_todo_tasks: RwLock<Vec<Value>>,
+    patched_todo_tasks: RwLock<Vec<(String, String, Value)>>,
+    deleted_todo_tasks: RwLock<Vec<(String, String)>>,
+    inline_png_b64: RwLock<String>,
+    inline_png_bytes: RwLock<Vec<u8>>,
 }
 
-fn check_bearer_header(headers: &HeaderMap, expected: &str) -> Result<(), Response> {
+fn check_bearer(headers: &HeaderMap, expected: &str) -> Result<(), Response> {
     let actual = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -120,7 +122,7 @@ fn check_bearer_header(headers: &HeaderMap, expected: &str) -> Result<(), Respon
             Json(json!({
                 "error": {
                     "code": "InvalidAuthenticationToken",
-                    "message": "Access token has expired or is not valid."
+                    "message": format!("Expected Bearer {expected}, got {actual:?}")
                 }
             })),
         )
@@ -128,1904 +130,1837 @@ fn check_bearer_header(headers: &HeaderMap, expected: &str) -> Result<(), Respon
     }
 }
 
-impl MockState {
-    fn new(initial_token: &str) -> Self {
-        let state = Self::default();
-        *state.expected_token.write().unwrap() = initial_token.to_string();
-        *state.next_msg_seq.write().unwrap() = 100;
-        state
-    }
-
-    fn next_id(&self, prefix: &str) -> String {
-        let mut seq = self.next_msg_seq.write().unwrap();
-        *seq += 1;
-        format!("{prefix}-{}", *seq)
-    }
-
-    fn check_bearer(&self, headers: &HeaderMap) -> Result<(), Response> {
-        let expected = self.expected_token.read().unwrap().clone();
-        check_bearer_header(headers, &expected)
-    }
-}
-
-fn mock_teams_payload() -> Vec<Value> {
-    vec![json!({
-        "id": "team-dev",
-        "displayName": "Engineering",
-        "description": "Engineering Team"
-    })]
-}
-
-fn mock_channels_payload() -> Vec<Value> {
-    vec![
-        json!({
-            "id": "chan-general",
-            "displayName": "General",
-            "description": "General channel",
-            "membershipType": "standard"
-        }),
-        json!({
-            "id": "chan-deploy",
-            "displayName": "Deployments",
-            "description": "Release announcements",
-            "membershipType": "standard"
-        }),
-    ]
-}
-
-fn mock_chats_payload() -> Vec<Value> {
-    vec![
-        json!({
-            "id": "19:oneonone-peer@unq.gbl.spaces",
-            "chatType": "oneOnOne",
-            "lastUpdatedDateTime": "2026-11-15T05:00:00Z",
-            "members": [
-                { "userId": "me-user-1", "displayName": "Me (Tester)" },
-                { "userId": "peer-kim", "displayName": "Alice" }
-            ],
-            "viewpoint": {
-                "lastMessageReadDateTime": "2026-11-15T04:00:00Z"
-            },
-            "lastMessagePreview": {
-                "id": "seed-1",
-                "createdDateTime": "2026-11-15T05:00:00Z",
-                "from": { "user": { "id": "peer-kim", "displayName": "Alice" } },
-                "body": { "contentType": "html", "content": "<p>Hello</p>" }
-            }
-        }),
-        json!({
-            "id": "19:group-sprint@thread.v2",
-            "chatType": "group",
-            "topic": "Backend Sprint",
-            "lastUpdatedDateTime": "2026-11-15T05:10:00Z",
-            "members": [
-                { "userId": "me-user-1", "displayName": "Me (Tester)" },
-                { "userId": "peer-kim", "displayName": "Alice" },
-                { "userId": "peer-lee", "displayName": "Bob" }
-            ]
-        }),
-    ]
-}
-
 async fn oauth_token_handler(
-    State(state): State<Arc<MockState>>,
+    State(st): State<Arc<MockGraphState>>,
+    Path(tenant): Path<String>,
     body: String,
-) -> impl IntoResponse {
+) -> Response {
+    let count = st.refresh_calls.fetch_add(1, Ordering::SeqCst) + 1;
+    assert_eq!(tenant, "tenant-e2e");
     assert!(
         body.contains("grant_type=refresh_token"),
         "expected refresh_token grant, got: {body}"
     );
-    assert!(
-        body.contains("refresh_token=stale-refresh-tok"),
-        "expected stored refresh_token in body: {body}"
-    );
-
-    *state.refresh_calls.write().unwrap() += 1;
-    let new_tok = "fresh-access-tok-2026";
-    *state.expected_token.write().unwrap() = new_tok.to_string();
-
+    let next_tok = {
+        let configured = st.refreshed_token_to_issue.read().unwrap().clone();
+        if configured.is_empty() {
+            format!("refreshed-outlook-tok-{count}")
+        } else {
+            configured
+        }
+    };
+    *st.expected_token.write().unwrap() = next_tok.clone();
     Json(json!({
         "token_type": "Bearer",
-        "expires_in": 3600,
-        "access_token": new_tok,
-        "refresh_token": "rotated-refresh-tok"
+        "access_token": next_tok,
+        "refresh_token": format!("rt-next-{count}"),
+        "expires_in": 3600
     }))
+    .into_response()
 }
 
-async fn get_me_handler(State(state): State<Arc<MockState>>, headers: HeaderMap) -> Response {
-    if let Some(auth_val) = headers
+async fn get_me_handler(State(st): State<Arc<MockGraphState>>, headers: HeaderMap) -> Response {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
+        return resp;
+    }
+    if let Some(auth) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
     {
-        state
-            .me_auth_headers
-            .write()
-            .unwrap()
-            .push(auth_val.to_string());
+        st.me_auth_headers.write().unwrap().push(auth.to_string());
     }
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-
     Json(json!({
-        "id": "me-user-1",
-        "displayName": "Me (Tester)",
-        "mail": "tester@contoso.com",
-        "userPrincipalName": "tester@contoso.com"
+        "id": "user-e2e-1",
+        "displayName": "Alice Outlook",
+        "mail": "alice@contoso.com",
+        "userPrincipalName": "alice@contoso.com",
+        "jobTitle": "Principal Engineer",
+        "department": "Core Productivity"
     }))
     .into_response()
 }
 
-async fn list_chats_handler(State(state): State<Arc<MockState>>, headers: HeaderMap) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+async fn list_mail_folders_handler(
+    State(st): State<Arc<MockGraphState>>,
+    headers: HeaderMap,
+) -> Response {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
-    Json(json!({ "value": mock_chats_payload() })).into_response()
+    Json(json!({
+        "value": [
+            {
+                "id": "folder-inbox",
+                "displayName": "Inbox",
+                "wellKnownName": "inbox",
+                "childFolderCount": 0,
+                "unreadItemCount": 2,
+                "totalItemCount": 3
+            },
+            {
+                "id": "folder-archive",
+                "displayName": "Archive",
+                "wellKnownName": "archive",
+                "childFolderCount": 0,
+                "unreadItemCount": 0,
+                "totalItemCount": 10
+            },
+            {
+                "id": "folder-sent",
+                "displayName": "Sent Items",
+                "wellKnownName": "sentitems",
+                "childFolderCount": 0,
+                "unreadItemCount": 0,
+                "totalItemCount": 5
+            },
+            {
+                "id": "folder-drafts",
+                "displayName": "Drafts",
+                "wellKnownName": "drafts",
+                "childFolderCount": 0,
+                "unreadItemCount": 0,
+                "totalItemCount": 1
+            }
+        ]
+    }))
+    .into_response()
 }
 
-async fn list_chat_messages_handler(
-    State(state): State<Arc<MockState>>,
-    headers: HeaderMap,
-    Path(chat_id): Path<String>,
-) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-    let map = state.chat_messages.read().unwrap();
-    let msgs: Vec<Value> = map
-        .get(&chat_id)
-        .map(|list| list.iter().map(|m| m.to_graph_json(None)).collect())
-        .unwrap_or_default();
-    Json(json!({ "value": msgs })).into_response()
+fn header_message_json(id: &str, subject: &str, preview: &str, is_read: bool) -> Value {
+    json!({
+        "id": id,
+        "internetMessageId": format!("<{id}@contoso.com>"),
+        "conversationId": "conv-q4",
+        "parentFolderId": "folder-inbox",
+        "subject": subject,
+        "from": { "emailAddress": { "name": "Bob Reviewer", "address": "bob@contoso.com" } },
+        "toRecipients": [{ "emailAddress": { "name": "Alice Outlook", "address": "alice@contoso.com" } }],
+        "receivedDateTime": "2026-11-18T10:00:00Z",
+        "sentDateTime": "2026-11-18T09:59:55Z",
+        "isRead": is_read,
+        "isDraft": false,
+        "flag": { "flagStatus": "notFlagged" },
+        "importance": "normal",
+        "inferenceClassification": "focused",
+        "hasAttachments": id == "msg-html-cid",
+        "bodyPreview": preview
+    })
 }
 
-async fn post_chat_message_handler(
-    State(state): State<Arc<MockState>>,
+async fn list_folder_messages_handler(
+    State(st): State<Arc<MockGraphState>>,
+    Path(folder_id): Path<String>,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
-    Path(chat_id): Path<String>,
-    Json(payload): Json<Value>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
-    state.posted_chat_payloads.write().unwrap().push(payload.clone());
-
-    let id = state.next_id("chat-msg");
-    let stored = StoredChatMsg {
-        id: id.clone(),
-        reply_to_id: None,
-        subject: payload
-            .get("subject")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        from_id: "me-user-1".to_string(),
-        from_name: "Me (Tester)".to_string(),
-        created_at: "2026-11-15T06:00:00Z".to_string(),
-        body_html: payload
-            .pointer("/body/content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        mentions: payload
-            .get("mentions")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default(),
-        attachments: payload
-            .get("attachments")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default(),
-    };
-    let json_resp = stored.to_graph_json(None);
-    state
-        .chat_messages
+    let q = query.unwrap_or_default();
+    st.list_queries
         .write()
         .unwrap()
-        .entry(chat_id)
-        .or_default()
-        .push(stored);
+        .push(format!("/me/mailFolders/{folder_id}/messages?{q}"));
 
-    (StatusCode::CREATED, Json(json_resp)).into_response()
+    Json(json!({
+        "value": [
+            header_message_json("msg-html-cid", "Q4 Metrics & Architecture", "See Q4 latency table", false),
+            header_message_json("msg-to-remove", "Temporary Notice", "Will be deleted by delta", true)
+        ]
+    }))
+    .into_response()
 }
 
-async fn joined_teams_handler(
-    State(state): State<Arc<MockState>>,
+async fn list_all_messages_handler(
+    State(st): State<Arc<MockGraphState>>,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
-    Json(json!({ "value": mock_teams_payload() })).into_response()
-}
-
-async fn batch_handler(
-    State(state): State<Arc<MockState>>,
-    headers: HeaderMap,
-    Json(payload): Json<Value>,
-) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-    let reqs = payload
-        .get("requests")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut responses = Vec::with_capacity(reqs.len());
-    for req in reqs {
-        let req_id = req.get("id").and_then(|v| v.as_str()).unwrap_or("0");
-        let url = req.get("url").and_then(|v| v.as_str()).unwrap_or("");
-        if url.contains("/teams/team-dev/channels") {
-            responses.push(json!({
-                "id": req_id,
-                "status": 200,
-                "body": { "value": mock_channels_payload() }
-            }));
-        } else {
-            responses.push(json!({
-                "id": req_id,
-                "status": 404,
-                "body": { "error": { "code": "NotFound", "message": "not found" } }
-            }));
-        }
-    }
-    Json(json!({ "responses": responses })).into_response()
-}
-
-async fn list_channel_messages_handler(
-    State(state): State<Arc<MockState>>,
-    headers: HeaderMap,
-    Path((team_id, channel_id)): Path<(String, String)>,
-) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-    let msgs_guard = state.channel_messages.read().unwrap();
-    let replies_guard = state.channel_replies.read().unwrap();
-    let list = msgs_guard
-        .get(&(team_id.clone(), channel_id.clone()))
-        .cloned()
-        .unwrap_or_default();
-    let values: Vec<Value> = list
-        .into_iter()
-        .map(|m| {
-            let reply_stubs: Vec<Value> = replies_guard
-                .get(&(team_id.clone(), channel_id.clone(), m.id.clone()))
-                .map(|rs| rs.iter().map(|r| json!({ "id": r.id })).collect())
-                .unwrap_or_default();
-            m.to_graph_json(Some(reply_stubs))
-        })
-        .collect();
-    Json(json!({ "value": values })).into_response()
-}
-
-async fn post_channel_message_handler(
-    State(state): State<Arc<MockState>>,
-    headers: HeaderMap,
-    Path((team_id, channel_id)): Path<(String, String)>,
-    Json(payload): Json<Value>,
-) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-    let id = state.next_id("chan-root");
-    let stored = StoredChatMsg {
-        id: id.clone(),
-        reply_to_id: None,
-        subject: payload
-            .get("subject")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        from_id: "me-user-1".to_string(),
-        from_name: "Me (Tester)".to_string(),
-        created_at: "2026-11-15T06:10:00Z".to_string(),
-        body_html: payload
-            .pointer("/body/content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        mentions: payload
-            .get("mentions")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default(),
-        attachments: payload
-            .get("attachments")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default(),
-    };
-    let resp_json = stored.to_graph_json(Some(vec![]));
-    state
-        .channel_messages
+    let q = query.unwrap_or_default();
+    st.list_queries
         .write()
         .unwrap()
-        .entry((team_id, channel_id))
-        .or_default()
-        .push(stored);
+        .push(format!("/me/messages?{q}"));
 
-    (StatusCode::CREATED, Json(resp_json)).into_response()
+    if q.contains("$search=") {
+        return Json(json!({
+            "value": [
+                header_message_json("msg-html-cid", "Q4 Metrics & Architecture", "Remote KQL hit", false)
+            ]
+        }))
+        .into_response();
+    }
+
+    Json(json!({
+        "value": [
+            header_message_json("msg-html-cid", "Q4 Metrics & Architecture", "See Q4 latency table", false)
+        ]
+    }))
+    .into_response()
 }
 
-async fn get_channel_root_handler(
-    State(state): State<Arc<MockState>>,
+async fn delta_folder_messages_handler(
+    State(st): State<Arc<MockGraphState>>,
+    Path(folder_id): Path<String>,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
-    Path((team_id, channel_id, root_id)): Path<(String, String, String)>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
-    let msgs_guard = state.channel_messages.read().unwrap();
-    let found = msgs_guard
-        .get(&(team_id.clone(), channel_id.clone()))
-        .and_then(|list| list.iter().find(|m| m.id == root_id))
-        .cloned();
-    match found {
-        Some(m) => Json(m.to_graph_json(None)).into_response(),
-        None => (StatusCode::NOT_FOUND, Json(json!({ "error": { "code": "NotFound", "message": "missing root" } }))).into_response(),
+    let call_num = st.delta_calls.fetch_add(1, Ordering::SeqCst) + 1;
+    let base = st.base_url.read().unwrap().clone();
+    let q = query.unwrap_or_default();
+
+    if q.contains("deltatoken=d1") || call_num >= 2 {
+        Json(json!({
+            "value": [
+                header_message_json("msg-html-cid", "Q4 Metrics & Architecture", "See Q4 latency table", true),
+                header_message_json("msg-delta-new", "Deployment 롤아웃 Update", "Production 롤아웃 completed", false),
+                {
+                    "id": "msg-to-remove",
+                    "@removed": { "reason": "deleted" }
+                }
+            ],
+            "@odata.deltaLink": format!("{base}/v1.0/me/mailFolders/{folder_id}/messages/delta?$deltatoken=d2")
+        }))
+        .into_response()
+    } else {
+        Json(json!({
+            "value": [
+                header_message_json("msg-html-cid", "Q4 Metrics & Architecture", "See Q4 latency table", false),
+                header_message_json("msg-to-remove", "Temporary Notice", "Will be deleted by delta", true)
+            ],
+            "@odata.deltaLink": format!("{base}/v1.0/me/mailFolders/{folder_id}/messages/delta?$deltatoken=d1")
+        }))
+        .into_response()
     }
 }
 
-async fn list_channel_replies_handler(
-    State(state): State<Arc<MockState>>,
+fn rich_cid_message_html() -> &'static str {
+    r#"
+    <html>
+      <head><style>.secret-noise { display: none; color: #ff0000; }</style></head>
+      <body>
+        <p>Hi Alice, here are the <strong>Q4</strong> results:</p>
+        <table>
+          <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+          <tbody><tr><td>Latency</td><td>12ms</td></tr></tbody>
+        </table>
+        <p>Inline chart below:</p>
+        <img src="cid:chart01@contoso" alt="Q4 Chart">
+        <div id="appendonsend"></div>
+        <hr tabindex="-1">
+        <div id="divRplyFwdMsg">
+          <b>From:</b> Bob Reviewer &lt;bob@contoso.com&gt;<br>
+          <b>Sent:</b> Wednesday, Nov 18, 2026<br>
+        </div>
+        <div><p>Previous thread context.</p></div>
+      </body>
+    </html>
+    "#
+}
+
+async fn get_message_handler(
+    State(st): State<Arc<MockGraphState>>,
+    Path(msg_id): Path<String>,
     headers: HeaderMap,
-    Path((team_id, channel_id, root_id)): Path<(String, String, String)>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
-    let guard = state.channel_replies.read().unwrap();
-    let replies: Vec<Value> = guard
-        .get(&(team_id, channel_id, root_id))
-        .map(|list| list.iter().map(|r| r.to_graph_json(None)).collect())
-        .unwrap_or_default();
-    Json(json!({ "value": replies })).into_response()
+
+    if msg_id == "msg-invite-1" {
+        return Json(json!({
+            "@odata.type": "#microsoft.graph.eventMessage",
+            "id": "msg-invite-1",
+            "internetMessageId": "<invite-1@contoso.com>",
+            "conversationId": "conv-invite-1",
+            "parentFolderId": "folder-inbox",
+            "subject": "Invitation: Architecture Review",
+            "from": { "emailAddress": { "name": "Carol Organizer", "address": "carol@contoso.com" } },
+            "toRecipients": [{ "emailAddress": { "name": "Alice Outlook", "address": "alice@contoso.com" } }],
+            "receivedDateTime": "2026-11-18T11:00:00Z",
+            "isRead": false,
+            "isDraft": false,
+            "importance": "normal",
+            "hasAttachments": false,
+            "meetingMessageType": "meetingRequest",
+            "startDateTime": { "dateTime": "2026-11-20T15:00:00Z", "timeZone": "UTC" },
+            "endDateTime": { "dateTime": "2026-11-20T16:00:00Z", "timeZone": "UTC" },
+            "location": { "displayName": "Conf Room A" },
+            "responseType": "notResponded",
+            "event": {
+                "id": "evt-invite-1",
+                "onlineMeeting": {
+                    "joinUrl": "https://teams.microsoft.com/l/meetup-join/19%3aarch_review/0"
+                },
+                "responseStatus": { "response": "notResponded" }
+            },
+            "bodyPreview": "Please join our architecture review",
+            "body": {
+                "contentType": "html",
+                "content": "<p>Join <a href=\"https://teams.microsoft.com/l/meetup-join/19%3aarch_review/0\">Teams Meeting</a></p>"
+            }
+        }))
+        .into_response();
+    }
+
+    let b64 = st.inline_png_b64.read().unwrap().clone();
+    let png_len = st.inline_png_bytes.read().unwrap().len();
+    Json(json!({
+        "id": msg_id,
+        "internetMessageId": format!("<{msg_id}@contoso.com>"),
+        "conversationId": "conv-q4",
+        "parentFolderId": "folder-inbox",
+        "subject": "Q4 Metrics & Architecture",
+        "from": { "emailAddress": { "name": "Bob Reviewer", "address": "bob@contoso.com" } },
+        "toRecipients": [{ "emailAddress": { "name": "Alice Outlook", "address": "alice@contoso.com" } }],
+        "receivedDateTime": "2026-11-18T10:00:00Z",
+        "sentDateTime": "2026-11-18T09:59:55Z",
+        "isRead": false,
+        "isDraft": false,
+        "flag": { "flagStatus": "notFlagged" },
+        "importance": "normal",
+        "inferenceClassification": "focused",
+        "hasAttachments": true,
+        "bodyPreview": "Hi Alice, here are the Q4 results",
+        "body": {
+            "contentType": "html",
+            "content": rich_cid_message_html()
+        },
+        "attachments": [
+            {
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "id": "att-inline-chart01",
+                "name": "chart01.png",
+                "contentType": "image/png",
+                "size": png_len,
+                "isInline": true,
+                "contentId": "chart01@contoso",
+                "contentBytes": b64
+            }
+        ]
+    }))
+    .into_response()
 }
 
-async fn post_channel_reply_handler(
-    State(state): State<Arc<MockState>>,
+async fn patch_message_handler(
+    State(st): State<Arc<MockGraphState>>,
+    Path(msg_id): Path<String>,
     headers: HeaderMap,
-    Path((team_id, channel_id, root_id)): Path<(String, String, String)>,
     Json(payload): Json<Value>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
-    state.posted_reply_payloads.write().unwrap().push(payload.clone());
-
-    let id = state.next_id("chan-reply");
-    let stored = StoredChatMsg {
-        id: id.clone(),
-        reply_to_id: Some(root_id.clone()),
-        subject: None,
-        from_id: "me-user-1".to_string(),
-        from_name: "Me (Tester)".to_string(),
-        created_at: "2026-11-15T06:15:00Z".to_string(),
-        body_html: payload
-            .pointer("/body/content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        mentions: payload
-            .get("mentions")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default(),
-        attachments: payload
-            .get("attachments")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default(),
-    };
-    let resp_json = stored.to_graph_json(None);
-    state
-        .channel_replies
+    st.patched_messages
         .write()
         .unwrap()
-        .entry((team_id, channel_id, root_id))
-        .or_default()
-        .push(stored);
-
-    (StatusCode::CREATED, Json(resp_json)).into_response()
+        .push((msg_id, payload));
+    StatusCode::OK.into_response()
 }
 
-async fn chat_drive_upload_handler(
-    State(state): State<Arc<MockState>>,
+async fn list_message_attachments_handler(
+    State(st): State<Arc<MockGraphState>>,
     headers: HeaderMap,
-    Path(rest): Path<String>,
-    body: Bytes,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
-    let file_name = rest
-        .trim_end_matches(":/content")
-        .rsplit('/')
-        .next()
-        .unwrap_or("uploaded.bin")
+    st.attachment_fetch_calls.fetch_add(1, Ordering::SeqCst);
+    let b64 = st.inline_png_b64.read().unwrap().clone();
+    let png_len = st.inline_png_bytes.read().unwrap().len();
+    Json(json!({
+        "value": [
+            {
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "id": "att-inline-chart01",
+                "name": "chart01.png",
+                "contentType": "image/png",
+                "size": png_len,
+                "isInline": true,
+                "contentId": "chart01@contoso",
+                "contentBytes": b64
+            }
+        ]
+    }))
+    .into_response()
+}
+
+async fn get_attachment_meta_handler(
+    State(st): State<Arc<MockGraphState>>,
+    Path((_msg_id, att_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
+        return resp;
+    }
+    st.attachment_fetch_calls.fetch_add(1, Ordering::SeqCst);
+    let png_len = st.inline_png_bytes.read().unwrap().len();
+    Json(json!({
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        "id": att_id,
+        "name": "chart01.png",
+        "contentType": "image/png",
+        "size": png_len,
+        "isInline": true,
+        "contentId": "chart01@contoso"
+    }))
+    .into_response()
+}
+
+async fn get_attachment_value_handler(
+    State(st): State<Arc<MockGraphState>>,
+    headers: HeaderMap,
+) -> Response {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
+        return resp;
+    }
+    st.attachment_fetch_calls.fetch_add(1, Ordering::SeqCst);
+    let bytes = st.inline_png_bytes.read().unwrap().clone();
+    ([(header::CONTENT_TYPE, "image/png")], bytes).into_response()
+}
+
+async fn send_mail_handler(
+    State(st): State<Arc<MockGraphState>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
+        return resp;
+    }
+    st.sent_mail_payloads.write().unwrap().push(payload);
+    StatusCode::ACCEPTED.into_response()
+}
+
+async fn reply_mail_handler(
+    State(st): State<Arc<MockGraphState>>,
+    Path(msg_id): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
+        return resp;
+    }
+    st.replied_ids.write().unwrap().push((msg_id, payload));
+    StatusCode::ACCEPTED.into_response()
+}
+
+async fn forward_mail_handler(
+    State(st): State<Arc<MockGraphState>>,
+    Path(msg_id): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
+        return resp;
+    }
+    st.forwarded_ids.write().unwrap().push((msg_id, payload));
+    StatusCode::ACCEPTED.into_response()
+}
+
+async fn move_mail_handler(
+    State(st): State<Arc<MockGraphState>>,
+    Path(msg_id): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
+        return resp;
+    }
+    let dest = payload["destinationId"]
+        .as_str()
+        .unwrap_or_default()
         .to_string();
-    let item_id = "drive-item-chat-1".to_string();
-    let share_url = format!("https://contoso.sharepoint.com/personal/tester/Documents/Microsoft%20Teams%20Chat%20Files/{file_name}");
-
-    state
-        .uploaded_files
+    st.moved_messages
         .write()
         .unwrap()
-        .insert(item_id.clone(), body.to_vec());
-    state
-        .share_contents
+        .push((msg_id.clone(), dest.clone()));
+    let mut moved = header_message_json(&msg_id, "Q4 Metrics & Architecture", "See Q4 latency table", true);
+    moved["parentFolderId"] = json!(if dest == "archive" { "folder-archive" } else { dest.as_str() });
+    Json(moved).into_response()
+}
+
+async fn calendar_view_handler(
+    State(st): State<Arc<MockGraphState>>,
+    headers: HeaderMap,
+) -> Response {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
+        return resp;
+    }
+    Json(json!({
+        "value": [
+            {
+                "id": "evt-existing-1",
+                "subject": "Weekly Sync",
+                "start": { "dateTime": "2026-11-19T10:00:00Z", "timeZone": "UTC" },
+                "end": { "dateTime": "2026-11-19T10:30:00Z", "timeZone": "UTC" },
+                "isAllDay": false,
+                "location": { "displayName": "Teams" },
+                "organizer": { "emailAddress": { "name": "Bob Reviewer", "address": "bob@contoso.com" } },
+                "attendees": [
+                    {
+                        "type": "required",
+                        "emailAddress": { "name": "Alice Outlook", "address": "alice@contoso.com" },
+                        "status": { "response": "notResponded" }
+                    }
+                ],
+                "responseStatus": { "response": "notResponded" },
+                "isOnlineMeeting": true,
+                "onlineMeeting": { "joinUrl": "https://teams.microsoft.com/l/meetup-join/19%3async/0" },
+                "body": { "contentType": "html", "content": "<p>Agenda</p>" },
+                "isCancelled": false
+            }
+        ]
+    }))
+    .into_response()
+}
+
+async fn create_event_handler(
+    State(st): State<Arc<MockGraphState>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
+        return resp;
+    }
+    st.created_events.write().unwrap().push(payload.clone());
+    Json(json!({
+        "id": "evt-created-1",
+        "subject": payload["subject"],
+        "start": payload["start"],
+        "end": payload["end"],
+        "isAllDay": false,
+        "location": payload["location"],
+        "organizer": { "emailAddress": { "name": "Alice Outlook", "address": "alice@contoso.com" } },
+        "attendees": [],
+        "responseStatus": { "response": "organizer" },
+        "isOnlineMeeting": payload["isOnlineMeeting"],
+        "onlineMeeting": { "joinUrl": "https://teams.microsoft.com/l/meetup-join/19%3acreated/0" },
+        "body": { "contentType": "html", "content": "<p>Kickoff</p>" },
+        "isCancelled": false
+    }))
+    .into_response()
+}
+
+async fn delete_event_handler(
+    State(st): State<Arc<MockGraphState>>,
+    Path(event_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
+        return resp;
+    }
+    st.deleted_event_ids.write().unwrap().push(event_id);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn rsvp_event_handler(
+    State(st): State<Arc<MockGraphState>>,
+    Path((event_id, action_name)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
+        return resp;
+    }
+    st.rsvp_calls
         .write()
         .unwrap()
-        .insert(share_url.clone(), body.to_vec());
+        .push((event_id, action_name, payload));
+    StatusCode::ACCEPTED.into_response()
+}
 
+async fn list_contacts_handler(
+    State(st): State<Arc<MockGraphState>>,
+    headers: HeaderMap,
+) -> Response {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
+        return resp;
+    }
     Json(json!({
-        "id": item_id,
-        "name": file_name,
-        "size": body.len(),
-        "eTag": "\"{153FA47D-18C9-4179-BE08-9879815A9F90},1\"",
-        "webUrl": share_url,
-        "webDavUrl": share_url
+        "value": [
+            {
+                "id": "contact-1",
+                "displayName": "Bob Reviewer",
+                "givenName": "Bob",
+                "surname": "Reviewer",
+                "emailAddresses": [{ "address": "bob@contoso.com", "name": "Bob Reviewer" }],
+                "mobilePhone": "+1-555-0100",
+                "businessPhones": [],
+                "companyName": "Contoso",
+                "jobTitle": "Staff Engineer",
+                "department": "Platform"
+            }
+        ]
     }))
     .into_response()
 }
 
-async fn create_link_handler(
-    State(state): State<Arc<MockState>>,
+async fn list_directory_users_handler(
+    State(st): State<Arc<MockGraphState>>,
     headers: HeaderMap,
-    Path(_item_id): Path<String>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
-    let shared_url = "https://contoso.sharepoint.com/:t:/s/chat/Eabc123";
-    // Copy the uploaded chat file bytes under the created sharing link too
-    if let Some(bytes) = state.uploaded_files.read().unwrap().get("drive-item-chat-1").cloned() {
-        state
-            .share_contents
-            .write()
-            .unwrap()
-            .insert(shared_url.to_string(), bytes);
-    }
     Json(json!({
-        "link": { "webUrl": shared_url },
-        "webUrl": shared_url
+        "value": [
+            {
+                "id": "dir-bob-dup",
+                "displayName": "Bob Reviewer",
+                "mail": "bob@contoso.com",
+                "userPrincipalName": "bob@contoso.com",
+                "jobTitle": "Staff Engineer",
+                "department": "Platform"
+            },
+            {
+                "id": "dir-carol",
+                "displayName": "Carol Organizer",
+                "mail": "carol@contoso.com",
+                "userPrincipalName": "carol@contoso.com",
+                "jobTitle": "Product Manager",
+                "department": "Outlook"
+            }
+        ]
     }))
     .into_response()
 }
 
-async fn channel_files_folder_handler(
-    State(state): State<Arc<MockState>>,
+async fn list_todo_lists_handler(
+    State(st): State<Arc<MockGraphState>>,
     headers: HeaderMap,
-    Path((_team_id, _channel_id)): Path<(String, String)>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     Json(json!({
-        "id": "folder-deploy-1",
-        "name": "Deployments",
-        "parentReference": {
-            "driveId": "drive-sp-dev"
-        }
+        "value": [
+            {
+                "id": "todo-list-default",
+                "displayName": "Tasks",
+                "wellknownListName": "defaultList",
+                "isOwner": true,
+                "isShared": false
+            }
+        ]
     }))
     .into_response()
 }
 
-async fn sp_drive_upload_handler(
-    State(state): State<Arc<MockState>>,
+async fn list_todo_tasks_handler(
+    State(st): State<Arc<MockGraphState>>,
     headers: HeaderMap,
-    Path((drive_id, rest)): Path<(String, String)>,
-    body: Bytes,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
-    let file_name = rest
-        .trim_end_matches(":/content")
-        .rsplit('/')
-        .next()
-        .unwrap_or("channel_file.bin")
+    Json(json!({
+        "value": [
+            {
+                "id": "task-existing-1",
+                "title": "Review Q4 RFC",
+                "status": "notStarted",
+                "importance": "high",
+                "body": { "contentType": "text", "content": "Check latency numbers" },
+                "dueDateTime": { "dateTime": "2026-11-25T17:00:00Z", "timeZone": "UTC" },
+                "createdDateTime": "2026-11-18T08:00:00Z",
+                "lastModifiedDateTime": "2026-11-18T08:00:00Z"
+            }
+        ]
+    }))
+    .into_response()
+}
+
+async fn create_todo_task_handler(
+    State(st): State<Arc<MockGraphState>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
+        return resp;
+    }
+    st.created_todo_tasks.write().unwrap().push(payload.clone());
+    Json(json!({
+        "id": "task-created-1",
+        "title": payload["title"],
+        "status": "notStarted",
+        "importance": payload.get("importance").and_then(Value::as_str).unwrap_or("normal"),
+        "body": payload.get("body").cloned().unwrap_or_else(|| json!({ "contentType": "text", "content": "" })),
+        "dueDateTime": payload.get("dueDateTime").cloned().unwrap_or(Value::Null),
+        "createdDateTime": "2026-11-18T12:00:00Z",
+        "lastModifiedDateTime": "2026-11-18T12:00:00Z"
+    }))
+    .into_response()
+}
+
+async fn patch_todo_task_handler(
+    State(st): State<Arc<MockGraphState>>,
+    Path((list_id, task_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
+        return resp;
+    }
+    let status = payload["status"]
+        .as_str()
+        .unwrap_or("notStarted")
         .to_string();
-    let item_id = format!("sp-item-{drive_id}-1");
-    let web_url = format!("https://contoso.sharepoint.com/sites/dev/Shared%20Documents/{file_name}");
-
-    state
-        .uploaded_files
+    st.patched_todo_tasks
         .write()
         .unwrap()
-        .insert(item_id.clone(), body.to_vec());
-    state
-        .share_contents
-        .write()
-        .unwrap()
-        .insert(web_url.clone(), body.to_vec());
-
+        .push((list_id, task_id.clone(), payload));
     Json(json!({
-        "id": item_id,
-        "name": file_name,
-        "size": body.len(),
-        "eTag": "\"{223FA47D-18C9-4179-BE08-9879815A9F91},1\"",
-        "webUrl": web_url,
-        "webDavUrl": web_url
+        "id": task_id,
+        "title": "Ship Outlook v0.1.0",
+        "status": status,
+        "importance": "high"
     }))
     .into_response()
 }
 
-async fn download_share_content_handler(
-    State(state): State<Arc<MockState>>,
+async fn delete_todo_task_handler(
+    State(st): State<Arc<MockGraphState>>,
+    Path((list_id, task_id)): Path<(String, String)>,
     headers: HeaderMap,
-    Path(share_token): Path<String>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    let expected = st.expected_token.read().unwrap().clone();
+    if let Err(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
-    let Some(encoded) = share_token.strip_prefix("u!") else {
-        return (StatusCode::BAD_REQUEST, "missing u! prefix").into_response();
-    };
-    let Ok(decoded_bytes) = URL_SAFE_NO_PAD.decode(encoded) else {
-        return (StatusCode::BAD_REQUEST, "bad share token").into_response();
-    };
-    let Ok(decoded_url) = String::from_utf8(decoded_bytes) else {
-        return (StatusCode::BAD_REQUEST, "non-utf8 share url").into_response();
-    };
-
-    let guard = state.share_contents.read().unwrap();
-    match guard.get(&decoded_url) {
-        Some(bytes) => (StatusCode::OK, bytes.clone()).into_response(),
-        None => (StatusCode::NOT_FOUND, format!("unknown share: {decoded_url}")).into_response(),
-    }
+    st.deleted_todo_tasks
+        .write()
+        .unwrap()
+        .push((list_id, task_id));
+    StatusCode::NO_CONTENT.into_response()
 }
 
-async fn spawn_mock_graph_server(initial_token: &str) -> (String, Arc<MockState>) {
-    let state = Arc::new(MockState::new(initial_token));
+async fn spawn_mock_graph_server(
+    initial_expected_token: &str,
+) -> (String, Arc<MockGraphState>, tokio::task::JoinHandle<()>) {
+    let png_bytes = make_test_png_bytes(16, 16);
+    let png_b64 = B64_STANDARD.encode(&png_bytes);
+    let state = Arc::new(MockGraphState {
+        expected_token: RwLock::new(initial_expected_token.to_string()),
+        inline_png_b64: RwLock::new(png_b64),
+        inline_png_bytes: RwLock::new(png_bytes),
+        ..Default::default()
+    });
+
     let app = Router::new()
         .route("/{tenant}/oauth2/v2.0/token", post(oauth_token_handler))
         .route("/v1.0/me", get(get_me_handler))
-        .route("/v1.0/me/chats", get(list_chats_handler))
+        .route("/v1.0/me/mailFolders", get(list_mail_folders_handler))
         .route(
-            "/v1.0/chats/{chat_id}/messages",
-            get(list_chat_messages_handler).post(post_chat_message_handler),
-        )
-        .route("/v1.0/me/joinedTeams", get(joined_teams_handler))
-        .route("/v1.0/$batch", post(batch_handler))
-        .route(
-            "/v1.0/teams/{team_id}/channels/{channel_id}/messages",
-            get(list_channel_messages_handler).post(post_channel_message_handler),
+            "/v1.0/me/mailFolders/{folder_id}/messages",
+            get(list_folder_messages_handler),
         )
         .route(
-            "/v1.0/teams/{team_id}/channels/{channel_id}/messages/{root_id}",
-            get(get_channel_root_handler),
+            "/v1.0/me/mailFolders/{folder_id}/messages/delta",
+            get(delta_folder_messages_handler),
+        )
+        .route("/v1.0/me/messages", get(list_all_messages_handler))
+        .route(
+            "/v1.0/me/messages/{msg_id}",
+            get(get_message_handler).patch(patch_message_handler),
         )
         .route(
-            "/v1.0/teams/{team_id}/channels/{channel_id}/messages/{root_id}/replies",
-            get(list_channel_replies_handler).post(post_channel_reply_handler),
-        )
-        .route("/v1.0/me/drive/root:/{*rest}", put(chat_drive_upload_handler))
-        .route("/v1.0/me/drive/items/{item_id}/createLink", post(create_link_handler))
-        .route(
-            "/v1.0/teams/{team_id}/channels/{channel_id}/filesFolder",
-            get(channel_files_folder_handler),
+            "/v1.0/me/messages/{msg_id}/attachments",
+            get(list_message_attachments_handler),
         )
         .route(
-            "/v1.0/drives/{drive_id}/items/{*rest}",
-            put(sp_drive_upload_handler),
+            "/v1.0/me/messages/{msg_id}/attachments/{att_id}",
+            get(get_attachment_meta_handler),
         )
         .route(
-            "/v1.0/shares/{share_token}/driveItem/content",
-            get(download_share_content_handler),
+            "/v1.0/me/messages/{msg_id}/attachments/{att_id}/$value",
+            get(get_attachment_value_handler),
+        )
+        .route("/v1.0/me/sendMail", post(send_mail_handler))
+        .route("/v1.0/me/messages/{msg_id}/reply", post(reply_mail_handler))
+        .route("/v1.0/me/messages/{msg_id}/forward", post(forward_mail_handler))
+        .route("/v1.0/me/messages/{msg_id}/move", post(move_mail_handler))
+        .route("/v1.0/me/calendarView", get(calendar_view_handler))
+        .route("/v1.0/me/events", post(create_event_handler))
+        .route(
+            "/v1.0/me/events/{event_id}",
+            axum::routing::delete(delete_event_handler),
+        )
+        .route(
+            "/v1.0/me/events/{event_id}/{action_name}",
+            post(rsvp_event_handler),
+        )
+        .route("/v1.0/me/contacts", get(list_contacts_handler))
+        .route("/v1.0/users", get(list_directory_users_handler))
+        .route("/v1.0/me/todo/lists", get(list_todo_lists_handler))
+        .route(
+            "/v1.0/me/todo/lists/{list_id}/tasks",
+            get(list_todo_tasks_handler).post(create_todo_task_handler),
+        )
+        .route(
+            "/v1.0/me/todo/lists/{list_id}/tasks/{task_id}",
+            patch(patch_todo_task_handler).delete(delete_todo_task_handler),
         )
         .with_state(state.clone());
 
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock Graph server");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve mock Graph");
-    });
+    let base_url = format!("http://{addr}");
+    *state.base_url.write().unwrap() = base_url.clone();
 
-    (format!("http://{addr}"), state)
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (base_url, state, handle)
 }
 
-fn build_test_config(base_url: &str, download_dir: &std::path::Path) -> AppConfig {
-    AppConfig {
-        client_id: "test-client-id".to_string(),
-        tenant_id: "test-tenant".to_string(),
-        graph_base_url: format!("{base_url}/v1.0"),
-        auth_base_url: base_url.to_string(),
-        download_dir: download_dir.to_string_lossy().to_string(),
-        ..AppConfig::default()
-    }
+fn test_config_for_server(base_url: &str) -> AppConfig {
+    let mut cfg = AppConfig::default();
+    cfg.client_id = "e2e-client-id".to_string();
+    cfg.tenant_id = "tenant-e2e".to_string();
+    cfg.auth_base_url = base_url.to_string();
+    cfg.graph_base_url = format!("{base_url}/v1.0");
+    cfg.share_m365_auth = true;
+    cfg
 }
 
 #[tokio::test]
-async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
+async fn e2e_mock_graph_auth_shared_m365_mail_delta_and_cid_sixel_preview() {
     ensure_isolated_env();
-    let temp = tempfile::tempdir().expect("create test tempdir");
-    let db_path = temp.path().join("data").join("cache.db");
-    let download_dir = temp.path().join("downloads");
+    let (base_url, state, server) = spawn_mock_graph_server("refreshed-outlook-tok-1").await;
+    let cfg = test_config_for_server(&base_url);
 
-    let (base_url, mock) = spawn_mock_graph_server("fresh-access-tok-2026").await;
-    let cfg = build_test_config(&base_url, &download_dir);
-
-    // -----------------------------------------------------------------------
-    // 1. Token auto-refresh: expired StoredTokens refreshes before calling /me
-    // -----------------------------------------------------------------------
-    let expired_tokens = StoredTokens {
-        access_token: "expired-access-tok".to_string(),
-        refresh_token: Some("stale-refresh-tok".to_string()),
-        expires_at: chrono::Utc::now().timestamp() - 3600,
+    // 1. Expired StoredTokens auto-refreshes via OAuth /token before /me
+    let dir = tempfile::tempdir().unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let expired = StoredTokens {
+        access_token: "expired-tok-0".into(),
+        refresh_token: Some("rt-initial".into()),
+        expires_at: now - 300,
         client_id: cfg.client_id.clone(),
         tenant_id: cfg.tenant_id.clone(),
-        user_id: None,
-        user_display_name: None,
-        user_email: None,
-        auth_mode: "pkce".to_string(),
+        user_id: Some("user-e2e-1".into()),
+        user_display_name: Some("Alice Outlook".into()),
+        user_email: Some("alice@contoso.com".into()),
+        auth_mode: "pkce".into(),
     };
-    let auth = AuthManager::from_tokens(cfg.clone(), expired_tokens);
-    let graph = GraphClient::new(cfg.clone(), auth.clone())
-        .expect("build GraphClient")
-        .with_my_user_id("me-user-1");
+    let auth = AuthManager::from_tokens(cfg.clone(), expired);
+    let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
 
     let me = graph.get_me().await.expect("get_me after auto-refresh");
-    assert_eq!(me.id, "me-user-1");
-    assert_eq!(me.display_name, "Me (Tester)");
-    assert_eq!(*mock.refresh_calls.read().unwrap(), 1);
+    assert_eq!(me.id, "user-e2e-1");
+    assert_eq!(me.email.as_deref(), Some("alice@contoso.com"));
+    assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
-        mock.me_auth_headers.read().unwrap().as_slice(),
-        &["Bearer fresh-access-tok-2026".to_string()]
-    );
-    let refreshed_state = auth.current_tokens().await.expect("tokens present");
-    assert_eq!(refreshed_state.access_token, "fresh-access-tok-2026");
-    assert_eq!(
-        refreshed_state.refresh_token.as_deref(),
-        Some("rotated-refresh-tok")
+        state.me_auth_headers.read().unwrap().as_slice(),
+        &["Bearer refreshed-outlook-tok-1".to_string()]
     );
 
-    // -----------------------------------------------------------------------
-    // 2. 1:1 & Group Chats + Markdown/@mention send + SQLite FTS5 Korean/EN search
-    // -----------------------------------------------------------------------
-    let storage = Storage::open(&db_path).expect("open SQLite storage");
-    let chats = graph.list_chats(50).await.expect("list_chats");
-    assert_eq!(chats.len(), 2);
-    storage.upsert_conversations(&chats).expect("upsert chats");
+    // 2. share_m365_auth shared token_file & shared session bootstrap
+    {
+        let prev_outlook_cfg = std::env::var_os("OUTLOOK_CONFIG_DIR");
+        let prev_teams_cfg = std::env::var_os("TEAMS_CONFIG_DIR");
+        let outlook_shared_dir = dir.path().join("outlook-shared");
+        let teams_dir = dir.path().join("teams-cli");
+        std::fs::create_dir_all(&outlook_shared_dir).unwrap();
+        std::fs::create_dir_all(&teams_dir).unwrap();
+        std::env::set_var("OUTLOOK_CONFIG_DIR", &outlook_shared_dir);
+        std::env::set_var("TEAMS_CONFIG_DIR", &teams_dir);
 
-    let one_on_one = chats
-        .iter()
-        .find(|c| c.conv_key == "chat:19:oneonone-peer@unq.gbl.spaces")
-        .expect("1:1 chat present");
-    assert_eq!(one_on_one.title, "Alice");
-    assert_eq!(one_on_one.peer_user_id.as_deref(), Some("peer-kim"));
+        let shared_tok_file = dir.path().join("shared_token.txt");
+        std::fs::write(
+            teams_dir.join("config.toml"),
+            format!(
+                "token_file = \"{}\"\n",
+                shared_tok_file.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
 
-    let group_chat = chats
-        .iter()
-        .find(|c| c.conv_key == "chat:19:group-sprint@thread.v2")
-        .expect("group chat present");
-    assert_eq!(group_chat.title, "Backend Sprint");
+        // 2a. Teams-only token is rejected
+        let teams_only_jwt = make_test_jwt(&json!({
+            "exp": now + 3600,
+            "scp": "User.Read Chat.ReadWrite"
+        }));
+        std::fs::write(&shared_tok_file, &teams_only_jwt).unwrap();
+        let auth_skip = AuthManager::new(cfg.clone()).unwrap();
+        assert!(auth_skip.valid_access_token().await.is_err());
 
-    let outgoing_chat_msg = parser::compile_outgoing_markdown(
-        "Hello @Alice! Staging **Kubernetes** 롤아웃 completed.",
-        None,
-        vec![MentionInfo {
-            id: 0,
-            user_id: "peer-kim".to_string(),
-            display_name: "Alice".to_string(),
-        }],
-        vec![],
-        vec![],
-        None,
-    );
-    assert!(outgoing_chat_msg.body_html.contains("<at id=\"0\">Alice</at>"));
-    assert!(outgoing_chat_msg
-        .body_html
-        .contains("<strong>Kubernetes</strong>"));
+        // 2b. Outlook-scoped shared token_file is reused
+        let outlook_shared_jwt = make_test_jwt(&json!({
+            "exp": now + 3600,
+            "scp": "User.Read Mail.ReadWrite Calendars.Read"
+        }));
+        std::fs::write(&shared_tok_file, &outlook_shared_jwt).unwrap();
+        *state.expected_token.write().unwrap() = outlook_shared_jwt.clone();
+        let auth_file = AuthManager::new(cfg.clone()).unwrap();
+        assert_eq!(
+            auth_file.current_tokens().await.unwrap().auth_mode,
+            "shared_teams_token_file"
+        );
+        let graph_shared_file = GraphClient::new(cfg.clone(), auth_file).unwrap();
+        assert_eq!(graph_shared_file.get_me().await.unwrap().id, "user-e2e-1");
 
-    let sent_chat = graph
-        .send_message(&one_on_one.target, &outgoing_chat_msg)
-        .await
-        .expect("send chat message");
-    assert!(sent_chat.is_me);
+        // 2c. Shared teams-cli session with Chat.Read + refresh_token silently upgrades
+        std::fs::remove_file(&shared_tok_file).unwrap();
+        std::fs::remove_file(teams_dir.join("config.toml")).unwrap();
+        let teams_session_tok = StoredTokens {
+            access_token: make_test_jwt(&json!({
+                "exp": now + 3600,
+                "scp": "User.Read Chat.Read"
+            })),
+            refresh_token: Some("rt-teams-shared".into()),
+            expires_at: now + 3600,
+            client_id: cfg.client_id.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            user_id: Some("user-e2e-1".into()),
+            user_display_name: Some("Alice Outlook".into()),
+            user_email: Some("alice@contoso.com".into()),
+            auth_mode: "pkce".into(),
+        };
+        let teams_creds_json = serde_json::to_vec_pretty(&teams_session_tok).unwrap();
+        std::fs::write(teams_dir.join("credentials.json"), teams_creds_json).unwrap();
+        let upgraded_jwt = make_test_jwt(&json!({
+            "exp": now + 3600,
+            "scp": "User.Read Mail.ReadWrite Mail.Send Calendars.ReadWrite Contacts.Read Tasks.ReadWrite"
+        }));
+        *state.refreshed_token_to_issue.write().unwrap() = upgraded_jwt.clone();
 
-    let fetched_chat_msgs = graph
-        .list_chat_messages("19:oneonone-peer@unq.gbl.spaces", 20)
-        .await
-        .expect("list_chat_messages");
-    assert_eq!(fetched_chat_msgs.len(), 1);
-    storage
-        .upsert_messages(&fetched_chat_msgs)
-        .expect("upsert chat messages");
+        let auth_upgrade = AuthManager::new(cfg.clone()).unwrap();
+        let tok = auth_upgrade.valid_access_token().await.unwrap();
+        assert_eq!(tok, upgraded_jwt);
+        assert_eq!(
+            auth_upgrade.current_tokens().await.unwrap().auth_mode,
+            "shared_teams_session"
+        );
+        let graph_upgraded = GraphClient::new(cfg.clone(), auth_upgrade).unwrap();
+        assert_eq!(graph_upgraded.get_me().await.unwrap().id, "user-e2e-1");
 
-    let ko_hits = storage
-        .search_messages("롤아웃", None, 10)
-        .expect("search Korean");
-    assert_eq!(ko_hits.len(), 1);
-    assert_eq!(ko_hits[0].conv_key, one_on_one.conv_key);
-    assert!(ko_hits[0].snippet.contains("롤아웃"));
-
-    let en_hits = storage
-        .search_messages("Kubernetes", Some(&one_on_one.conv_key), 10)
-        .expect("search English");
-    assert_eq!(en_hits.len(), 1);
-    assert_eq!(en_hits[0].msg_id, sent_chat.msg_id);
-
-    // -----------------------------------------------------------------------
-    // 3. Team -> Channel -> Thread: resolve "Engineering/Deployments", post with subject,
-    //    reply in thread, fetch get_thread, verify reply_count in Storage
-    // -----------------------------------------------------------------------
-    let teams: Vec<TeamSummary> = graph
-        .list_joined_teams_with_channels()
-        .await
-        .expect("list_joined_teams_with_channels");
-    assert_eq!(teams.len(), 1);
-    assert_eq!(teams[0].display_name, "Engineering");
-    assert_eq!(teams[0].channels.len(), 2);
-    storage.upsert_teams(&teams).expect("upsert teams");
-
-    let all_convs = storage.list_conversations().expect("list_conversations");
-    let deploy_chan =
-        resolver::resolve_from_slice(&all_convs, "Engineering/Deployments").expect("resolve channel");
-    assert_eq!(
-        deploy_chan.target,
-        ConversationTarget::Channel {
-            team_id: "team-dev".to_string(),
-            channel_id: "chan-deploy".to_string(),
+        match prev_outlook_cfg {
+            Some(v) => std::env::set_var("OUTLOOK_CONFIG_DIR", v),
+            None => std::env::remove_var("OUTLOOK_CONFIG_DIR"),
         }
-    );
+        match prev_teams_cfg {
+            Some(v) => std::env::set_var("TEAMS_CONFIG_DIR", v),
+            None => std::env::remove_var("TEAMS_CONFIG_DIR"),
+        }
+    }
 
-    let chan_post = parser::compile_outgoing_markdown(
-        "Starting production v2.4.0 deployment.",
-        Some("v2.4.0 Release Notice".to_string()),
-        vec![],
-        vec![],
-        vec![],
-        None,
-    );
-    let root_msg = graph
-        .send_message(&deploy_chan.target, &chan_post)
-        .await
-        .expect("send channel root post");
-    assert_eq!(root_msg.subject.as_deref(), Some("v2.4.0 Release Notice"));
+    // Restore expected token to the first AuthManager's refreshed token for remaining mail ops
+    let active_tok = auth.valid_access_token().await.unwrap();
+    *state.expected_token.write().unwrap() = active_tok;
 
-    let chan_reply = parser::compile_outgoing_markdown(
-        "Canary health check passed.",
-        None,
-        vec![],
-        vec![],
-        vec![],
-        None,
-    );
-    let reply_msg = graph
-        .reply_message(&deploy_chan.target, &root_msg.msg_id, &chan_reply)
+    // 3. list_mail_folders + Header-first list_mail_messages + SQLite persistence
+    let db_path = dir.path().join("cache.db");
+    let storage = Storage::open(&db_path).expect("open sqlite storage");
+
+    let folders = graph.list_mail_folders().await.expect("list_mail_folders");
+    assert_eq!(folders.len(), 4);
+    assert!(folders.iter().any(|f| f.well_known_name.as_deref() == Some("inbox")));
+    assert!(folders.iter().any(|f| f.well_known_name.as_deref() == Some("archive")));
+    storage.upsert_mail_folders(&folders).unwrap();
+
+    let header_msgs = graph
+        .list_mail_messages("inbox", 20, true)
         .await
-        .expect("reply to channel thread");
+        .expect("header-first list_mail_messages");
+    assert_eq!(header_msgs.len(), 2);
+    assert!(header_msgs.iter().all(|m| !m.body_loaded));
+    let last_list_q = state.list_queries.read().unwrap().last().unwrap().clone();
+    assert!(
+        last_list_q.contains("$select=") && !last_list_q.contains(",body,"),
+        "header-first select must omit full body: {last_list_q}"
+    );
+    storage.upsert_mail_messages(&header_msgs).unwrap();
+
+    // 4. Full message hydration + HTML table / <style> noise / QuotedHistory / cid: inline image
+    let hydrated = graph
+        .get_mail_message("msg-html-cid")
+        .await
+        .expect("get_mail_message");
+    assert!(hydrated.body_loaded);
+    assert_eq!(hydrated.attachments.len(), 1);
+    assert!(hydrated.attachments[0].is_inline);
     assert_eq!(
-        reply_msg.parent_msg_id.as_deref(),
-        Some(root_msg.msg_id.as_str())
+        hydrated.attachments[0].content_id.as_deref(),
+        Some("chart01@contoso")
+    );
+    assert!(hydrated.attachments[0].content_bytes_b64.is_some());
+    storage.upsert_mail_messages(&[hydrated.clone()]).unwrap();
+
+    let blocks = parser::html_in::parse_message_blocks(
+        &hydrated.body_html,
+        &hydrated.attachments,
+    );
+    let plain = parser::html_in::blocks_to_plain(&blocks);
+    assert!(!plain.contains("secret-noise"));
+    assert!(!plain.contains("#ff0000"));
+    assert!(blocks.iter().any(|b| matches!(b, RichBlock::Table { .. })));
+    assert!(blocks.iter().any(|b| matches!(
+        b,
+        RichBlock::InlineImageChip {
+            content_id: Some(cid),
+            ..
+        } if cid == "chart01@contoso"
+    )));
+    assert!(blocks
+        .iter()
+        .any(|b| matches!(b, RichBlock::QuotedHistory { .. })));
+
+    // 5. delta_mail_messages cursor persistence without overwriting hydrated body_loaded == true bodies
+    let (d1_msgs, d1_removed, d1_link) = graph
+        .delta_mail_messages("inbox", None, 50)
+        .await
+        .expect("initial delta");
+    assert_eq!(d1_msgs.len(), 2);
+    assert!(d1_removed.is_empty());
+    let d1_link = d1_link.expect("initial deltaLink");
+    assert!(d1_link.contains("deltatoken=d1"));
+    storage.upsert_mail_messages(&d1_msgs).unwrap();
+    storage
+        .upsert_sync_cursor(&SyncCursor {
+            scope_key: "mail:inbox".into(),
+            delta_link: Some(d1_link.clone()),
+            history_next_link: None,
+            last_synced_at: "2026-11-18T10:05:00Z".into(),
+        })
+        .unwrap();
+
+    let (d2_msgs, d2_removed, d2_link) = graph
+        .delta_mail_messages("inbox", Some(&d1_link), 50)
+        .await
+        .expect("incremental delta");
+    assert_eq!(d2_msgs.len(), 2);
+    assert_eq!(d2_removed, vec!["msg-to-remove".to_string()]);
+    let d2_link = d2_link.expect("incremental deltaLink");
+    assert!(d2_link.contains("deltatoken=d2"));
+    storage.upsert_mail_messages(&d2_msgs).unwrap();
+    storage.delete_mail_messages_by_ids(&d2_removed).unwrap();
+    storage
+        .upsert_sync_cursor(&SyncCursor {
+            scope_key: "mail:inbox".into(),
+            delta_link: Some(d2_link.clone()),
+            history_next_link: None,
+            last_synced_at: "2026-11-18T10:06:00Z".into(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        storage
+            .get_sync_cursor("mail:inbox")
+            .unwrap()
+            .unwrap()
+            .delta_link
+            .as_deref(),
+        Some(d2_link.as_str())
+    );
+    let stored_hydrated = storage
+        .get_mail_message("msg-html-cid")
+        .unwrap()
+        .expect("hydrated message remains in storage");
+    assert!(stored_hydrated.body_loaded);
+    assert!(stored_hydrated.is_read, "header delta must update is_read");
+    assert!(
+        stored_hydrated.body_html.contains("cid:chart01@contoso"),
+        "delta header must not clobber hydrated body_html"
+    );
+    assert!(
+        stored_hydrated.attachments[0].content_bytes_b64.is_some(),
+        "delta header must not clobber expanded attachments"
+    );
+    assert!(storage.get_mail_message("msg-to-remove").unwrap().is_none());
+
+    // 6. img_preview Halfblock, Kitty, iTerm2 & pure-Rust Sixel from fetched cid: bytes + zero-network ImagePreviewOverlay
+    let fetch_before = state.attachment_fetch_calls.load(Ordering::SeqCst);
+    let (_att_name, att_ct, fetched_png) = graph
+        .fetch_mail_attachment_bytes("msg-html-cid", "cid:chart01@contoso")
+        .await
+        .expect("fetch cid attachment bytes");
+    assert_eq!(att_ct, "image/png");
+    assert_eq!(fetched_png, *state.inline_png_bytes.read().unwrap());
+    assert!(state.attachment_fetch_calls.load(Ordering::SeqCst) > fetch_before);
+
+    let halfblock = img_preview::render_ansi_stdout_with_pref(
+        &fetched_png,
+        24,
+        8,
+        ImageProtocolPreference::Halfblock,
+    )
+    .expect("halfblock render");
+    assert!(halfblock.contains("\x1b[38;2;") || halfblock.contains('▀'));
+
+    let kitty = img_preview::render_ansi_stdout_with_pref(
+        &fetched_png,
+        24,
+        8,
+        ImageProtocolPreference::Kitty,
+    )
+    .expect("kitty render");
+    assert!(kitty.starts_with("\x1b_G") && kitty.trim_end().ends_with("\x1b\\"));
+
+    let iterm2 = img_preview::render_ansi_stdout_with_pref(
+        &fetched_png,
+        24,
+        8,
+        ImageProtocolPreference::Iterm2,
+    )
+    .expect("iterm2 render");
+    assert!(iterm2.starts_with("\x1b]1337;File="));
+
+    let sixel = img_preview::render_ansi_stdout_with_pref(
+        &fetched_png,
+        24,
+        8,
+        ImageProtocolPreference::Sixel,
+    )
+    .expect("sixel render");
+    assert!(
+        sixel.contains("\x1bP0;1;q") && sixel.trim_end().ends_with("\x1b\\"),
+        "expected Sixel DCS payload, got: {:?}",
+        &sixel[..sixel.len().min(64)]
     );
 
-    let thread = graph
-        .get_thread("team-dev", "chan-deploy", &root_msg.msg_id, 50)
-        .await
-        .expect("get_thread");
-    assert_eq!(thread.root.msg_id, root_msg.msg_id);
-    assert_eq!(thread.replies.len(), 1);
-    assert_eq!(thread.root.reply_count, 1);
+    // Verify ImagePreviewOverlay uses preloaded content_bytes_b64 with ZERO redundant Graph attachment fetches
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let sync_ctl = sync::spawn_sync_engine(cfg.clone(), graph.clone(), storage.clone(), event_tx);
+    let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut ui_app = UiAppState::new(cfg.clone(), auth.clone(), graph.clone(), storage.clone(), sync_ctl, ui_tx);
+    ui_app.mail_messages = vec![stored_hydrated.clone()];
+    ui_app.active_mail_id = Some(stored_hydrated.id.clone());
+    let mut ui_state = UiState::from_config(&cfg);
+    ui_state.term_width = 100;
+    ui_state.term_height = 30;
 
-    let mut thread_bundle = vec![thread.root.clone()];
-    thread_bundle.extend(thread.replies.iter().cloned());
-    storage
-        .upsert_messages(&thread_bundle)
-        .expect("persist thread in storage");
-
-    let stored_root = storage
-        .get_message(&deploy_chan.conv_key, &root_msg.msg_id)
-        .expect("get stored root")
-        .expect("root exists in storage");
-    assert_eq!(stored_root.reply_count, 1);
-
-    let stored_thread = storage
-        .get_thread(&deploy_chan.conv_key, &root_msg.msg_id, 50)
-        .expect("get_thread from storage")
-        .expect("thread exists in storage");
-    assert_eq!(stored_thread.replies.len(), 1);
-
-    // -----------------------------------------------------------------------
-    // 4. File Attachments: Chat send_file, Channel Thread send_file, download_attachment
-    // -----------------------------------------------------------------------
-    let chat_file_path = temp.path().join("chat-spec.txt");
-    let chat_file_bytes = b"Teams Chat Upload Payload \xed\x95\x9c\xea\xb8\x80";
-    std::fs::write(&chat_file_path, chat_file_bytes).expect("write chat test file");
-
-    let sent_chat_file = graph
-        .send_file(&one_on_one.target, &chat_file_path, Some("<p>Chat attachment</p>"), None)
-        .await
-        .expect("send_file to chat");
-    assert_eq!(sent_chat_file.attachments.len(), 1);
-    assert_eq!(sent_chat_file.attachments[0].content_type, "reference");
-    assert!(sent_chat_file
-        .body_html
-        .contains("<attachment id=\"153fa47d-18c9-4179-be08-9879815a9f90\"></attachment>"));
-
-    // Verify wire payload posted to POST /chats/{id}/messages
-    let chat_wire = mock
-        .posted_chat_payloads
-        .read()
-        .unwrap()
-        .last()
-        .cloned()
-        .expect("posted chat payload");
-    let wire_body = chat_wire["body"]["content"].as_str().unwrap_or("");
-    assert!(wire_body.contains("<attachment id=\"153fa47d-18c9-4179-be08-9879815a9f90\">"));
-    assert_eq!(chat_wire["attachments"][0]["contentType"], "reference");
-
-    // Channel Thread send_file
-    let chan_file_path = temp.path().join("release-notes.md");
-    let chan_file_bytes = b"# Release v2.4.0\nAll checks passed.\n";
-    std::fs::write(&chan_file_path, chan_file_bytes).expect("write channel test file");
-
-    let sent_chan_file = graph
-        .send_file(
-            &deploy_chan.target,
-            &chan_file_path,
-            Some("<p>Release notes attached</p>"),
-            Some(&root_msg.msg_id),
+    let calls_before_overlay = state.attachment_fetch_calls.load(Ordering::SeqCst);
+    let _ = action::dispatch(Action::OpenImagePreview, &mut ui_app, &mut ui_state);
+    assert!(matches!(
+        ui_state.overlays.last(),
+        Some(Overlay::ImagePreview(_))
+    ));
+    let mut decoded_ok = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(msg)) = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            ui_rx.recv(),
         )
         .await
-        .expect("send_file to channel thread");
-    assert_eq!(sent_chan_file.attachments.len(), 1);
-    assert_eq!(sent_chan_file.attachments[0].content_type, "reference");
+        {
+            ui_app.handle_ui_msg(&mut ui_state, msg);
+            if let Some(Overlay::ImagePreview(ref ov)) = ui_state.overlays.last() {
+                if let Some(cur) = ov.current() {
+                    let (cols, rows) = ov.target_dimensions(ui_state.term_width, ui_state.term_height);
+                    let key = UiAppState::preview_image_cache_key(
+                        cur.owner_id(),
+                        cur.att_id(),
+                        cols,
+                        rows,
+                        ui_state.graphics_caps.protocol,
+                    );
+                    if ui_app.image_cache.contains_key(&key) {
+                        decoded_ok = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    assert!(decoded_ok, "ImagePreviewOverlay must decode inline cid image");
     assert_eq!(
-        sent_chan_file.parent_msg_id.as_deref(),
-        Some(root_msg.msg_id.as_str())
+        state.attachment_fetch_calls.load(Ordering::SeqCst),
+        calls_before_overlay,
+        "ImagePreviewOverlay must NOT make redundant network call when content_bytes_b64 is present"
     );
-    let reply_wire = mock
-        .posted_reply_payloads
-        .read()
-        .unwrap()
-        .last()
-        .cloned()
-        .expect("posted reply payload");
-    assert_eq!(reply_wire["attachments"][0]["contentType"], "reference");
-    assert!(reply_wire["body"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .contains("<attachment id=\"223fa47d-18c9-4179-be08-9879815a9f91\">"));
+    ui_state.close_overlays_of(OverlayKind::ImagePreview);
+    assert!(ImagePreviewOverlay::from_mail_message(&stored_hydrated, None).is_some());
 
-    // download_attachment via /shares/u!.../driveItem/content
-    let chat_att: &AttachmentInfo = &sent_chat_file.attachments[0];
-    let downloaded = graph
-        .download_attachment(chat_att, &download_dir)
+    // 7. send_mail (inline_images cid:), reply_mail, forward_mail, set_mail_read, set_mail_flag, move_mail_message("archive"), FTS5 search_mail
+    graph
+        .send_mail(&OutgoingMail {
+            subject: "Inline Logo Report".into(),
+            body_html: "<p>Logo: <img src=\"cid:logo@contoso\"></p>".into(),
+            to: vec!["carol@contoso.com".into()],
+            inline_images: vec![InlineImageUpload {
+                temp_id: "tmp-1".into(),
+                content_id: "logo@contoso".into(),
+                file_name: "logo.png".into(),
+                content_type: "image/png".into(),
+                bytes: fetched_png.clone(),
+            }],
+            save_to_sent_items: true,
+            ..Default::default()
+        })
         .await
-        .expect("download_attachment");
-    assert!(downloaded.path.exists());
+        .expect("send_mail with inline cid");
+    let sent = state.sent_mail_payloads.read().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["message"]["attachments"][0]["isInline"], true);
     assert_eq!(
-        std::fs::read(&downloaded.path).expect("read downloaded file"),
-        chat_file_bytes
+        sent[0]["message"]["attachments"][0]["contentId"],
+        "logo@contoso"
+    );
+    drop(sent);
+
+    graph
+        .reply_mail("msg-html-cid", "<p>Thanks Bob!</p>", false)
+        .await
+        .expect("reply_mail");
+    assert_eq!(state.replied_ids.read().unwrap().len(), 1);
+
+    graph
+        .forward_mail("msg-html-cid", &["carol@contoso.com".into()], "<p>FYI</p>")
+        .await
+        .expect("forward_mail");
+    assert_eq!(state.forwarded_ids.read().unwrap().len(), 1);
+
+    graph.set_mail_read("msg-html-cid", false).await.unwrap();
+    storage.set_mail_read_local("msg-html-cid", false).unwrap();
+    graph.set_mail_flag("msg-html-cid", true).await.unwrap();
+    storage.set_mail_flagged_local("msg-html-cid", true).unwrap();
+
+    let moved = graph
+        .move_mail_message("msg-html-cid", "archive")
+        .await
+        .expect("move_mail_message archive");
+    assert_eq!(moved.folder_id.as_deref(), Some("folder-archive"));
+    storage
+        .move_mail_folder_local("msg-html-cid", "folder-archive")
+        .unwrap();
+    assert_eq!(
+        storage
+            .get_mail_message("msg-html-cid")
+            .unwrap()
+            .unwrap()
+            .folder_id
+            .as_deref(),
+        Some("folder-archive")
     );
 
-    // -----------------------------------------------------------------------
-    // 5. Agent Surfaces: mcp::handle_rpc_line & serve::build_router
-    // -----------------------------------------------------------------------
+    let fts_en = storage.search_mail("Latency", None, 10).unwrap();
+    assert!(fts_en.iter().any(|h| h.id == "msg-html-cid"));
+    let fts_ko = storage.search_mail("롤아웃", None, 10).unwrap();
+    assert!(fts_ko.iter().any(|h| h.id == "msg-delta-new"));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn e2e_mock_graph_calendar_rsvp_contacts_and_todo() {
+    ensure_isolated_env();
+    let (base_url, state, server) = spawn_mock_graph_server("cal-todo-tok-1").await;
+    let cfg = test_config_for_server(&base_url);
+    let dir = tempfile::tempdir().unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let tok = StoredTokens {
+        access_token: "cal-todo-tok-1".into(),
+        refresh_token: None,
+        expires_at: now + 3600,
+        client_id: cfg.client_id.clone(),
+        tenant_id: cfg.tenant_id.clone(),
+        user_id: Some("user-e2e-1".into()),
+        user_display_name: Some("Alice Outlook".into()),
+        user_email: Some("alice@contoso.com".into()),
+        auth_mode: "access_token".into(),
+    };
+    let auth = AuthManager::from_tokens(cfg.clone(), tok);
+    let graph = GraphClient::new(cfg, auth).unwrap();
+    let storage = Storage::open(&dir.path().join("cal_todo.db")).unwrap();
+
+    // 1. Calendar view, create, RSVP (accept, tentativelyAccept, decline), delete
+    let events: Vec<CalendarEvent> = graph
+        .list_calendar_view("2026-11-18T00:00:00Z", "2026-11-26T00:00:00Z", 20)
+        .await
+        .expect("list_calendar_view");
+    assert_eq!(events.len(), 1);
+    assert!(events[0].is_online_meeting);
+    assert!(events[0]
+        .online_meeting_url
+        .as_deref()
+        .unwrap()
+        .contains("teams.microsoft.com/l/meetup-join/"));
+    storage.upsert_calendar_events(&events).unwrap();
+
+    let created_ev = graph
+        .create_calendar_event(&OutgoingEvent {
+            subject: "Design Kickoff".into(),
+            start_iso: "2026-11-21T14:00:00Z".into(),
+            end_iso: "2026-11-21T15:00:00Z".into(),
+            time_zone: Some("UTC".into()),
+            is_all_day: false,
+            location: Some("Teams".into()),
+            body_html: Some("<p>Kickoff</p>".into()),
+            attendees: vec!["bob@contoso.com".into()],
+            is_online_meeting: true,
+        })
+        .await
+        .expect("create_calendar_event");
+    assert_eq!(created_ev.id, "evt-created-1");
+    assert_eq!(
+        state.created_events.read().unwrap()[0]["onlineMeetingProvider"],
+        "teamsForBusiness"
+    );
+
+    graph
+        .respond_calendar_event("evt-existing-1", EventRsvpAction::Accept, Some("See you there"))
+        .await
+        .unwrap();
+    storage
+        .update_event_response_local("evt-existing-1", "accepted")
+        .unwrap();
+    graph
+        .respond_calendar_event(
+            "evt-existing-1",
+            EventRsvpAction::TentativelyAccept,
+            Some("Might join late"),
+        )
+        .await
+        .unwrap();
+    graph
+        .respond_calendar_event("evt-existing-1", EventRsvpAction::Decline, None)
+        .await
+        .unwrap();
+    let rsvps = state.rsvp_calls.read().unwrap();
+    assert_eq!(rsvps[0].1, "accept");
+    assert_eq!(rsvps[1].1, "tentativelyAccept");
+    assert_eq!(rsvps[2].1, "decline");
+    drop(rsvps);
+
+    graph
+        .delete_calendar_event("evt-created-1")
+        .await
+        .expect("delete_calendar_event");
+    assert_eq!(
+        state.deleted_event_ids.read().unwrap().as_slice(),
+        &["evt-created-1".to_string()]
+    );
+
+    // 2. MeetingRequestInfo invite email parsing
+    let invite_msg: MailMessage = graph
+        .get_mail_message("msg-invite-1")
+        .await
+        .expect("get_mail_message invite");
+    let mr = invite_msg
+        .meeting_request
+        .expect("MeetingRequestInfo parsed");
+    assert_eq!(mr.meeting_message_type.as_deref(), Some("meetingRequest"));
+    assert_eq!(mr.event_id.as_deref(), Some("evt-invite-1"));
+    assert_eq!(mr.start_iso.as_deref(), Some("2026-11-20T15:00:00Z"));
+    assert_eq!(mr.end_iso.as_deref(), Some("2026-11-20T16:00:00Z"));
+    assert_eq!(mr.location.as_deref(), Some("Conf Room A"));
+    assert!(mr
+        .online_meeting_url
+        .as_deref()
+        .unwrap()
+        .contains("teams.microsoft.com/l/meetup-join/"));
+    assert_eq!(mr.response_status.as_deref(), Some("notResponded"));
+
+    // 3. Contacts & directory search (with email deduplication)
+    let contacts = graph.list_contacts(20).await.expect("list_contacts");
+    assert_eq!(contacts.len(), 1);
+    assert_eq!(contacts[0].source, "contact");
+
+    let merged_contacts = graph
+        .search_contacts_and_directory("contoso.com", 20)
+        .await
+        .expect("search_contacts_and_directory");
+    assert_eq!(merged_contacts.len(), 2, "bob@contoso.com should be deduplicated");
+    assert!(merged_contacts.iter().any(|c| c.display_name == "Bob Reviewer" && c.source == "contact"));
+    assert!(merged_contacts.iter().any(|c| c.display_name == "Carol Organizer" && c.source == "directory"));
+    storage.upsert_contacts(&merged_contacts).unwrap();
+    assert_eq!(storage.list_contacts(Some("carol"), 10).unwrap().len(), 1);
+
+    // 4. Microsoft To Do CRUD
+    let todo_lists = graph.list_todo_lists().await.expect("list_todo_lists");
+    assert_eq!(todo_lists.len(), 1);
+    storage.upsert_todo_lists(&todo_lists).unwrap();
+
+    let created_task: TodoTask = graph
+        .create_todo_task(
+            "default",
+            &OutgoingTodoTask {
+                title: "Ship Outlook v0.1.0".into(),
+                body_plain: Some("Run zero-warning gate".into()),
+                due_date_iso: Some("2026-11-22T00:00:00Z".into()),
+                importance: Some("high".into()),
+            },
+        )
+        .await
+        .expect("create_todo_task");
+    assert_eq!(created_task.id, "task-created-1");
+    assert!(!created_task.is_completed());
+    storage.upsert_todo_tasks(&[created_task.clone()]).unwrap();
+
+    let completed = graph
+        .set_todo_task_completed("default", &created_task.id, true)
+        .await
+        .expect("set_todo_task_completed true");
+    assert!(completed.is_completed());
+    storage
+        .set_todo_task_completed_local(&created_task.id, true)
+        .unwrap();
+
+    let reopened = graph
+        .set_todo_task_completed("default", &created_task.id, false)
+        .await
+        .expect("set_todo_task_completed false");
+    assert!(!reopened.is_completed());
+
+    graph
+        .delete_todo_task("default", &created_task.id)
+        .await
+        .expect("delete_todo_task");
+    storage.delete_todo_task(&created_task.id).unwrap();
+    assert!(storage
+        .list_todo_tasks(Some("todo-list-default"), true)
+        .unwrap()
+        .is_empty());
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
+    ensure_isolated_env();
+    let (base_url, _state, graph_server) = spawn_mock_graph_server("agent-tok-1").await;
+    let cfg = test_config_for_server(&base_url);
+    let dir = tempfile::tempdir().unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let tok = StoredTokens {
+        access_token: "agent-tok-1".into(),
+        refresh_token: None,
+        expires_at: now + 3600,
+        client_id: cfg.client_id.clone(),
+        tenant_id: cfg.tenant_id.clone(),
+        user_id: Some("user-e2e-1".into()),
+        user_display_name: Some("Alice Outlook".into()),
+        user_email: Some("alice@contoso.com".into()),
+        auth_mode: "access_token".into(),
+    };
+    let auth = AuthManager::from_tokens(cfg.clone(), tok);
+    let graph = GraphClient::new(cfg.clone(), auth).unwrap();
+    let storage = Storage::open(&dir.path().join("agent.db")).unwrap();
+
+    // Seed local SQLite data via Graph
+    let folders = graph.list_mail_folders().await.unwrap();
+    storage.upsert_mail_folders(&folders).unwrap();
+    let msg = graph.get_mail_message("msg-html-cid").await.unwrap();
+    storage.upsert_mail_messages(&[msg]).unwrap();
+    let events = graph
+        .list_calendar_view("2026-11-18T00:00:00Z", "2026-11-26T00:00:00Z", 10)
+        .await
+        .unwrap();
+    storage.upsert_calendar_events(&events).unwrap();
+    let todo_lists = graph.list_todo_lists().await.unwrap();
+    storage.upsert_todo_lists(&todo_lists).unwrap();
+    let tasks = graph.list_todo_tasks("default", true, 20).await.unwrap();
+    storage.upsert_todo_tasks(&tasks).unwrap();
+
+    // 1. Non-loopback --bind auth guard must refuse unauthenticated 0.0.0.0 bind
+    let bind_err = serve::run(
+        cfg.clone(),
+        graph.clone(),
+        storage.clone(),
+        ServeOptions {
+            bind: "0.0.0.0".to_string(),
+            port: 0,
+            api_key: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        bind_err.to_string().contains("non-loopback") || bind_err.to_string().contains("--token"),
+        "unexpected non-loopback error: {bind_err}"
+    );
+
+    // 2. HTTP router on local port + /health, /openapi.json, /v1/mail/*, /v1/calendar/events, /v1/todo/tasks
+    let router = serve::build_router(cfg.clone(), graph.clone(), storage.clone(), None);
+    let api_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = api_listener.local_addr().unwrap();
+    let api_server = tokio::spawn(async move {
+        let _ = axum::serve(api_listener, router).await;
+    });
+    let http = reqwest::Client::new();
+    let api_base = format!("http://{api_addr}");
+
+    let health: Value = http
+        .get(format!("{api_base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["ok"], true);
+    assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+
+    let openapi: Value = http
+        .get(format!("{api_base}/openapi.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(openapi["openapi"], "3.1.0");
+    assert_eq!(openapi["info"]["version"], "0.1.0");
+    assert!(openapi["paths"]["/v1/mail/folders"].is_object());
+    assert!(openapi["paths"]["/v1/mail/messages"].is_object());
+    assert!(openapi["paths"]["/v1/calendar/events"].is_object());
+    assert!(openapi["paths"]["/v1/todo/tasks"].is_object());
+
+    let folders_json: Value = http
+        .get(format!("{api_base}/v1/mail/folders?offline=true"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(folders_json["folders"].as_array().unwrap().len(), 4);
+
+    let msgs_json: Value = http
+        .get(format!("{api_base}/v1/mail/messages?folder=inbox&offline=true"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(msgs_json["messages"].as_array().unwrap().len(), 1);
+
+    let events_json: Value = http
+        .get(format!("{api_base}/v1/calendar/events?offline=true"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(events_json["events"].as_array().unwrap().len(), 1);
+
+    let tasks_json: Value = http
+        .get(format!("{api_base}/v1/todo/tasks?offline=true"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(tasks_json["tasks"].as_array().unwrap().len(), 1);
+
+    // Bearer-protected router rejects unauthenticated and accepts valid token
+    let protected_router = serve::build_router(
+        cfg.clone(),
+        graph.clone(),
+        storage.clone(),
+        Some("agent-secret-token".to_string()),
+    );
+    let prot_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let prot_addr = prot_listener.local_addr().unwrap();
+    let prot_server = tokio::spawn(async move {
+        let _ = axum::serve(prot_listener, protected_router).await;
+    });
+    let unauth_resp = http
+        .get(format!("http://{prot_addr}/v1/mail/folders"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let auth_resp = http
+        .get(format!("http://{prot_addr}/v1/mail/folders?offline=true"))
+        .bearer_auth("agent-secret-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(auth_resp.status(), reqwest::StatusCode::OK);
+
+    // 3. MCP JSON-RPC initialize + tools/list + list_messages + search_mail
     let init_resp = mcp::handle_rpc_line(
         &cfg,
         &graph,
         &storage,
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"0.1"}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
     )
     .await
-    .expect("mcp initialize response");
-    assert_eq!(init_resp["result"]["serverInfo"]["name"], "teams");
+    .unwrap();
+    assert_eq!(init_resp["result"]["serverInfo"]["name"], "outlook");
+    assert_eq!(init_resp["result"]["serverInfo"]["version"], "0.1.0");
+
+    assert!(mcp::handle_rpc_line(
+        &cfg,
+        &graph,
+        &storage,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    )
+    .await
+    .is_none());
 
     let tools_resp = mcp::handle_rpc_line(
         &cfg,
         &graph,
         &storage,
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
     )
     .await
-    .expect("mcp tools/list response");
+    .unwrap();
     let tool_names: Vec<&str> = tools_resp["result"]["tools"]
-        .as_array()
-        .expect("tools array")
-        .iter()
-        .filter_map(|t| t["name"].as_str())
-        .collect();
-    assert!(tool_names.contains(&"list_chats"));
-    assert!(tool_names.contains(&"get_thread"));
-    assert!(tool_names.contains(&"delete_message"));
-
-    let list_chats_req = json!({
-        "jsonrpc": "2.0",
-        "id": 3,
-        "method": "tools/call",
-        "params": {
-            "name": "list_chats",
-            "arguments": { "refresh": true }
-        }
-    });
-    let list_chats_resp = mcp::handle_rpc_line(&cfg, &graph, &storage, &list_chats_req.to_string())
-        .await
-        .expect("mcp list_chats response");
-    assert_ne!(list_chats_resp["result"]["isError"], Value::Bool(true));
-    let chats_text = list_chats_resp["result"]["content"][0]["text"]
-        .as_str()
-        .expect("list_chats text");
-    assert!(chats_text.contains("Alice"));
-    assert!(chats_text.contains("Backend Sprint"));
-
-    let get_thread_req = json!({
-        "jsonrpc": "2.0",
-        "id": 4,
-        "method": "tools/call",
-        "params": {
-            "name": "get_thread",
-            "arguments": {
-                "target": "Engineering/Deployments",
-                "root_msg_id": root_msg.msg_id
-            }
-        }
-    });
-    let get_thread_resp = mcp::handle_rpc_line(&cfg, &graph, &storage, &get_thread_req.to_string())
-        .await
-        .expect("mcp get_thread response");
-    assert_ne!(get_thread_resp["result"]["isError"], Value::Bool(true));
-    let thread_text = get_thread_resp["result"]["content"][0]["text"]
-        .as_str()
-        .expect("get_thread text");
-    assert!(thread_text.contains("v2.4.0 Release Notice"));
-    assert!(thread_text.contains("Canary health check passed."));
-
-    // delete_message without confirm: true must be rejected
-    let delete_missing_confirm = json!({
-        "jsonrpc": "2.0",
-        "id": 5,
-        "method": "tools/call",
-        "params": {
-            "name": "delete_message",
-            "arguments": {
-                "target": "Engineering/Deployments",
-                "msg_id": root_msg.msg_id
-            }
-        }
-    });
-    let del_err_resp =
-        mcp::handle_rpc_line(&cfg, &graph, &storage, &delete_missing_confirm.to_string())
-            .await
-            .expect("mcp delete_message rejection");
-    assert_eq!(del_err_resp["result"]["isError"], Value::Bool(true));
-
-    let delete_false_confirm = json!({
-        "jsonrpc": "2.0",
-        "id": 6,
-        "method": "tools/call",
-        "params": {
-            "name": "delete_message",
-            "arguments": {
-                "target": "Engineering/Deployments",
-                "msg_id": root_msg.msg_id,
-                "confirm": false
-            }
-        }
-    });
-    let del_false_resp =
-        mcp::handle_rpc_line(&cfg, &graph, &storage, &delete_false_confirm.to_string())
-            .await
-            .expect("mcp delete_message false rejection");
-    assert_eq!(del_false_resp["result"]["isError"], Value::Bool(true));
-
-    // HTTP JSON API (`serve::build_router`)
-    let router = serve::build_router(
-        cfg.clone(),
-        graph.clone(),
-        storage.clone(),
-        Some("e2e-secret".to_string()),
-    );
-    let serve_listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind serve listener");
-    let serve_addr = serve_listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(serve_listener, router)
-            .await
-            .expect("serve HTTP API");
-    });
-
-    let http = reqwest::Client::new();
-    let serve_base = format!("http://{serve_addr}");
-
-    let health_res = http
-        .get(format!("{serve_base}/health"))
-        .send()
-        .await
-        .expect("GET /health");
-    assert_eq!(health_res.status(), StatusCode::OK);
-    let health_json: Value = health_res.json().await.unwrap();
-    assert_eq!(health_json["ok"], true);
-    assert_eq!(health_json["user_id"], "me-user-1");
-
-    let unauth_res = http
-        .get(format!("{serve_base}/conversations"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(unauth_res.status(), StatusCode::UNAUTHORIZED);
-
-    let convs_res = http
-        .get(format!("{serve_base}/conversations"))
-        .bearer_auth("e2e-secret")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(convs_res.status(), StatusCode::OK);
-    let convs_json: Value = convs_res.json().await.unwrap();
-    assert!(convs_json["conversations"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|c| c["title"] == "Deployments"));
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(tool_names.contains(&"list_messages"));
+    assert!(tool_names.contains(&"search_mail"));
 
-    let search_res = http
-        .get(format!(
-            "{serve_base}/search?q={}",
-            urlencoding::encode("롤아웃")
-        ))
-        .bearer_auth("e2e-secret")
-        .send()
-        .await
+    let list_call = mcp::handle_rpc_line(
+        &cfg,
+        &graph,
+        &storage,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_messages","arguments":{"folder":"inbox","offline":true}}}"#,
+    )
+    .await
+    .unwrap();
+    let list_text = list_call["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(list_text.contains("msg-html-cid"));
+
+    let search_local_call = mcp::handle_rpc_line(
+        &cfg,
+        &graph,
+        &storage,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"search_mail","arguments":{"query":"Latency","offline":true}}}"#,
+    )
+    .await
+    .unwrap();
+    let search_local_text = search_local_call["result"]["content"][0]["text"]
+        .as_str()
         .unwrap();
-    assert_eq!(search_res.status(), StatusCode::OK);
-    let search_json: Value = search_res.json().await.unwrap();
-    assert_eq!(search_json["hits"].as_array().unwrap().len(), 1);
+    assert!(search_local_text.contains("msg-html-cid"));
 
-    let thread_res = http
-        .get(format!(
-            "{serve_base}/conversations/{}/threads/{}",
-            urlencoding::encode(&deploy_chan.conv_key),
-            urlencoding::encode(&root_msg.msg_id)
-        ))
-        .bearer_auth("e2e-secret")
-        .send()
-        .await
+    let search_remote_call = mcp::handle_rpc_line(
+        &cfg,
+        &graph,
+        &storage,
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"search_mail","arguments":{"query":"Architecture","offline":false}}}"#,
+    )
+    .await
+    .unwrap();
+    let search_remote_text = search_remote_call["result"]["content"][0]["text"]
+        .as_str()
         .unwrap();
-    assert_eq!(thread_res.status(), StatusCode::OK);
-    let thread_json: Value = thread_res.json().await.unwrap();
-    assert_eq!(thread_json["thread"]["root"]["msg_id"], root_msg.msg_id);
-    assert_eq!(
-        thread_json["thread"]["replies"].as_array().unwrap().len(),
-        2
-    );
+    assert!(search_remote_text.contains("Remote KQL hit"));
 
-    let _: Option<MessageItem> = storage
-        .get_message(&deploy_chan.conv_key, &root_msg.msg_id)
-        .unwrap();
-}
-
-// ===========================================================================
-// Pure Teams E2E: Deep @odata.nextLink History, SQLite Tie-Breaking & Scope Diagnostics
-// ===========================================================================
-
-fn build_direct_graph_client(
-    base_url: &str,
-    download_dir: &std::path::Path,
-    token: &str,
-) -> (AppConfig, GraphClient) {
-    let cfg = build_test_config(base_url, download_dir);
-    let tokens = StoredTokens {
-        access_token: token.to_string(),
-        refresh_token: None,
-        expires_at: chrono::Utc::now().timestamp() + 3600,
-        client_id: cfg.client_id.clone(),
-        tenant_id: cfg.tenant_id.clone(),
-        user_id: Some("me-user-1".to_string()),
-        user_display_name: Some("Me (Tester)".to_string()),
-        user_email: Some("tester@contoso.com".to_string()),
-        auth_mode: "pkce".to_string(),
-    };
-    let auth = AuthManager::from_tokens(cfg.clone(), tokens);
-    let graph = GraphClient::new(cfg.clone(), auth)
-        .expect("build direct GraphClient")
-        .with_my_user_id("me-user-1");
-    (cfg, graph)
-}
-
-fn mock_graph_message(
-    id: &str,
-    created_at: &str,
-    body_text: &str,
-    reply_to_id: Option<&str>,
-    replies: Option<Vec<Value>>,
-) -> Value {
-    let mut obj = json!({
-        "id": id,
-        "replyToId": reply_to_id,
-        "messageType": "message",
-        "createdDateTime": created_at,
-        "subject": Value::Null,
-        "importance": "normal",
-        "from": {
-            "user": {
-                "id": "peer-kim",
-                "displayName": "Alice"
-            }
-        },
-        "body": {
-            "contentType": "html",
-            "content": format!("<p>{body_text}</p>")
-        },
-        "mentions": [],
-        "attachments": [],
-        "reactions": []
-    });
-    if let Some(r) = replies {
-        obj["replies"] = Value::Array(r);
-    }
-    obj
-}
-
-#[tokio::test]
-async fn e2e_mock_graph_multipage_chat_history_and_sqlite_tiebreak() {
-    ensure_isolated_env();
-    let temp = tempfile::tempdir().expect("create history test tempdir");
-    let db_path = temp.path().join("data").join("cache.db");
-    let download_dir = temp.path().join("downloads");
-    let token = "history-e2e-tok-2026";
-    let chat_id = "19:history-chat@thread.v2";
-
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind history mock server");
-    let addr = listener.local_addr().unwrap();
-    let base_url = format!("http://{addr}");
-    let graph_base = format!("{base_url}/v1.0");
-
-    let encoded_chat = urlencoding::encode(chat_id).into_owned();
-    let p2_link = format!("{graph_base}/chats/{encoded_chat}/messages?$skiptoken=p2");
-    let p3_link = format!("{graph_base}/chats/{encoded_chat}/messages?$skiptoken=p3");
-    let expired_link = format!("{graph_base}/chats/{encoded_chat}/messages?$skiptoken=expired");
-
-    let requested_queries = Arc::new(RwLock::new(Vec::<String>::new()));
-    let rq_clone = requested_queries.clone();
-    let (p2_c, p3_c) = (p2_link.clone(), p3_link.clone());
-
-    let app = Router::new()
-        .route(
-            "/v1.0/me",
-            get(|| async move {
-                Json(json!({
-                    "id": "me-user-1",
-                    "displayName": "Me (Tester)",
-                    "mail": "tester@contoso.com",
-                    "userPrincipalName": "tester@contoso.com"
-                }))
-            }),
-        )
-        .route(
-            "/v1.0/chats/{chat_id}/messages",
-            get(move |RawQuery(q): RawQuery| {
-                let (p2_url, p3_url, queries) = (p2_c.clone(), p3_c.clone(), rq_clone.clone());
-                async move {
-                    let query = q.unwrap_or_default();
-                    queries.write().unwrap().push(query.clone());
-                    if query.contains("$skiptoken=expired") {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(json!({
-                                "error": {
-                                    "code": "InvalidSkipToken",
-                                    "message": "The skiptoken has expired."
-                                }
-                            })),
-                        )
-                            .into_response();
-                    }
-                    if query.contains("$skiptoken=p2") {
-                        return Json(json!({
-                            "value": [
-                                mock_graph_message("m4", "2026-11-10T10:00:00Z", "Message 4 (same timestamp)", None, None),
-                                mock_graph_message("m3", "2026-11-10T10:00:00Z", "Message 3 (same timestamp)", None, None),
-                            ],
-                            "@odata.nextLink": p3_url
-                        }))
-                        .into_response();
-                    }
-                    if query.contains("$skiptoken=p3") {
-                        return Json(json!({
-                            "value": [
-                                mock_graph_message("m2", "2026-11-10T09:00:00Z", "Message 2", None, None),
-                                mock_graph_message("m1", "2026-11-10T08:00:00Z", "Message 1 (oldest)", None, None),
-                            ]
-                        }))
-                        .into_response();
-                    }
-                    Json(json!({
-                        "value": [
-                            mock_graph_message("m6", "2026-11-10T12:00:00Z", "Message 6 (latest)", None, None),
-                            mock_graph_message("m5", "2026-11-10T11:00:00Z", "Message 5", None, None),
-                        ],
-                        "@odata.nextLink": p2_url
-                    }))
-                    .into_response()
-                }
-            }),
-        );
-
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("serve history mock Graph");
-    });
-
-    let (_cfg, graph) = build_direct_graph_client(&base_url, &download_dir, token);
-    let storage = Storage::open(&db_path).expect("open SQLite storage");
-    let target = ConversationTarget::Chat {
-        chat_id: chat_id.to_string(),
-    };
-    let conv_key = target.conv_key();
-
-    // 1. Page 1 -> returns newest messages (m5, m6) + @odata.nextLink pointing to p2
-    let (p1_msgs, next_after_p1) = graph
-        .list_messages_page(&target, 50, None)
-        .await
-        .expect("list_messages_page page 1");
-    let p1_ids: Vec<&str> = p1_msgs.iter().map(|m| m.msg_id.as_str()).collect();
-    assert_eq!(p1_ids, vec!["m5", "m6"]);
-    assert_eq!(next_after_p1.as_deref(), Some(p2_link.as_str()));
-    storage.upsert_messages(&p1_msgs).expect("upsert page 1");
-
-    // 2. Page 2 via fetch_older_messages(saved_next_link = p2) -> same-timestamp m3, m4 + p3 link
-    let (p2_msgs, next_after_p2) = graph
-        .fetch_older_messages(&target, next_after_p1.as_deref(), Some("2026-11-10T11:00:00Z"), 2)
-        .await
-        .expect("fetch_older_messages page 2");
-    let p2_ids: Vec<&str> = p2_msgs.iter().map(|m| m.msg_id.as_str()).collect();
-    assert_eq!(p2_ids, vec!["m3", "m4"]);
-    assert_eq!(
-        next_after_p2.as_deref(),
-        Some(p3_link.as_str()),
-        "nextLink should still point to page 3 before EOF"
-    );
-    storage.upsert_messages(&p2_msgs).expect("upsert page 2");
-
-    // 3. Page 3 via fetch_older_messages(saved_next_link = p3) -> m1, m2 + None (EOF)
-    let (p3_msgs, next_after_p3) = graph
-        .fetch_older_messages(&target, next_after_p2.as_deref(), Some("2026-11-10T10:00:00Z"), 2)
-        .await
-        .expect("fetch_older_messages page 3");
-    let p3_ids: Vec<&str> = p3_msgs.iter().map(|m| m.msg_id.as_str()).collect();
-    assert_eq!(p3_ids, vec!["m1", "m2"]);
-    assert_eq!(next_after_p3, None, "new_next_link must be None only at EOF");
-    storage.upsert_messages(&p3_msgs).expect("upsert page 3");
-
-    // 4. SQLite tie-breaking cursor walk from m6 back to m1 without skipping m3/m4
-    let mut walked_desc = vec!["m6".to_string()];
-    let mut cursor_ts = "2026-11-10T12:00:00Z".to_string();
-    let mut cursor_id = Some("m6".to_string());
-    loop {
-        let older = storage
-            .list_older_root_messages(&conv_key, 1, &cursor_ts, cursor_id.as_deref())
-            .expect("list_older_root_messages step");
-        if older.is_empty() {
-            break;
-        }
-        assert_eq!(older.len(), 1);
-        walked_desc.push(older[0].msg_id.clone());
-        cursor_ts = older[0].created_at.clone();
-        cursor_id = Some(older[0].msg_id.clone());
-    }
-    assert_eq!(walked_desc, vec!["m6", "m5", "m4", "m3", "m2", "m1"]);
-
-    // Also verify batch retrieval strictly before m4 includes m3 (same timestamp) + m2 + m1
-    let before_m4 = storage
-        .list_older_root_messages(&conv_key, 10, "2026-11-10T10:00:00Z", Some("m4"))
-        .expect("list_older_root_messages before m4");
-    let before_m4_ids: Vec<&str> = before_m4.iter().map(|m| m.msg_id.as_str()).collect();
-    assert_eq!(before_m4_ids, vec!["m1", "m2", "m3"]);
-
-    // 5. Expired $skiptoken=expired -> 400 InvalidSkipToken -> transparent fallback to Page 1 -> p2 -> p3
-    let (fallback_msgs, fallback_next) = graph
-        .fetch_older_messages(&target, Some(&expired_link), None, 6)
-        .await
-        .expect("fetch_older_messages should fall back on expired skiptoken");
-    let fallback_ids: Vec<&str> = fallback_msgs.iter().map(|m| m.msg_id.as_str()).collect();
-    assert_eq!(fallback_ids, vec!["m1", "m2", "m3", "m4", "m5", "m6"]);
-    assert_eq!(fallback_next, None);
-    assert!(
-        requested_queries
-            .read()
-            .unwrap()
-            .iter()
-            .any(|q| q.contains("$skiptoken=expired")),
-        "expected expired skiptoken to be attempted before fallback"
-    );
-
-    server.abort();
-}
-
-#[tokio::test]
-async fn e2e_mock_graph_channel_expand_replies_pagination_and_chats_orderby_fallback() {
-    ensure_isolated_env();
-    let temp = tempfile::tempdir().expect("create channel/chats pagination tempdir");
-    let download_dir = temp.path().join("downloads");
-    let token = "channel-chats-e2e-tok-2026";
-
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind channel/chats mock server");
-    let addr = listener.local_addr().unwrap();
-    let base_url = format!("http://{addr}");
-    let graph_base = format!("{base_url}/v1.0");
-
-    let chan_p2_link =
-        format!("{graph_base}/teams/team-dev/channels/chan-general/messages?$skiptoken=chan_p2");
-    let chats_p2_link = format!("{graph_base}/me/chats?$skiptoken=chats_p2");
-
-    let channel_queries = Arc::new(RwLock::new(Vec::<String>::new()));
-    let chat_queries = Arc::new(RwLock::new(Vec::<String>::new()));
-    let cq_clone = channel_queries.clone();
-    let chq_clone = chat_queries.clone();
-
-    let app = Router::new()
-        .route(
-            "/v1.0/me",
-            get(|| async move {
-                Json(json!({
-                    "id": "me-user-1",
-                    "displayName": "Me (Tester)",
-                    "mail": "tester@contoso.com",
-                    "userPrincipalName": "tester@contoso.com"
-                }))
-            }),
-        )
-        .route(
-            "/v1.0/teams/{team_id}/channels/{channel_id}/messages",
-            get(move |RawQuery(q): RawQuery| {
-                let (chan_p2, queries) = (chan_p2_link.clone(), cq_clone.clone());
-                async move {
-                    let query = q.unwrap_or_default();
-                    queries.write().unwrap().push(query.clone());
-                    if query.contains("$skiptoken=chan_p2") {
-                        return Json(json!({
-                            "value": [
-                                mock_graph_message(
-                                    "root-1",
-                                    "2026-11-10T09:00:00Z",
-                                    "Older channel root 1",
-                                    None,
-                                    Some(vec![mock_graph_message(
-                                        "reply-1a",
-                                        "2026-11-10T09:05:00Z",
-                                        "Older reply 1a",
-                                        Some("root-1"),
-                                        None,
-                                    )]),
-                                )
-                            ]
-                        }))
-                        .into_response();
-                    }
-                    assert!(
-                        query.contains("$expand=replies"),
-                        "initial channel page must include $expand=replies, got: {query}"
-                    );
-                    Json(json!({
-                        "value": [
-                            mock_graph_message(
-                                "root-2",
-                                "2026-11-10T12:00:00Z",
-                                "Latest channel root 2",
-                                None,
-                                Some(vec![mock_graph_message(
-                                    "reply-2a",
-                                    "2026-11-10T12:05:00Z",
-                                    "Latest reply 2a",
-                                    Some("root-2"),
-                                    None,
-                                )]),
-                            )
-                        ],
-                        "@odata.nextLink": chan_p2
-                    }))
-                    .into_response()
-                }
-            }),
-        )
-        .route(
-            "/v1.0/me/chats",
-            get(move |RawQuery(q): RawQuery| {
-                let (chats_p2, queries) = (chats_p2_link.clone(), chq_clone.clone());
-                async move {
-                    let query = q.unwrap_or_default();
-                    queries.write().unwrap().push(query.clone());
-
-                    if query.contains("$orderby") {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(json!({
-                                "error": {
-                                    "code": "BadRequest",
-                                    "message": "Query option '$orderby' is not supported for this request."
-                                }
-                            })),
-                        )
-                            .into_response();
-                    }
-
-                    let make_chat_batch = |start: usize, count: usize| -> Vec<Value> {
-                        (start..start + count)
-                            .map(|idx| {
-                                json!({
-                                    "id": format!("19:chat-{idx:03}@thread.v2"),
-                                    "chatType": "group",
-                                    "topic": format!("Chat {idx:03}"),
-                                    "lastUpdatedDateTime": "2026-11-15T05:00:00Z",
-                                    "members": [
-                                        { "userId": "me-user-1", "displayName": "Me (Tester)" },
-                                        { "userId": format!("user-{idx}"), "displayName": format!("User {idx}") }
-                                    ]
-                                })
-                            })
-                            .collect()
-                    };
-
-                    if query.contains("$skiptoken=chats_p2") {
-                        return Json(json!({
-                            "value": make_chat_batch(51, 30)
-                        }))
-                        .into_response();
-                    }
-
-                    Json(json!({
-                        "value": make_chat_batch(1, 50),
-                        "@odata.nextLink": chats_p2
-                    }))
-                    .into_response()
-                }
-            }),
-        );
-
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("serve channel/chats mock Graph");
-    });
-
-    let (_cfg, graph) = build_direct_graph_client(&base_url, &download_dir, token);
-
-    // 1. Channel multi-page pagination with $expand=replies
-    let chan_target = ConversationTarget::Channel {
-        team_id: "team-dev".to_string(),
-        channel_id: "chan-general".to_string(),
-    };
-    let (chan_msgs, chan_next) = graph
-        .fetch_older_messages(&chan_target, None, None, 2)
-        .await
-        .expect("fetch_older_messages across 2 channel pages");
-    assert_eq!(chan_next, None);
-    let chan_ids: Vec<&str> = chan_msgs.iter().map(|m| m.msg_id.as_str()).collect();
-    assert_eq!(chan_ids, vec!["root-1", "reply-1a", "root-2", "reply-2a"]);
-    let reply_1a = chan_msgs.iter().find(|m| m.msg_id == "reply-1a").unwrap();
-    assert_eq!(reply_1a.parent_msg_id.as_deref(), Some("root-1"));
-    assert_eq!(channel_queries.read().unwrap().len(), 2);
-
-    // 2. /me/chats multi-page list_chats(75) with $orderby 400 fallback
-    let chats = graph
-        .list_chats(75)
-        .await
-        .expect("list_chats(75) with $orderby fallback across 2 pages");
-    assert_eq!(chats.len(), 75);
-    assert_eq!(chats[0].title, "Chat 001");
-    assert_eq!(chats[49].title, "Chat 050");
-    assert_eq!(chats[74].title, "Chat 075");
-
-    let recorded_chat_queries = chat_queries.read().unwrap();
-    assert!(
-        recorded_chat_queries.iter().any(|q| q.contains("$orderby")),
-        "expected $orderby to be attempted first"
-    );
-    assert!(
-        recorded_chat_queries
-            .iter()
-            .any(|q| q.contains("$skiptoken=chats_p2")),
-        "expected page 2 $skiptoken=chats_p2 to be fetched"
-    );
-
-    server.abort();
-}
-
-#[tokio::test]
-async fn e2e_mock_graph_restricted_chat_read_basic_token_and_403_diagnostics() {
-    ensure_isolated_env();
-    let temp = tempfile::tempdir().expect("create restricted token test tempdir");
-    let download_dir = temp.path().join("downloads");
-
-    // Construct JWT with "scp": "User.Read Chat.ReadBasic"
-    let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
-    let payload_json = json!({
-        "oid": "me-user-1",
-        "name": "Me (Tester)",
-        "upn": "tester@contoso.com",
-        "scp": "User.Read Chat.ReadBasic",
-        "exp": 4_102_444_800_i64
-    });
-    let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json.to_string().as_bytes());
-    let restricted_jwt = format!("{header_b64}.{payload_b64}.mock-signature");
-
-    let diag = diagnose_access_token_scopes(&restricted_jwt);
-    assert!(diag.has_scope_claims);
-    assert!(diag.chat_read_basic_only);
-    assert!(!diag.can_read_chats);
-    assert!(
-        diag.warnings
-            .iter()
-            .any(|w| w.contains("Chat.ReadBasic") && w.contains("message bodies")),
-        "expected clear Chat.ReadBasic warning, got: {:?}",
-        diag.warnings
-    );
-
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind 403 mock server");
-    let addr = listener.local_addr().unwrap();
-    let base_url = format!("http://{addr}");
-
-    let app = Router::new()
-        .route(
-            "/v1.0/me",
-            get(|| async move {
-                Json(json!({
-                    "id": "me-user-1",
-                    "displayName": "Me (Tester)",
-                    "mail": "tester@contoso.com",
-                    "userPrincipalName": "tester@contoso.com"
-                }))
-            }),
-        )
-        .route(
-            "/v1.0/chats/{chat_id}/messages",
-            get(|| async move {
-                (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({
-                        "error": {
-                            "code": "Authorization_RequestDenied",
-                            "message": "Insufficient privileges to complete the operation."
-                        }
-                    })),
-                )
-            }),
-        );
-
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("serve 403 mock Graph");
-    });
-
-    let (_cfg, graph) = build_direct_graph_client(&base_url, &download_dir, &restricted_jwt);
-    let target = ConversationTarget::Chat {
-        chat_id: "19:restricted-chat@thread.v2".to_string(),
-    };
-
-    let err = graph
-        .fetch_older_messages(&target, None, None, 20)
-        .await
-        .expect_err("403 Forbidden must return Err, not empty Ok");
-
-    let explanation = explain_graph_permission_error(&err.to_string(), Some(&restricted_jwt))
-        .expect("explain_graph_permission_error should explain 403");
-    assert!(
-        explanation.contains(teams_cli::auth::INSUFFICIENT_PERMISSIONS_PREFIX)
-            && explanation.contains("Chat.ReadBasic"),
-        "expected Chat.ReadBasic explanation, got: {explanation}"
-    );
-
-    server.abort();
-}
-
-#[tokio::test]
-async fn e2e_inline_image_preview_and_self_updater() {
-    // 1. Inline Terminal Image Preview: generate in-memory PNG via image::RgbaImage
-    let img: RgbaImage = ImageBuffer::from_fn(16, 12, |x, y| {
-        Rgba([((x * 16) % 256) as u8, ((y * 20) % 256) as u8, 180, 255])
-    });
-    let mut png_bytes = Vec::new();
-    image::DynamicImage::ImageRgba8(img)
-        .write_to(&mut Cursor::new(&mut png_bytes), image::ImageFormat::Png)
-        .expect("encode RGBA image to PNG");
-
-    let rendered = img_preview::decode_and_render_halfblocks(&png_bytes, 16, 8, (0, 0, 0))
-        .expect("decode_and_render_halfblocks");
-    assert_eq!(rendered.width_px, 16);
-    assert_eq!(rendered.height_px, 12);
-    assert_eq!(rendered.cols, 16);
-    assert_eq!(rendered.rows, 6);
-    assert_eq!(rendered.format_label, "PNG");
-    assert_eq!(rendered.lines.len(), 6);
-    for line in &rendered.lines {
-        assert!(!line.spans.is_empty());
-        assert!(line.spans.iter().all(|s| !s.content.is_empty() && s.content.chars().all(|c| c == '▀')));
-    }
-
-    let ansi_stdout = img_preview::render_ansi_stdout(&png_bytes, 16, 8)
-        .expect("render_ansi_stdout");
-    assert!(!ansi_stdout.trim().is_empty());
-    assert!(
-        ansi_stdout.contains('▀')
-            || ansi_stdout.starts_with("\x1b]")
-            || ansi_stdout.starts_with("\x1b_G")
-            || ansi_stdout.starts_with("\x1bP"),
-        "expected valid halfblock, iTerm2, Kitty, or Sixel escape output"
-    );
-
-    let halfblock_stdout = img_preview::render_ansi_stdout_with_pref(
-        &png_bytes,
-        16,
-        8,
-        ImageProtocolPreference::Halfblock,
-    )
-    .expect("render_ansi_stdout_with_pref(Halfblock)");
-    assert!(halfblock_stdout.contains('▀'));
-    assert!(halfblock_stdout.contains("\x1b[38;2;"));
-
-    let kitty_stdout = img_preview::render_ansi_stdout_with_pref(
-        &png_bytes,
-        16,
-        8,
-        ImageProtocolPreference::Kitty,
-    )
-    .expect("render_ansi_stdout_with_pref(Kitty)");
-    assert!(kitty_stdout.starts_with("\x1b_Gf=100,a=T,"));
-    assert!(kitty_stdout.ends_with("\x1b\\\n"));
-
-    let iterm2_stdout = img_preview::render_ansi_stdout_with_pref(
-        &png_bytes,
-        16,
-        8,
-        ImageProtocolPreference::Iterm2,
-    )
-    .expect("render_ansi_stdout_with_pref(Iterm2)");
-    assert!(iterm2_stdout.starts_with("\x1b]1337;File=inline=1;"));
-    assert!(iterm2_stdout.ends_with("\x07\n"));
-
-    let sixel_stdout = img_preview::render_ansi_stdout_with_pref(
-        &png_bytes,
-        16,
-        8,
-        ImageProtocolPreference::Sixel,
-    )
-    .expect("render_ansi_stdout_with_pref(Sixel)");
-    assert!(sixel_stdout.starts_with("\x1bP0;1;q\"1;1;"));
-    assert!(sixel_stdout.ends_with("\x1b\\\n"));
-
-    let sixel_tui = img_preview::decode_and_render_for_protocol(
-        &png_bytes,
-        16,
-        8,
-        (37, 42, 61),
-        TerminalGraphicsCaps {
-            protocol: TerminalImageProtocol::Sixel,
-            cell_px: (8, 16),
-            cell_px_exact: true,
-        },
-    )
-    .expect("decode_and_render_for_protocol(Sixel)");
-    assert_eq!(sixel_tui.protocol, TerminalImageProtocol::Sixel);
-        assert!(
-            sixel_tui
-                .pixel_payload
-                .as_deref()
-                .is_some_and(|p| p.starts_with("\x1bP0;1;q\"1;1;") && p.ends_with("\x1b\\"))
-        );
-
-    // 1b. End-to-end mock Graph hostedContents inline screenshot synthesis -> fetch -> Halfblock/Sixel render
-    ensure_isolated_env();
-    #[derive(Clone)]
-    struct HostedImgMockState {
-        base_url: String,
-        png_bytes: Vec<u8>,
-    }
-    let hosted_listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind hostedContents mock Graph server");
-    let hosted_addr = hosted_listener.local_addr().unwrap();
-    let hosted_base = format!("http://{hosted_addr}");
-    let hosted_state = HostedImgMockState {
-        base_url: hosted_base.clone(),
-        png_bytes: png_bytes.clone(),
-    };
-    let hosted_app = Router::new()
-        .route(
-            "/v1.0/chats/c-img/messages",
-            get(|State(st): State<HostedImgMockState>, headers: HeaderMap| async move {
-                if let Err(resp) = check_bearer_header(&headers, "inline-img-tok") {
-                    return resp;
-                }
-                let img_url = format!(
-                    "{}/v1.0/chats/c-img/messages/m-img/hostedContents/hc-1/$value",
-                    st.base_url
-                );
-                Json(json!({
-                    "value": [{
-                        "id": "m-img",
-                        "messageType": "message",
-                        "createdDateTime": "2026-11-18T12:00:00Z",
-                        "from": { "user": { "id": "peer-kim", "displayName": "Alice" } },
-                        "body": {
-                            "contentType": "html",
-                            "content": format!("<p>Screenshot:</p><img src=\"{img_url}\">")
-                        },
-                        "mentions": [],
-                        "attachments": [],
-                        "reactions": []
-                    }]
-                }))
-                .into_response()
-            }),
-        )
-        .route(
-            "/v1.0/chats/c-img/messages/m-img/hostedContents/hc-1/$value",
-            get(|State(st): State<HostedImgMockState>, headers: HeaderMap| async move {
-                if let Err(resp) = check_bearer_header(&headers, "inline-img-tok") {
-                    return resp;
-                }
-                (StatusCode::OK, st.png_bytes).into_response()
-            }),
-        )
-        .with_state(hosted_state);
-
-    let hosted_server = tokio::spawn(async move {
-        axum::serve(hosted_listener, hosted_app)
-            .await
-            .expect("serve hostedContents mock Graph");
-    });
-
-    let hosted_tmp = tempfile::tempdir().expect("hosted tmp");
-    let hosted_cfg = build_test_config(&hosted_base, hosted_tmp.path());
-    let hosted_tokens = StoredTokens {
-        access_token: "inline-img-tok".to_string(),
-        refresh_token: None,
-        expires_at: chrono::Utc::now().timestamp() + 3600,
-        client_id: hosted_cfg.client_id.clone(),
-        tenant_id: hosted_cfg.tenant_id.clone(),
-        user_id: Some("me-user-1".to_string()),
-        user_display_name: None,
-        user_email: None,
-        auth_mode: "access_token".to_string(),
-    };
-    let hosted_auth = AuthManager::from_tokens(hosted_cfg.clone(), hosted_tokens);
-    let hosted_graph = GraphClient::new(hosted_cfg, hosted_auth).expect("hosted GraphClient");
-
-    let fetched_msgs = hosted_graph
-        .list_chat_messages("c-img", 10)
-        .await
-        .expect("list_chat_messages with inline hostedContents img");
-    assert_eq!(fetched_msgs.len(), 1);
-    let eff_atts = fetched_msgs[0].effective_attachments();
-    assert_eq!(eff_atts.len(), 1);
-    assert_eq!(eff_atts[0].id, "hosted:hc-1");
-    assert_eq!(eff_atts[0].content_type, "hostedContent");
-
-    let (_dl_name, _dl_ct, dl_bytes) = hosted_graph
-        .fetch_attachment_bytes(&eff_atts[0])
-        .await
-        .expect("fetch_attachment_bytes for hosted:hc-1");
-    assert_eq!(dl_bytes, png_bytes);
-
-    let hosted_halfblock = img_preview::decode_and_render_halfblocks(&dl_bytes, 16, 8, (0, 0, 0))
-        .expect("render fetched hosted:hc-1 halfblocks");
-    assert!(!hosted_halfblock.lines.is_empty());
-
-    let hosted_sixel = img_preview::render_ansi_stdout_with_pref(
-        &dl_bytes,
-        16,
-        8,
-        ImageProtocolPreference::Sixel,
-    )
-    .expect("render fetched hosted:hc-1 Sixel");
-    assert!(hosted_sixel.starts_with("\x1bP0;1;q\"1;1;"));
-    assert!(hosted_sixel.ends_with("\x1b\\\n"));
-
-    hosted_server.abort();
-
-    // 2. Self-Updater E2E against mock GitHub Releases server
+    // 4. Self-updater mock GitHub release check (outlook-0.2.0-...) + mandatory SHA256SUMS.txt verification
     #[derive(Clone)]
     struct MockGhState {
         base_url: String,
         asset_name: String,
-        asset_bytes: Vec<u8>,
-        sums_text: String,
+        asset_bytes: Arc<Vec<u8>>,
+        sums_text: Arc<RwLock<Option<String>>>,
     }
 
-    let asset_name = match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("windows", "x86_64") => "teams.exe".to_string(),
-        ("windows", "aarch64") => "teams-9.9.9-aarch64-pc-windows-msvc.zip".to_string(),
-        ("macos", "x86_64") => "teams-9.9.9-x86_64-apple-darwin.tar.gz".to_string(),
-        ("macos", "aarch64") => "teams-9.9.9-aarch64-apple-darwin.tar.gz".to_string(),
-        ("linux", "x86_64") => "teams-9.9.9-x86_64-unknown-linux-gnu.tar.gz".to_string(),
-        ("linux", "aarch64") => "teams-9.9.9-aarch64-unknown-linux-gnu.tar.gz".to_string(),
-        _ => "teams".to_string(),
+    let raw_bin_asset = if cfg!(windows) {
+        "outlook.exe"
+    } else {
+        "outlook"
+    }
+    .to_string();
+    let versioned_asset = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => "outlook-0.2.0-x86_64-pc-windows-msvc.zip".to_string(),
+        ("windows", "aarch64") => "outlook-0.2.0-aarch64-pc-windows-msvc.zip".to_string(),
+        ("macos", "x86_64") => "outlook-0.2.0-x86_64-apple-darwin.tar.gz".to_string(),
+        ("macos", "aarch64") => "outlook-0.2.0-aarch64-apple-darwin.tar.gz".to_string(),
+        ("linux", "x86_64") => "outlook-0.2.0-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+        ("linux", "aarch64") => "outlook-0.2.0-aarch64-unknown-linux-gnu.tar.gz".to_string(),
+        _ => raw_bin_asset.clone(),
     };
-    let asset_bytes = b"MOCK-RELEASE-BINARY-V9.9.9".to_vec();
-    let digest = hex::encode(Sha256::digest(&asset_bytes));
-    let sums_text = format!("{digest}  {asset_name}\n");
+    let new_binary = b"NEW-OUTLOOK-0.2.0-VERIFIED-BINARY".to_vec();
+    let valid_digest = hex::encode(Sha256::digest(&new_binary));
 
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock GitHub server");
-    let addr = listener.local_addr().unwrap();
-    let gh_base = format!("http://{addr}");
-
-    let gh_state = MockGhState {
-        base_url: gh_base.clone(),
-        asset_name: asset_name.clone(),
-        asset_bytes,
-        sums_text,
-    };
-
-    let gh_app = Router::new()
-        .route(
-            "/repos/shinick-dev/teams/releases/latest",
-            get(|State(st): State<MockGhState>| async move {
+    // 4a. Versioned release check (outlook-0.2.0-...)
+    let gh_listener_check = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gh_addr_check = gh_listener_check.local_addr().unwrap();
+    let gh_base_check = format!("http://{gh_addr_check}");
+    let ver_asset_clone = versioned_asset.clone();
+    let gh_base_clone = gh_base_check.clone();
+    let gh_app_check = Router::new().route(
+        "/repos/shinick-dev/outlook/releases/latest",
+        get(move || {
+            let asset_name = ver_asset_clone.clone();
+            let base = gh_base_clone.clone();
+            async move {
                 Json(json!({
-                    "tag_name": "v9.9.9",
-                    "html_url": format!("{}/shinick-dev/teams/releases/tag/v9.9.9", st.base_url),
+                    "tag_name": "v0.2.0",
+                    "html_url": format!("{base}/shinick-dev/outlook/releases/tag/v0.2.0"),
                     "assets": [
                         {
-                            "name": st.asset_name,
-                            "size": st.asset_bytes.len() as u64,
-                            "url": format!("{}/assets/binary", st.base_url),
-                            "browser_download_url": format!("{}/download/{}", st.base_url, st.asset_name)
+                            "name": asset_name,
+                            "size": 1024,
+                            "browser_download_url": format!("{base}/download/{asset_name}")
                         },
                         {
                             "name": "SHA256SUMS.txt",
-                            "size": st.sums_text.len() as u64,
-                            "url": format!("{}/assets/sums", st.base_url),
-                            "browser_download_url": format!("{}/download/SHA256SUMS.txt", st.base_url)
+                            "size": 128,
+                            "browser_download_url": format!("{base}/download/SHA256SUMS.txt")
                         }
                     ]
                 }))
-            }),
-        )
-        .route(
-            "/assets/sums",
-            get(|State(st): State<MockGhState>| async move { (StatusCode::OK, st.sums_text) }),
-        )
-        .route(
-            "/download/SHA256SUMS.txt",
-            get(|State(st): State<MockGhState>| async move { (StatusCode::OK, st.sums_text) }),
-        )
-        .route(
-            "/assets/binary",
-            get(|State(st): State<MockGhState>| async move { (StatusCode::OK, st.asset_bytes) }),
-        )
-        .route(
-            &format!("/download/{asset_name}"),
-            get(|State(st): State<MockGhState>| async move { (StatusCode::OK, st.asset_bytes) }),
-        )
-        .with_state(gh_state);
-
-    let gh_server = tokio::spawn(async move {
-        axum::serve(listener, gh_app)
-            .await
-            .expect("serve mock GitHub");
+            }
+        }),
+    );
+    let gh_check_server = tokio::spawn(async move {
+        let _ = axum::serve(gh_listener_check, gh_app_check).await;
     });
 
-    let result = updater::check_or_apply_update_with_api_base(
-        &gh_base,
-        "shinick-dev/teams",
+    let check_res = updater::check_or_apply_update_with_api_base(
+        &gh_base_check,
+        "shinick-dev/outlook",
         true,
         false,
     )
     .await
-    .expect("check_or_apply_update_with_api_base");
+    .expect("check_or_apply_update_with_api_base check_only");
+    assert!(check_res.update_available);
+    assert!(!check_res.updated);
+    assert_eq!(check_res.latest_version, "0.2.0");
+    assert_eq!(check_res.asset_name.as_deref(), Some(versioned_asset.as_str()));
+    gh_check_server.abort();
 
-    assert_eq!(result.current_version, env!("CARGO_PKG_VERSION"));
-    assert_eq!(result.latest_version, "9.9.9");
-    assert!(result.update_available);
-    assert!(!result.updated);
-    assert_eq!(result.asset_name.as_deref(), Some(asset_name.as_str()));
-    assert!(result.release_url.contains("v9.9.9"));
+    // 4b. Mandatory SHA256SUMS.txt verification (missing -> bad hash -> valid hash)
+    let gh_listener_apply = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gh_addr_apply = gh_listener_apply.local_addr().unwrap();
+    let gh_base_apply = format!("http://{gh_addr_apply}");
+    let gh_state = MockGhState {
+        base_url: gh_base_apply.clone(),
+        asset_name: raw_bin_asset.clone(),
+        asset_bytes: Arc::new(new_binary.clone()),
+        sums_text: Arc::new(RwLock::new(None)),
+    };
+    let gh_app_apply = Router::new()
+        .route(
+            "/repos/shinick-dev/outlook/releases/latest",
+            get(|State(st): State<MockGhState>| async move {
+                let mut assets = vec![json!({
+                    "name": st.asset_name,
+                    "size": st.asset_bytes.len(),
+                    "browser_download_url": format!("{}/download/{}", st.base_url, st.asset_name)
+                })];
+                if let Some(ref sums) = *st.sums_text.read().unwrap() {
+                    assets.push(json!({
+                        "name": "SHA256SUMS.txt",
+                        "size": sums.len(),
+                        "browser_download_url": format!("{}/download/SHA256SUMS.txt", st.base_url)
+                    }));
+                }
+                Json(json!({
+                    "tag_name": "v0.2.0",
+                    "html_url": format!("{}/shinick-dev/outlook/releases/tag/v0.2.0", st.base_url),
+                    "assets": assets
+                }))
+            }),
+        )
+        .route(
+            &format!("/download/{raw_bin_asset}"),
+            get(|State(st): State<MockGhState>| async move {
+                ([(header::CONTENT_TYPE, "application/octet-stream")], (*st.asset_bytes).clone())
+            }),
+        )
+        .route(
+            "/download/SHA256SUMS.txt",
+            get(|State(st): State<MockGhState>| async move {
+                st.sums_text
+                    .read()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_default()
+            }),
+        )
+        .with_state(gh_state.clone());
+    let gh_apply_server = tokio::spawn(async move {
+        let _ = axum::serve(gh_listener_apply, gh_app_apply).await;
+    });
 
-    gh_server.abort();
+    let fake_exe = dir.path().join(&raw_bin_asset);
+    std::fs::write(&fake_exe, b"OLD-OUTLOOK-0.1.0-BINARY").unwrap();
+
+    // Missing SHA256SUMS.txt -> refused
+    let err_missing = updater::check_or_apply_update_at(
+        &gh_base_apply,
+        "shinick-dev/outlook",
+        false,
+        false,
+        &fake_exe,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(err_missing.to_string().contains("SHA256SUMS.txt"));
+    assert_eq!(std::fs::read(&fake_exe).unwrap(), b"OLD-OUTLOOK-0.1.0-BINARY");
+
+    // Mismatched SHA256SUMS.txt -> refused before replacing fake_exe
+    *gh_state.sums_text.write().unwrap() = Some(format!(
+        "0000000000000000000000000000000000000000000000000000000000000000  {raw_bin_asset}\n"
+    ));
+    let err_bad_hash = updater::check_or_apply_update_at(
+        &gh_base_apply,
+        "shinick-dev/outlook",
+        false,
+        false,
+        &fake_exe,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{err_bad_hash:#}").contains("SHA-256"));
+    assert_eq!(std::fs::read(&fake_exe).unwrap(), b"OLD-OUTLOOK-0.1.0-BINARY");
+
+    // Valid SHA256SUMS.txt -> applied cleanly
+    *gh_state.sums_text.write().unwrap() = Some(format!("{valid_digest}  {raw_bin_asset}\n"));
+    let applied = updater::check_or_apply_update_at(
+        &gh_base_apply,
+        "shinick-dev/outlook",
+        false,
+        false,
+        &fake_exe,
+        None,
+    )
+    .await
+    .expect("valid SHA256SUMS update succeeds");
+    assert!(applied.updated);
+    assert_eq!(applied.latest_version, "0.2.0");
+    assert_eq!(std::fs::read(&fake_exe).unwrap(), new_binary);
+
+    gh_apply_server.abort();
+    prot_server.abort();
+    api_server.abort();
+    graph_server.abort();
 }

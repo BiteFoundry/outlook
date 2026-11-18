@@ -1,14 +1,14 @@
 <#
 .SYNOPSIS
-    Idempotently installs the `teams` terminal launcher on any Windows PC.
+    Idempotently installs the `outlook` terminal launcher on any Windows PC.
 
 .DESCRIPTION
-    1. Ensures <RepoRoot>\target\release\teams.exe exists (downloads the prebuilt
-       release binary from GitHub `shinick-dev/teams` via `gh` when missing, so
+    1. Ensures <RepoRoot>\target\release\outlook.exe exists (downloads the prebuilt
+       release binary from GitHub `shinick-dev/outlook` via `gh` when missing, so
        Rust/Cargo is NOT required on target PCs).
-    2. Registers/updates `# >>> teams launcher >>>` (`function teams`) in PowerShell $PROFILE.
-    3. If $HOME\Tools\bin exists, also writes `teams.cmd` there so already-open shells
-       find `teams` immediately.
+    2. Registers/updates `# >>> outlook launcher >>>` (`function outlook`) in PowerShell $PROFILE.
+    3. If $HOME\Tools\bin exists, also writes `outlook.cmd` there so already-open shells
+       find `outlook` immediately.
 
 .EXAMPLE
     pwsh -File .\scripts\install-profile.ps1
@@ -32,32 +32,32 @@ $resolvedRoot = if (Test-Path -LiteralPath $RepoRoot) {
 }
 
 $releaseDir = Join-Path $resolvedRoot 'target\release'
-$releaseExe = Join-Path $releaseDir 'teams.exe'
+$releaseExe = Join-Path $releaseDir 'outlook.exe'
 
 if (-not (Test-Path -LiteralPath $releaseExe)) {
     $gh = Get-Command gh -ErrorAction SilentlyContinue
     if ($gh) {
-        Write-Output "[teams] Downloading prebuilt teams.exe from shinick-dev/teams GitHub Release..."
+        Write-Output "[outlook] Downloading prebuilt outlook.exe from shinick-dev/outlook GitHub Release..."
         New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
-        & $gh.Source release download -R 'shinick-dev/teams' --pattern 'teams.exe' --dir $releaseDir --clobber
+        & $gh.Source release download -R 'shinick-dev/outlook' --pattern 'outlook.exe' --dir $releaseDir --clobber
     }
 }
 
 $escapedRoot = $resolvedRoot.Replace("'", "''")
-$startMarker = '# >>> teams launcher >>>'
-$endMarker = '# <<< teams launcher <<<'
+$startMarker = '# >>> outlook launcher >>>'
+$endMarker = '# <<< outlook launcher <<<'
 
 $block = @"
 $startMarker
-# Opens the Microsoft Teams terminal client (CLI/TUI/HTTP/MCP) from anywhere.
-function teams {
+# Opens the Microsoft Outlook terminal client (CLI/TUI/HTTP/MCP) from anywhere.
+function outlook {
     `$root = '$escapedRoot'
-    `$exe = Join-Path `$root 'target\release\teams.exe'
+    `$exe = Join-Path `$root 'target\release\outlook.exe'
     if (-not (Test-Path -LiteralPath `$exe)) {
         if (Get-Command gh -ErrorAction SilentlyContinue) {
             `$relDir = Split-Path -Parent `$exe
             New-Item -ItemType Directory -Force -Path `$relDir | Out-Null
-            gh release download -R 'shinick-dev/teams' --pattern 'teams.exe' --dir `$relDir --clobber 2>`$null
+            gh release download -R 'shinick-dev/outlook' --pattern 'outlook.exe' --dir `$relDir --clobber 2>`$null
         }
     }
     if (-not (Test-Path -LiteralPath `$exe)) {
@@ -82,18 +82,18 @@ if (Test-Path -LiteralPath $ProfilePath) {
     if ($null -eq $existing) { $existing = '' }
 }
 
-$pattern = '(?ms)^# >>> teams launcher >>>\r?\n.*?^# <<< teams launcher <<<\r?\n?'
+$pattern = '(?ms)^# >>> outlook launcher >>>\r?\n.*?^# <<< outlook launcher <<<\r?\n?'
 if ([regex]::IsMatch($existing, $pattern)) {
     $updated = [regex]::Replace($existing, $pattern, { param($m) $block + [Environment]::NewLine }, 1)
-    $action = 'Update teams launcher block'
+    $action = 'Update outlook launcher block'
 } elseif ([string]::IsNullOrWhiteSpace($existing)) {
     $updated = $block + [Environment]::NewLine
-    $action = 'Create profile with teams launcher block'
+    $action = 'Create profile with outlook launcher block'
 } else {
     $trimmed = $existing.TrimEnd("`r", "`n")
     $nl = [Environment]::NewLine
     $updated = $trimmed + $nl + $nl + $block + $nl
-    $action = 'Append teams launcher block'
+    $action = 'Append outlook launcher block'
 }
 
 if ($updated -ne $existing) {
@@ -103,15 +103,15 @@ if ($updated -ne $existing) {
         Write-Output "$action in $ProfilePath."
     }
 } else {
-    Write-Output "teams launcher in $ProfilePath is already up to date."
+    Write-Output "outlook launcher in $ProfilePath is already up to date."
 }
 
 $toolsBin = Join-Path $HOME 'Tools\bin'
 if (Test-Path -LiteralPath $toolsBin) {
-    $teamsShimPath = Join-Path $toolsBin 'teams.cmd'
-    $teamsShimContent = "@echo off`r`nchcp 65001 >nul`r`n`"$resolvedRoot\teams.cmd`" %*`r`n"
-    if ($PSCmdlet.ShouldProcess($teamsShimPath, 'Write PATH shim teams.cmd')) {
-        [System.IO.File]::WriteAllText($teamsShimPath, $teamsShimContent, [System.Text.Encoding]::ASCII)
-        Write-Output "Updated PATH shim: $teamsShimPath"
+    $outlookShimPath = Join-Path $toolsBin 'outlook.cmd'
+    $outlookShimContent = "@echo off`r`nchcp 65001 >nul`r`n`"$resolvedRoot\outlook.cmd`" %*`r`n"
+    if ($PSCmdlet.ShouldProcess($outlookShimPath, 'Write PATH shim outlook.cmd')) {
+        [System.IO.File]::WriteAllText($outlookShimPath, $outlookShimContent, [System.Text.Encoding]::ASCII)
+        Write-Output "Updated PATH shim: $outlookShimPath"
     }
 }

@@ -22,27 +22,27 @@ jobs:
         include:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            package: teams-win32-x64
+            package: outlook-win32-x64
             archive: zip
           - target: aarch64-pc-windows-msvc
             os: windows-latest
-            package: teams-win32-arm64
+            package: outlook-win32-arm64
             archive: zip
           - target: x86_64-apple-darwin
             os: macos-15-intel
-            package: teams-darwin-x64
+            package: outlook-darwin-x64
             archive: tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
-            package: teams-darwin-arm64
+            package: outlook-darwin-arm64
             archive: tar.gz
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            package: teams-linux-x64
+            package: outlook-linux-x64
             archive: tar.gz
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            package: teams-linux-arm64
+            package: outlook-linux-arm64
             archive: tar.gz
 
     steps:
@@ -77,15 +77,15 @@ jobs:
 
       - name: Verify Linux GLIBC <= 2.28 compatibility
         if: matrix.os == 'ubuntu-latest'
-        run: node scripts/verify-glibc.mjs "target/${{ matrix.target }}/release/teams" --max 2.28
+        run: node scripts/verify-glibc.mjs "target/${{ matrix.target }}/release/outlook" --max 2.28
 
       - name: Smoke test binary on AlmaLinux 8 container
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/teams --version
-          docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/teams --help >/dev/null
+          docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/outlook --version
+          docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/outlook --help >/dev/null
 
       - name: Build release binary
         if: matrix.os != 'ubuntu-latest'
@@ -99,15 +99,15 @@ jobs:
         run: |
           set -euo pipefail
           version=$(node -p "require('./package.json').version")
-          name="teams-${version}-${{ matrix.target }}"
+          name="outlook-${version}-${{ matrix.target }}"
           mkdir -p release-staging
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            7z a "release-staging/${name}.zip" "target/${{ matrix.target }}/release/teams.exe"
+            7z a "release-staging/${name}.zip" "target/${{ matrix.target }}/release/outlook.exe"
             if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
-              cp "target/${{ matrix.target }}/release/teams.exe" "release-staging/teams.exe"
+              cp "target/${{ matrix.target }}/release/outlook.exe" "release-staging/outlook.exe"
             fi
           else
-            tar -czf "release-staging/${name}.tar.gz" -C "target/${{ matrix.target }}/release" teams
+            tar -czf "release-staging/${name}.tar.gz" -C "target/${{ matrix.target }}/release" outlook
           fi
 
       - name: Stage npm artifact directory
@@ -164,8 +164,8 @@ jobs:
           node scripts/sync-version.mjs --check
           node scripts/verify-glibc.mjs --self-test
 
-          for package in teams-win32-x64 teams-win32-arm64 teams-darwin-x64 \
-                         teams-darwin-arm64 teams-linux-x64 teams-linux-arm64; do
+          for package in outlook-win32-x64 outlook-win32-arm64 outlook-darwin-x64 \
+                         outlook-darwin-arm64 outlook-linux-x64 outlook-linux-arm64; do
             if [ ! -f "dist/${package}/package.json" ]; then
               echo "missing dist/${package}/package.json" >&2
               exit 1
@@ -181,14 +181,14 @@ jobs:
             fi
           done
 
-          test -f bin/teams.js
+          test -f bin/outlook.js
           test -f scripts/postinstall.mjs
-          test -f dist/teams-win32-x64/bin/teams.exe
-          test -f dist/teams-win32-arm64/bin/teams.exe
-          test -f dist/teams-darwin-x64/bin/teams
-          test -f dist/teams-darwin-arm64/bin/teams
-          test -f dist/teams-linux-x64/bin/teams
-          test -f dist/teams-linux-arm64/bin/teams
+          test -f dist/outlook-win32-x64/bin/outlook.exe
+          test -f dist/outlook-win32-arm64/bin/outlook.exe
+          test -f dist/outlook-darwin-x64/bin/outlook
+          test -f dist/outlook-darwin-arm64/bin/outlook
+          test -f dist/outlook-linux-x64/bin/outlook
+          test -f dist/outlook-linux-arm64/bin/outlook
 
       - name: Publish platform packages
         env:
@@ -196,7 +196,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for dir in dist/teams-*; do
+          for dir in dist/outlook-*; do
             echo "publishing $(basename "${dir}")"
             npm publish "${dir}" --access public
           done
@@ -231,7 +231,7 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo 'Prebuilt pure Microsoft Teams binary (`teams` / `teams.exe`) — CLI, TUI, HTTP API, and MCP server.'
+            echo 'Prebuilt pure Microsoft Outlook binary (`outlook` / `outlook.exe`) — CLI, TUI, HTTP API, and MCP server.'
             if [ -f "release-notes/${GITHUB_REF_NAME}.md" ]; then
               echo ""
               cat "release-notes/${GITHUB_REF_NAME}.md"

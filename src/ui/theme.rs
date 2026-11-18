@@ -1,4 +1,4 @@
-//! Semantic multi-depth color & style tokens for the Microsoft Teams TUI.
+//! Semantic multi-depth color & style tokens for the Microsoft Outlook TUI.
 //!
 //! Supports Truecolor (`Midnight Dark` / `Daylight Light`), `Ansi256`, `Ansi16`, and `NO_COLOR`.
 

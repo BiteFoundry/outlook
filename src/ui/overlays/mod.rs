@@ -4,13 +4,12 @@ pub mod attachments;
 pub mod command_palette;
 pub mod confirm;
 pub mod context_menu;
+pub mod event_form;
+pub mod folder_picker;
 pub mod image_preview;
-pub mod mentions;
-pub mod new_chat;
+pub mod mail_compose;
 pub mod path_input;
-pub mod presence;
-pub mod reactions;
-pub mod room_info;
+pub mod quick_input;
 pub mod search;
 pub mod settings;
 
@@ -25,12 +24,13 @@ use ratatui::{
 use crate::ui::{
     action::Action,
     app::{AppState, UiState},
-    hitmap::{HitMap, HitTarget, MessageScope},
+    hitmap::{HitMap, HitTarget},
     overlays::{
         attachments::AttachmentsState, command_palette::CommandPalette, confirm::ConfirmDialog,
-        context_menu::ContextMenu, image_preview::ImagePreviewOverlay, new_chat::NewChatState,
-        path_input::PathInputState, presence::PresenceOverlay, reactions::ReactionsOverlay,
-        room_info::RoomInfoState, search::SearchOverlay, settings::SettingsState,
+        context_menu::ContextMenu, event_form::EventFormOverlay,
+        folder_picker::FolderPickerOverlay, image_preview::ImagePreviewOverlay,
+        mail_compose::MailComposeOverlay, path_input::PathInputState,
+        quick_input::QuickInputOverlay, search::SearchOverlay, settings::SettingsState,
     },
 };
 
@@ -40,21 +40,15 @@ pub enum OverlayKind {
     CommandPalette,
     Settings,
     Search,
-    Presence,
-    Reactions,
     Attachments,
     PathInput,
-    NewChat,
-    RoomInfo,
+    MailCompose,
+    EventForm,
+    FolderPicker,
+    QuickInput,
     ImagePreview,
     Help,
     Confirm,
-}
-
-impl OverlayKind {
-    pub fn is_singleton(self) -> bool {
-        true
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,12 +66,12 @@ pub enum Overlay {
     CommandPalette(CommandPalette),
     Settings(SettingsState),
     Search(SearchOverlay),
-    Presence(PresenceOverlay),
-    Reactions(ReactionsOverlay),
     Attachments(AttachmentsState),
     PathInput(PathInputState),
-    NewChat(NewChatState),
-    RoomInfo(RoomInfoState),
+    MailCompose(MailComposeOverlay),
+    EventForm(EventFormOverlay),
+    FolderPicker(FolderPickerOverlay),
+    QuickInput(QuickInputOverlay),
     ImagePreview(ImagePreviewOverlay),
     Help(HelpOverlay),
     Confirm(ConfirmDialog),
@@ -90,12 +84,12 @@ impl Overlay {
             Overlay::CommandPalette(_) => OverlayKind::CommandPalette,
             Overlay::Settings(_) => OverlayKind::Settings,
             Overlay::Search(_) => OverlayKind::Search,
-            Overlay::Presence(_) => OverlayKind::Presence,
-            Overlay::Reactions(_) => OverlayKind::Reactions,
             Overlay::Attachments(_) => OverlayKind::Attachments,
             Overlay::PathInput(_) => OverlayKind::PathInput,
-            Overlay::NewChat(_) => OverlayKind::NewChat,
-            Overlay::RoomInfo(_) => OverlayKind::RoomInfo,
+            Overlay::MailCompose(_) => OverlayKind::MailCompose,
+            Overlay::EventForm(_) => OverlayKind::EventForm,
+            Overlay::FolderPicker(_) => OverlayKind::FolderPicker,
+            Overlay::QuickInput(_) => OverlayKind::QuickInput,
             Overlay::ImagePreview(_) => OverlayKind::ImagePreview,
             Overlay::Help(_) => OverlayKind::Help,
             Overlay::Confirm(_) => OverlayKind::Confirm,
@@ -103,13 +97,16 @@ impl Overlay {
     }
 
     pub fn accepts_text(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Overlay::Search(_)
-                | Overlay::CommandPalette(_)
-                | Overlay::PathInput(_)
-                | Overlay::NewChat(_)
-        )
+            | Overlay::CommandPalette(_)
+            | Overlay::PathInput(_)
+            | Overlay::FolderPicker(_)
+            | Overlay::QuickInput(_) => true,
+            Overlay::MailCompose(c) => c.field <= 4,
+            Overlay::EventForm(e) => e.field <= 4 || e.field == 6,
+            _ => false,
+        }
     }
 
     pub fn context_menu(menu: ContextMenu) -> Self {
@@ -128,14 +125,6 @@ impl Overlay {
         Overlay::Search(SearchOverlay::default())
     }
 
-    pub fn presence() -> Self {
-        Overlay::Presence(PresenceOverlay::default())
-    }
-
-    pub fn reactions(scope: MessageScope, msg_index: usize) -> Self {
-        Overlay::Reactions(ReactionsOverlay::new(scope, msg_index))
-    }
-
     pub fn attachments() -> Self {
         Overlay::Attachments(AttachmentsState::default())
     }
@@ -144,12 +133,20 @@ impl Overlay {
         Overlay::PathInput(PathInputState::new())
     }
 
-    pub fn new_chat() -> Self {
-        Overlay::NewChat(NewChatState::new())
+    pub fn mail_compose(compose: MailComposeOverlay) -> Self {
+        Overlay::MailCompose(compose)
     }
 
-    pub fn room_info() -> Self {
-        Overlay::RoomInfo(RoomInfoState::default())
+    pub fn event_form() -> Self {
+        Overlay::EventForm(EventFormOverlay::new())
+    }
+
+    pub fn folder_picker(message_ids: Vec<String>) -> Self {
+        Overlay::FolderPicker(FolderPickerOverlay::new(message_ids))
+    }
+
+    pub fn quick_input(quick: QuickInputOverlay) -> Self {
+        Overlay::QuickInput(quick)
     }
 
     pub fn help() -> Self {
@@ -187,19 +184,17 @@ impl Overlay {
                 other => settings.handle(other, app),
             },
             Overlay::Search(search) => search.handle(action, app),
-            Overlay::Presence(presence) => presence.handle(action),
-            Overlay::Reactions(reactions) => reactions.handle(action),
             Overlay::Attachments(tray) => tray.handle(action, app),
             Overlay::PathInput(input) => input.handle(action),
-            Overlay::NewChat(new_chat) => match action {
-                Action::Tab => new_chat.handle(&Action::MoveDown, app),
-                Action::PrevFocus => new_chat.handle(&Action::MoveUp, app),
-                other => new_chat.handle(other, app),
-            },
-            Overlay::RoomInfo(info) => info.handle(action),
+            Overlay::MailCompose(compose) => compose.handle(action, app),
+            Overlay::EventForm(form) => form.handle(action),
+            Overlay::FolderPicker(picker) => picker.handle(action, app),
+            Overlay::QuickInput(input) => input.handle(action),
             Overlay::ImagePreview(preview) => preview.handle(action),
             Overlay::Help(_) => match action {
-                Action::CloseOverlay | Action::Activate => OverlayOutcome::Close,
+                Action::CloseOverlay | Action::Activate | Action::Input('q') => {
+                    OverlayOutcome::Close
+                }
                 Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
                 _ => OverlayOutcome::Handled,
             },
@@ -213,37 +208,76 @@ impl Overlay {
             Overlay::CommandPalette(palette) => palette.select(index),
             Overlay::Settings(settings) => settings.select(index),
             Overlay::Search(search) => search.select(index),
-            Overlay::Presence(presence) => presence.select(index),
-            Overlay::Reactions(reactions) => reactions.select(index),
             Overlay::Attachments(tray) => tray.select(index),
-            Overlay::NewChat(new_chat) => new_chat.select(index),
-            Overlay::RoomInfo(info) => info.select(index),
-            Overlay::ImagePreview(_) | Overlay::PathInput(_) | Overlay::Help(_) | Overlay::Confirm(_) => {}
+            Overlay::MailCompose(compose) => compose.select_field(index),
+            Overlay::EventForm(form) => form.select(index),
+            Overlay::FolderPicker(picker) => picker.select(index),
+            Overlay::QuickInput(_)
+            | Overlay::ImagePreview(_)
+            | Overlay::PathInput(_)
+            | Overlay::Help(_)
+            | Overlay::Confirm(_) => {}
         }
     }
 
     pub fn draw(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         app: &AppState,
         ui: &UiState,
         hitmap: &mut HitMap,
-    ) {
+    ) -> Option<(u16, u16)> {
         match self {
-            Overlay::ContextMenu(menu) => menu.draw(frame, area, ui, hitmap),
-            Overlay::CommandPalette(palette) => palette.draw(frame, area, app, ui, hitmap),
-            Overlay::Settings(settings) => settings.draw(frame, area, app, ui, hitmap),
-            Overlay::Search(search) => search.draw(frame, area, app, ui, hitmap),
-            Overlay::Presence(presence) => presence.draw(frame, area, app, ui, hitmap),
-            Overlay::Reactions(reactions) => reactions.draw(frame, area, app, ui, hitmap),
-            Overlay::Attachments(tray) => tray.draw(frame, area, app, ui, hitmap),
-            Overlay::PathInput(input) => input.draw(frame, area, ui, hitmap),
-            Overlay::NewChat(new_chat) => new_chat.draw(frame, area, app, ui, hitmap),
-            Overlay::RoomInfo(info) => info.draw(frame, area, app, ui, hitmap),
-            Overlay::ImagePreview(preview) => preview.draw(frame, area, app, ui, hitmap),
-            Overlay::Help(_) => draw_help(frame, area, ui, hitmap),
-            Overlay::Confirm(dialog) => dialog.draw(frame, area, ui, hitmap),
+            Overlay::ContextMenu(menu) => {
+                menu.draw(frame, area, ui, hitmap);
+                None
+            }
+            Overlay::CommandPalette(palette) => {
+                palette.draw(frame, area, app, ui, hitmap);
+                None
+            }
+            Overlay::Settings(settings) => {
+                settings.draw(frame, area, app, ui, hitmap);
+                None
+            }
+            Overlay::Search(search) => {
+                search.draw(frame, area, app, ui, hitmap);
+                None
+            }
+            Overlay::Attachments(tray) => {
+                tray.draw(frame, area, app, ui, hitmap);
+                None
+            }
+            Overlay::PathInput(input) => {
+                input.draw(frame, area, ui, hitmap);
+                None
+            }
+            Overlay::MailCompose(compose) => compose.draw(frame, area, app, ui, hitmap),
+            Overlay::EventForm(form) => {
+                form.draw(frame, area, ui, hitmap);
+                None
+            }
+            Overlay::FolderPicker(picker) => {
+                picker.draw(frame, area, app, ui, hitmap);
+                None
+            }
+            Overlay::QuickInput(input) => {
+                input.draw(frame, area, ui, hitmap);
+                None
+            }
+            Overlay::ImagePreview(preview) => {
+                preview.draw(frame, area, app, ui, hitmap);
+                None
+            }
+            Overlay::Help(_) => {
+                draw_help(frame, area, ui, hitmap);
+                None
+            }
+            Overlay::Confirm(dialog) => {
+                dialog.draw(frame, area, ui, hitmap);
+                None
+            }
         }
     }
 }
@@ -257,51 +291,52 @@ pub struct HelpOverlay;
 
 const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
     (
-        "Navigation & Switching",
+        "Navigation & Tabs",
         &[
-            ("Ctrl+K", "Omni-Switcher (chats, channels, commands)"),
-            ("1/2/3 · Alt+1..3", "Chats / Teams / Activity (@mentions)"),
-            ("u / U / Alt+u", "Jump to next / previous unread"),
-            ("` / Alt+← / Alt+→", "Last conversation / history back-fwd"),
-            ("Alt+↑ / Alt+↓", "Previous / next conversation in list"),
-            ("←/→ or h/l (Nav)", "Collapse / expand team or open chat"),
-            ("p / f (Nav)", "Pin conversation / filter unread only"),
-            ("Tab / Shift+Tab", "Cycle pane focus"),
+            ("1 / 2 / 3 · Alt+1..3", "Switch Mail / Calendar / Tasks"),
+            ("Ctrl+K", "Omni-Switcher (>cmd #folder @contact /search)"),
+            ("/ / Ctrl+F", "Search mail (FTS5 local + Graph remote)"),
+            ("Tab / Enter / Esc", "Move focus Folders <-> List <-> Reader"),
+            ("j / k · ↑ / ↓", "Move selection / scroll reading pane"),
+            ("Space / PgDn / PgUp", "Page-scroll reading pane from list"),
+            ("Ctrl+B", "Toggle left sidebar"),
+            ("Ctrl+R / F5", "Manual sync / refresh"),
         ],
     ),
     (
-        "Messages & Threads",
+        "Mail Triage & Reader",
         &[
-            ("↑/↓, j/k", "Select messages / navigate list"),
-            ("PgUp / PgDn", "Scroll history (stays in Composer)"),
-            ("Ctrl+↑ / Ctrl+↓", "Scroll 3 lines from Composer"),
-            ("o / H / s", "Load older (50) / deep history sync"),
-            ("t / + / e", "Open channel thread / add reaction"),
-            ("r / y / Del", "Reply / copy / delete message"),
-            ("v / d / m", "Preview image / download / menu"),
+            ("c", "Compose new email"),
+            ("r / R / f", "Reply / Reply All / Forward"),
+            ("e / Del / #", "Archive / Delete email"),
+            ("u / g", "Toggle Read/Unread / Toggle Flag"),
+            ("m", "Move email to folder"),
+            ("t / F / U", "Thread grouping / Focused / Unread filter"),
+            ("z / v / Alt+v", "Toggle quoted reply / HD image preview"),
+            ("d / A / o", "Download attachment / picker / open link"),
         ],
     ),
     (
-        "Composing & Search",
+        "Mail Compose",
         &[
-            ("i / Enter", "Focus Composer / send message"),
-            ("Shift+Enter / Ctrl+E", "Newline / external $EDITOR"),
-            ("Ctrl+W / Alt+Bksp", "Delete word backward"),
-            ("Ctrl+V / Ctrl+Shift+X", "Paste image / clear pending images"),
-            ("Alt+T / Ctrl+S", "Toggle thread target / channel subject"),
-            ("Ctrl+O / Ctrl+T", "Send file / attachments tray"),
-            ("Ctrl+F / /", "Search messages"),
+            ("Ctrl+Enter / Alt+Enter", "Send email"),
+            ("Tab / Enter (To/Cc/Bcc)", "Insert autocomplete contact chip"),
+            ("Ctrl+V", "Paste text or clipboard screenshot (cid:)"),
+            ("Ctrl+A", "Attach local file"),
+            ("Ctrl+E", "Edit body in external $EDITOR"),
+            ("Ctrl+S", "Save draft (Esc auto-stashes locally)"),
         ],
     ),
     (
-        "Window & Preferences",
+        "Calendar, Tasks & Prefs",
         &[
-            ("Ctrl+D", "Toggle density (Cozy / Compact)"),
-            ("Ctrl+N / Ctrl+U", "New chat / room info & members"),
-            ("Ctrl+P / Ctrl+,", "Set presence / settings"),
-            ("Ctrl+B", "Toggle left navigation rail"),
-            ("F5 / R", "Refresh conversations"),
-            ("? / Ctrl+Q", "Help / quit (confirms unsent draft)"),
+            ("n (Cal / Tasks)", "New event / new task or To Do list"),
+            ("a / y / x", "RSVP Accept / Tentative / Decline"),
+            ("o (Cal / Invite)", "Join online meeting URL"),
+            ("Space / Enter (Tasks)", "Toggle task completion"),
+            ("Ctrl+D", "Toggle Cozy / Compact list density"),
+            ("Ctrl+,", "Open settings (theme, protocol, etc.)"),
+            ("? / Ctrl+Q", "Help / quit Outlook"),
         ],
     ),
 ];
@@ -310,17 +345,18 @@ fn draw_help(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
     let theme = &ui.theme;
     let rect = centered_rect(
         area,
-        area.width.saturating_sub(6).min(96),
+        area.width.saturating_sub(4).min(100),
         area.height.saturating_sub(3).min(24),
     );
     frame.render_widget(Clear, rect);
     hitmap.add(rect, HitTarget::OverlayBody);
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
         .title(Line::from(Span::styled(
-            " Microsoft Teams TUI Help · Esc Close ",
+            " Microsoft Outlook TUI Help · Esc Close ",
             theme.title(true),
         )))
         .border_style(theme.border_style(true));
@@ -345,7 +381,7 @@ fn draw_help(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
         )));
         for (key, desc) in entries.iter() {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {key:<21}"), theme.accent_style()),
+                Span::styled(format!("  {key:<23}"), theme.accent_style()),
                 Span::raw(desc.to_string()),
             ]));
         }
@@ -368,16 +404,4 @@ pub fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
         width,
         height,
     )
-}
-
-pub fn draw_stack(
-    frame: &mut Frame,
-    area: Rect,
-    app: &AppState,
-    ui: &UiState,
-    hitmap: &mut HitMap,
-) {
-    if let Some(overlay) = ui.overlays.last() {
-        overlay.draw(frame, area, app, ui, hitmap);
-    }
 }

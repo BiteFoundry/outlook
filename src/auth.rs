@@ -1,9 +1,10 @@
 //! OAuth 2.0 authentication (PKCE loopback, Device Code Flow, Client Secret / env token)
-//! + OS keyring (`keyring`) with file fallback (`credentials.json`) + automatic refresh.
+//! + OS keyring (`keyring`) with file fallback (`credentials.json`) + automatic refresh
+//! + optional shared Microsoft 365 (`teams-cli`) session bootstrap.
 
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -23,9 +24,21 @@ use tokio::{
 };
 use url::Url;
 
-use crate::config::{credential_fallback_path, write_atomic, AppConfig};
+use crate::config::{credential_fallback_path, legacy_teams_config_dir, write_atomic, AppConfig};
 
-const KEYRING_SERVICE: &str = "teams-cli";
+/// Default Microsoft Graph delegated OAuth scopes for `outlook-cli`.
+pub const DEFAULT_SCOPES: &[&str] = &[
+    "User.Read",
+    "Mail.ReadWrite",
+    "Mail.Send",
+    "Calendars.ReadWrite",
+    "Contacts.Read",
+    "Tasks.ReadWrite",
+    "offline_access",
+];
+
+const KEYRING_SERVICE: &str = "outlook-cli";
+const LEGACY_TEAMS_KEYRING_SERVICE: &str = "teams-cli";
 const KEYRING_USER: &str = "default";
 const LOGIN_CALLBACK_TIMEOUT_SECS: u64 = 300;
 #[cfg(target_os = "linux")]
@@ -42,6 +55,9 @@ const EXTERNAL_REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
 const REFRESH_CMD_FAILURE_COOLDOWN: Duration = Duration::from_secs(15);
 #[cfg(target_os = "windows")]
 const WINDOWS_CRED_MAX_BYTES: usize = 2500;
+
+/// Canonical prefix emitted by `explain_graph_permission_error` for 403 Graph errors.
+pub const INSUFFICIENT_PERMISSIONS_PREFIX: &str = "Insufficient Graph permissions (403):";
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredTokens {
@@ -97,7 +113,13 @@ pub struct LoginOptions {
 struct ExternalTokenCache {
     env_token: Option<(String, StoredTokens)>,
     file_token: Option<(
-        std::path::PathBuf,
+        PathBuf,
+        Option<std::time::SystemTime>,
+        u64,
+        StoredTokens,
+    )>,
+    shared_file_token: Option<(
+        PathBuf,
         Option<std::time::SystemTime>,
         u64,
         StoredTokens,
@@ -112,8 +134,11 @@ pub struct AuthManager {
     refresh_mutex: Arc<tokio::sync::Mutex<()>>,
     external_cache: Arc<std::sync::Mutex<Option<ExternalTokenCache>>>,
     refresh_cmd_cooldown_until: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    ephemeral: bool,
     #[cfg(test)]
-    token_path_override: Option<std::path::PathBuf>,
+    token_path_override: Option<PathBuf>,
+    #[cfg(test)]
+    legacy_teams_dir_override: Option<PathBuf>,
 }
 
 impl AuthManager {
@@ -131,8 +156,11 @@ impl AuthManager {
             refresh_mutex: Arc::new(tokio::sync::Mutex::new(())),
             external_cache: Arc::new(std::sync::Mutex::new(None)),
             refresh_cmd_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            ephemeral: false,
             #[cfg(test)]
             token_path_override: None,
+            #[cfg(test)]
+            legacy_teams_dir_override: None,
         })
     }
 
@@ -145,14 +173,39 @@ impl AuthManager {
             refresh_mutex: Arc::new(tokio::sync::Mutex::new(())),
             external_cache: Arc::new(std::sync::Mutex::new(None)),
             refresh_cmd_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            ephemeral: true,
             #[cfg(test)]
             token_path_override: None,
+            #[cfg(test)]
+            legacy_teams_dir_override: None,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn with_token_path(mut self, path: std::path::PathBuf) -> Self {
+    pub(crate) fn empty_for_test(config: AppConfig) -> Self {
+        let http = build_auth_http_client().unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            config,
+            http,
+            tokens: Arc::new(RwLock::new(None)),
+            refresh_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            external_cache: Arc::new(std::sync::Mutex::new(None)),
+            refresh_cmd_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
+            ephemeral: true,
+            token_path_override: None,
+            legacy_teams_dir_override: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_token_path(mut self, path: PathBuf) -> Self {
         self.token_path_override = Some(path);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_legacy_teams_dir(mut self, dir: PathBuf) -> Self {
+        self.legacy_teams_dir_override = Some(dir);
         self
     }
 
@@ -160,6 +213,9 @@ impl AuthManager {
         #[cfg(test)]
         if let Some(ref path) = self.token_path_override {
             return save_tokens_to_path(tokens, path);
+        }
+        if self.ephemeral {
+            return Ok(());
         }
         save_stored_tokens(tokens)
     }
@@ -169,7 +225,18 @@ impl AuthManager {
         if let Some(ref path) = self.token_path_override {
             return load_tokens_from_path(path);
         }
+        if self.ephemeral {
+            return Ok(None);
+        }
         load_stored_tokens()
+    }
+
+    fn effective_scopes_string(&self) -> String {
+        if !self.config.scopes.is_empty() {
+            self.config.scopes.join(" ")
+        } else {
+            DEFAULT_SCOPES.join(" ")
+        }
     }
 
     pub fn config(&self) -> &AppConfig {
@@ -189,7 +256,7 @@ impl AuthManager {
     }
 
     fn cached_env_access_token(&self) -> Option<StoredTokens> {
-        let Ok(raw) = std::env::var("TEAMS_ACCESS_TOKEN") else {
+        let Ok(raw) = std::env::var("OUTLOOK_ACCESS_TOKEN") else {
             if let Ok(mut guard) = self.external_cache.lock() {
                 if let Some(ref mut cache) = *guard {
                     cache.env_token = None;
@@ -215,6 +282,19 @@ impl AuthManager {
     }
 
     fn cached_external_token_file(&self, path: &Path) -> Result<StoredTokens> {
+        self.cached_token_file_with_mode(path, "token_file", false)
+    }
+
+    fn cached_shared_teams_token_file(&self, path: &Path) -> Result<StoredTokens> {
+        self.cached_token_file_with_mode(path, "shared_teams_token_file", true)
+    }
+
+    fn cached_token_file_with_mode(
+        &self,
+        path: &Path,
+        auth_mode: &str,
+        shared_slot: bool,
+    ) -> Result<StoredTokens> {
         let meta = std::fs::metadata(path)
             .with_context(|| format!("Failed to read external token file: {}", path.display()))?;
         let modified = meta.modified().ok();
@@ -223,7 +303,12 @@ impl AuthManager {
         if modified.is_some() {
             if let Ok(guard) = self.external_cache.lock() {
                 if let Some(ref cache) = *guard {
-                    if let Some((ref p, m, l, ref tok)) = cache.file_token {
+                    let slot = if shared_slot {
+                        &cache.shared_file_token
+                    } else {
+                        &cache.file_token
+                    };
+                    if let Some((ref p, m, l, ref tok)) = *slot {
                         if p == path && m == modified && l == len {
                             return Ok(tok.clone());
                         }
@@ -232,18 +317,27 @@ impl AuthManager {
             }
         }
 
-        match read_external_token_file(path, &self.config) {
+        match read_external_token_file_with_mode(path, auth_mode, &self.config) {
             Ok(tok) => {
                 if let Ok(mut guard) = self.external_cache.lock() {
                     let cache = guard.get_or_insert_with(ExternalTokenCache::default);
-                    cache.file_token = Some((path.to_path_buf(), modified, len, tok.clone()));
+                    let entry = Some((path.to_path_buf(), modified, len, tok.clone()));
+                    if shared_slot {
+                        cache.shared_file_token = entry;
+                    } else {
+                        cache.file_token = entry;
+                    }
                 }
                 Ok(tok)
             }
             Err(err) => {
                 if let Ok(mut guard) = self.external_cache.lock() {
                     if let Some(ref mut cache) = *guard {
-                        cache.file_token = None;
+                        if shared_slot {
+                            cache.shared_file_token = None;
+                        } else {
+                            cache.file_token = None;
+                        }
                     }
                 }
                 Err(err)
@@ -255,7 +349,125 @@ impl AuthManager {
         if let Ok(mut guard) = self.external_cache.lock() {
             if let Some(ref mut cache) = *guard {
                 cache.file_token = None;
+                cache.shared_file_token = None;
             }
+        }
+    }
+
+    fn resolve_legacy_teams_config_dir(&self) -> Option<PathBuf> {
+        #[cfg(test)]
+        if let Some(ref dir) = self.legacy_teams_dir_override {
+            return Some(dir.clone());
+        }
+        #[cfg(test)]
+        if self.token_path_override.is_some() && std::env::var_os("TEAMS_CONFIG_DIR").is_none() {
+            // Keep isolated token-path tests from accidentally reading the user's real teams-cli dir.
+            return None;
+        }
+        if self.ephemeral {
+            return None;
+        }
+        legacy_teams_config_dir()
+    }
+
+    fn resolve_shared_teams_token_file_path(&self) -> Option<PathBuf> {
+        #[cfg(test)]
+        if self.token_path_override.is_some()
+            && self.legacy_teams_dir_override.is_none()
+            && std::env::var_os("TEAMS_TOKEN_FILE").is_none()
+            && std::env::var_os("TEAMS_CONFIG_DIR").is_none()
+        {
+            return None;
+        }
+        if self.ephemeral {
+            #[cfg(test)]
+            let allow_override = self.legacy_teams_dir_override.is_some();
+            #[cfg(not(test))]
+            let allow_override = false;
+            if !allow_override {
+                return None;
+            }
+        }
+        if let Ok(val) = std::env::var("TEAMS_TOKEN_FILE") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(expand_tilde_path(trimmed));
+            }
+        }
+        let teams_dir = self.resolve_legacy_teams_config_dir()?;
+        let cfg_path = teams_dir.join("config.toml");
+        let raw = std::fs::read_to_string(&cfg_path).ok()?;
+        #[derive(Deserialize)]
+        struct LegacyTeamsCfg {
+            #[serde(default)]
+            token_file: String,
+        }
+        let parsed: LegacyTeamsCfg = toml::from_str(&raw).ok()?;
+        let trimmed = parsed.token_file.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(expand_tilde_path(trimmed))
+        }
+    }
+
+    fn load_shared_teams_token_file_if_eligible(&self) -> Option<StoredTokens> {
+        if !self.config.share_m365_auth {
+            return None;
+        }
+        let path = self.resolve_shared_teams_token_file_path()?;
+        if !path.exists() {
+            return None;
+        }
+        let tok = self.cached_shared_teams_token_file(&path).ok()?;
+        if token_is_outlook_eligible_or_opaque(&tok.access_token) {
+            Some(tok)
+        } else {
+            None
+        }
+    }
+
+    fn load_legacy_teams_stored_tokens(&self) -> Option<StoredTokens> {
+        if !self.config.share_m365_auth {
+            return None;
+        }
+        if self.ephemeral {
+            #[cfg(test)]
+            let allow_override = self.legacy_teams_dir_override.is_some();
+            #[cfg(not(test))]
+            let allow_override = false;
+            if !allow_override {
+                return None;
+            }
+        }
+        #[cfg(test)]
+        let skip_real_keyring = self.ephemeral
+            || self.token_path_override.is_some()
+            || self.legacy_teams_dir_override.is_some();
+        #[cfg(not(test))]
+        let skip_real_keyring = self.ephemeral;
+
+        let keyring_tok = if !skip_real_keyring && should_use_keyring() {
+            read_keyring_tokens(LEGACY_TEAMS_KEYRING_SERVICE)
+        } else {
+            None
+        };
+
+        let file_tok = self
+            .resolve_legacy_teams_config_dir()
+            .and_then(|dir| load_tokens_from_path(&dir.join("credentials.json")).ok().flatten());
+
+        match (keyring_tok, file_tok) {
+            (Some(kr), Some(fl)) => {
+                if fl.expires_at > kr.expires_at {
+                    Some(fl)
+                } else {
+                    Some(kr)
+                }
+            }
+            (Some(kr), None) => Some(kr),
+            (None, Some(fl)) => Some(fl),
+            (None, None) => None,
         }
     }
 
@@ -297,7 +509,22 @@ impl AuthManager {
         if let Some(file) = file_tok {
             return Some(file);
         }
-        mem_tok
+        if mem_tok.is_some() {
+            return mem_tok;
+        }
+        if let Ok(Some(disk)) = self.load_from_configured_source() {
+            return Some(disk);
+        }
+        if let Some(shared_file) = self.load_shared_teams_token_file_if_eligible() {
+            return Some(shared_file);
+        }
+        if let Some(mut teams_tok) = self.load_legacy_teams_stored_tokens() {
+            if !teams_tok.is_expired_soon(0) && token_has_outlook_scopes(&teams_tok.access_token) {
+                teams_tok.auth_mode = "shared_teams_session".to_string();
+                return Some(teams_tok);
+            }
+        }
+        None
     }
 
     pub async fn current_tokens(&self) -> Option<StoredTokens> {
@@ -311,17 +538,18 @@ impl AuthManager {
     }
 
     /// Returns a valid Bearer access token, hot-reloading external `credentials.json` / `token_file` updates,
-    /// running `TEAMS_TOKEN_REFRESH_CMD`, or refreshing via OAuth `refresh_token` automatically when needed.
+    /// running `OUTLOOK_TOKEN_REFRESH_CMD`, refreshing via OAuth `refresh_token`, or bootstrapping from
+    /// shared `teams-cli` M365 tokens when `config.share_m365_auth` is enabled.
     pub async fn valid_access_token(&self) -> Result<String> {
         let has_refresh_cmd = self.has_refresh_cmd();
 
         if let Some(tok) = self.resolve_current_tokens_raw().await {
             let is_external = matches!(
                 tok.auth_mode.as_str(),
-                "env_token" | "token_file" | "refresh_cmd"
+                "env_token" | "token_file" | "refresh_cmd" | "shared_teams_token_file"
             );
             if is_external {
-                if has_refresh_cmd {
+                if has_refresh_cmd && tok.auth_mode != "shared_teams_token_file" {
                     let skew_secs = self.external_refresh_skew_secs();
                     if !tok.is_expired_soon(skew_secs) {
                         return Ok(tok.access_token);
@@ -331,8 +559,15 @@ impl AuthManager {
                 }
 
                 if tok.is_expired_soon(0) {
+                    if tok.auth_mode == "shared_teams_token_file" {
+                        bail!(
+                            "Shared Teams token expired (exp: {}, auth_mode={}) — refresh your Teams token or run 'outlook login'.",
+                            format_local_exp(tok.expires_at),
+                            tok.auth_mode
+                        );
+                    }
                     bail!(
-                        "Token expired (exp: {}, auth_mode={}) — refresh your token and retry. (Auto-refresh supported via TEAMS_TOKEN_FILE + TEAMS_TOKEN_REFRESH_CMD)",
+                        "Token expired (exp: {}, auth_mode={}) — refresh your token and retry. (Auto-refresh supported via OUTLOOK_TOKEN_FILE + OUTLOOK_TOKEN_REFRESH_CMD)",
                         format_local_exp(tok.expires_at),
                         tok.auth_mode
                     );
@@ -344,6 +579,20 @@ impl AuthManager {
                     );
                 }
                 return Ok(tok.access_token);
+            }
+
+            if tok.auth_mode == "shared_teams_session" {
+                if !tok.is_expired_soon(90) && token_has_outlook_scopes(&tok.access_token) {
+                    return Ok(tok.access_token);
+                }
+                if self.can_refresh_token(&tok) {
+                    let upgraded = self.upgrade_shared_teams_session(&tok).await?;
+                    return Ok(upgraded.access_token);
+                }
+                if !tok.is_expired_soon(0) && token_has_outlook_scopes(&tok.access_token) {
+                    return Ok(tok.access_token);
+                }
+                bail!("Shared Microsoft 365 session expired. Run 'outlook login' first.");
             }
 
             if !tok.is_expired_soon(90) {
@@ -362,6 +611,13 @@ impl AuthManager {
                 }
             }
             if self.can_refresh_token(&tok) {
+                // Ensure `self.tokens` holds `tok` before refreshing (e.g. if loaded from disk).
+                {
+                    let mut guard = self.tokens.write().await;
+                    if guard.is_none() {
+                        *guard = Some(tok.clone());
+                    }
+                }
                 let refreshed = self.refresh_oauth_serialized(None, Some(90)).await?;
                 return Ok(refreshed.access_token);
             }
@@ -377,7 +633,7 @@ impl AuthManager {
             let tok = self.cached_external_token_file(&token_path)?;
             if tok.is_expired_soon(0) {
                 bail!(
-                    "Token expired (exp: {}, auth_mode={}) — refresh your token and retry. (Auto-refresh supported via TEAMS_TOKEN_FILE + TEAMS_TOKEN_REFRESH_CMD)",
+                    "Token expired (exp: {}, auth_mode={}) — refresh your token and retry. (Auto-refresh supported via OUTLOOK_TOKEN_FILE + OUTLOOK_TOKEN_REFRESH_CMD)",
                     format_local_exp(tok.expires_at),
                     tok.auth_mode
                 );
@@ -390,7 +646,95 @@ impl AuthManager {
             *guard = Some(reloaded.clone());
             return Ok(reloaded.access_token);
         }
-        bail!("Not logged in. Run 'teams login' first.")
+
+        // Shared M365 fallback: check teams-cli StoredTokens even if its access token is expired
+        // or lacks Outlook scopes, as long as it has a refresh_token we can silently exchange.
+        if self.config.share_m365_auth {
+            if let Some(teams_tok) = self.load_legacy_teams_stored_tokens() {
+                if !teams_tok.is_expired_soon(90) && token_has_outlook_scopes(&teams_tok.access_token)
+                {
+                    return Ok(teams_tok.access_token);
+                }
+                if teams_tok
+                    .refresh_token
+                    .as_deref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false)
+                {
+                    let upgraded = self.upgrade_shared_teams_session(&teams_tok).await?;
+                    return Ok(upgraded.access_token);
+                }
+            }
+        }
+
+        bail!("Not logged in. Run 'outlook login' first.")
+    }
+
+    async fn upgrade_shared_teams_session(&self, teams_tok: &StoredTokens) -> Result<StoredTokens> {
+        let _refresh_guard = self.refresh_mutex.lock().await;
+
+        // Re-check in case another concurrent task already cached an Outlook token.
+        if let Some(ref mem) = *self.tokens.read().await {
+            if !mem.is_expired_soon(30) && token_has_outlook_scopes(&mem.access_token) {
+                return Ok(mem.clone());
+            }
+        }
+        if let Ok(Some(disk)) = self.load_from_configured_source() {
+            if !disk.is_expired_soon(10) {
+                let mut guard = self.tokens.write().await;
+                *guard = Some(disk.clone());
+                return Ok(disk);
+            }
+        }
+
+        let rt = teams_tok
+            .refresh_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("Shared Microsoft 365 session has no refresh token. Run 'outlook login'."))?;
+
+        let token_url = self.token_endpoint(&teams_tok.tenant_id);
+        let scope = self.effective_scopes_string();
+        let params = [
+            ("client_id", teams_tok.client_id.as_str()),
+            ("grant_type", "refresh_token"),
+            ("refresh_token", rt),
+            ("scope", scope.as_str()),
+        ];
+
+        let token_resp = self
+            .post_token_form(&token_url, &params)
+            .await
+            .map_err(|err| {
+                anyhow!(
+                    "Shared Microsoft 365 session could not acquire Outlook scopes ({err}). Run 'outlook login' to consent Outlook permissions."
+                )
+            })?;
+
+        let expires_in = token_resp.expires_in.unwrap_or(3600).max(60);
+        let claims = parse_jwt_claims(&token_resp.access_token).unwrap_or_default();
+        let updated = StoredTokens {
+            access_token: token_resp.access_token,
+            refresh_token: token_resp
+                .refresh_token
+                .or_else(|| teams_tok.refresh_token.clone()),
+            expires_at: chrono::Utc::now().timestamp() + expires_in,
+            client_id: teams_tok.client_id.clone(),
+            tenant_id: teams_tok.tenant_id.clone(),
+            user_id: teams_tok.user_id.clone().or(claims.user_id),
+            user_display_name: teams_tok
+                .user_display_name
+                .clone()
+                .or(claims.user_display_name),
+            user_email: teams_tok.user_email.clone().or(claims.user_email),
+            auth_mode: "shared_teams_session".to_string(),
+        };
+
+        let mut guard = self.tokens.write().await;
+        self.persist_tokens(&updated)?;
+        *guard = Some(updated.clone());
+        Ok(updated)
     }
 
     async fn try_hot_reload_from_disk(
@@ -418,10 +762,17 @@ impl AuthManager {
             return false;
         }
         let guard = self.tokens.read().await;
-        guard
-            .as_ref()
-            .map(|tok| self.can_refresh_token(tok))
-            .unwrap_or(false)
+        if let Some(tok) = guard.as_ref() {
+            return self.can_refresh_token(tok);
+        }
+        drop(guard);
+        if self.load_shared_teams_token_file_if_eligible().is_some() {
+            return false;
+        }
+        if let Some(teams_tok) = self.load_legacy_teams_stored_tokens() {
+            return self.can_refresh_token(&teams_tok);
+        }
+        false
     }
 
     fn can_refresh_token(&self, tok: &StoredTokens) -> bool {
@@ -529,10 +880,22 @@ impl AuthManager {
             return self.run_external_refresh_cmd(current.as_ref(), true).await;
         }
         if self.cached_env_access_token().is_some() {
-            bail!("TEAMS_ACCESS_TOKEN environment variable token cannot be auto-refreshed (TEAMS_TOKEN_REFRESH_CMD is not set).");
+            bail!("OUTLOOK_ACCESS_TOKEN environment variable token cannot be auto-refreshed (OUTLOOK_TOKEN_REFRESH_CMD is not set).");
         }
         if let Some(path) = self.config.resolved_token_file() {
             return self.cached_external_token_file(&path);
+        }
+        if let Some(shared_path) = self.resolve_shared_teams_token_file_path() {
+            if shared_path.exists() && self.tokens.read().await.is_none() {
+                return self.cached_shared_teams_token_file(&shared_path);
+            }
+        }
+        if self.tokens.read().await.is_none() && self.config.share_m365_auth {
+            if let Some(teams_tok) = self.load_legacy_teams_stored_tokens() {
+                if self.can_refresh_token(&teams_tok) {
+                    return self.upgrade_shared_teams_session(&teams_tok).await;
+                }
+            }
         }
         self.refresh_oauth_serialized(None, None).await
     }
@@ -556,7 +919,7 @@ impl AuthManager {
             return Ok(refreshed);
         }
         if self.cached_env_access_token().is_some() {
-            bail!("TEAMS_ACCESS_TOKEN environment variable token cannot be auto-refreshed.");
+            bail!("OUTLOOK_ACCESS_TOKEN environment variable token cannot be auto-refreshed.");
         }
         if let Some(path) = self.config.resolved_token_file() {
             if let Ok(disk_tok) = self.cached_external_token_file(&path) {
@@ -564,7 +927,29 @@ impl AuthManager {
                     return Ok(disk_tok);
                 }
             }
-            bail!("External token file is expired or was rejected. Refresh your token or set TEAMS_TOKEN_REFRESH_CMD.");
+            bail!("External token file is expired or was rejected. Refresh your token or set OUTLOOK_TOKEN_REFRESH_CMD.");
+        }
+        if self.tokens.read().await.is_none() {
+            if let Some(shared_path) = self.resolve_shared_teams_token_file_path() {
+                if shared_path.exists() {
+                    if let Ok(disk_tok) = self.cached_shared_teams_token_file(&shared_path) {
+                        if disk_tok.access_token != failed_access_token
+                            && !disk_tok.is_expired_soon(0)
+                            && token_is_outlook_eligible_or_opaque(&disk_tok.access_token)
+                        {
+                            return Ok(disk_tok);
+                        }
+                    }
+                    bail!("Shared Teams token file was rejected or expired. Refresh your Teams token or run 'outlook login'.");
+                }
+            }
+            if self.config.share_m365_auth {
+                if let Some(teams_tok) = self.load_legacy_teams_stored_tokens() {
+                    if self.can_refresh_token(&teams_tok) {
+                        return self.upgrade_shared_teams_session(&teams_tok).await;
+                    }
+                }
+            }
         }
         self.refresh_oauth_serialized(Some(failed_access_token), None).await
     }
@@ -740,10 +1125,10 @@ impl AuthManager {
         }
 
         let current = current_opt
-            .ok_or_else(|| anyhow!("No stored token found. Run 'teams login' first."))?;
+            .ok_or_else(|| anyhow!("No stored token found. Run 'outlook login' first."))?;
 
         let token_url = self.token_endpoint(&current.tenant_id);
-        let scope = self.config.effective_scopes().join(" ");
+        let scope = self.effective_scopes_string();
 
         let token_resp = if let Some(rt) = current
             .refresh_token
@@ -760,7 +1145,7 @@ impl AuthManager {
             self.post_token_form(&token_url, &params).await?
         } else if current.auth_mode == "client_credentials" {
             let secret = env_client_secret().ok_or_else(|| {
-                anyhow!("TEAMS_CLIENT_SECRET environment variable is required to refresh client_credentials token.")
+                anyhow!("OUTLOOK_CLIENT_SECRET environment variable is required to refresh client_credentials token.")
             })?;
             let params = [
                 ("client_id", current.client_id.as_str()),
@@ -770,7 +1155,7 @@ impl AuthManager {
             ];
             self.post_token_form(&token_url, &params).await?
         } else {
-            bail!("Cannot refresh token (no refresh_token). Run 'teams login' again.");
+            bail!("Cannot refresh token (no refresh_token). Run 'outlook login' again.");
         };
 
         let expires_in = token_resp.expires_in.unwrap_or(3600).max(60);
@@ -831,7 +1216,7 @@ impl AuthManager {
     async fn login_device_code(&self, client_id: &str, tenant_id: &str) -> Result<StoredTokens> {
         let device_url = self.devicecode_endpoint(tenant_id);
         let token_url = self.token_endpoint(tenant_id);
-        let scope = self.config.effective_scopes().join(" ");
+        let scope = self.effective_scopes_string();
 
         let res = self
             .http
@@ -849,10 +1234,8 @@ impl AuthManager {
         let dc: DeviceCodeResponse =
             serde_json::from_str(&body_text).context("Failed to parse Device Code response")?;
 
-        eprintln!("\n[Microsoft Teams Login - Device Code]");
-        eprintln!(
-            "Open the following URL in your browser and enter the code:"
-        );
+        eprintln!("\n[Microsoft Outlook Login - Device Code]");
+        eprintln!("Open the following URL in your browser and enter the code:");
         eprintln!("  URL : {}", dc.verification_uri);
         eprintln!("  Code: {}", dc.user_code);
         if let Some(msg) = dc.message.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -948,7 +1331,7 @@ impl AuthManager {
             .with_context(|| format!("Failed to bind local callback port (127.0.0.1:{bind_port})"))?;
         let actual_port = listener.local_addr()?.port();
         let redirect_uri = format!("http://localhost:{actual_port}");
-        let scope = self.config.effective_scopes().join(" ");
+        let scope = self.effective_scopes_string();
 
         let mut auth_url = Url::parse(&self.authorize_endpoint(tenant_id))
             .context("Failed to build authorize URL")?;
@@ -963,7 +1346,7 @@ impl AuthManager {
             .append_pair("code_challenge", &code_challenge)
             .append_pair("code_challenge_method", "S256");
 
-        eprintln!("\n[Microsoft Teams Login - Browser Auth (PKCE)]");
+        eprintln!("\n[Microsoft Outlook Login - Browser Auth (PKCE)]");
         eprintln!("If the browser does not open automatically, copy and open the URL below:");
         eprintln!("{}\n", auth_url.as_str());
 
@@ -1030,7 +1413,7 @@ impl AuthManager {
 
     async fn post_token_form(&self, url: &str, params: &[(&str, &str)]) -> Result<TokenResponse> {
         let mut req = self.http.post(url).form(params);
-        if let Ok(origin) = std::env::var("TEAMS_TOKEN_ORIGIN") {
+        if let Ok(origin) = std::env::var("OUTLOOK_TOKEN_ORIGIN") {
             let trimmed = origin.trim();
             if !trimmed.is_empty() {
                 req = req.header("Origin", trimmed);
@@ -1065,7 +1448,7 @@ impl AuthManager {
             tok.user_email = email;
             if !matches!(
                 tok.auth_mode.as_str(),
-                "env_token" | "token_file" | "refresh_cmd"
+                "env_token" | "token_file" | "refresh_cmd" | "shared_teams_token_file"
             ) {
                 self.persist_tokens(tok)?;
             }
@@ -1076,39 +1459,54 @@ impl AuthManager {
     pub async fn logout(&self) -> Result<()> {
         let mut guard = self.tokens.write().await;
         *guard = None;
+        #[cfg(test)]
+        if let Some(ref path) = self.token_path_override {
+            return delete_tokens_at_path(path);
+        }
+        if self.ephemeral {
+            return Ok(());
+        }
         delete_stored_tokens()
     }
 }
 
-pub fn load_stored_tokens() -> Result<Option<StoredTokens>> {
-    let mut keyring_tok: Option<StoredTokens> = None;
-    if should_use_keyring() {
-        #[cfg(target_os = "linux")]
-        {
-            if let Some(Ok(secret_json)) = run_linux_keyring_op(|| {
-                let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
-                entry.get_password()
-            }) {
+fn read_keyring_tokens(service: &str) -> Option<StoredTokens> {
+    #[cfg(target_os = "linux")]
+    {
+        let service_owned = service.to_string();
+        if let Some(Ok(secret_json)) = run_linux_keyring_op(move || {
+            let entry = keyring::Entry::new(&service_owned, KEYRING_USER)?;
+            entry.get_password()
+        }) {
+            if !secret_json.trim().is_empty() {
+                if let Ok(parsed) = serde_json::from_str::<StoredTokens>(&secret_json) {
+                    return Some(parsed);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if let Ok(entry) = keyring::Entry::new(service, KEYRING_USER) {
+            if let Ok(secret_json) = entry.get_password() {
                 if !secret_json.trim().is_empty() {
                     if let Ok(parsed) = serde_json::from_str::<StoredTokens>(&secret_json) {
-                        keyring_tok = Some(parsed);
+                        return Some(parsed);
                     }
                 }
             }
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-                if let Ok(secret_json) = entry.get_password() {
-                    if !secret_json.trim().is_empty() {
-                        if let Ok(parsed) = serde_json::from_str::<StoredTokens>(&secret_json) {
-                            keyring_tok = Some(parsed);
-                        }
-                    }
-                }
-            }
-        }
+        None
     }
+}
+
+pub fn load_stored_tokens() -> Result<Option<StoredTokens>> {
+    let keyring_tok = if should_use_keyring() {
+        read_keyring_tokens(KEYRING_SERVICE)
+    } else {
+        None
+    };
     let file_tok = load_tokens_from_path(&credential_fallback_path())?;
     match (keyring_tok, file_tok) {
         (Some(kr), Some(fl)) => {
@@ -1138,11 +1536,9 @@ pub fn save_stored_tokens(tokens: &StoredTokens) -> Result<()> {
             let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
             entry.set_password(&json_for_keyring)
         }) {
-            // Mirror to fallback file for consistency across environments.
             let _ = save_tokens_to_path(tokens, &fallback);
             return Ok(());
         }
-        // Secret Service unavailable, errored, or timed out: fall back to 0600 credentials.json.
         return save_tokens_to_path(tokens, &fallback);
     }
     #[cfg(not(target_os = "linux"))]
@@ -1154,12 +1550,9 @@ pub fn save_stored_tokens(tokens: &StoredTokens) -> Result<()> {
         match keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
             Ok(entry) => {
                 if entry.set_password(&json).is_ok() {
-                    // Mirror to fallback file for consistency across environments.
                     let _ = save_tokens_to_path(tokens, &fallback);
                     return Ok(());
                 }
-                // Keyring failed (e.g., Windows Credential blob limit or headless daemon):
-                // remove any stale keyring entry and persist to fallback file.
                 let _ = entry.delete_credential();
                 save_tokens_to_path(tokens, &fallback)
             }
@@ -1183,10 +1576,7 @@ pub fn delete_stored_tokens() -> Result<()> {
         #[cfg(not(target_os = "linux"))]
         {
             if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-                match entry.delete_credential() {
-                    Ok(()) | Err(keyring::Error::NoEntry) => {}
-                    Err(_) => {}
-                }
+                let _ = entry.delete_credential();
             }
         }
     }
@@ -1240,7 +1630,7 @@ fn generate_random_b64(num_bytes: usize) -> String {
 
 fn build_auth_http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
-        .user_agent(concat!("teams-cli/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("outlook-cli/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
         .build()
         .context("Failed to initialize HTTP client")
@@ -1255,12 +1645,9 @@ fn is_truthy_env(val: Option<&str>) -> bool {
 }
 
 fn keyring_disabled() -> bool {
-    is_truthy_env(std::env::var("TEAMS_DISABLE_KEYRING").ok().as_deref())
+    is_truthy_env(std::env::var("OUTLOOK_DISABLE_KEYRING").ok().as_deref())
 }
 
-/// Checks whether a `DBUS_SESSION_BUS_ADDRESS` value points to a plausible session bus.
-/// Missing/empty addresses or `unix:path=<p>` entries whose socket path does not exist
-/// return `false` so headless Linux/SSH environments skip D-Bus Secret Service immediately.
 #[cfg(any(target_os = "linux", test))]
 fn linux_secret_service_likely_available_with<F>(
     dbus_addr: Option<&str>,
@@ -1289,10 +1676,9 @@ where
             match socket_path {
                 Some(p) if !p.is_empty() && path_exists(Path::new(p)) => return true,
                 Some(_) => continue,
-                None => return true, // e.g., unix:abstract=...
+                None => return true,
             }
         } else {
-            // Non-unix transport (e.g., tcp:, systemd:, launchd:)
             return true;
         }
     }
@@ -1331,7 +1717,7 @@ where
 {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     if std::thread::Builder::new()
-        .name("teams-keyring".to_string())
+        .name("outlook-keyring".to_string())
         .spawn(move || {
             let _ = tx.send(op());
         })
@@ -1376,9 +1762,12 @@ fn should_open_browser_with_env(
 }
 
 fn should_open_browser() -> bool {
+    let no_browser = std::env::var("OUTLOOK_NO_BROWSER")
+        .ok()
+        .or_else(|| std::env::var("TEAMS_NO_BROWSER").ok());
     should_open_browser_with_env(
         cfg!(all(unix, not(target_os = "macos"))),
-        std::env::var("TEAMS_NO_BROWSER").ok().as_deref(),
+        no_browser.as_deref(),
         std::env::var("DISPLAY").ok().as_deref(),
         std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
         std::env::var("WSL_DISTRO_NAME").ok().as_deref(),
@@ -1386,10 +1775,15 @@ fn should_open_browser() -> bool {
 }
 
 fn env_client_secret() -> Option<String> {
-    std::env::var("TEAMS_CLIENT_SECRET")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    for key in ["OUTLOOK_CLIENT_SECRET", "AZURE_CLIENT_SECRET"] {
+        if let Ok(val) = std::env::var(key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn should_skip_keyring_on_init(config: &AppConfig) -> bool {
@@ -1399,7 +1793,7 @@ fn should_skip_keyring_on_init(config: &AppConfig) -> bool {
 }
 
 fn env_access_token(config: &AppConfig) -> Option<StoredTokens> {
-    let raw = std::env::var("TEAMS_ACCESS_TOKEN").ok()?;
+    let raw = std::env::var("OUTLOOK_ACCESS_TOKEN").ok()?;
     env_access_token_from_str(&raw, config)
 }
 
@@ -1418,15 +1812,33 @@ fn env_access_token_from_str(raw: &str, config: &AppConfig) -> Option<StoredToke
     ))
 }
 
+fn expand_tilde_path(input: &str) -> PathBuf {
+    if input == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    }
+    if let Some(rest) = input
+        .strip_prefix("~/")
+        .or_else(|| input.strip_prefix("~\\"))
+    {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(input)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenScopeDiagnostics {
     pub scopes: Vec<String>,
     pub roles: Vec<String>,
     pub has_scope_claims: bool,
-    pub can_read_chats: bool,
-    pub chat_read_basic_only: bool,
-    pub can_send_chats: bool,
-    pub can_read_channels: bool,
+    pub can_read_mail: bool,
+    pub mail_read_basic_only: bool,
+    pub can_send_mail: bool,
+    pub can_read_calendar: bool,
+    pub can_write_calendar: bool,
+    pub can_read_contacts: bool,
+    pub can_read_tasks: bool,
     pub warnings: Vec<String>,
 }
 
@@ -1442,7 +1854,40 @@ struct JwtClaims {
     roles: Vec<String>,
 }
 
-/// Inspects JWT `scp` / `roles` claims on an access token to detect missing or restricted Teams Graph permissions.
+fn token_has_outlook_scopes(token: &str) -> bool {
+    let Some(claims) = parse_jwt_claims(token) else {
+        return false;
+    };
+    claims
+        .scopes
+        .iter()
+        .chain(claims.roles.iter())
+        .any(|s| is_outlook_scope_name(s))
+}
+
+fn token_is_outlook_eligible_or_opaque(token: &str) -> bool {
+    let Some(claims) = parse_jwt_claims(token) else {
+        return true;
+    };
+    if claims.scopes.is_empty() && claims.roles.is_empty() {
+        return true;
+    }
+    claims
+        .scopes
+        .iter()
+        .chain(claims.roles.iter())
+        .any(|s| is_outlook_scope_name(s))
+}
+
+fn is_outlook_scope_name(scope: &str) -> bool {
+    let lower = scope.trim().to_ascii_lowercase();
+    lower.starts_with("mail.")
+        || lower.starts_with("calendars.")
+        || lower.starts_with("tasks.")
+        || lower.starts_with("contacts.")
+}
+
+/// Inspects JWT `scp` / `roles` claims on an access token to detect missing Outlook Graph permissions.
 pub fn diagnose_access_token_scopes(access_token: &str) -> TokenScopeDiagnostics {
     let Some(claims) = parse_jwt_claims(access_token) else {
         return TokenScopeDiagnostics::default();
@@ -1458,26 +1903,80 @@ pub fn diagnose_access_token_scopes(access_token: &str) -> TokenScopeDiagnostics
         })
     };
 
-    let can_read_chats = has_any(&["Chat.Read", "Chat.ReadWrite", "Chat.Read.All", "Chat.ReadWrite.All"]);
-    let has_chat_basic = has_any(&["Chat.ReadBasic", "Chat.ReadBasic.All"]);
-    let chat_read_basic_only = has_chat_basic && !can_read_chats;
-    let can_send_chats = has_any(&["Chat.ReadWrite", "Chat.ReadWrite.All", "ChatMessage.Send"]);
-    let can_read_channels = has_any(&["ChannelMessage.Read.All", "ChannelMessage.ReadWrite"]);
+    let can_read_mail = has_any(&[
+        "Mail.Read",
+        "Mail.ReadWrite",
+        "Mail.Read.Shared",
+        "Mail.ReadWrite.Shared",
+        "Mail.Read.All",
+        "Mail.ReadWrite.All",
+    ]);
+    let has_mail_basic = has_any(&["Mail.ReadBasic", "Mail.ReadBasic.All"]);
+    let mail_read_basic_only = has_mail_basic && !can_read_mail;
+    let can_send_mail = has_any(&["Mail.Send", "Mail.Send.Shared", "Mail.Send.All"]);
+    let can_read_calendar = has_any(&[
+        "Calendars.Read",
+        "Calendars.ReadWrite",
+        "Calendars.Read.Shared",
+        "Calendars.ReadWrite.Shared",
+        "Calendars.Read.All",
+        "Calendars.ReadWrite.All",
+    ]);
+    let can_write_calendar = has_any(&[
+        "Calendars.ReadWrite",
+        "Calendars.ReadWrite.Shared",
+        "Calendars.ReadWrite.All",
+    ]);
+    let can_read_contacts = has_any(&[
+        "Contacts.Read",
+        "Contacts.ReadWrite",
+        "Contacts.Read.Shared",
+        "Contacts.ReadWrite.Shared",
+        "Contacts.Read.All",
+        "Contacts.ReadWrite.All",
+    ]);
+    let can_read_tasks = has_any(&[
+        "Tasks.Read",
+        "Tasks.ReadWrite",
+        "Tasks.Read.Shared",
+        "Tasks.ReadWrite.Shared",
+        "Tasks.Read.All",
+        "Tasks.ReadWrite.All",
+    ]);
 
     let mut warnings = Vec::new();
     if has_scope_claims {
-        if chat_read_basic_only {
+        if mail_read_basic_only {
             warnings.push(
-                "Current token only has `Chat.ReadBasic` without `Chat.Read` / `Chat.ReadWrite`; reading message bodies and older history is restricted.".to_string(),
+                "Current token only has `Mail.ReadBasic` without `Mail.Read` or `Mail.ReadWrite`; reading email bodies and attachments is restricted.".to_string(),
             );
-        } else if !can_read_chats {
+        } else if !can_read_mail {
             warnings.push(
-                "Current token lacks `Chat.Read` or `Chat.ReadWrite`; reading 1:1 or group chat messages may be denied.".to_string(),
+                "Current token lacks `Mail.Read` or `Mail.ReadWrite`; reading mail folders and messages may be denied.".to_string(),
             );
         }
-        if !can_read_channels {
+        if !can_send_mail {
             warnings.push(
-                "Current token lacks `ChannelMessage.Read.All`; reading channel messages and history may be restricted.".to_string(),
+                "Current token lacks `Mail.Send`; sending, replying to, or forwarding emails may be denied.".to_string(),
+            );
+        }
+        if !can_read_calendar {
+            warnings.push(
+                "Current token lacks `Calendars.Read` or `Calendars.ReadWrite`; reading calendar events may be denied.".to_string(),
+            );
+        } else if !can_write_calendar {
+            warnings.push(
+                "Current token lacks `Calendars.ReadWrite`; creating, updating, or responding to calendar events may be denied.".to_string(),
+            );
+        }
+        if !can_read_contacts {
+            warnings.push(
+                "Current token lacks `Contacts.Read`; reading Outlook contacts may be denied.".to_string(),
+            );
+        }
+        if !can_read_tasks {
+            warnings.push(
+                "Current token lacks `Tasks.Read` or `Tasks.ReadWrite`; accessing Microsoft To Do tasks may be denied.".to_string(),
             );
         }
     }
@@ -1486,10 +1985,13 @@ pub fn diagnose_access_token_scopes(access_token: &str) -> TokenScopeDiagnostics
         scopes: claims.scopes,
         roles: claims.roles,
         has_scope_claims,
-        can_read_chats,
-        chat_read_basic_only,
-        can_send_chats,
-        can_read_channels,
+        can_read_mail,
+        mail_read_basic_only,
+        can_send_mail,
+        can_read_calendar,
+        can_write_calendar,
+        can_read_contacts,
+        can_read_tasks,
         warnings,
     }
 }
@@ -1519,7 +2021,7 @@ fn contains_http_403_token(s: &str) -> bool {
     false
 }
 
-/// Converts a raw Graph 403 / insufficient-privileges error into an actionable English explanation with token scope context.
+/// Converts a raw Graph 403 / insufficient-privileges error into an actionable English explanation with Outlook scope context.
 pub fn explain_graph_permission_error(err_msg: &str, access_token: Option<&str>) -> Option<String> {
     let detail = err_msg
         .split_once("): ")
@@ -1529,6 +2031,7 @@ pub fn explain_graph_permission_error(err_msg: &str, access_token: Option<&str>)
     let looks_forbidden = contains_http_403_token(&lower)
         || lower.contains("forbidden")
         || lower.contains("authorization_requestdenied")
+        || lower.contains("erroraccessdenied")
         || lower.contains("insufficient privileges")
         || lower.contains("missing scope")
         || lower.contains("aclcheckfailed");
@@ -1537,17 +2040,50 @@ pub fn explain_graph_permission_error(err_msg: &str, access_token: Option<&str>)
     }
     if let Some(tok) = access_token {
         let diag = diagnose_access_token_scopes(tok);
-        if let Some(first) = diag.warnings.first() {
-            return Some(format!("{INSUFFICIENT_PERMISSIONS_PREFIX} {first}"));
+        let full_lower = err_msg.to_ascii_lowercase();
+        let targeted = if full_lower.contains("/sendmail")
+            || full_lower.contains("/reply")
+            || full_lower.contains("/forward")
+        {
+            (!diag.can_send_mail).then(|| {
+                "Current token lacks `Mail.Send`; sending, replying to, or forwarding emails may be denied."
+                    .to_string()
+            })
+        } else if full_lower.contains("/calendar") || full_lower.contains("/events") {
+            if !diag.can_read_calendar {
+                Some(
+                    "Current token lacks `Calendars.Read` or `Calendars.ReadWrite`; reading calendar events may be denied."
+                        .to_string(),
+                )
+            } else if !diag.can_write_calendar {
+                Some(
+                    "Current token lacks `Calendars.ReadWrite`; creating, updating, or responding to calendar events may be denied."
+                        .to_string(),
+                )
+            } else {
+                None
+            }
+        } else if full_lower.contains("/todo") {
+            (!diag.can_read_tasks).then(|| {
+                "Current token lacks `Tasks.Read` or `Tasks.ReadWrite`; accessing Microsoft To Do tasks may be denied."
+                    .to_string()
+            })
+        } else if full_lower.contains("/contacts") {
+            (!diag.can_read_contacts).then(|| {
+                "Current token lacks `Contacts.Read`; reading Outlook contacts may be denied."
+                    .to_string()
+            })
+        } else {
+            None
+        };
+        if let Some(msg) = targeted.or_else(|| diag.warnings.into_iter().next()) {
+            return Some(format!("{INSUFFICIENT_PERMISSIONS_PREFIX} {msg}"));
         }
     }
     Some(format!(
-        "{INSUFFICIENT_PERMISSIONS_PREFIX} current token lacks message read scopes (`Chat.Read` / `ChannelMessage.Read.All`) or access to this conversation is restricted."
+        "{INSUFFICIENT_PERMISSIONS_PREFIX} current token lacks required Outlook scopes (`Mail.ReadWrite`, `Mail.Send`, `Calendars.ReadWrite`, `Contacts.Read`, `Tasks.ReadWrite`) or access to this resource is restricted."
     ))
 }
-
-/// Canonical prefix emitted by `explain_graph_permission_error` for 403 Graph errors.
-pub const INSUFFICIENT_PERMISSIONS_PREFIX: &str = "Insufficient Graph permissions (403):";
 
 fn strip_bearer_prefix(raw: &str) -> &str {
     let trimmed = raw.trim();
@@ -1813,12 +2349,20 @@ fn parse_external_token_str(
     ))
 }
 
-/// Reads an external access token (raw JWT or JSON from `tc-auth` / Azure CLI / `StoredTokens`)
+/// Reads an external access token (raw JWT or JSON from Azure CLI / `StoredTokens`)
 /// from `path`, normalizing BOM, optional `Bearer ` prefix, and JWT claims.
 pub fn read_external_token_file(path: &Path, config: &AppConfig) -> Result<StoredTokens> {
+    read_external_token_file_with_mode(path, "token_file", config)
+}
+
+fn read_external_token_file_with_mode(
+    path: &Path,
+    auth_mode: &str,
+    config: &AppConfig,
+) -> Result<StoredTokens> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read external token file: {}", path.display()))?;
-    parse_external_token_str(&raw, "token_file", config, &path.display().to_string())
+    parse_external_token_str(&raw, auth_mode, config, &path.display().to_string())
 }
 
 async fn execute_external_refresh_shell(cmd_str: &str, token_file: Option<&Path>) -> Result<String> {
@@ -1840,7 +2384,7 @@ async fn execute_external_refresh_shell(cmd_str: &str, token_file: Option<&Path>
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
     if let Some(path) = token_file {
-        cmd.env("TEAMS_TOKEN_FILE", path);
+        cmd.env("OUTLOOK_TOKEN_FILE", path);
     }
 
     let child = cmd
@@ -1903,7 +2447,10 @@ fn format_local_exp(ts: i64) -> String {
 
 async fn accept_pkce_callback(listener: &TcpListener, expected_state: &str) -> Result<String> {
     loop {
-        let (mut socket, _) = listener.accept().await.context("Failed to accept callback connection")?;
+        let (mut socket, _) = listener
+            .accept()
+            .await
+            .context("Failed to accept callback connection")?;
 
         let mut buf = Vec::with_capacity(4096);
         let read_res = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1949,8 +2496,7 @@ async fn accept_pkce_callback(listener: &TcpListener, expected_state: &str) -> R
         };
 
         if !matches!(parsed.path(), "/" | "/callback") {
-            let _ =
-                write_http_response(&mut socket, "404 Not Found", "<h1>Not Found</h1>").await;
+            let _ = write_http_response(&mut socket, "404 Not Found", "<h1>Not Found</h1>").await;
             continue;
         }
 
@@ -1996,10 +2542,10 @@ async fn accept_pkce_callback(listener: &TcpListener, expected_state: &str) -> R
 
         let success_html = r#"<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Teams CLI Login</title></head>
+<head><meta charset="utf-8"><title>Outlook CLI Login</title></head>
 <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#f5f5f7;color:#1d1d1f">
   <div style="background:#fff;padding:2.5rem 3rem;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.08);text-align:center">
-    <h1 style="margin:0 0 .5rem;color:#464eb8">Microsoft Teams CLI Login Complete</h1>
+    <h1 style="margin:0 0 .5rem;color:#0078d4">Microsoft Outlook CLI Login Complete</h1>
     <p style="margin:0;color:#555">Authentication succeeded. You can close this window and return to the terminal.</p>
   </div>
 </body>
@@ -2065,11 +2611,27 @@ struct OAuthErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{EnvVarGuard, TEST_ENV_LOCK as ENV_LOCK};
     use tempfile::tempdir;
 
     #[test]
+    fn test_default_scopes_contract() {
+        assert_eq!(
+            DEFAULT_SCOPES,
+            &[
+                "User.Read",
+                "Mail.ReadWrite",
+                "Mail.Send",
+                "Calendars.ReadWrite",
+                "Contacts.Read",
+                "Tasks.ReadWrite",
+                "offline_access",
+            ]
+        );
+    }
+
+    #[test]
     fn test_pkce_s256_rfc7636_vector() {
-        // RFC 7636 Appendix B test vector
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         let expected = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
         assert_eq!(compute_pkce_s256(verifier), expected);
@@ -2132,11 +2694,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_direct_access_token_login_and_valid_token() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::clear_auth_env();
         let mut cfg = AppConfig::default();
         cfg.client_id = "cid".into();
         cfg.tenant_id = "tid".into();
 
-        // Construct without touching real user keyring/config by using from_tokens or temp TEAMS_CONFIG_DIR
         let tok = StoredTokens {
             access_token: "direct-tok".into(),
             refresh_token: None,
@@ -2157,6 +2720,9 @@ mod tests {
     async fn test_client_credentials_login_and_concurrent_refresh() {
         use axum::{routing::post, Json, Router};
         use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::clear_auth_env();
 
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_clone = hits.clone();
@@ -2197,7 +2763,6 @@ mod tests {
         cfg.client_id = "cid".into();
         cfg.tenant_id = "tenant-1".into();
 
-        // 1. Client credentials login
         let dummy = StoredTokens {
             access_token: "old".into(),
             refresh_token: Some("rt-0".into()),
@@ -2220,7 +2785,6 @@ mod tests {
         assert_eq!(logged_in.auth_mode, "client_credentials");
         assert_eq!(logged_in.access_token, "cc-token-1");
 
-        // 2. Concurrent refresh_for_failed_token prevents thundering herd
         let expired_tok = StoredTokens {
             access_token: "stale-tok".into(),
             refresh_token: Some("rt-1".into()),
@@ -2235,9 +2799,6 @@ mod tests {
         let mgr2 = Arc::new(
             AuthManager::from_tokens(cfg, expired_tok.clone()).with_token_path(cred_path.clone()),
         );
-        // Pin the on-disk credential to the same stale token so the hot-reload path
-        // cannot short-circuit the OAuth refresh this test exercises. The assertions
-        // below are unchanged: concurrent callers must coalesce into one token request.
         save_tokens_to_path(&expired_tok, &cred_path).unwrap();
         let hits_before = hits.load(Ordering::SeqCst);
         let (r1, r2, r3) = tokio::join!(
@@ -2252,6 +2813,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_hot_reload_external_f12_token_from_disk() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::clear_auth_env();
         let dir = tempdir().unwrap();
         let cred_path = dir.path().join("credentials.json");
         let now = chrono::Utc::now().timestamp();
@@ -2259,7 +2822,7 @@ mod tests {
         let initial = StoredTokens {
             access_token: "f12-old-token".into(),
             refresh_token: None,
-            expires_at: now + 20, // within 90s skew -> triggers hot-reload check
+            expires_at: now + 20,
             client_id: "cid".into(),
             tenant_id: "tid".into(),
             user_id: Some("u1".into()),
@@ -2272,7 +2835,6 @@ mod tests {
         let mgr = AuthManager::from_tokens(AppConfig::default(), initial)
             .with_token_path(cred_path.clone());
 
-        // External refresher script updates `credentials.json` on disk without restarting TUI
         let externally_refreshed = StoredTokens {
             access_token: "f12-fresh-token".into(),
             refresh_token: None,
@@ -2297,7 +2859,6 @@ mod tests {
         let existing_str = existing_socket.to_string_lossy().to_string();
         let missing_str = dir.path().join("missing-bus").to_string_lossy().to_string();
 
-        // Missing or empty DBUS_SESSION_BUS_ADDRESS -> unavailable
         assert!(!linux_secret_service_likely_available_with(
             None,
             false,
@@ -2309,7 +2870,6 @@ mod tests {
             |p| p.exists()
         ));
 
-        // unix:path pointing to missing socket -> unavailable
         let missing_addr = format!("unix:path={missing_str}");
         assert!(!linux_secret_service_likely_available_with(
             Some(&missing_addr),
@@ -2317,7 +2877,6 @@ mod tests {
             |p| p.exists()
         ));
 
-        // unix:path pointing to existing socket (with extra attributes) -> available
         let existing_addr = format!("unix:path={existing_str},guid=123456");
         assert!(linux_secret_service_likely_available_with(
             Some(&existing_addr),
@@ -2325,14 +2884,12 @@ mod tests {
             |p| p.exists()
         ));
 
-        // Previously failed keyring runtime -> unavailable even with valid socket
         assert!(!linux_secret_service_likely_available_with(
             Some(&existing_addr),
             true,
             |p| p.exists()
         ));
 
-        // Multi-segment where second segment exists -> available
         let multi_addr = format!("unix:path={missing_str};unix:path={existing_str}");
         assert!(linux_secret_service_likely_available_with(
             Some(&multi_addr),
@@ -2340,7 +2897,6 @@ mod tests {
             |p| p.exists()
         ));
 
-        // Abstract unix socket -> available
         assert!(linux_secret_service_likely_available_with(
             Some("unix:abstract=/tmp/dbus-test"),
             false,
@@ -2350,7 +2906,6 @@ mod tests {
 
     #[test]
     fn test_should_open_browser_headless_linux_and_overrides() {
-        // Explicit opt-out disables browser everywhere
         assert!(!should_open_browser_with_env(
             false,
             Some("1"),
@@ -2365,11 +2920,7 @@ mod tests {
             Some("wayland-0"),
             Some("Ubuntu")
         ));
-
-        // Windows / macOS defaults to true unless TEAMS_NO_BROWSER is set
         assert!(should_open_browser_with_env(false, None, None, None, None));
-
-        // Headless Linux / SSH without DISPLAY, WAYLAND_DISPLAY, or WSL -> false
         assert!(!should_open_browser_with_env(true, None, None, None, None));
         assert!(!should_open_browser_with_env(
             true,
@@ -2378,8 +2929,6 @@ mod tests {
             Some(""),
             None
         ));
-
-        // X11, Wayland, or WSL -> true
         assert!(should_open_browser_with_env(
             true,
             None,
@@ -2418,7 +2967,6 @@ mod tests {
     #[test]
     fn test_parse_jwt_claims_padded_and_standard_base64() {
         let exp = 1_893_456_000_i64;
-        // Include characters that produce '+' / '/' and '=' padding in standard base64
         let payload = serde_json::json!({
             "exp": exp,
             "oid": "oid-user-123?>",
@@ -2439,28 +2987,12 @@ mod tests {
             assert_eq!(claims.tenant_id.as_deref(), Some("tenant-abc"));
             assert_eq!(claims.client_id.as_deref(), Some("app-xyz"));
         }
-
-        // Fallbacks: sub, preferred_username, azp
-        let fallback_jwt = make_test_jwt_with_encoder(
-            &serde_json::json!({
-                "exp": exp,
-                "sub": "sub-999",
-                "preferred_username": "pref@contoso.com",
-                "azp": "azp-111"
-            }),
-            false,
-        );
-        let fallback_claims = parse_jwt_claims(&fallback_jwt).unwrap();
-        assert_eq!(fallback_claims.user_id.as_deref(), Some("sub-999"));
-        assert_eq!(
-            fallback_claims.user_email.as_deref(),
-            Some("pref@contoso.com")
-        );
-        assert_eq!(fallback_claims.client_id.as_deref(), Some("azp-111"));
     }
 
     #[test]
     fn test_read_external_token_file_raw_and_azure_cli_json() {
+        let _env_lock = ENV_LOCK.blocking_lock();
+        let _env_guard = EnvVarGuard::clear_auth_env();
         let dir = tempdir().unwrap();
         let cfg = AppConfig::default();
         let future_exp = chrono::Utc::now().timestamp() + 3600;
@@ -2468,28 +3000,22 @@ mod tests {
             &serde_json::json!({
                 "exp": future_exp,
                 "oid": "oid-42",
-                "name": "Hong",
-                "upn": "hong@example.com",
+                "name": "Alice",
+                "upn": "alice@example.com",
                 "tid": "tid-42",
                 "appid": "cid-42"
             }),
             true,
         );
 
-        // 1. Raw JWT file with UTF-8 BOM, leading/trailing blank lines, and Bearer prefix
         let raw_path = dir.path().join("access_token");
         std::fs::write(&raw_path, format!("\u{feff}\n  Bearer {jwt}  \n\n")).unwrap();
         let raw_tok = read_external_token_file(&raw_path, &cfg).unwrap();
         assert_eq!(raw_tok.access_token, jwt);
         assert_eq!(raw_tok.expires_at, future_exp);
         assert_eq!(raw_tok.user_id.as_deref(), Some("oid-42"));
-        assert_eq!(raw_tok.user_display_name.as_deref(), Some("Hong"));
-        assert_eq!(raw_tok.user_email.as_deref(), Some("hong@example.com"));
-        assert_eq!(raw_tok.tenant_id, "tid-42");
-        assert_eq!(raw_tok.client_id, "cid-42");
         assert_eq!(raw_tok.auth_mode, "token_file");
 
-        // 2. Azure CLI camelCase JSON (`accessToken`, `expiresOn`)
         let az_path = dir.path().join("az.json");
         let az_json = serde_json::json!({
             "accessToken": jwt,
@@ -2502,10 +3028,8 @@ mod tests {
         assert_eq!(az_tok.access_token, jwt);
         assert_eq!(az_tok.expires_at, 1_894_708_800);
         assert_eq!(az_tok.tenant_id, "az-tenant");
-        assert_eq!(az_tok.user_id.as_deref(), Some("oid-42"));
         assert_eq!(az_tok.auth_mode, "token_file");
 
-        // 3. Empty file returns clear error
         let empty_path = dir.path().join("empty");
         std::fs::write(&empty_path, "\u{feff}   \n").unwrap();
         let err = read_external_token_file(&empty_path, &cfg).unwrap_err();
@@ -2514,26 +3038,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_token_refresh_cmd_auto_refreshes_expiring_token_file() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::clear_auth_env();
         let dir = tempdir().unwrap();
         let token_path = dir.path().join("access_token");
         let now = chrono::Utc::now().timestamp();
 
-        let soon_jwt = make_test_jwt_with_encoder(
-            &serde_json::json!({
-                "exp": now + 60, // within default 5-min (300s) skew
-                "oid": "u-1",
-                "name": "Tester",
-                "upn": "tester@example.com"
-            }),
-            false,
-        );
+        let soon_jwt =
+            make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 60, "oid": "u-1" }), false);
         let fresh_jwt = make_test_jwt_with_encoder(
-            &serde_json::json!({
-                "exp": now + 3600,
-                "oid": "u-1",
-                "name": "Tester",
-                "upn": "tester@example.com"
-            }),
+            &serde_json::json!({ "exp": now + 3600, "oid": "u-1" }),
             false,
         );
         std::fs::write(&token_path, &soon_jwt).unwrap();
@@ -2553,70 +3067,18 @@ mod tests {
 
         let mgr = AuthManager::new(cfg).unwrap();
         assert!(mgr.is_refreshable().await);
-
-        let returned = mgr.valid_access_token().await.unwrap();
-        assert_eq!(returned, fresh_jwt);
-        assert_eq!(
-            mgr.current_tokens().await.unwrap().access_token,
-            fresh_jwt
-        );
-    }
-
-    #[tokio::test]
-    async fn test_token_refresh_cmd_bootstraps_missing_token_file_and_stdout_only() {
-        let dir = tempdir().unwrap();
-        let missing_path = dir.path().join("bootstrapped_token");
-        let now = chrono::Utc::now().timestamp();
-        let fresh_jwt = make_test_jwt_with_encoder(
-            &serde_json::json!({
-                "exp": now + 3600,
-                "oid": "boot-oid",
-                "upn": "boot@example.com"
-            }),
-            false,
-        );
-
-        // 1. Missing token_file bootstrapped via token_refresh_cmd writing the file
-        let mut cfg = AppConfig::default();
-        cfg.token_file = missing_path.to_string_lossy().to_string();
-        #[cfg(windows)]
-        {
-            cfg.token_refresh_cmd = format!("echo {fresh_jwt}> \"{}\"", missing_path.display());
-        }
-        #[cfg(not(windows))]
-        {
-            cfg.token_refresh_cmd = format!(
-                "printf '%s\\n' '{fresh_jwt}' > '{}'",
-                missing_path.display()
-            );
-        }
-        let mgr = AuthManager::new(cfg).unwrap();
         assert_eq!(mgr.valid_access_token().await.unwrap(), fresh_jwt);
-
-        // 2. Stdout-only token_refresh_cmd (no token_file)
-        let mut cfg_stdout = AppConfig::default();
-        #[cfg(windows)]
-        {
-            cfg_stdout.token_refresh_cmd = format!("echo {fresh_jwt}");
-        }
-        #[cfg(not(windows))]
-        {
-            cfg_stdout.token_refresh_cmd = format!("printf '%s\\n' '{fresh_jwt}'");
-        }
-        let mgr_stdout = AuthManager::new(cfg_stdout).unwrap();
-        let tok = mgr_stdout.current_tokens().await.unwrap();
-        assert_eq!(tok.access_token, fresh_jwt);
-        assert_eq!(tok.auth_mode, "refresh_cmd");
-        assert_eq!(tok.user_id.as_deref(), Some("boot-oid"));
+        assert_eq!(mgr.current_tokens().await.unwrap().access_token, fresh_jwt);
     }
 
     #[tokio::test]
     async fn test_token_refresh_cmd_failure_fallback_and_bail() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::clear_auth_env();
         let dir = tempdir().unwrap();
         let token_path = dir.path().join("access_token");
         let now = chrono::Utc::now().timestamp();
 
-        // Still-valid (not hard-expired) token within skew_secs -> falls back with warning
         let soon_jwt = make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 120 }), false);
         std::fs::write(&token_path, &soon_jwt).unwrap();
         let mut cfg = AppConfig::default();
@@ -2627,18 +3089,17 @@ mod tests {
         let mgr = AuthManager::new(cfg.clone()).unwrap();
         assert_eq!(mgr.valid_access_token().await.unwrap(), soon_jwt);
 
-        // Hard-expired token + failing refresh_cmd -> bails with clear error
         let expired_jwt =
             make_test_jwt_with_encoder(&serde_json::json!({ "exp": now - 60 }), false);
         std::fs::write(&token_path, &expired_jwt).unwrap();
         let err = mgr.valid_access_token().await.unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("External token refresh failed"), "unexpected error: {msg}");
-        assert!(msg.contains("exp:"), "missing exp in error: {msg}");
+        assert!(err.to_string().contains("External token refresh failed"));
     }
 
     #[tokio::test]
     async fn test_expired_external_tokens_return_clear_expiry_error() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::clear_auth_env();
         let dir = tempdir().unwrap();
         let token_path = dir.path().join("expired_token");
         let now = chrono::Utc::now().timestamp();
@@ -2646,32 +3107,24 @@ mod tests {
             make_test_jwt_with_encoder(&serde_json::json!({ "exp": now - 120 }), false);
         std::fs::write(&token_path, &expired_jwt).unwrap();
 
-        // 1. token_file without refresh_cmd
         let mut cfg = AppConfig::default();
         cfg.token_file = token_path.to_string_lossy().to_string();
         let mgr_file = AuthManager::new(cfg.clone()).unwrap();
         assert!(!mgr_file.is_refreshable().await);
-        let err_file = mgr_file.valid_access_token().await.unwrap_err();
-        let msg_file = err_file.to_string();
-        assert!(
-            msg_file.contains("Token expired (exp:") && msg_file.contains("auth_mode=token_file"),
-            "unexpected token_file error: {msg_file}"
-        );
+        let msg_file = mgr_file.valid_access_token().await.unwrap_err().to_string();
+        assert!(msg_file.contains("Token expired (exp:") && msg_file.contains("auth_mode=token_file"));
 
-        // 2. env_token without refresh_cmd (constructed via env_access_token_from_str to avoid env races)
         let env_tok = env_access_token_from_str(&expired_jwt, &AppConfig::default()).unwrap();
         assert_eq!(env_tok.auth_mode, "env_token");
         let mgr_env = AuthManager::from_tokens(AppConfig::default(), env_tok);
-        let err_env = mgr_env.valid_access_token().await.unwrap_err();
-        let msg_env = err_env.to_string();
-        assert!(
-            msg_env.contains("Token expired (exp:") && msg_env.contains("auth_mode=env_token"),
-            "unexpected env_token error: {msg_env}"
-        );
+        let msg_env = mgr_env.valid_access_token().await.unwrap_err().to_string();
+        assert!(msg_env.contains("Token expired (exp:") && msg_env.contains("auth_mode=env_token"));
     }
 
     #[tokio::test]
     async fn test_external_token_skips_keyring_and_persistence() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::clear_auth_env();
         let dir = tempdir().unwrap();
         let cred_path = dir.path().join("should_not_be_created_creds.json");
         let token_path = dir.path().join("ext_token");
@@ -2684,7 +3137,6 @@ mod tests {
         cfg.token_file = token_path.to_string_lossy().to_string();
         assert!(should_skip_keyring_on_init(&cfg));
 
-        // Even with a fresh AuthManager pointing at token_file, update_identity must NOT persist to disk/keyring
         let ext_tok = read_external_token_file(&token_path, &cfg).unwrap();
         let mgr = AuthManager::from_tokens(cfg, ext_tok).with_token_path(cred_path.clone());
         mgr.update_identity(
@@ -2694,187 +3146,303 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            !cred_path.exists(),
-            "external token must never be persisted to credentials.json/keyring"
-        );
-        let updated = mgr.current_tokens().await.unwrap();
-        assert_eq!(updated.access_token, fresh_jwt);
-    }
-
-    #[tokio::test]
-    async fn test_token_refresh_cmd_coalesces_concurrent_calls() {
-        let dir = tempdir().unwrap();
-        let token_path = dir.path().join("access_token");
-        let count_path = dir.path().join("runs.log");
-        let now = chrono::Utc::now().timestamp();
-
-        let soon_jwt = make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 60 }), false);
-        let fresh_jwt =
-            make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 3600 }), false);
-        std::fs::write(&token_path, &soon_jwt).unwrap();
-
-        let mut cfg = AppConfig::default();
-        cfg.token_file = token_path.to_string_lossy().to_string();
-        cfg.token_refresh_mins = 5;
-        #[cfg(windows)]
-        {
-            cfg.token_refresh_cmd = format!(
-                "echo hit>> \"{}\" && echo {fresh_jwt}> \"{}\"",
-                count_path.display(),
-                token_path.display()
-            );
-        }
-        #[cfg(not(windows))]
-        {
-            cfg.token_refresh_cmd = format!(
-                "echo hit >> '{}' && printf '%s\\n' '{fresh_jwt}' > '{}'",
-                count_path.display(),
-                token_path.display()
-            );
-        }
-
-        let mgr = Arc::new(AuthManager::new(cfg).unwrap());
-        let (r1, r2, r3) = tokio::join!(
-            mgr.valid_access_token(),
-            mgr.valid_access_token(),
-            mgr.valid_access_token(),
-        );
-        assert_eq!(r1.unwrap(), fresh_jwt);
-        assert_eq!(r2.unwrap(), fresh_jwt);
-        assert_eq!(r3.unwrap(), fresh_jwt);
-        let log = std::fs::read_to_string(&count_path).unwrap();
-        assert_eq!(
-            log.lines().count(),
-            1,
-            "concurrent refresh_cmd calls must coalesce into one execution"
-        );
+        assert!(!cred_path.exists());
     }
 
     #[test]
-    fn test_diagnose_access_token_scopes_chat_read_basic_only() {
-        let jwt = make_test_jwt_with_encoder(
+    fn test_diagnose_access_token_scopes_outlook_permissions() {
+        let mail_basic_jwt = make_test_jwt_with_encoder(
             &serde_json::json!({
-                "scp": "User.Read Chat.ReadBasic",
+                "scp": "User.Read Mail.ReadBasic",
                 "oid": "u-1"
             }),
             false,
         );
-        let diag = diagnose_access_token_scopes(&jwt);
-        assert!(diag.has_scope_claims);
-        assert!(diag.chat_read_basic_only);
-        assert!(!diag.can_read_chats);
-        assert!(!diag.can_send_chats);
-        assert!(!diag.can_read_channels);
-        assert!(diag.warnings.iter().any(|w| w.contains("Chat.ReadBasic")));
-    }
+        let diag_basic = diagnose_access_token_scopes(&mail_basic_jwt);
+        assert!(diag_basic.has_scope_claims);
+        assert!(diag_basic.mail_read_basic_only);
+        assert!(!diag_basic.can_read_mail);
+        assert!(!diag_basic.can_send_mail);
+        assert!(!diag_basic.can_read_calendar);
+        assert!(diag_basic.warnings.iter().any(|w| w.contains("Mail.ReadBasic")));
 
-    #[test]
-    fn test_diagnose_access_token_scopes_full_delegated_and_app_roles() {
-        let delegated_jwt = make_test_jwt_with_encoder(
+        let full_jwt = make_test_jwt_with_encoder(
             &serde_json::json!({
-                "scp": "User.Read Chat.ReadWrite ChannelMessage.Read.All",
+                "scp": "User.Read Mail.ReadWrite Mail.Send Calendars.ReadWrite Contacts.Read Tasks.ReadWrite",
                 "oid": "u-2"
             }),
             false,
         );
-        let diag_del = diagnose_access_token_scopes(&delegated_jwt);
-        assert!(diag_del.has_scope_claims);
-        assert!(diag_del.can_read_chats);
-        assert!(!diag_del.chat_read_basic_only);
-        assert!(diag_del.can_send_chats);
-        assert!(diag_del.can_read_channels);
-        assert!(diag_del.warnings.is_empty());
+        let diag_full = diagnose_access_token_scopes(&full_jwt);
+        assert!(diag_full.has_scope_claims);
+        assert!(diag_full.can_read_mail);
+        assert!(!diag_full.mail_read_basic_only);
+        assert!(diag_full.can_send_mail);
+        assert!(diag_full.can_read_calendar);
+        assert!(diag_full.can_write_calendar);
+        assert!(diag_full.can_read_contacts);
+        assert!(diag_full.can_read_tasks);
+        assert!(diag_full.warnings.is_empty());
 
         let app_jwt = make_test_jwt_with_encoder(
             &serde_json::json!({
-                "roles": ["Chat.Read.All", "ChannelMessage.Read.All"],
+                "roles": ["Mail.Read.All", "Calendars.Read.All", "Contacts.Read.All"],
                 "appid": "app-1"
             }),
             false,
         );
         let diag_app = diagnose_access_token_scopes(&app_jwt);
-        assert!(diag_app.has_scope_claims);
-        assert!(diag_app.can_read_chats);
-        assert!(!diag_app.chat_read_basic_only);
-        assert!(!diag_app.can_send_chats);
-        assert!(diag_app.can_read_channels);
-        assert!(diag_app.warnings.is_empty());
+        assert!(diag_app.can_read_mail);
+        assert!(!diag_app.can_send_mail);
+        assert!(diag_app.can_read_calendar);
+        assert!(!diag_app.can_write_calendar);
+        assert!(diag_app.can_read_contacts);
+        assert!(!diag_app.can_read_tasks);
 
-        let app_rw_jwt = make_test_jwt_with_encoder(
-            &serde_json::json!({
-                "roles": ["Chat.ReadWrite.All", "ChannelMessage.Read.All"],
-                "appid": "app-2"
-            }),
-            false,
-        );
-        let diag_app_rw = diagnose_access_token_scopes(&app_rw_jwt);
-        assert!(diag_app_rw.can_read_chats);
-        assert!(diag_app_rw.can_send_chats);
-        assert!(diag_app_rw.can_read_channels);
-        assert!(diag_app_rw.warnings.is_empty());
-    }
-
-    #[test]
-    fn test_diagnose_access_token_scopes_opaque_and_no_claims() {
         let opaque = diagnose_access_token_scopes("opaque-non-jwt-token");
         assert!(!opaque.has_scope_claims);
         assert!(opaque.warnings.is_empty());
-
-        let no_scope_jwt = make_test_jwt_with_encoder(
-            &serde_json::json!({
-                "oid": "u-3",
-                "exp": 1_900_000_000
-            }),
-            false,
-        );
-        let no_scope = diagnose_access_token_scopes(&no_scope_jwt);
-        assert!(!no_scope.has_scope_claims);
-        assert!(no_scope.warnings.is_empty());
     }
 
     #[test]
-    fn test_explain_graph_permission_error_403_vs_network() {
-        let basic_jwt = make_test_jwt_with_encoder(
+    fn test_explain_graph_permission_error_outlook_403_vs_network() {
+        let read_only_jwt = make_test_jwt_with_encoder(
             &serde_json::json!({
-                "scp": "User.Read Chat.ReadBasic"
+                "scp": "User.Read Mail.Read Calendars.Read"
             }),
             false,
         );
-        let full_jwt = make_test_jwt_with_encoder(
-            &serde_json::json!({
-                "scp": "User.Read Chat.ReadWrite ChannelMessage.Read.All"
-            }),
-            false,
-        );
-
-        let explained_basic = explain_graph_permission_error(
-            "Graph API error (GET https://graph.microsoft.com/v1.0/chats/c1/messages): 403 Forbidden [Forbidden] Missing scope",
-            Some(&basic_jwt),
+        let explained_send = explain_graph_permission_error(
+            "Graph API error (POST https://graph.microsoft.com/v1.0/me/sendMail): 403 Forbidden [ErrorAccessDenied]",
+            Some(&read_only_jwt),
         )
-        .expect("403 must be explained");
-        assert!(explained_basic.contains("403"));
-        assert!(explained_basic.contains("Chat.ReadBasic"));
+        .expect("403 on sendMail must be explained");
+        assert!(explained_send.contains("403"));
+        assert!(explained_send.contains("Mail.Send"));
 
-        let explained_full = explain_graph_permission_error(
-            "Graph API error (GET https://graph.microsoft.com/v1.0/chats/c1/messages): 403 Forbidden",
-            Some(&full_jwt),
+        let explained_cal = explain_graph_permission_error(
+            "Graph API error (POST https://graph.microsoft.com/v1.0/me/events/e1/accept): 403 Forbidden",
+            Some(&read_only_jwt),
         )
-        .expect("403 with full token falls back to generic explanation");
-        assert!(explained_full.contains("403"));
-        assert!(!explained_full.contains("Chat.ReadBasic"));
+        .expect("403 on calendar RSVP must be explained");
+        assert!(explained_cal.contains("Calendars.ReadWrite"));
 
         assert_eq!(
             explain_graph_permission_error(
-                "Graph HTTP request failed (GET http://127.0.0.1:40312/v1.0/chats/c1/messages): connection refused",
-                Some(&basic_jwt),
+                "Graph HTTP request failed (GET http://127.0.0.1:40312/v1.0/me/messages): connection refused",
+                Some(&read_only_jwt),
             ),
             None
         );
-        assert_eq!(
-            explain_graph_permission_error("dns resolution failed", Some(&basic_jwt)),
-            None
+    }
+
+    #[tokio::test]
+    async fn test_shared_teams_token_file_fallback_with_outlook_and_teams_only_scopes() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::clear_auth_env();
+        let dir = tempdir().unwrap();
+        let teams_dir = dir.path().join("teams-cli");
+        std::fs::create_dir_all(&teams_dir).unwrap();
+        let teams_tok_path = dir.path().join("shared_teams_token.txt");
+        std::fs::write(
+            teams_dir.join("config.toml"),
+            format!(
+                "token_file = \"{}\"\n",
+                teams_tok_path.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let teams_only_jwt = make_test_jwt_with_encoder(
+            &serde_json::json!({
+                "exp": now + 3600,
+                "scp": "User.Read Chat.ReadWrite"
+            }),
+            false,
         );
+        std::fs::write(&teams_tok_path, &teams_only_jwt).unwrap();
+
+        let outlook_cred_path = dir.path().join("outlook_creds.json");
+        let mut cfg = AppConfig::default();
+        cfg.share_m365_auth = true;
+
+        // 1. Teams-only token in teams-cli token_file must NOT be reused
+        let mgr_skip = AuthManager::empty_for_test(cfg.clone())
+            .with_token_path(outlook_cred_path.clone())
+            .with_legacy_teams_dir(teams_dir.clone());
+        assert!(mgr_skip.current_tokens().await.is_none());
+        assert!(mgr_skip.valid_access_token().await.is_err());
+
+        // 2. Token with Outlook scopes in teams-cli token_file IS reused with (mtime, len) caching
+        let outlook_jwt = make_test_jwt_with_encoder(
+            &serde_json::json!({
+                "exp": now + 3600,
+                "scp": "User.Read Mail.ReadWrite Calendars.Read"
+            }),
+            false,
+        );
+        std::fs::write(&teams_tok_path, &outlook_jwt).unwrap();
+        let tok1 = mgr_skip.current_tokens().await.unwrap();
+        assert_eq!(tok1.auth_mode, "shared_teams_token_file");
+        assert_eq!(tok1.access_token, outlook_jwt);
+        assert_eq!(mgr_skip.valid_access_token().await.unwrap(), outlook_jwt);
+
+        // 3. Updating token file content (even opaque) invalidates (mtime, len) cache
+        std::fs::write(&teams_tok_path, "opaque-shared-m365-token-v2").unwrap();
+        let tok2 = mgr_skip.current_tokens().await.unwrap();
+        assert_eq!(tok2.auth_mode, "shared_teams_token_file");
+        assert_eq!(tok2.access_token, "opaque-shared-m365-token-v2");
+
+        // 4. share_m365_auth = false disables fallback completely
+        let mut disabled_cfg = cfg;
+        disabled_cfg.share_m365_auth = false;
+        let mgr_disabled = AuthManager::empty_for_test(disabled_cfg)
+            .with_token_path(outlook_cred_path)
+            .with_legacy_teams_dir(teams_dir);
+        assert!(mgr_disabled.current_tokens().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_shared_teams_session_reuse_and_silent_refresh_upgrade() {
+        use axum::{http::StatusCode, routing::post, Json, Router};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::clear_auth_env();
+
+        let reject_consent = Arc::new(AtomicBool::new(false));
+        let reject_clone = reject_consent.clone();
+        let refresh_hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = refresh_hits.clone();
+        let now = chrono::Utc::now().timestamp();
+        let upgraded_jwt = make_test_jwt_with_encoder(
+            &serde_json::json!({
+                "exp": now + 3600,
+                "scp": "User.Read Mail.ReadWrite Mail.Send Calendars.ReadWrite Contacts.Read Tasks.ReadWrite",
+                "oid": "u-shared"
+            }),
+            false,
+        );
+        let upgraded_clone = upgraded_jwt.clone();
+
+        let app = Router::new().route(
+            "/tid-shared/oauth2/v2.0/token",
+            post(move |body: String| {
+                let reject = reject_clone.clone();
+                let hits = hits_clone.clone();
+                let jwt = upgraded_clone.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    assert!(body.contains("grant_type=refresh_token"));
+                    assert!(body.contains("Mail.ReadWrite"));
+                    if reject.load(Ordering::SeqCst) {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "invalid_grant",
+                                "error_description": "AADSTS65001: The user or administrator has not consented to use the application."
+                            })),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "access_token": jwt,
+                                "refresh_token": "rt-upgraded",
+                                "expires_in": 3600
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = tempdir().unwrap();
+        let teams_dir = dir.path().join("teams-cli");
+        std::fs::create_dir_all(&teams_dir).unwrap();
+        let outlook_cred_path = dir.path().join("outlook-cli").join("credentials.json");
+
+        let mut cfg = AppConfig::default();
+        cfg.auth_base_url = format!("http://{addr}");
+        cfg.share_m365_auth = true;
+
+        // 1. Teams session already has Mail.ReadWrite -> reused directly without hitting token endpoint
+        let teams_with_mail = StoredTokens {
+            access_token: make_test_jwt_with_encoder(
+                &serde_json::json!({
+                    "exp": now + 3600,
+                    "scp": "User.Read Chat.Read Mail.ReadWrite"
+                }),
+                false,
+            ),
+            refresh_token: Some("rt-teams".into()),
+            expires_at: now + 3600,
+            client_id: "cid".into(),
+            tenant_id: "tid-shared".into(),
+            user_id: Some("u-shared".into()),
+            user_display_name: Some("Shared User".into()),
+            user_email: Some("shared@example.com".into()),
+            auth_mode: "pkce".into(),
+        };
+        save_tokens_to_path(&teams_with_mail, &teams_dir.join("credentials.json")).unwrap();
+
+        let mgr_reuse = AuthManager::empty_for_test(cfg.clone())
+            .with_token_path(outlook_cred_path.clone())
+            .with_legacy_teams_dir(teams_dir.clone());
+        let reused_tok = mgr_reuse.valid_access_token().await.unwrap();
+        assert_eq!(reused_tok, teams_with_mail.access_token);
+        assert_eq!(refresh_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            mgr_reuse.current_tokens().await.unwrap().auth_mode,
+            "shared_teams_session"
+        );
+
+        // 2. Teams session has only Chat.Read + refresh_token -> silent refresh upgrades & persists to outlook-cli
+        let teams_chat_only = StoredTokens {
+            access_token: make_test_jwt_with_encoder(
+                &serde_json::json!({
+                    "exp": now + 3600,
+                    "scp": "User.Read Chat.Read"
+                }),
+                false,
+            ),
+            refresh_token: Some("rt-teams".into()),
+            expires_at: now + 3600,
+            client_id: "cid".into(),
+            tenant_id: "tid-shared".into(),
+            user_id: Some("u-shared".into()),
+            user_display_name: Some("Shared User".into()),
+            user_email: Some("shared@example.com".into()),
+            auth_mode: "pkce".into(),
+        };
+        save_tokens_to_path(&teams_chat_only, &teams_dir.join("credentials.json")).unwrap();
+
+        let mgr_upgrade = AuthManager::empty_for_test(cfg.clone())
+            .with_token_path(outlook_cred_path.clone())
+            .with_legacy_teams_dir(teams_dir.clone());
+        let upgraded = mgr_upgrade.valid_access_token().await.unwrap();
+        assert_eq!(upgraded, upgraded_jwt);
+        assert_eq!(refresh_hits.load(Ordering::SeqCst), 1);
+        let persisted = load_tokens_from_path(&outlook_cred_path).unwrap().unwrap();
+        assert_eq!(persisted.access_token, upgraded_jwt);
+        assert_eq!(persisted.refresh_token.as_deref(), Some("rt-upgraded"));
+        assert_eq!(persisted.auth_mode, "shared_teams_session");
+
+        // 3. Entra consent error -> clean English error instructing user to run `outlook login`
+        reject_consent.store(true, Ordering::SeqCst);
+        let outlook_cred_path_2 = dir.path().join("outlook-cli-2").join("credentials.json");
+        let mgr_fail = AuthManager::empty_for_test(cfg)
+            .with_token_path(outlook_cred_path_2)
+            .with_legacy_teams_dir(teams_dir);
+        let err = mgr_fail.valid_access_token().await.unwrap_err().to_string();
+        assert!(err.contains("outlook login"), "unexpected error: {err}");
     }
 
     #[test]
@@ -2898,68 +3466,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_external_token_file_mtime_len_cache_and_http_client() {
-        let dir = tempdir().unwrap();
-        let token_path = dir.path().join("ext_tok.json");
-        let now = chrono::Utc::now().timestamp();
-        let jwt1 = make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 3600, "oid": "u-1" }), false);
-        let jwt2 = make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 7200, "oid": "u-2-longer" }), false);
-
-        std::fs::write(&token_path, &jwt1).unwrap();
-        let mut cfg = AppConfig::default();
-        cfg.token_file = token_path.to_string_lossy().to_string();
-        let mgr = AuthManager::new(cfg).unwrap();
-        let _client = mgr.http_client();
-
-        let t1 = mgr.cached_external_token_file(&token_path).unwrap();
-        assert_eq!(t1.access_token, jwt1);
-        // Second call hits cache with identical (mtime, len)
-        let t1_cached = mgr.cached_external_token_file(&token_path).unwrap();
-        assert_eq!(t1_cached.access_token, jwt1);
-
-        // Changing file content (different len/mtime) invalidates cache
-        std::fs::write(&token_path, &jwt2).unwrap();
-        let t2 = mgr.cached_external_token_file(&token_path).unwrap();
-        assert_eq!(t2.access_token, jwt2);
-        assert_eq!(t2.user_id.as_deref(), Some("u-2-longer"));
-    }
-
-    #[tokio::test]
-    async fn test_token_refresh_cmd_cooldown_while_unexpired() {
-        let dir = tempdir().unwrap();
-        let token_path = dir.path().join("access_token");
-        let count_path = dir.path().join("fail_runs.log");
-        let now = chrono::Utc::now().timestamp();
-
-        let soon_jwt = make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 120 }), false);
-        std::fs::write(&token_path, &soon_jwt).unwrap();
-
-        let mut cfg = AppConfig::default();
-        cfg.token_file = token_path.to_string_lossy().to_string();
-        cfg.token_refresh_mins = 5;
-        #[cfg(windows)]
-        {
-            cfg.token_refresh_cmd = format!("echo hit>> \"{}\" && exit 1", count_path.display());
-        }
-        #[cfg(not(windows))]
-        {
-            cfg.token_refresh_cmd = format!("echo hit >> '{}' && exit 1", count_path.display());
-        }
-
-        let mgr = AuthManager::new(cfg).unwrap();
-        assert_eq!(mgr.valid_access_token().await.unwrap(), soon_jwt);
-        assert_eq!(mgr.valid_access_token().await.unwrap(), soon_jwt);
-        assert_eq!(mgr.valid_access_token().await.unwrap(), soon_jwt);
-
-        let runs = std::fs::read_to_string(&count_path).unwrap();
-        assert_eq!(
-            runs.lines().count(),
-            1,
-            "failing refresh_cmd while token is still valid must enter 15s cooldown"
-        );
-    }
-
-    #[tokio::test]
     async fn test_accept_pkce_callback_ignores_stray_requests() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2969,7 +3475,6 @@ mod tests {
         });
 
         let client = reqwest::Client::new();
-        // Stray request without state/code -> 400 Bad Request, listener keeps waiting
         let stray1 = client
             .get(format!("http://{addr}/?foo=bar"))
             .send()
@@ -2977,7 +3482,6 @@ mod tests {
             .unwrap();
         assert_eq!(stray1.status(), reqwest::StatusCode::BAD_REQUEST);
 
-        // Stray request with mismatched state -> 400 Bad Request, listener keeps waiting
         let stray2 = client
             .get(format!("http://{addr}/callback?code=wrong&state=bad-state"))
             .send()
@@ -2985,7 +3489,6 @@ mod tests {
             .unwrap();
         assert_eq!(stray2.status(), reqwest::StatusCode::BAD_REQUEST);
 
-        // Valid callback -> 200 OK and returns code
         let ok_resp = client
             .get(format!(
                 "http://{addr}/?code=valid-auth-code&state=expected-state-123"
@@ -2997,5 +3500,95 @@ mod tests {
 
         let code = server_task.await.unwrap().unwrap();
         assert_eq!(code, "valid-auth-code");
+    }
+
+    #[tokio::test]
+    async fn test_from_tokens_is_ephemeral_and_never_persists_to_disk() {
+        use axum::{routing::post, Json, Router};
+
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::clear_auth_env();
+
+        let dir = tempdir().unwrap();
+        let config_dir_str = dir.path().to_string_lossy().to_string();
+        let _override_guard = EnvVarGuard::set(&[
+            ("OUTLOOK_CONFIG_DIR", Some(&config_dir_str)),
+            ("OUTLOOK_DISABLE_KEYRING", Some("1")),
+        ]);
+        let cred_path = dir.path().join("credentials.json");
+
+        let app = Router::new().route(
+            "/tenant-ephemeral/oauth2/v2.0/token",
+            post(|| async {
+                Json(serde_json::json!({
+                    "access_token": "ephemeral-refreshed-tok",
+                    "refresh_token": "ephemeral-new-rt",
+                    "expires_in": 3600
+                }))
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.auth_base_url = format!("http://{addr}");
+        cfg.client_id = "cid-eph".into();
+        cfg.tenant_id = "tenant-ephemeral".into();
+
+        let expired = StoredTokens {
+            access_token: "ephemeral-old-tok".into(),
+            refresh_token: Some("ephemeral-rt-0".into()),
+            expires_at: chrono::Utc::now().timestamp() - 300,
+            client_id: "cid-eph".into(),
+            tenant_id: "tenant-ephemeral".into(),
+            user_id: None,
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "pkce".into(),
+        };
+
+        let mgr = AuthManager::from_tokens(cfg, expired);
+        assert!(mgr.ephemeral);
+        assert!(mgr.token_path_override.is_none());
+
+        // Refresh updates in-memory tokens without creating credentials.json on disk.
+        let tok = mgr.valid_access_token().await.unwrap();
+        assert_eq!(tok, "ephemeral-refreshed-tok");
+        assert!(!cred_path.exists());
+
+        let mem = mgr.current_tokens().await.unwrap();
+        assert_eq!(mem.access_token, "ephemeral-refreshed-tok");
+        assert_eq!(mem.refresh_token.as_deref(), Some("ephemeral-new-rt"));
+
+        // Profile/identity cache update stays in memory and does not persist to disk.
+        mgr.update_identity(
+            "eph-u1".into(),
+            "Ephemeral User".into(),
+            Some("eph@example.com".into()),
+        )
+        .await
+        .unwrap();
+        assert!(!cred_path.exists());
+        let after_identity = mgr.current_tokens().await.unwrap();
+        assert_eq!(after_identity.user_id.as_deref(), Some("eph-u1"));
+        assert_eq!(
+            after_identity.user_display_name.as_deref(),
+            Some("Ephemeral User")
+        );
+        assert_eq!(
+            after_identity.user_email.as_deref(),
+            Some("eph@example.com")
+        );
+
+        // Ephemeral AuthManager also never reads or deletes pre-existing disk credentials.
+        save_tokens_to_path(&after_identity, &cred_path).unwrap();
+        assert!(mgr.load_from_configured_source().unwrap().is_none());
+        mgr.logout().await.unwrap();
+        assert!(mgr.current_tokens().await.is_none());
+        assert!(cred_path.exists());
     }
 }

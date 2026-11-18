@@ -1,27 +1,27 @@
-# `teams` MCP Server
+# `outlook` MCP Server
 
-`teams mcp` (alias `mcp-server`) runs a [Model Context Protocol](https://modelcontextprotocol.io/) server over **stdio** using newline-delimited JSON-RPC 2.0. It exposes pure **Microsoft Teams** capabilities (1:1/group/meeting chats, teams & channels, threads, deep `@odata.nextLink` message history, OneDrive/SharePoint file & inline image uploads, attachment downloads, reactions, FTS5 search, and Presence) to MCP-capable agents such as Claude Desktop, Claude Code, and Codex.
+`outlook mcp` (alias `mcp-server`) runs a [Model Context Protocol](https://modelcontextprotocol.io/) server over **stdio** using newline-delimited JSON-RPC 2.0. It exposes pure **Microsoft Outlook** capabilities (**Mail**, **Calendar**, **Microsoft To Do**, and **Contacts & Entra Directory**) to MCP-capable agents such as Claude Desktop, Claude Code, and OpenAI Codex.
 
 ## Requirements
 
-1. Build or install the `teams` binary:
+1. Install or build the `outlook` binary:
    ```bash
-   npm install -g @shinick/teams
+   npm install -g @shinick/outlook
    # or from source:
    cargo build --release
    ```
 2. Authenticate once (the MCP server never prompts interactively on stdin):
    ```bash
-   teams login
+   outlook login
    ```
-   Or configure `TEAMS_ACCESS_TOKEN` / `TEAMS_TOKEN_FILE` (+ optional `TEAMS_TOKEN_REFRESH_CMD`) in the environment or `config.toml`.
-3. Ensure `teams` (e.g. `target/release/teams.exe` on Windows or on `PATH`) is accessible to your MCP host.
+   Or configure `OUTLOOK_ACCESS_TOKEN` / `OUTLOOK_TOKEN_FILE` (+ optional `OUTLOOK_TOKEN_REFRESH_CMD`), or rely on the automatic M365 shared-session bootstrap from `teams-cli` / `TEAMS_TOKEN_FILE` (`OUTLOOK_SHARE_M365_AUTH=true`).
+3. Ensure `outlook` (e.g. `target/release/outlook.exe` on Windows or on `PATH`) is accessible to your MCP host.
 
 ## Starting manually
 
 ```bash
-teams mcp          # stdio: one JSON-RPC 2.0 object per line
-teams mcp-server   # alias
+outlook mcp          # stdio: one JSON-RPC 2.0 object per line
+outlook mcp-server   # alias
 ```
 
 `stdout` is strictly reserved for single-line JSON-RPC 2.0 responses; diagnostics and startup warnings are written to `stderr` only.
@@ -35,8 +35,8 @@ teams mcp-server   # alias
 ```json
 {
   "mcpServers": {
-    "teams": {
-      "command": "teams",
+    "outlook": {
+      "command": "outlook",
       "args": ["mcp"]
     }
   }
@@ -48,8 +48,8 @@ On Windows with an explicit executable path:
 ```json
 {
   "mcpServers": {
-    "teams": {
-      "command": "C:\\Users\\me\\source\\teams\\target\\release\\teams.exe",
+    "outlook": {
+      "command": "C:\\Users\\me\\source\\outlook\\target\\release\\outlook.exe",
       "args": ["mcp"]
     }
   }
@@ -59,18 +59,18 @@ On Windows with an explicit executable path:
 ### Claude Code
 
 ```bash
-claude mcp add teams -- teams mcp
+claude mcp add outlook -- outlook mcp
 # or with an explicit binary path:
-claude mcp add teams -- C:\Users\me\source\teams\target\release\teams.exe mcp
+claude mcp add outlook -- C:\Users\me\source\outlook\target\release\outlook.exe mcp
 ```
 
-### Codex
+### OpenAI Codex
 
 `~/.codex/config.toml`:
 
 ```toml
-[mcp_servers.teams]
-command = "teams"
+[mcp_servers.outlook]
+command = "outlook"
 args = ["mcp"]
 ```
 
@@ -78,44 +78,43 @@ args = ["mcp"]
 
 - **Transport**: JSON-RPC 2.0 over stdio, **newline-delimited JSON** (one JSON object per line, no `Content-Length` headers; maximum `8 MiB` per request line).
 - **Supported `protocolVersion`s**: `2024-11-05`, `2025-03-26`, `2025-06-18` (unknown versions fall back to `2025-06-18`).
-- **`serverInfo`**: `{ "name": "teams", "version": "0.7.3" }` (matches `CARGO_PKG_VERSION`).
-- **Startup**: `initialize` responds immediately; on an empty cache, initial conversation bootstrap runs asynchronously in the background.
+- **`serverInfo`**: `{ "name": "outlook", "version": "0.1.0" }` (matches `CARGO_PKG_VERSION`).
+- **Startup**: `initialize` responds immediately; on an empty cache, initial mail folder bootstrap runs asynchronously in the background.
 - **Notifications**: requests without `id` or methods starting with `notifications/` (such as `notifications/initialized`) emit no response.
 - **`ping`**: returns `{}`.
 - **Error codes**: `-32700` parse error, `-32600` invalid JSON-RPC envelope (or oversized line > `8 MiB`), `-32601` method not found.
 - **`tools/call`**: returns `{ "content": [{ "type": "text", "text": "<pretty JSON>" }], "isError": false }` on success, or `"isError": true` with an error message (including JWT `scp`/`roles` permission diagnostics on `403`) on validation/Graph failures.
 
-## Microsoft Teams Tools (17)
+## Microsoft Outlook Tools (20)
 
-`target` arguments accept a canonical `conv_key` (`chat:...` or `chan:<team_id>:<channel_id>`), raw `chat_id`, `"Team/Channel"`, or a unique case-insensitive conversation title substring.
+Mail `folder` arguments accept a canonical folder ID, display name/prefix, or well-known alias (`inbox`, `sent`, `drafts`, `archive`, `trash`, `junk`). To Do `list` arguments accept a list ID, display name, or `'tasks'` / `'defaultList'`.
 
-| Tool | Arguments | Returns |
-| --- | --- | --- |
-| `list_chats` | `refresh?` (bool), `limit?` (1..1000) | `{ "chats": [...] }` |
-| `create_chat` | `members` (`string[]`, min 1), `topic?` | `{ "ok": true, "conversation": {...} }` |
-| `list_teams_channels` | `refresh?` (bool) | `{ "teams": [...] }` |
-| `get_messages` | `target`, `limit?` (1..1000), `before?` (ISO-8601 timestamp, `YYYY-MM-DD`, or `msg_id`), `offline?` (bool) | `{ "conversation": {...}, "messages": [...], "has_more": bool, "next_before": string \| null }` |
-| `get_thread` | `target`, `root_msg_id`, `limit?` (1..1000) | `{ "conversation": {...}, "thread": {...} }` |
-| `send_message` | `target`, `markdown`, `subject?`, `mentions?`, `important?` | `{ "ok": true, "conversation": {...}, "message": {...} }` |
-| `reply_message` | `target`, `msg_id`, `markdown`, `mentions?`, `important?` | `{ "ok": true, "conversation": {...}, "reply_to": "...", "message": {...} }` |
-| `send_file` | `target`, `path`, `caption?`, `thread_root_id?`, `inline?` | `{ "ok": true, "conversation": {...}, "path": "...", "message": {...} }` |
-| `download_attachment` | `target`, `msg_id`, `index?`, `out_dir?`, `thread_root_id?` | `{ "ok": true, "path": "...", "file_name": "...", "bytes_written": ... }` |
-| `react_message` | `target`, `msg_id`, `reaction`, `enable?` (default `true`), `thread_root_id?` | `{ "ok": true, "conv_key": "...", "msg_id": "...", "reaction": "...", "enable": ... }` |
-| `edit_message` | `target`, `msg_id`, `markdown`, `thread_root_id?` | `{ "ok": true, "conv_key": "...", "msg_id": "..." }` |
-| `delete_message` | `target`, `msg_id`, `confirm` (must be literal `true`), `thread_root_id?` | `{ "ok": true, "conv_key": "...", "msg_id": "..." }` |
-| `search_messages` | `query`, `target?`, `limit?` (1..1000) | `{ "query": "...", "hits": [...] }` |
-| `list_members` | `target` | `{ "conv_key": "...", "title": "...", "members": [...] }` |
-| `mark_read` | `target` | `{ "ok": true, "conv_key": "..." }` |
-| `get_presence` | `user_ids?` (`string[]`) | `{ "presence": {...} }` or `{ "presences": [...] }` |
-| `set_presence` | `availability` (`Available\|Busy\|DoNotDisturb\|BeRightBack\|Away\|Reset`), `activity?`, `expiration_mins?` (1..1440) | `{ "ok": true, "availability": "...", "activity": "...", "expiration_mins": ... }` |
-
-### Mentions and importance in `send_message` and `reply_message`
-
-`mentions` accepts either `"user_id:DisplayName"` strings or `{ "id"?: 0, "user_id": "...", "display_name": "..." }` objects. Set `important: true` to mark the message with high importance.
+| # | Tool | Domain | Arguments | Returns |
+| --- | --- | --- | --- | --- |
+| 1 | `whoami` | Auth | *(none)* | `{ "authenticated": bool, "user_id": ..., "email": ..., "auth_mode": ..., "auth_source": ..., "scopes": [...] }` |
+| 2 | `list_mail_folders` | Mail | `refresh?` (bool), `offline?` (bool) | `{ "folders": [...] }` |
+| 3 | `list_messages` | Mail | `folder?` (default `'inbox'`), `limit?` (1..200), `unread?`, `flagged?`, `focused?`, `offline?` | `{ "folder": {...}, "messages": [...] }` |
+| 4 | `get_message` | Mail | `message_id` (req), `mark_read?`, `offline?` | `{ "message": {...} }` |
+| 5 | `send_mail` | Mail | `to` (`string[]`, req), `subject` (req), `body` (Markdown, req), `cc?`, `bcc?`, `importance?` (`low\|normal\|high`), `attachments?`, `save_to_sent_items?` | `{ "ok": true, "to": [...], "subject": "..." }` |
+| 6 | `reply_mail` | Mail | `message_id` (req), `body` (req), `reply_all?` | `{ "ok": true, "message_id": "...", "reply_all": bool }` |
+| 7 | `forward_mail` | Mail | `message_id` (req), `to` (`string[]`, req), `comment?` | `{ "ok": true, "message_id": "...", "to": [...] }` |
+| 8 | `update_message` | Mail | `message_id` (req), `is_read?`, `flagged?`, `destination_folder?` | `{ "ok": true, "message_id": "...", "is_read": ..., "flagged": ..., "moved": ... }` |
+| 9 | `delete_message` | Mail | `message_id` (req), `confirm` (must be literal `true`) | `{ "ok": true, "message_id": "..." }` |
+| 10 | `download_attachment` | Mail | `message_id` (req), `attachment_index?` (>=0), `attachment?` (ID/name/index), `output_dir?` | `{ "ok": true, "attachment": {...}, "file": {...} }` |
+| 11 | `search_mail` | Mail | `query` (req), `folder?`, `limit?` (1..200), `offline?` | `{ "query": "...", "hits": [...] }` (offline) or `{ "query": "...", "messages": [...] }` (online) |
+| 12 | `list_events` | Calendar | `from?` (`ISO-8601\|YYYY-MM-DD`), `to?`, `days?` (1..365), `limit?` (1..200), `offline?` | `{ "start": "...", "end": "...", "events": [...] }` |
+| 13 | `create_event` | Calendar | `subject` (req), `start` (req), `end` (req), `time_zone?`, `is_all_day?`, `location?`, `body?`, `attendees?`, `is_online_meeting?` | `{ "ok": true, "event": {...} }` |
+| 14 | `respond_event` | Calendar | `event_id` (req), `response` (`accept\|tentative\|decline`, req), `comment?` | `{ "ok": true, "event_id": "...", "response": "..." }` |
+| 15 | `delete_event` | Calendar | `event_id` (req), `confirm` (must be literal `true`) | `{ "ok": true, "event_id": "..." }` |
+| 16 | `list_todo_lists` | To Do | `refresh?`, `offline?` | `{ "lists": [...] }` |
+| 17 | `list_tasks` | To Do | `list?`, `include_completed?`, `limit?` (1..200), `offline?` | `{ "list": {...}, "list_id": "...", "tasks": [...] }` |
+| 18 | `create_task` | To Do | `title` (req), `list?`, `notes?`, `due?` (`YYYY-MM-DD\|ISO-8601`), `importance?` (`low\|normal\|high`) | `{ "ok": true, "task": {...} }` |
+| 19 | `complete_task` | To Do | `task_id` (req), `list?`, `completed?` (default `true`) | `{ "ok": true, "task": {...} }` |
+| 20 | `search_contacts` | Contacts | `query?`, `limit?` (1..200), `offline?` | `{ "contacts": [...] }` |
 
 ### Destructive tool guard (`confirm: true`)
 
-`delete_message` requires `"confirm": true` as a literal JSON boolean. Omitting `confirm`, passing `false`, `"true"`, or `1` is rejected during argument validation before any Graph API call is made.
+`delete_message` and `delete_event` require `"confirm": true` as a literal JSON boolean. Omitting `confirm`, passing `false`, `"true"`, or `1` is rejected during argument validation before any Graph API call is made.
 
 ### Example JSON-RPC session
 
@@ -123,15 +122,14 @@ args = ["mcp"]
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"agent","version":"1.0"}}}
 {"jsonrpc":"2.0","method":"notifications/initialized"}
 {"jsonrpc":"2.0","id":2,"method":"tools/list"}
-{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_chats","arguments":{"refresh":true,"limit":100}}}
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_messages","arguments":{"target":"Engineering/General","before":"2026-11-01","limit":50}}}
-{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"send_message","arguments":{"target":"Engineering/General","markdown":"Build **passed**!","subject":"CI","mentions":["u1:Alice"]}}}
-{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"delete_message","arguments":{"target":"Engineering/General","msg_id":"1700000000000","confirm":true}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_messages","arguments":{"folder":"inbox","unread":true,"limit":20}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"send_mail","arguments":{"to":["alice@contoso.com"],"subject":"Release v0.1.0","body":"Build **passed**!"}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"create_event","arguments":{"subject":"Design Sync","start":"2026-11-20T09:00:00Z","end":"2026-11-20T10:00:00Z","is_online_meeting":true}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"delete_message","arguments":{"message_id":"AAMkAGI2...","confirm":true}}}
 ```
 
 ## Notes and limitations
 
-- `send_file` reads `path` on the host running `teams mcp`, not on a remote MCP client.
-- `get_messages` with `before` automatically walks Microsoft Graph `@odata.nextLink` (`$skiptoken`) pages when `offline` is `false` (default) and caches fetched messages into `cache.db`.
-- `search_messages` queries the local SQLite FTS5 cache (`cache.db`); run `teams sync --depth 100` or `get_messages` first if local history is empty.
-- `react_message` supports `like`, `heart`, `laugh`, `surprised`, `sad`, `angry`, and unicode emoji.
+- `send_mail` `attachments` paths and `download_attachment` `output_dir` paths are resolved on the host running `outlook mcp`, not on a remote MCP client.
+- Pass `"offline": true` on read/search tools (`list_mail_folders`, `list_messages`, `get_message`, `search_mail`, `list_events`, `list_todo_lists`, `list_tasks`, `search_contacts`) to query the local SQLite cache (`cache.db`) without network calls.
+- `search_mail` with `"offline": false` (default) queries Microsoft Graph KQL `$search` and caches matched messages into SQLite.

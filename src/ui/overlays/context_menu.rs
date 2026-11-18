@@ -1,4 +1,4 @@
-//! Right-click / `m` context menu.
+//! Right-click context menu for Mail, Calendar, Tasks, and Global actions.
 
 use ratatui::{
     layout::Rect,
@@ -9,23 +9,20 @@ use ratatui::{
 };
 
 use crate::{
-    models::ConversationKind,
+    models::EventRsvpAction,
     ui::{
         action::Action,
         app::{AppState, UiState},
-        hitmap::{HitMap, HitTarget, MessageScope},
+        hitmap::{HitMap, HitTarget},
         overlays::{OverlayKind, OverlayOutcome},
     },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextTarget {
-    NavRow(usize),
-    Message {
-        scope: MessageScope,
-        msg_index: usize,
-    },
-    Composer,
+    MailItem(usize),
+    CalendarEvent(usize),
+    TodoTask(usize),
     Global,
 }
 
@@ -55,108 +52,72 @@ pub struct ContextMenu {
 }
 
 impl ContextMenu {
-    pub fn build(target: ContextTarget, anchor: (u16, u16), app: &AppState, ui: &UiState) -> Self {
+    pub fn build(target: ContextTarget, anchor: (u16, u16), app: &AppState, _ui: &UiState) -> Self {
         let items = match target {
-            ContextTarget::NavRow(index) => vec![
-                MenuItem::new("Open", Some("Enter"), Action::SelectNavRow(index)),
-                MenuItem::new("Refresh", Some("F5"), Action::RefreshAll),
-                MenuItem::new(
-                    "New Chat",
-                    Some("Ctrl+N"),
-                    Action::OpenOverlay(OverlayKind::NewChat),
-                ),
-            ],
-            ContextTarget::Message { scope, msg_index } => {
-                let msg = app.message_at(scope, msg_index);
-                let is_channel_root = scope == MessageScope::Chat
-                    && app
-                        .active_conversation()
-                        .is_some_and(|c| c.kind == ConversationKind::Channel)
-                    && msg.is_some_and(|m| m.parent_msg_id.is_none());
-                let has_attach = msg.is_some_and(|m| !m.attachments.is_empty());
-                let is_me = msg.is_some_and(|m| m.is_me);
-
-                let mut items = Vec::new();
-                if is_channel_root {
-                    items.push(MenuItem::new(
-                        "Open Thread",
-                        Some("t"),
-                        Action::OpenThread { msg_index },
+            ContextTarget::MailItem(_) => {
+                let mut list = vec![
+                    MenuItem::new("Reply", Some("r"), Action::MailReply { reply_all: false }),
+                    MenuItem::new("Reply All", Some("R"), Action::MailReply { reply_all: true }),
+                    MenuItem::new("Forward", Some("f"), Action::MailForward),
+                    MenuItem::new("Toggle Read/Unread", Some("u"), Action::MailToggleRead),
+                    MenuItem::new("Toggle Flag", Some("g"), Action::MailToggleFlag),
+                    MenuItem::new("Archive", Some("e"), Action::MailArchive),
+                    MenuItem::new("Move to Folder…", Some("m"), Action::OpenFolderPicker),
+                    MenuItem::new("Delete", Some("Del"), Action::DeleteItem),
+                ];
+                if app
+                    .active_mail()
+                    .is_some_and(|m| m.has_attachments || !m.attachments.is_empty())
+                {
+                    list.push(MenuItem::new(
+                        "Attachments",
+                        Some("A"),
+                        Action::OpenOverlay(OverlayKind::Attachments),
+                    ));
+                    list.push(MenuItem::new(
+                        "Preview Images",
+                        Some("v"),
+                        Action::OpenImagePreview,
                     ));
                 }
-                items.push(MenuItem::new(
-                    "Reply / Quote",
-                    Some("r"),
-                    Action::ReplyTo { scope, msg_index },
-                ));
-                items.push(MenuItem::new(
-                    "Add Reaction",
-                    Some("+"),
-                    Action::OpenReactions { scope, msg_index },
-                ));
-                items.push(MenuItem::new(
-                    "Copy Message",
-                    Some("y"),
-                    Action::CopyMessage { scope, msg_index },
-                ));
-                if has_attach {
-                    let attach_index = ui.attach_index.min(
-                        msg.map_or(0, |m| m.attachments.len().saturating_sub(1)),
-                    );
-                    items.push(MenuItem::new(
-                        "Download Attachment",
-                        Some("d"),
-                        Action::DownloadAttachment {
-                            scope,
-                            msg_index,
-                            attach_index,
-                        },
-                    ));
-                }
-                if is_me {
-                    items.push(MenuItem::new(
-                        "Delete Message",
-                        Some("Del"),
-                        Action::RequestDeleteMessage { scope, msg_index },
-                    ));
-                }
-                items
+                list
             }
-            ContextTarget::Composer => vec![
-                MenuItem::new("Send", Some("Enter"), Action::SendMessage),
-                MenuItem::new("Toggle Subject", Some("Ctrl+S"), Action::ToggleSubject),
-                MenuItem::new("External Editor", Some("Ctrl+E"), Action::OpenExternalEditor),
-                MenuItem::new("Cancel Reply", Some("Esc"), Action::CancelReply),
-                MenuItem::new(
-                    "Clear Pending Images",
-                    Some("Ctrl+Shift+X"),
-                    Action::ClearPendingImages,
-                ),
-                MenuItem::new("Clear Draft", None, Action::ClearComposer),
+            ContextTarget::CalendarEvent(_) => {
+                let mut list = vec![
+                    MenuItem::new("Accept", Some("a"), Action::CalendarRsvp(EventRsvpAction::Accept)),
+                    MenuItem::new(
+                        "Tentative",
+                        Some("y"),
+                        Action::CalendarRsvp(EventRsvpAction::TentativelyAccept),
+                    ),
+                    MenuItem::new("Decline", Some("x"), Action::CalendarRsvp(EventRsvpAction::Decline)),
+                ];
+                if app
+                    .active_event()
+                    .and_then(|e| e.online_meeting_url.as_ref())
+                    .is_some()
+                {
+                    list.push(MenuItem::new(
+                        "Join Online Meeting",
+                        Some("o"),
+                        Action::OpenActiveLink,
+                    ));
+                }
+                list.push(MenuItem::new("Delete Event", Some("Del"), Action::DeleteCalendarEvent));
+                list
+            }
+            ContextTarget::TodoTask(_) => vec![
+                MenuItem::new("Toggle Complete", Some("Space"), Action::ToggleTodoCompleted),
+                MenuItem::new("New Task", Some("n"), Action::OpenNewTodoTask),
+                MenuItem::new("Delete Task", Some("Del"), Action::DeleteTodoTask),
             ],
             ContextTarget::Global => vec![
-                MenuItem::new("Search", Some("Ctrl+F"), Action::OpenSearch),
-                MenuItem::new(
-                    "New Chat",
-                    Some("Ctrl+N"),
-                    Action::OpenOverlay(OverlayKind::NewChat),
-                ),
-                MenuItem::new(
-                    "Change Presence",
-                    Some("Ctrl+P"),
-                    Action::OpenOverlay(OverlayKind::Presence),
-                ),
-                MenuItem::new("Refresh", Some("F5"), Action::RefreshAll),
-                MenuItem::new(
-                    "Settings",
-                    Some("Ctrl+,"),
-                    Action::OpenOverlay(OverlayKind::Settings),
-                ),
-                MenuItem::new(
-                    "Help",
-                    Some("?"),
-                    Action::OpenOverlay(OverlayKind::Help),
-                ),
+                MenuItem::new("Compose Email", Some("c"), Action::OpenMailCompose),
+                MenuItem::new("Search Mail", Some("/"), Action::OpenSearch),
+                MenuItem::new("Omni-Switcher", Some("Ctrl+K"), Action::OpenOverlay(OverlayKind::CommandPalette)),
+                MenuItem::new("Refresh", Some("Ctrl+R"), Action::RefreshAll),
+                MenuItem::new("Settings", Some("Ctrl+,"), Action::OpenOverlay(OverlayKind::Settings)),
+                MenuItem::new("Help", Some("?"), Action::OpenOverlay(OverlayKind::Help)),
                 MenuItem::new("Quit", Some("Ctrl+Q"), Action::QuitConfirm),
             ],
         };
@@ -209,9 +170,9 @@ impl ContextMenu {
         let rect = anchored_rect(area, self.anchor, width, height);
 
         let title = match self.context {
-            ContextTarget::NavRow(_) => " Conversation Menu ",
-            ContextTarget::Message { .. } => " Message Menu ",
-            ContextTarget::Composer => " Composer Menu ",
+            ContextTarget::MailItem(_) => " Email Menu ",
+            ContextTarget::CalendarEvent(_) => " Event Menu ",
+            ContextTarget::TodoTask(_) => " Task Menu ",
             ContextTarget::Global => " Menu ",
         };
         frame.render_widget(Clear, rect);
@@ -234,7 +195,7 @@ impl ContextMenu {
             let label_style = if selected {
                 theme.selection().remove_modifier(Modifier::BOLD)
             } else {
-                ratatui::style::Style::default()
+                Style::default()
             };
             let hint_style = if selected {
                 theme.selection()

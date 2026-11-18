@@ -1,13 +1,13 @@
 #!/usr/bin/env sh
-# Unix launcher for teams (analogous to teams.cmd on Windows).
+# Unix launcher for outlook (analogous to outlook.cmd on Windows).
 #
 # Uses prebuilt release binary if present, attempts `gh release download` from
-# shinick-dev/teams when available, and falls back to `cargo build --release`.
+# shinick-dev/outlook when available, and falls back to `cargo build --release`.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 TARGET_DIR=${CARGO_TARGET_DIR:-"$ROOT/target"}
-BIN="$TARGET_DIR/release/teams"
+BIN="$TARGET_DIR/release/outlook"
 
 if [ ! -x "$BIN" ] && command -v gh >/dev/null 2>&1; then
     OS=$(uname -s)
@@ -21,8 +21,8 @@ if [ ! -x "$BIN" ] && command -v gh >/dev/null 2>&1; then
     esac
     if [ -n "$TRIPLE" ]; then
         mkdir -p "$TARGET_DIR/release"
-        TMP_TGZ="$TARGET_DIR/release/teams-$TRIPLE.tar.gz"
-        if gh release download -R shinick-dev/teams --pattern "teams-*-$TRIPLE.tar.gz" -O "$TMP_TGZ" --clobber >/dev/null 2>&1; then
+        TMP_TGZ="$TARGET_DIR/release/outlook-$TRIPLE.tar.gz"
+        if gh release download -R shinick-dev/outlook --pattern "outlook-*-$TRIPLE.tar.gz" -O "$TMP_TGZ" --clobber >/dev/null 2>&1; then
             tar -xzf "$TMP_TGZ" -C "$TARGET_DIR/release" >/dev/null 2>&1 || true
             rm -f "$TMP_TGZ"
             [ -f "$BIN" ] && chmod +x "$BIN"
@@ -31,7 +31,7 @@ if [ ! -x "$BIN" ] && command -v gh >/dev/null 2>&1; then
 fi
 
 if [ ! -x "$BIN" ]; then
-    echo "[teams] release build not found - building..." >&2
+    echo "[outlook] release build not found - building..." >&2
     cargo build --release --manifest-path "$ROOT/Cargo.toml" >&2
 fi
 

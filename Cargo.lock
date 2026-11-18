@@ -2131,6 +2131,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "outlook-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "clap",
+ "crossterm",
+ "dirs",
+ "futures",
+ "hex",
+ "image",
+ "keyring",
+ "notify-rust",
+ "open",
+ "rand 0.8.8",
+ "ratatui",
+ "reqwest",
+ "rusqlite",
+ "rustls",
+ "scraper",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tower-http",
+ "unicode-width 0.2.3",
+ "url",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3107,43 +3144,6 @@ dependencies = [
  "thiserror 2.0.21",
  "windows",
  "windows-version",
-]
-
-[[package]]
-name = "teams-cli"
-version = "0.7.3"
-dependencies = [
- "anyhow",
- "arboard",
- "axum",
- "base64 0.22.1",
- "chrono",
- "clap",
- "crossterm",
- "dirs",
- "futures",
- "hex",
- "image",
- "keyring",
- "notify-rust",
- "open",
- "rand 0.8.8",
- "ratatui",
- "reqwest",
- "rusqlite",
- "rustls",
- "scraper",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "toml",
- "tower-http",
- "unicode-width 0.2.3",
- "url",
- "urlencoding",
- "uuid",
 ]
 
 [[package]]

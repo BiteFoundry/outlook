@@ -1,4 +1,4 @@
-//! Teams HTML + attachment parser into `Vec<RichBlock>`, plain text, and GFM Markdown.
+//! Outlook HTML + attachment parser into `Vec<RichBlock>`, plain text, and GFM Markdown.
 
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -6,10 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use scraper::{ElementRef, Html, Node};
 
-use crate::{
-    models::{AttachmentInfo, MentionInfo, RichBlock, RichSpan, TextStyleFlags},
-    parser::card_in::{is_card_content_type, parse_card_attachment},
-};
+use crate::models::{MailAttachment, RichBlock, RichSpan, TextStyleFlags};
 
 const HTML_CACHE_MAX_ENTRIES: usize = 1024;
 const HTML_CACHE_MAX_HTML_BYTES: usize = 256 * 1024;
@@ -38,7 +35,7 @@ impl HtmlParseCache {
         if self.entries.contains_key(&key) {
             self.entries.insert(key, value);
             if self.order.back() != Some(&key) {
-                if let Some(pos) = self.order.iter().rposition(|k| k == &key) {
+                if let Some(pos) = self.order.iter().rposition(|k| *k == key) {
                     self.order.remove(pos);
                 }
                 self.order.push_back(key);
@@ -108,11 +105,7 @@ fn hash_opt_str_field(h1: &mut DefaultHasher, h2: &mut Fnv1a64, opt: Option<&str
     }
 }
 
-fn compute_parse_fingerprint(
-    html: &str,
-    attachments: &[AttachmentInfo],
-    mentions: &[MentionInfo],
-) -> HtmlCacheKey {
+fn compute_parse_fingerprint(html: &str, attachments: &[MailAttachment]) -> HtmlCacheKey {
     let mut h1 = DefaultHasher::new();
     let mut h2 = Fnv1a64::new();
 
@@ -125,29 +118,31 @@ fn compute_parse_fingerprint(
     attachments.len().hash(&mut h2);
     for att in attachments {
         hash_str_field(&mut h1, &mut h2, &att.id);
+        hash_str_field(&mut h1, &mut h2, &att.name);
         hash_str_field(&mut h1, &mut h2, &att.content_type);
-        hash_opt_str_field(&mut h1, &mut h2, att.name.as_deref());
-        hash_opt_str_field(&mut h1, &mut h2, att.content_url.as_deref());
-        hash_opt_str_field(&mut h1, &mut h2, att.content_json.as_deref());
-        hash_opt_str_field(&mut h1, &mut h2, att.thumbnail_url.as_deref());
-    }
-
-    mentions.len().hash(&mut h1);
-    mentions.len().hash(&mut h2);
-    for m in mentions {
-        m.id.hash(&mut h1);
-        m.id.hash(&mut h2);
-        m.user_id.hash(&mut h1);
-        m.user_id.hash(&mut h2);
-        hash_str_field(&mut h1, &mut h2, &m.display_name);
+        att.size.hash(&mut h1);
+        att.size.hash(&mut h2);
+        att.is_inline.hash(&mut h1);
+        att.is_inline.hash(&mut h2);
+        hash_opt_str_field(&mut h1, &mut h2, att.content_id.as_deref());
     }
 
     (h1.finish(), h2.finish(), html.len())
 }
 
+fn has_plain_quote_or_reply_marker(text: &str) -> bool {
+    text.lines().any(|line| {
+        let t = line.trim_start();
+        t.starts_with('>')
+            || t.starts_with("-----Original Message-----")
+            || t.starts_with("From:")
+            || t.ends_with("wrote:")
+    })
+}
+
 fn try_fast_path_plain_or_empty(
     html: &str,
-    attachments: &[AttachmentInfo],
+    attachments: &[MailAttachment],
 ) -> Option<Arc<[RichBlock]>> {
     if !attachments.is_empty() {
         return None;
@@ -155,7 +150,11 @@ fn try_fast_path_plain_or_empty(
     if html.trim().is_empty() {
         return Some(Arc::from([]));
     }
-    if !html.contains('<') && !html.contains('&') && !html.contains('\0') {
+    if !html.contains('<')
+        && !html.contains('&')
+        && !html.contains('\0')
+        && !has_plain_quote_or_reply_marker(html)
+    {
         let collapsed = collapse_html_whitespace(html);
         let trimmed = collapsed.trim();
         if trimmed.is_empty() {
@@ -171,17 +170,16 @@ fn try_fast_path_plain_or_empty(
 
 pub fn parse_message_blocks_arc(
     html: &str,
-    attachments: &[AttachmentInfo],
-    mentions: &[MentionInfo],
+    attachments: &[MailAttachment],
 ) -> Arc<[RichBlock]> {
     if let Some(fast) = try_fast_path_plain_or_empty(html, attachments) {
         return fast;
     }
     if html.len() > HTML_CACHE_MAX_HTML_BYTES {
-        return Arc::from(parse_message_blocks_uncached(html, attachments, mentions));
+        return Arc::from(parse_message_blocks_uncached(html, attachments));
     }
 
-    let key = compute_parse_fingerprint(html, attachments, mentions);
+    let key = compute_parse_fingerprint(html, attachments);
     let cache = HTML_PARSE_CACHE.get_or_init(|| Mutex::new(HtmlParseCache::default()));
     {
         let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -190,54 +188,54 @@ pub fn parse_message_blocks_arc(
         }
     }
 
-    let parsed: Arc<[RichBlock]> =
-        Arc::from(parse_message_blocks_uncached(html, attachments, mentions));
+    let parsed: Arc<[RichBlock]> = Arc::from(parse_message_blocks_uncached(html, attachments));
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     guard.insert(key, Arc::clone(&parsed));
     parsed
 }
 
-pub fn parse_message_blocks(
-    html: &str,
-    attachments: &[AttachmentInfo],
-    mentions: &[MentionInfo],
-) -> Vec<RichBlock> {
-    parse_message_blocks_arc(html, attachments, mentions).to_vec()
+pub fn parse_message_blocks(html: &str, attachments: &[MailAttachment]) -> Vec<RichBlock> {
+    parse_message_blocks_arc(html, attachments).to_vec()
 }
 
 pub(crate) fn parse_message_blocks_no_cache(
     html: &str,
-    attachments: &[AttachmentInfo],
-    mentions: &[MentionInfo],
+    attachments: &[MailAttachment],
 ) -> Arc<[RichBlock]> {
     if let Some(fast) = try_fast_path_plain_or_empty(html, attachments) {
         return fast;
     }
-    Arc::from(parse_message_blocks_uncached(html, attachments, mentions))
+    Arc::from(parse_message_blocks_uncached(html, attachments))
 }
 
 fn parse_message_blocks_uncached(
     html: &str,
-    attachments: &[AttachmentInfo],
-    mentions: &[MentionInfo],
+    attachments: &[MailAttachment],
 ) -> Vec<RichBlock> {
     let mut ctx = ParserContext {
-        attachments,
-        mentions,
         seen_attachments: HashSet::new(),
         seen_inline_srcs: HashSet::new(),
-        seen_hosted_ids: HashSet::new(),
+        seen_content_ids: HashSet::new(),
         blocks: Vec::new(),
+        quoted_blocks: Vec::new(),
+        in_quoted_history: false,
         current_spans: Vec::new(),
         next_image_index: 0,
     };
 
     if !html.trim().is_empty() {
-        let fragment = Html::parse_fragment(html);
-        ctx.walk_children(fragment.root_element(), &TextStyleFlags::default());
-        ctx.flush_paragraph();
+        if !html.contains('<') && !html.contains('&') {
+            ctx.parse_plain_text_lines(html);
+        } else {
+            let fragment = Html::parse_fragment(html);
+            ctx.walk_children(fragment.root_element(), &TextStyleFlags::default());
+            ctx.flush_paragraph();
+        }
     }
 
+    ctx.finalize_quoted_history();
+
+    ctx.in_quoted_history = false;
     for att in attachments {
         if !ctx.seen_attachments.contains(&att.id) && !ctx.is_seen_inline_attachment(att) {
             ctx.push_attachment_block(att);
@@ -293,42 +291,34 @@ pub fn blocks_to_plain(blocks: &[RichBlock]) -> String {
                     parts.push(lines.join("\n"));
                 }
             }
-            RichBlock::Card {
-                title,
-                subtitle,
-                facts,
-                body_lines,
-                actions,
-            } => {
+            RichBlock::Table { headers, rows } => {
                 let mut lines = Vec::new();
-                if let Some(t) = title.as_deref().filter(|s| !s.is_empty()) {
-                    lines.push(t.to_string());
-                }
-                if let Some(sub) = subtitle.as_deref().filter(|s| !s.is_empty()) {
-                    lines.push(sub.to_string());
-                }
-                for bl in body_lines {
-                    if !bl.is_empty() {
-                        lines.push(bl.clone());
+                if !headers.is_empty() {
+                    let h = headers
+                        .iter()
+                        .map(|cell| spans_to_plain(cell).trim().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    if !h.trim().is_empty() {
+                        lines.push(h);
                     }
                 }
-                for (k, v) in facts {
-                    if k.is_empty() {
-                        lines.push(v.clone());
-                    } else {
-                        lines.push(format!("{k}: {v}"));
-                    }
-                }
-                for (label, target) in actions {
-                    if target.is_empty() {
-                        lines.push(format!("[{label}]"));
-                    } else {
-                        lines.push(format!("[{label}] ({target})"));
+                for row in rows {
+                    let r = row
+                        .iter()
+                        .map(|cell| spans_to_plain(cell).trim().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    if !r.trim().is_empty() {
+                        lines.push(r);
                     }
                 }
                 if !lines.is_empty() {
                     parts.push(lines.join("\n"));
                 }
+            }
+            RichBlock::Divider => {
+                parts.push("---".to_string());
             }
             RichBlock::AttachmentChip { id, name } => {
                 let label = name.as_deref().unwrap_or(id.as_str());
@@ -336,6 +326,12 @@ pub fn blocks_to_plain(blocks: &[RichBlock]) -> String {
             }
             RichBlock::InlineImageChip { index, .. } => {
                 parts.push(format!("[Image #{}]", index + 1));
+            }
+            RichBlock::QuotedHistory { blocks, .. } => {
+                let inner = blocks_to_plain(blocks);
+                if !inner.trim().is_empty() {
+                    parts.push(inner);
+                }
             }
         }
     }
@@ -388,69 +384,166 @@ pub fn blocks_to_markdown(blocks: &[RichBlock]) -> String {
                     parts.push(lines.join("\n"));
                 }
             }
-            RichBlock::Card {
-                title,
-                subtitle,
-                facts,
-                body_lines,
-                actions,
-            } => {
-                let mut lines = Vec::new();
-                if let Some(t) = title.as_deref().filter(|s| !s.is_empty()) {
-                    lines.push(format!("> **{t}**"));
-                }
-                if let Some(sub) = subtitle.as_deref().filter(|s| !s.is_empty()) {
-                    lines.push(format!("> *{sub}*"));
-                }
-                for bl in body_lines {
-                    if !bl.is_empty() {
-                        lines.push(format!("> {bl}"));
+            RichBlock::Table { headers, rows } => {
+                let col_count = headers
+                    .len()
+                    .max(rows.iter().map(Vec::len).max().unwrap_or(0));
+                if col_count > 0 {
+                    let mut lines = Vec::new();
+                    let header_cells: Vec<String> = if !headers.is_empty() {
+                        (0..col_count)
+                            .map(|i| {
+                                headers
+                                    .get(i)
+                                    .map(|c| escape_md_table_cell(&spans_to_markdown(c)))
+                                    .unwrap_or_default()
+                            })
+                            .collect()
+                    } else {
+                        vec![String::new(); col_count]
+                    };
+                    lines.push(format!("| {} |", header_cells.join(" | ")));
+                    lines.push(format!(
+                        "| {} |",
+                        vec!["---"; col_count].join(" | ")
+                    ));
+                    for row in rows {
+                        let cells: Vec<String> = (0..col_count)
+                            .map(|i| {
+                                row.get(i)
+                                    .map(|c| escape_md_table_cell(&spans_to_markdown(c)))
+                                    .unwrap_or_default()
+                            })
+                            .collect();
+                        lines.push(format!("| {} |", cells.join(" | ")));
                     }
-                }
-                for (k, v) in facts {
-                    lines.push(format!("> - **{k}**: {v}"));
-                }
-                if !actions.is_empty() {
-                    let btns: Vec<String> = actions
-                        .iter()
-                        .map(|(label, url)| {
-                            if url.starts_with("http://") || url.starts_with("https://") {
-                                format!("[{label}]({url})")
-                            } else {
-                                format!("[{label}]")
-                            }
-                        })
-                        .collect();
-                    lines.push(format!("> {}", btns.join(" · ")));
-                }
-                if !lines.is_empty() {
                     parts.push(lines.join("\n"));
                 }
+            }
+            RichBlock::Divider => {
+                parts.push("---".to_string());
             }
             RichBlock::AttachmentChip { id, name } => {
                 let label = name.as_deref().unwrap_or(id.as_str());
                 parts.push(format!("[Attachment: {label}]"));
             }
-            RichBlock::InlineImageChip { src, index } => {
-                parts.push(format!("![image-{}]({src})", index + 1));
+            RichBlock::InlineImageChip {
+                src,
+                content_id,
+                index,
+            } => {
+                if let Some(cid) = content_id {
+                    parts.push(format!("![image-{}](cid:{cid})", index + 1));
+                } else {
+                    parts.push(format!("![image-{}]({src})", index + 1));
+                }
+            }
+            RichBlock::QuotedHistory { blocks, .. } => {
+                let inner = blocks_to_markdown(blocks);
+                if !inner.trim().is_empty() {
+                    let quoted = inner
+                        .lines()
+                        .map(|l| {
+                            if l.trim().is_empty() {
+                                ">".to_string()
+                            } else {
+                                format!("> {l}")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    parts.push(quoted);
+                }
             }
         }
     }
     parts.join("\n\n")
 }
 
-struct ParserContext<'a> {
-    attachments: &'a [AttachmentInfo],
-    mentions: &'a [MentionInfo],
+fn escape_md_table_cell(raw: &str) -> String {
+    raw.trim().replace('\n', " ").replace('|', "\\|")
+}
+
+pub(crate) fn normalize_content_id(raw: &str) -> String {
+    let mut s = raw.trim();
+    if let Some(rest) = s
+        .strip_prefix("cid:")
+        .or_else(|| s.strip_prefix("CID:"))
+        .or_else(|| {
+            if s.len() >= 4 && s[..4].eq_ignore_ascii_case("cid:") {
+                Some(&s[4..])
+            } else {
+                None
+            }
+        })
+    {
+        s = rest.trim();
+    }
+    s.trim_start_matches('<').trim_end_matches('>').trim().to_string()
+}
+
+struct ParserContext {
     seen_attachments: HashSet<String>,
     seen_inline_srcs: HashSet<String>,
-    seen_hosted_ids: HashSet<String>,
+    seen_content_ids: HashSet<String>,
     blocks: Vec<RichBlock>,
+    quoted_blocks: Vec<RichBlock>,
+    in_quoted_history: bool,
     current_spans: Vec<RichSpan>,
     next_image_index: usize,
 }
 
-impl<'a> ParserContext<'a> {
+impl ParserContext {
+    fn push_block(&mut self, block: RichBlock) {
+        if self.in_quoted_history {
+            self.quoted_blocks.push(block);
+        } else {
+            self.blocks.push(block);
+        }
+    }
+
+    fn parse_plain_text_lines(&mut self, text: &str) {
+        let mut normal_lines: Vec<&str> = Vec::new();
+        let mut quote_lines: Vec<String> = Vec::new();
+
+        let flush_normal = |ctx: &mut Self, buf: &mut Vec<&str>| {
+            if !buf.is_empty() {
+                let joined = buf.join("\n");
+                let trimmed = joined.trim();
+                if !trimmed.is_empty() {
+                    ctx.push_block(RichBlock::Paragraph(vec![RichSpan::plain(trimmed)]));
+                }
+                buf.clear();
+            }
+        };
+        let flush_quote = |ctx: &mut Self, buf: &mut Vec<String>| {
+            if !buf.is_empty() {
+                let joined = buf.join("\n");
+                let trimmed = joined.trim();
+                if !trimmed.is_empty() {
+                    ctx.push_block(RichBlock::Quote(vec![RichSpan::plain(trimmed)]));
+                }
+                buf.clear();
+            }
+        };
+
+        for line in text.lines() {
+            let trimmed_start = line.trim_start();
+            if let Some(after_gt) = trimmed_start.strip_prefix('>') {
+                flush_normal(self, &mut normal_lines);
+                quote_lines.push(after_gt.strip_prefix(' ').unwrap_or(after_gt).trim_end().to_string());
+            } else if trimmed_start.is_empty() {
+                flush_normal(self, &mut normal_lines);
+                flush_quote(self, &mut quote_lines);
+            } else {
+                flush_quote(self, &mut quote_lines);
+                normal_lines.push(line.trim_end());
+            }
+        }
+        flush_normal(self, &mut normal_lines);
+        flush_quote(self, &mut quote_lines);
+    }
+
     fn walk_children(&mut self, parent: ElementRef<'_>, style: &TextStyleFlags) {
         for child in parent.children() {
             match child.value() {
@@ -459,6 +552,13 @@ impl<'a> ParserContext<'a> {
                 }
                 Node::Element(_) => {
                     if let Some(child_el) = ElementRef::wrap(child) {
+                        if !self.in_quoted_history && is_quoted_history_boundary(child_el) {
+                            self.flush_paragraph();
+                            self.in_quoted_history = true;
+                            if child_el.value().name() == "hr" {
+                                continue;
+                            }
+                        }
                         self.handle_element(child_el, style);
                     }
                 }
@@ -470,9 +570,18 @@ impl<'a> ParserContext<'a> {
     fn handle_element(&mut self, el_ref: ElementRef<'_>, style: &TextStyleFlags) {
         let el = el_ref.value();
         let tag = el.name();
+
+        if is_ignored_noise_tag(tag) || has_display_none(el) {
+            return;
+        }
+
         match tag {
             "br" => {
                 self.push_raw_span("\n", &TextStyleFlags::default());
+            }
+            "hr" => {
+                self.flush_paragraph();
+                self.push_block(RichBlock::Divider);
             }
             "b" | "strong" => {
                 let mut next = style.clone();
@@ -509,32 +618,7 @@ impl<'a> ParserContext<'a> {
                 }
                 self.walk_children(el_ref, &next);
             }
-            "at" => {
-                let mut next = style.clone();
-                next.mention = true;
-                let inner = collect_raw_text(el_ref);
-                let trimmed = inner.trim();
-                let name = if !trimmed.is_empty() {
-                    trimmed.to_string()
-                } else if let Some(id_val) = el.attr("id").and_then(|v| v.parse::<i32>().ok()) {
-                    self.mentions
-                        .iter()
-                        .find(|m| m.id == id_val)
-                        .map(|m| m.display_name.clone())
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                if !name.is_empty() {
-                    let display = if name.starts_with('@') {
-                        name
-                    } else {
-                        format!("@{name}")
-                    };
-                    self.push_raw_span(&display, &next);
-                }
-            }
-            "p" | "div" => {
+            "p" | "div" | "section" | "article" | "main" | "header" | "footer" | "center" => {
                 self.flush_paragraph();
                 self.walk_children(el_ref, style);
                 self.flush_paragraph();
@@ -544,7 +628,7 @@ impl<'a> ParserContext<'a> {
                 let level = tag[1..].parse::<u8>().unwrap_or(1);
                 let spans = self.collect_inline_spans(el_ref, style);
                 if !spans_are_blank(&spans) {
-                    self.blocks.push(RichBlock::Heading {
+                    self.push_block(RichBlock::Heading {
                         level,
                         spans: trim_spans(spans),
                     });
@@ -554,7 +638,7 @@ impl<'a> ParserContext<'a> {
                 self.flush_paragraph();
                 let spans = self.collect_quote_spans(el_ref, style);
                 if !spans_are_blank(&spans) {
-                    self.blocks.push(RichBlock::Quote(trim_spans(spans)));
+                    self.push_block(RichBlock::Quote(trim_spans(spans)));
                 }
             }
             "pre" => {
@@ -563,7 +647,7 @@ impl<'a> ParserContext<'a> {
                 let code = collect_raw_text(el_ref);
                 let trimmed = code.trim_matches(|c| c == '\r' || c == '\n');
                 if !trimmed.is_empty() {
-                    self.blocks.push(RichBlock::CodeBlock {
+                    self.push_block(RichBlock::CodeBlock {
                         lang,
                         code: trimmed.to_string(),
                     });
@@ -583,21 +667,15 @@ impl<'a> ParserContext<'a> {
                     }
                 }
                 if !items.is_empty() {
-                    self.blocks.push(RichBlock::BulletList(items));
+                    self.push_block(RichBlock::BulletList(items));
                 }
             }
-            "attachment" => {
+            "table" => {
                 self.flush_paragraph();
-                if let Some(id) = el.attr("id").map(str::trim).filter(|s| !s.is_empty()) {
-                    self.seen_attachments.insert(id.to_string());
-                    if let Some(att) = self.attachments.iter().find(|a| a.id == id) {
-                        self.push_attachment_block(att);
-                    } else {
-                        self.blocks.push(RichBlock::AttachmentChip {
-                            id: id.to_string(),
-                            name: None,
-                        });
-                    }
+                if should_linearize_table(el_ref) {
+                    self.linearize_table(el_ref, style);
+                } else if let Some(table_block) = self.parse_data_table(el_ref, style) {
+                    self.push_block(table_block);
                 }
             }
             "emoji" => {
@@ -623,6 +701,9 @@ impl<'a> ParserContext<'a> {
                 }
             }
             "img" => {
+                if is_tracking_pixel_img(el) {
+                    return;
+                }
                 if is_emoji_sprite_img(el) {
                     if let Some(alt) =
                         non_empty_attr(el, "alt").or_else(|| non_empty_attr(el, "title"))
@@ -634,20 +715,163 @@ impl<'a> ParserContext<'a> {
                 if let Some(src) = el.attr("src").map(str::trim).filter(|s| !s.is_empty()) {
                     self.flush_paragraph();
                     self.seen_inline_srcs.insert(src.to_string());
-                    if let Some(hid) = extract_hosted_content_id(src) {
-                        self.seen_hosted_ids.insert(hid.to_string());
+                    let content_id = extract_cid(src);
+                    if let Some(ref cid) = content_id {
+                        self.seen_content_ids.insert(cid.to_ascii_lowercase());
                     }
                     let index = self.next_image_index;
                     self.next_image_index += 1;
-                    self.blocks.push(RichBlock::InlineImageChip {
+                    self.push_block(RichBlock::InlineImageChip {
                         src: src.to_string(),
+                        content_id,
                         index,
                     });
                 }
             }
-            "script" | "style" => {}
             _ => {
                 self.walk_children(el_ref, style);
+            }
+        }
+    }
+
+    fn linearize_table(&mut self, table_el: ElementRef<'_>, style: &TextStyleFlags) {
+        let mut walked_any_cell = false;
+        for child in table_el.children() {
+            let Some(child_el) = ElementRef::wrap(child) else {
+                continue;
+            };
+            match child_el.value().name() {
+                "thead" | "tbody" | "tfoot" => {
+                    for row_node in child_el.children() {
+                        if let Some(row_el) = ElementRef::wrap(row_node) {
+                            if row_el.value().name() == "tr" {
+                                self.linearize_table_row(row_el, style);
+                                walked_any_cell = true;
+                            }
+                        }
+                    }
+                }
+                "tr" => {
+                    self.linearize_table_row(child_el, style);
+                    walked_any_cell = true;
+                }
+                _ => {}
+            }
+        }
+        if !walked_any_cell {
+            self.walk_children(table_el, style);
+            self.flush_paragraph();
+        }
+    }
+
+    fn linearize_table_row(&mut self, row_el: ElementRef<'_>, style: &TextStyleFlags) {
+        for cell_node in row_el.children() {
+            let Some(cell_el) = ElementRef::wrap(cell_node) else {
+                continue;
+            };
+            if matches!(cell_el.value().name(), "td" | "th") && !has_display_none(cell_el.value()) {
+                self.flush_paragraph();
+                self.walk_children(cell_el, style);
+                self.flush_paragraph();
+            }
+        }
+    }
+
+    fn parse_data_table(
+        &mut self,
+        table_el: ElementRef<'_>,
+        style: &TextStyleFlags,
+    ) -> Option<RichBlock> {
+        let mut headers: Vec<Vec<RichSpan>> = Vec::new();
+        let mut rows: Vec<Vec<Vec<RichSpan>>> = Vec::new();
+        let mut saw_thead = false;
+
+        let mut raw_rows: Vec<(bool, ElementRef<'_>)> = Vec::new();
+        for child in table_el.children() {
+            let Some(child_el) = ElementRef::wrap(child) else {
+                continue;
+            };
+            match child_el.value().name() {
+                "thead" => {
+                    saw_thead = true;
+                    for r in child_el.children().filter_map(ElementRef::wrap) {
+                        if r.value().name() == "tr" {
+                            raw_rows.push((true, r));
+                        }
+                    }
+                }
+                "tbody" | "tfoot" => {
+                    for r in child_el.children().filter_map(ElementRef::wrap) {
+                        if r.value().name() == "tr" {
+                            raw_rows.push((false, r));
+                        }
+                    }
+                }
+                "tr" => {
+                    raw_rows.push((false, child_el));
+                }
+                _ => {}
+            }
+        }
+
+        for (idx, (in_thead, row_el)) in raw_rows.into_iter().enumerate() {
+            let mut cells: Vec<Vec<RichSpan>> = Vec::new();
+            let mut th_count = 0usize;
+            let mut total_cells = 0usize;
+
+            for cell_el in row_el.children().filter_map(ElementRef::wrap) {
+                let tag = cell_el.value().name();
+                if matches!(tag, "th" | "td") {
+                    total_cells += 1;
+                    if tag == "th" {
+                        th_count += 1;
+                    }
+                    let cell_spans = trim_spans(self.collect_inline_spans(cell_el, style));
+                    cells.push(cell_spans);
+                }
+            }
+
+            let all_blank = cells.iter().all(|c| spans_are_blank(c));
+            if all_blank || cells.is_empty() {
+                continue;
+            }
+
+            let is_header_row = (in_thead && headers.is_empty())
+                || (!saw_thead && idx == 0 && headers.is_empty() && th_count == total_cells);
+            if is_header_row {
+                headers = cells;
+            } else {
+                rows.push(cells);
+            }
+        }
+
+        if headers.is_empty() && rows.is_empty() {
+            None
+        } else {
+            Some(RichBlock::Table { headers, rows })
+        }
+    }
+
+    fn finalize_quoted_history(&mut self) {
+        if !self.quoted_blocks.is_empty() {
+            let quoted = std::mem::take(&mut self.quoted_blocks);
+            let line_count = count_blocks_lines(&quoted);
+            self.blocks.push(RichBlock::QuotedHistory {
+                line_count,
+                blocks: quoted,
+            });
+            return;
+        }
+
+        // Check for trailing quote chains or plain-text Outlook/Gmail reply headers at the end of `self.blocks`.
+        if let Some(split_idx) = find_trailing_quoted_split_index(&self.blocks) {
+            let quoted = self.blocks.split_off(split_idx);
+            if !quoted.is_empty() {
+                let line_count = count_blocks_lines(&quoted);
+                self.blocks.push(RichBlock::QuotedHistory {
+                    line_count,
+                    blocks: quoted,
+                });
             }
         }
     }
@@ -680,7 +904,7 @@ impl<'a> ParserContext<'a> {
                     self.push_inline_text(text.text.as_ref(), style);
                 }
                 Node::Element(el) => {
-                    if el.attr("itemprop") == Some("time") {
+                    if is_ignored_noise_tag(el.name()) || has_display_none(el) {
                         continue;
                     }
                     let Some(child_el) = ElementRef::wrap(child) else {
@@ -705,6 +929,15 @@ impl<'a> ParserContext<'a> {
                         "i" | "em" => {
                             let mut next = style.clone();
                             next.italic = true;
+                            self.walk_quote_children(child_el, &next);
+                        }
+                        "a" => {
+                            let mut next = style.clone();
+                            if let Some(href) =
+                                el.attr("href").map(str::trim).filter(|s| !s.is_empty())
+                            {
+                                next.link_url = Some(href.to_string());
+                            }
                             self.walk_quote_children(child_el, &next);
                         }
                         "code" => {
@@ -769,50 +1002,271 @@ impl<'a> ParserContext<'a> {
     fn flush_paragraph(&mut self) {
         let spans = std::mem::take(&mut self.current_spans);
         if !spans_are_blank(&spans) {
-            self.blocks.push(RichBlock::Paragraph(trim_spans(spans)));
+            let trimmed = trim_spans(spans);
+            self.push_block(RichBlock::Paragraph(trimmed));
         }
     }
 
-    fn push_attachment_block(&mut self, att: &AttachmentInfo) {
-        if is_card_content_type(&att.content_type) {
-            if let Some(card) = parse_card_attachment(att) {
-                self.blocks.push(card);
-                return;
-            }
-        }
+    fn push_attachment_block(&mut self, att: &MailAttachment) {
         self.blocks.push(RichBlock::AttachmentChip {
             id: att.id.clone(),
-            name: att.name.clone(),
+            name: if att.name.trim().is_empty() {
+                None
+            } else {
+                Some(att.name.clone())
+            },
         });
     }
 
-    fn is_seen_inline_attachment(&self, att: &AttachmentInfo) -> bool {
-        if let Some(url) = att.content_url.as_deref() {
-            if self.seen_inline_srcs.contains(url) {
+    fn is_seen_inline_attachment(&self, att: &MailAttachment) -> bool {
+        if let Some(cid) = att.content_id.as_deref() {
+            let norm = normalize_content_id(cid).to_ascii_lowercase();
+            if !norm.is_empty() && self.seen_content_ids.contains(&norm) {
                 return true;
             }
-            if let Some(hid) = extract_hosted_content_id(url) {
-                if self.seen_hosted_ids.contains(hid) {
-                    return true;
-                }
-            }
         }
-        let att_hid = att.id.strip_prefix("hosted:").unwrap_or(&att.id);
-        self.seen_hosted_ids.contains(att_hid)
+        att.is_inline && self.seen_inline_srcs.contains(&att.id)
     }
 }
 
-pub(crate) fn extract_hosted_content_id(url: &str) -> Option<&str> {
-    let rest = url
-        .split_once("/hostedContents/")
-        .map(|(_, r)| r)
-        .or_else(|| url.strip_prefix("hostedContents/"))?;
-    let seg = rest.split(['/', '?', '#']).next()?.trim();
-    if seg.is_empty() {
-        None
-    } else {
-        Some(seg)
+fn count_blocks_lines(blocks: &[RichBlock]) -> usize {
+    let plain = blocks_to_plain(blocks);
+    plain.lines().count().max(blocks.len()).max(1)
+}
+
+fn find_trailing_quoted_split_index(blocks: &[RichBlock]) -> Option<usize> {
+    if blocks.is_empty() {
+        return None;
     }
+
+    // 1) Explicit Outlook/plain-text reply boundary paragraph (`-----Original Message-----` or `From: ... Sent: ...`)
+    for (idx, block) in blocks.iter().enumerate() {
+        if let RichBlock::Paragraph(spans) = block {
+            let text = spans_to_plain(spans);
+            let trimmed = text.trim();
+            if trimmed.starts_with("-----Original Message-----")
+                || (trimmed.contains("From:") && (trimmed.contains("Sent:") || trimmed.contains("Date:")))
+            {
+                // Avoid folding if it's the very first block and there's nothing before it?
+                // Even if an email starts with a forwarded block, folding after non-empty lead or >0 blocks is good;
+                // require either idx > 0 or >= 2 blocks so a 1-line "From: HR" greeting isn't folded.
+                if idx > 0 || blocks.len() >= 2 {
+                    return Some(idx);
+                }
+            }
+        }
+    }
+
+    // 2) Trailing `RichBlock::Quote` blocks at the end of the email (optionally preceded by `On ... wrote:` or `<hr>`).
+    let mut quote_start = blocks.len();
+    while quote_start > 0 && matches!(blocks[quote_start - 1], RichBlock::Quote(_)) {
+        quote_start -= 1;
+    }
+    if quote_start < blocks.len() {
+        if quote_start > 0 {
+            if let RichBlock::Paragraph(spans) = &blocks[quote_start - 1] {
+                let prev = spans_to_plain(spans);
+                let t = prev.trim();
+                if t.ends_with("wrote:") || t.ends_with("wrote :") {
+                    quote_start -= 1;
+                }
+            }
+        }
+        if quote_start > 0 && matches!(blocks[quote_start - 1], RichBlock::Divider) {
+            quote_start -= 1;
+        }
+        if quote_start > 0 {
+            return Some(quote_start);
+        }
+    }
+
+    None
+}
+
+fn is_quoted_history_boundary(el_ref: ElementRef<'_>) -> bool {
+    let el = el_ref.value();
+    if let Some(id) = el.attr("id") {
+        let lower_id = id.trim().to_ascii_lowercase();
+        if matches!(lower_id.as_str(), "appendonsend" | "divrplyfwdmsg") {
+            return true;
+        }
+    }
+    if let Some(cls) = el.attr("class") {
+        if cls.split_whitespace().any(|c| {
+            let lc = c.to_ascii_lowercase();
+            matches!(
+                lc.as_str(),
+                "gmail_quote" | "gmail_quote_container" | "yahoo_quoted" | "outlookmessageheader"
+            )
+        }) {
+            return true;
+        }
+    }
+    if el.name() == "hr" && el.attr("tabindex").is_some_and(|v| v.trim() == "-1") {
+        let mut tail_text = String::new();
+        for sib in el_ref.next_siblings().take(6) {
+            if let Some(sib_el) = ElementRef::wrap(sib) {
+                if sib_el.value().attr("id").is_some_and(|id| {
+                    let l = id.trim().to_ascii_lowercase();
+                    l == "divrplyfwdmsg" || l == "appendonsend"
+                }) {
+                    return true;
+                }
+                collect_raw_text_inner(sib_el, &mut tail_text);
+            } else if let Node::Text(t) = sib.value() {
+                tail_text.push_str(t.text.as_ref());
+            }
+        }
+        if tail_text.contains("From:")
+            && (tail_text.contains("Sent:")
+                || tail_text.contains("Date:")
+                || tail_text.contains("Subject:"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_ignored_noise_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "head" | "style" | "script" | "meta" | "title" | "xml" | "o:p" | "noscript" | "template"
+    )
+}
+
+fn has_display_none(el: &scraper::node::Element) -> bool {
+    let Some(style) = el.attr("style") else {
+        return false;
+    };
+    for decl in style.split(';') {
+        let Some((prop, val)) = decl.split_once(':') else {
+            continue;
+        };
+        if prop.trim().eq_ignore_ascii_case("display") && val.trim().eq_ignore_ascii_case("none") {
+            return true;
+        }
+    }
+    false
+}
+
+fn parse_css_dim_px(raw: &str) -> Option<u32> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    let num_str = trimmed.strip_suffix("px").unwrap_or(&trimmed).trim();
+    num_str.parse::<f32>().ok().map(|v| v.round().max(0.0) as u32)
+}
+
+fn is_tracking_pixel_img(el: &scraper::node::Element) -> bool {
+    if has_display_none(el) {
+        return true;
+    }
+
+    let attr_w = el.attr("width").and_then(parse_css_dim_px);
+    let attr_h = el.attr("height").and_then(parse_css_dim_px);
+    if matches!((attr_w, attr_h), (Some(w), Some(h)) if w <= 1 && h <= 1)
+        || attr_w == Some(0)
+        || attr_h == Some(0)
+    {
+        return true;
+    }
+
+    if let Some(style) = el.attr("style") {
+        let mut css_w: Option<u32> = None;
+        let mut css_h: Option<u32> = None;
+        for decl in style.split(';') {
+            let Some((prop, val)) = decl.split_once(':') else {
+                continue;
+            };
+            let prop_l = prop.trim().to_ascii_lowercase();
+            if prop_l == "width" {
+                css_w = parse_css_dim_px(val);
+            } else if prop_l == "height" {
+                css_h = parse_css_dim_px(val);
+            }
+        }
+        if matches!((css_w, css_h), (Some(w), Some(h)) if w <= 1 && h <= 1)
+            || css_w == Some(0)
+            || css_h == Some(0)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_presentation_role(el: &scraper::node::Element) -> bool {
+    el.attr("role").is_some_and(|r| {
+        let trimmed = r.trim();
+        trimmed.eq_ignore_ascii_case("presentation") || trimmed.eq_ignore_ascii_case("none")
+    })
+}
+
+fn has_nested_table(table_el: ElementRef<'_>) -> bool {
+    table_el.descendants().skip(1).any(|desc| {
+        ElementRef::wrap(desc).is_some_and(|el| el.value().name() == "table")
+    })
+}
+
+fn should_linearize_table(table_el: ElementRef<'_>) -> bool {
+    if is_presentation_role(table_el.value()) || has_nested_table(table_el) {
+        return true;
+    }
+
+    let mut max_cols = 0usize;
+    for child in table_el.children() {
+        let Some(child_el) = ElementRef::wrap(child) else {
+            continue;
+        };
+        if is_presentation_role(child_el.value()) {
+            return true;
+        }
+        match child_el.value().name() {
+            "thead" | "tbody" | "tfoot" => {
+                for row_el in child_el.children().filter_map(ElementRef::wrap) {
+                    if row_el.value().name() == "tr" {
+                        if is_presentation_role(row_el.value()) {
+                            return true;
+                        }
+                        max_cols = max_cols.max(count_row_columns(row_el));
+                    }
+                }
+            }
+            "tr" => {
+                max_cols = max_cols.max(count_row_columns(child_el));
+            }
+            _ => {}
+        }
+    }
+
+    max_cols <= 1
+}
+
+fn count_row_columns(row_el: ElementRef<'_>) -> usize {
+    let mut cols = 0usize;
+    for cell in row_el.children().filter_map(ElementRef::wrap) {
+        if matches!(cell.value().name(), "td" | "th") {
+            let span = cell
+                .value()
+                .attr("colspan")
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(1);
+            cols += span;
+        }
+    }
+    cols
+}
+
+fn extract_cid(src: &str) -> Option<String> {
+    let trimmed = src.trim();
+    if trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("cid:") {
+        let norm = normalize_content_id(&trimmed[4..]);
+        if !norm.is_empty() {
+            return Some(norm);
+        }
+    }
+    None
 }
 
 fn non_empty_attr<'a>(el: &'a scraper::node::Element, name: &str) -> Option<&'a str> {
@@ -900,6 +1354,9 @@ fn collect_raw_text_inner(el_ref: ElementRef<'_>, out: &mut String) {
         match child.value() {
             Node::Text(t) => out.push_str(t.text.as_ref()),
             Node::Element(el) => {
+                if is_ignored_noise_tag(el.name()) || has_display_none(el) {
+                    continue;
+                }
                 if el.name() == "br" {
                     out.push('\n');
                 } else if let Some(child_el) = ElementRef::wrap(child) {
@@ -1027,93 +1484,33 @@ fn spans_to_markdown(spans: &[RichSpan]) -> String {
 mod tests {
     use super::*;
 
-    fn sample_attachment(id: &str, name: &str) -> AttachmentInfo {
-        AttachmentInfo {
+    fn sample_attachment(id: &str, name: &str, content_id: Option<&str>) -> MailAttachment {
+        MailAttachment {
             id: id.to_string(),
-            content_type: "reference".to_string(),
-            content_url: Some(format!("https://example.com/{name}")),
-            name: Some(name.to_string()),
-            content_json: None,
-            thumbnail_url: None,
-        }
-    }
-
-    fn sample_mention(id: i32, user_id: &str, display_name: &str) -> MentionInfo {
-        MentionInfo {
-            id,
-            user_id: user_id.to_string(),
-            display_name: display_name.to_string(),
+            name: name.to_string(),
+            content_type: "application/octet-stream".to_string(),
+            size: 128,
+            is_inline: content_id.is_some(),
+            content_id: content_id.map(str::to_string),
+            content_bytes_b64: None,
         }
     }
 
     #[test]
-    fn parse_message_blocks_cache_hit_matches_uncached() {
-        let html = "<p>Hello <b>Teams</b> <at id=\"0\"></at></p>";
-        let atts = vec![sample_attachment("a1", "spec.pdf")];
-        let mentions = vec![sample_mention(0, "u1", "Alice")];
+    fn parse_message_blocks_cache_hit_and_lru_eviction() {
+        let html = "<p>Hello <b>Outlook</b></p>";
+        let atts = vec![sample_attachment("a1", "spec.pdf", None)];
 
-        let expected = parse_message_blocks_uncached(html, &atts, &mentions);
-        let first = parse_message_blocks(html, &atts, &mentions);
-        let second = parse_message_blocks(html, &atts, &mentions);
-
+        let expected = parse_message_blocks_uncached(html, &atts);
+        let first = parse_message_blocks(html, &atts);
+        let second = parse_message_blocks(html, &atts);
         assert_eq!(first, expected);
         assert_eq!(second, expected);
-    }
 
-    #[test]
-    fn parse_message_blocks_cache_distinguishes_attachments_and_mentions() {
-        let html = "<p>Check <at id=\"0\"></at></p>";
-        let att_a = vec![sample_attachment("a1", "alpha.txt")];
-        let att_b = vec![sample_attachment("a1", "beta.txt")];
-        let men_a = vec![sample_mention(0, "u1", "Alice")];
-        let men_b = vec![sample_mention(0, "u2", "Bob")];
-
-        assert_ne!(
-            compute_parse_fingerprint(html, &att_a, &men_a),
-            compute_parse_fingerprint(html, &att_b, &men_a)
-        );
-        assert_ne!(
-            compute_parse_fingerprint(html, &att_a, &men_a),
-            compute_parse_fingerprint(html, &att_a, &men_b)
-        );
-
-        let res_a = parse_message_blocks(html, &att_a, &men_a);
-        let res_b = parse_message_blocks(html, &att_b, &men_b);
-        assert_ne!(res_a, res_b);
-        assert!(blocks_to_plain(&res_a).contains("@Alice"));
-        assert!(blocks_to_plain(&res_a).contains("alpha.txt"));
-        assert!(blocks_to_plain(&res_b).contains("@Bob"));
-        assert!(blocks_to_plain(&res_b).contains("beta.txt"));
-    }
-
-    #[test]
-    fn parse_message_blocks_skips_cache_for_huge_html() {
-        let big_text = "x".repeat(HTML_CACHE_MAX_HTML_BYTES + 64);
-        let html = format!("<p>{big_text}</p>");
-        let blocks = parse_message_blocks(&html, &[], &[]);
-        assert_eq!(blocks.len(), 1);
-    }
-
-    #[test]
-    fn html_cache_evicts_at_max_capacity() {
-        let mut cache = HtmlParseCache::default();
-        for i in 0..(HTML_CACHE_MAX_ENTRIES + 50) {
-            cache.insert((i as u64, (i as u64) ^ 0x55, i), Arc::from(Vec::new()));
-        }
-        assert_eq!(cache.entries.len(), HTML_CACHE_MAX_ENTRIES);
-        assert_eq!(cache.order.len(), HTML_CACHE_MAX_ENTRIES);
-        assert!(cache.get(&(0, 0x55, 0)).is_none());
-        let last = HTML_CACHE_MAX_ENTRIES + 49;
-        assert!(cache.get(&(last as u64, (last as u64) ^ 0x55, last)).is_some());
-    }
-
-    #[test]
-    fn html_cache_promotes_on_get_lru() {
         let mut cache = HtmlParseCache::default();
         for i in 0..HTML_CACHE_MAX_ENTRIES {
             cache.insert((i as u64, 1, i), Arc::from(Vec::new()));
         }
-        // Promote key 0 to MRU before inserting one new item; key 1 should be evicted instead of 0.
         assert!(cache.get(&(0, 1, 0)).is_some());
         cache.insert((99999, 1, 99999), Arc::from(Vec::new()));
         assert!(cache.get(&(0, 1, 0)).is_some());
@@ -1121,26 +1518,135 @@ mod tests {
     }
 
     #[test]
-    fn emoji_sprites_render_inline_text_without_image_chips() {
-        let html = r#"<p>Ship it <emoji alt="🚀"><img itemtype="http://schema.skype.com/Emoji" src="https://statics.teams.cdn.office.net/evergreen-assets/personal-expressions/v2/assets/emoticons/rocket/default/50_f.png" alt="🚀"></emoji> now <img itemtype="http://schema.skype.com/Emoji" src="https://example.com/e.png" alt="👍"> and <img src="https://statics.teams.cdn.office.net/evergreen-assets/personal-expressions/v2/assets/emoticons/smile/default/50_f.png" title="😊"></p>"#;
-        let blocks = parse_message_blocks(html, &[], &[]);
-        assert!(
-            !blocks
-                .iter()
-                .any(|b| matches!(b, RichBlock::InlineImageChip { .. })),
-            "emoji sprites must not produce InlineImageChip: {blocks:?}"
-        );
+    fn strips_email_noise_and_tracking_pixels() {
+        let html = r#"
+            <head>
+                <title>Hidden Title</title>
+                <style>.foo { color: red; }</style>
+                <meta charset="utf-8">
+            </head>
+            <xml><o:DocumentProperties><o:Author>Bot</o:Author></o:DocumentProperties></xml>
+            <div style="display:none;max-height:0px;">Preheader preview noise</div>
+            <p>Actual email body<o:p></o:p></p>
+            <img src="https://track.example.com/open.gif" width="1" height="1">
+            <img src="https://track.example.com/pixel.png" style="width: 1px; height: 1px;">
+            <img src="https://track.example.com/hidden.png" style="display: none;">
+            <script>alert(1)</script>
+            <img src="cid:<image001.png@01DB1234>" width="400" height="200">
+        "#;
+        let blocks = parse_message_blocks(html, &[]);
         let plain = blocks_to_plain(&blocks);
-        assert_eq!(plain, "Ship it 🚀 now 👍 and 😊");
+        assert!(!plain.contains("Hidden Title"));
+        assert!(!plain.contains("color: red"));
+        assert!(!plain.contains("Preheader"));
+        assert!(!plain.contains("alert(1)"));
+        assert!(plain.contains("Actual email body"));
+
+        let imgs: Vec<&RichBlock> = blocks
+            .iter()
+            .filter(|b| matches!(b, RichBlock::InlineImageChip { .. }))
+            .collect();
+        assert_eq!(imgs.len(), 1);
+        match imgs[0] {
+            RichBlock::InlineImageChip {
+                src,
+                content_id,
+                index,
+            } => {
+                assert_eq!(src, "cid:<image001.png@01DB1234>");
+                assert_eq!(content_id.as_deref(), Some("image001.png@01DB1234"));
+                assert_eq!(*index, 0);
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]
-    fn emoji_without_wrapper_alt_falls_back_to_child_img_alt() {
-        let html = r#"<p>Done <emoji><img itemtype="http://schema.skype.com/Emoji" src="https://statics.teams.cdn.office.net/e.png" alt="✅"></emoji></p>"#;
-        let blocks = parse_message_blocks(html, &[], &[]);
-        assert!(blocks
-            .iter()
-            .all(|b| !matches!(b, RichBlock::InlineImageChip { .. })));
-        assert_eq!(blocks_to_plain(&blocks), "Done ✅");
+    fn flattens_layout_tables_and_preserves_data_tables() {
+        let html = r#"
+            <table role="presentation">
+                <tr><td><h1>Newsletter Title</h1></td></tr>
+                <tr><td>
+                    <table>
+                        <tr><td>
+                            <p>Intro paragraph</p>
+                            <table>
+                                <thead><tr><th>Service</th><th>Status</th></tr></thead>
+                                <tbody>
+                                    <tr><td>Mail</td><td>Healthy</td></tr>
+                                    <tr><td>Calendar</td><td>Degraded</td></tr>
+                                </tbody>
+                            </table>
+                        </td></tr>
+                    </table>
+                </td></tr>
+            </table>
+        "#;
+        let blocks = parse_message_blocks(html, &[]);
+        assert!(matches!(blocks[0], RichBlock::Heading { level: 1, .. }));
+        assert!(matches!(blocks[1], RichBlock::Paragraph(_)));
+        match &blocks[2] {
+            RichBlock::Table { headers, rows } => {
+                assert_eq!(headers.len(), 2);
+                assert_eq!(spans_to_plain(&headers[0]), "Service");
+                assert_eq!(spans_to_plain(&headers[1]), "Status");
+                assert_eq!(rows.len(), 2);
+                assert_eq!(spans_to_plain(&rows[0][0]), "Mail");
+                assert_eq!(spans_to_plain(&rows[0][1]), "Healthy");
+                assert_eq!(spans_to_plain(&rows[1][0]), "Calendar");
+                assert_eq!(spans_to_plain(&rows[1][1]), "Degraded");
+            }
+            other => panic!("expected RichBlock::Table, got {other:?}"),
+        }
+        assert_eq!(blocks.len(), 3);
+    }
+
+    #[test]
+    fn folds_outlook_gmail_and_plain_quoted_history() {
+        let outlook_html = r#"
+            <div><p>Sounds good, let's ship it.</p></div>
+            <div id="appendonsend"></div>
+            <hr tabindex="-1">
+            <div id="divRplyFwdMsg">
+                <b>From:</b> Alice &lt;alice@example.com&gt;<br>
+                <b>Sent:</b> Monday, Nov 18, 2026<br>
+            </div>
+            <div><p>Can we release today?</p><p>Thanks, Alice</p></div>
+        "#;
+        let blocks = parse_message_blocks(outlook_html, &[]);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks_to_plain(&blocks[..1]), "Sounds good, let's ship it.");
+        match &blocks[1] {
+            RichBlock::QuotedHistory { line_count, blocks } => {
+                assert!(*line_count >= 3);
+                let qplain = blocks_to_plain(blocks);
+                assert!(qplain.contains("From: Alice"));
+                assert!(qplain.contains("Can we release today?"));
+            }
+            other => panic!("expected QuotedHistory, got {other:?}"),
+        }
+
+        let gmail_html = r#"
+            <div dir="ltr">I will review this afternoon.</div>
+            <div class="gmail_quote">
+                <div class="gmail_attr">On Mon, Nov 18, 2026 Alice wrote:</div>
+                <blockquote class="gmail_quote">Please check PR #42.</blockquote>
+            </div>
+        "#;
+        let gblocks = parse_message_blocks(gmail_html, &[]);
+        assert_eq!(gblocks.len(), 2);
+        assert!(matches!(gblocks[0], RichBlock::Paragraph(_)));
+        assert!(matches!(gblocks[1], RichBlock::QuotedHistory { .. }));
+
+        let plain_reply = "Yes, approved!\n\nOn Mon, Alice wrote:\n> Line one\n> Line two";
+        let pblocks = parse_message_blocks(plain_reply, &[]);
+        assert_eq!(pblocks.len(), 2);
+        assert!(matches!(pblocks[0], RichBlock::Paragraph(_)));
+        match &pblocks[1] {
+            RichBlock::QuotedHistory { line_count, .. } => {
+                assert!(*line_count >= 2);
+            }
+            other => panic!("expected QuotedHistory, got {other:?}"),
+        }
     }
 }

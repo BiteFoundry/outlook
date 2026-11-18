@@ -512,9 +512,8 @@ fn spawn_sync_supervisor(
                 sync_busy: conn.status.sync_busy,
             });
             let initial_focus = proxy_focus_rx.borrow_and_update().clone();
-            if initial_focus.target.is_some() || initial_focus.thread_root_id.is_some() {
-                conn.sync_ctrl
-                    .set_focus(initial_focus.target, initial_focus.thread_root_id);
+            if initial_focus != FocusTarget::default() {
+                conn.sync_ctrl.set_focus(initial_focus);
             }
 
             loop {
@@ -543,7 +542,7 @@ fn spawn_sync_supervisor(
                             return;
                         }
                         let focus = proxy_focus_rx.borrow_and_update().clone();
-                        conn.sync_ctrl.set_focus(focus.target, focus.thread_root_id);
+                        conn.sync_ctrl.set_focus(focus);
                     }
                 }
             }
@@ -561,8 +560,8 @@ fn spawn_sync_supervisor(
         }
 
         let current_focus = proxy_focus_rx.borrow_and_update().clone();
-        if current_focus.target.is_some() || current_focus.thread_root_id.is_some() {
-            local_ctrl.set_focus(current_focus.target, current_focus.thread_root_id);
+        if current_focus != FocusTarget::default() {
+            local_ctrl.set_focus(current_focus);
         }
 
         loop {
@@ -582,7 +581,7 @@ fn spawn_sync_supervisor(
                         break;
                     }
                     let focus = proxy_focus_rx.borrow_and_update().clone();
-                    local_ctrl.set_focus(focus.target, focus.thread_root_id);
+                    local_ctrl.set_focus(focus);
                 }
             }
         }
@@ -614,7 +613,7 @@ pub async fn run_with_persona(
 
     let (proxy_focus_tx, proxy_focus_rx) = watch::channel(FocusTarget::default());
     let (proxy_nudge_tx, proxy_nudge_rx) = mpsc::unbounded_channel::<SyncCommand>();
-    let sync_ctrl = SyncController::from_channels(proxy_focus_tx, proxy_nudge_tx, false);
+    let sync_ctrl = SyncController::from_channels(proxy_focus_tx, proxy_nudge_tx);
 
     let mut ui = UiState::from_config(&config);
     ui.kitty_keyboard_supported = guard.keyboard_enhanced;
@@ -626,7 +625,7 @@ pub async fn run_with_persona(
         sync_ctrl.clone(),
         ui_tx.clone(),
     );
-    app.load_cached_teams();
+    app.load_cached_initial();
     draw_frame(&mut terminal, &mut app, &mut ui, &mut guard)?;
 
     spawn_sync_supervisor(
@@ -662,7 +661,11 @@ pub async fn run_with_persona(
             }
             ui.active_pixel_graphic = None;
             guard.restore();
-            let result = composer::external_edit(ui.composer.text());
+            let initial_body = match ui.overlays.last() {
+                Some(ui::overlays::Overlay::MailCompose(c)) => c.body.text().to_string(),
+                _ => String::new(),
+            };
+            let result = composer::external_edit(&initial_body);
             let mut stdout = io::stdout();
             enable_raw_mode()?;
             execute!(
@@ -685,8 +688,12 @@ pub async fn run_with_persona(
 
             match result {
                 Ok(edited) => {
-                    ui.composer.load_text(&edited);
-                    ui.info("Updated draft from external editor");
+                    if let Some(ui::overlays::Overlay::MailCompose(ref mut c)) =
+                        ui.overlays.last_mut()
+                    {
+                        c.body.load_text(&edited);
+                    }
+                    ui.info("Updated email body from external editor");
                 }
                 Err(err) => {
                     ui.error(format!("External editor error: {err}"));
@@ -823,7 +830,9 @@ pub async fn run_with_persona(
         }
     }
 
-    app.stash_draft(&ui);
+    if let Some(ui::overlays::Overlay::MailCompose(c)) = ui.overlays.last() {
+        app.stash_compose_draft(c);
+    }
     let _ = sync_ctrl.request(SyncCommand::Shutdown);
     drop(guard);
     Ok(())

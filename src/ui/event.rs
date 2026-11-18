@@ -91,36 +91,44 @@ mod tests {
     }
 
     #[test]
-    fn composer_text_beats_global_quit() {
-        let keymap = Keymap::default_teams();
-        let action = key_to_action(
-            press(KeyCode::Char('q'), KeyModifiers::NONE),
-            Focus::Composer,
-            &keymap,
-            true,
+    fn overlay_text_input_beats_browse_hotkeys() {
+        let keymap = Keymap::default_outlook();
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Char('c'), KeyModifiers::NONE),
+                Focus::Overlay,
+                &keymap,
+                true,
+            ),
+            Some(Action::Input('c'))
         );
-        assert_eq!(action, Some(Action::Input('q')));
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Enter, KeyModifiers::ALT),
+                Focus::Overlay,
+                &keymap,
+                true,
+            ),
+            Some(Action::OverlaySubmit)
+        );
     }
 
     #[test]
-    fn composer_ctrl_s_toggles_subject() {
-        let keymap = Keymap::default_teams();
-        let action = key_to_action(
-            press(KeyCode::Char('s'), KeyModifiers::CONTROL),
-            Focus::Composer,
-            &keymap,
-            true,
+    fn list_focus_maps_triage_and_tab_keys() {
+        let keymap = Keymap::default_outlook();
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Char('r'), KeyModifiers::NONE),
+                Focus::List,
+                &keymap,
+                false,
+            ),
+            Some(Action::MailReply { reply_all: false })
         );
-        assert_eq!(action, Some(Action::ToggleSubject));
-    }
-
-    #[test]
-    fn chat_bare_q_does_not_quit_ctrl_q_confirms_and_t_opens_thread() {
-        let keymap = Keymap::default_teams();
         assert_eq!(
             key_to_action(
                 press(KeyCode::Char('q'), KeyModifiers::NONE),
-                Focus::Chat,
+                Focus::List,
                 &keymap,
                 false,
             ),
@@ -129,167 +137,11 @@ mod tests {
         assert_eq!(
             key_to_action(
                 press(KeyCode::Char('q'), KeyModifiers::CONTROL),
-                Focus::Chat,
+                Focus::List,
                 &keymap,
                 false,
             ),
             Some(Action::QuitConfirm)
-        );
-        assert_eq!(
-            key_to_action(
-                press(KeyCode::Char('t'), KeyModifiers::NONE),
-                Focus::Chat,
-                &keymap,
-                false,
-            ),
-            Some(Action::OpenThreadForSelected)
-        );
-    }
-
-    #[test]
-    fn non_text_overlay_maps_jk_to_move_and_preserves_overlay_hotkeys() {
-        let keymap = Keymap::default_teams();
-        assert_eq!(
-            key_to_action(
-                press(KeyCode::Char('j'), KeyModifiers::NONE),
-                Focus::Overlay,
-                &keymap,
-                false,
-            ),
-            Some(Action::MoveDown)
-        );
-        assert_eq!(
-            key_to_action(
-                press(KeyCode::Char('k'), KeyModifiers::NONE),
-                Focus::Overlay,
-                &keymap,
-                false,
-            ),
-            Some(Action::MoveUp)
-        );
-        assert_eq!(
-            key_to_action(
-                press(KeyCode::Char('2'), KeyModifiers::NONE),
-                Focus::Overlay,
-                &keymap,
-                false,
-            ),
-            Some(Action::Input('2'))
-        );
-    }
-
-    #[test]
-    fn teams_tabs_image_and_history_keys() {
-        let keymap = Keymap::default_teams();
-        assert_eq!(
-            key_to_action_for_tab(
-                press(KeyCode::Char('1'), KeyModifiers::NONE),
-                Focus::Nav,
-                0,
-                &keymap,
-                false,
-            ),
-            Some(Action::SelectNavTab(0))
-        );
-        assert_eq!(
-            key_to_action_for_tab(
-                press(KeyCode::Char('2'), KeyModifiers::NONE),
-                Focus::Chat,
-                0,
-                &keymap,
-                false,
-            ),
-            Some(Action::SelectNavTab(1))
-        );
-        assert_eq!(
-            key_to_action_for_tab(
-                press(KeyCode::Char('3'), KeyModifiers::NONE),
-                Focus::Thread,
-                0,
-                &keymap,
-                false,
-            ),
-            Some(Action::SelectNavTab(2))
-        );
-        assert_eq!(
-            key_to_action_for_tab(
-                press(KeyCode::Char('2'), KeyModifiers::NONE),
-                Focus::Composer,
-                0,
-                &keymap,
-                true,
-            ),
-            Some(Action::Input('2'))
-        );
-        assert_eq!(
-            key_to_action_for_tab(
-                press(KeyCode::Char('2'), KeyModifiers::ALT),
-                Focus::Composer,
-                0,
-                &keymap,
-                true,
-            ),
-            Some(Action::SelectNavTab(1))
-        );
-        assert_eq!(
-            key_to_action_for_tab(
-                press(KeyCode::Char('1'), KeyModifiers::CONTROL),
-                Focus::Nav,
-                0,
-                &keymap,
-                false,
-            ),
-            Some(Action::SelectNavTab(0))
-        );
-        assert_eq!(
-            key_to_action_for_tab(
-                press(KeyCode::Char('2'), KeyModifiers::CONTROL),
-                Focus::Nav,
-                0,
-                &keymap,
-                false,
-            ),
-            Some(Action::SelectNavTab(1))
-        );
-        assert_eq!(
-            key_to_action_for_tab(
-                press(KeyCode::Char('3'), KeyModifiers::CONTROL),
-                Focus::Nav,
-                0,
-                &keymap,
-                false,
-            ),
-            Some(Action::SelectNavTab(2))
-        );
-        assert_eq!(
-            key_to_action_for_tab(
-                press(KeyCode::Char('v'), KeyModifiers::NONE),
-                Focus::Chat,
-                0,
-                &keymap,
-                false,
-            ),
-            Some(Action::OpenImagePreview)
-        );
-        assert_eq!(
-            key_to_action_for_tab(
-                press(KeyCode::Char('o'), KeyModifiers::NONE),
-                Focus::Chat,
-                0,
-                &keymap,
-                false,
-            ),
-            Some(Action::LoadOlder)
-        );
-        assert_eq!(
-            key_to_action_for_tab(
-                press(KeyCode::Char('H'), KeyModifiers::SHIFT),
-                Focus::Chat,
-                0,
-                &keymap,
-                false,
-            ),
-            Some(Action::SyncHistory)
         );
     }
 }

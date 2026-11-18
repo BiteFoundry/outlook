@@ -1,4 +1,4 @@
-//! Application configuration, local paths, settings (`config.toml`), and per-conversation/thread drafts (`drafts.json`).
+//! Application configuration, local paths, settings (`config.toml`), and mail drafts (`drafts.json`).
 //!
 //! Shared foundation module: treat public signatures here as stable across all modules.
 
@@ -13,16 +13,18 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const APP_DIR_NAME: &str = "teams-cli";
+pub const APP_DIR_NAME: &str = "outlook-cli";
+pub const LEGACY_TEAMS_APP_DIR_NAME: &str = "teams-cli";
 pub const DEFAULT_GRAPH_BASE_URL: &str = "https://graph.microsoft.com/v1.0";
 pub const DEFAULT_AUTH_BASE_URL: &str = "https://login.microsoftonline.com";
 /// Default Microsoft multi-tenant public client ID fallback when user does not supply a custom Azure App Client ID.
-/// Users can always override via `--client-id`, `TEAMS_CLIENT_ID`, `AZURE_CLIENT_ID`, or `config.toml`.
+/// Users can always override via `--client-id`, `OUTLOOK_CLIENT_ID`, `TEAMS_CLIENT_ID`, `AZURE_CLIENT_ID`, or `config.toml`.
 pub const DEFAULT_PUBLIC_CLIENT_ID: &str = "14d82eec-204b-4c2f-b7e8-296a70dab67e";
 pub const DEFAULT_TENANT_ID: &str = "common";
-pub const DEFAULT_GITHUB_REPO: &str = "shinick-dev/teams";
+pub const DEFAULT_GITHUB_REPO: &str = "shinick-dev/outlook";
+pub const DEFAULT_SERVE_PORT: u16 = 3939;
 
-/// Message stream density mode in TUI (`Cozy` grouped default vs `Compact` single-line gutter).
+/// Message/mail list density mode in TUI (`Cozy` default vs `Compact`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DensityMode {
@@ -131,23 +133,23 @@ impl ImageProtocolPreference {
     }
 }
 
-/// Entry persona (`teams`), kept as an enum for stable configuration/caller ergonomics.
+/// Entry persona (`outlook`), kept as an enum for stable configuration/caller ergonomics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Persona {
     #[default]
-    Teams,
+    Outlook,
 }
 
 impl Persona {
-    /// Detects entry persona (pure Microsoft Teams).
+    /// Detects entry persona (pure Microsoft Outlook).
     pub fn detect() -> Self {
-        Self::Teams
+        Self::Outlook
     }
 
     pub fn bin_name(self) -> &'static str {
         match self {
-            Self::Teams => "teams",
+            Self::Outlook => "outlook",
         }
     }
 }
@@ -159,112 +161,119 @@ pub struct AppConfig {
     pub client_id: String,
     /// Entra ID Tenant ID (`common`, `organizations`, domain, or tenant GUID).
     pub tenant_id: String,
-    /// Optional OAuth scopes override. Empty uses the standard Microsoft Teams delegated scope set.
+    /// Optional OAuth scopes override. Empty uses the standard Microsoft Outlook delegated scope set.
     pub scopes: Vec<String>,
     /// Base URL for Microsoft Graph v1.0 (overridable for sovereign clouds or mock testing).
     pub graph_base_url: String,
     /// Base URL for Entra OAuth2 endpoints (overridable for sovereign clouds or mock testing).
     pub auth_base_url: String,
-    /// GitHub `owner/repo` used by `teams update`.
+    /// GitHub `owner/repo` used by `outlook update`.
     pub github_repo: String,
     /// Enable desktop toast/bell notifications in TUI.
     pub notify: bool,
     /// Show left navigation rail in wide layout.
     pub show_nav_rail: bool,
-    /// Automatically open right thread/info pane on wide terminals.
-    pub auto_thread_pane: bool,
-    /// Render inline image thumbnails directly inside terminal Chat views.
+    /// Group emails by `conversation_id` in Mail list (toggleable with `t`).
+    pub group_threads: bool,
+    /// Focused Inbox filter (toggleable with `F`).
+    pub focused_only: bool,
+    /// Render inline image thumbnails directly inside terminal Mail views.
     pub inline_images: bool,
     /// Preferred terminal image rendering protocol (`auto`, `kitty`, `iterm2`, `sixel`, `halfblock`).
     pub image_protocol: ImageProtocolPreference,
-    /// Custom download directory. Empty defaults to `Downloads/teams`.
+    /// Custom download directory. Empty defaults to `Downloads/outlook`.
     pub download_dir: String,
-    /// Fast poll interval (ms) for active conversation in TUI.
+    /// Active folder fast delta poll interval (ms) in TUI.
     pub active_poll_ms: u64,
-    /// Background chat preview diff interval (ms).
-    pub chat_poll_ms: u64,
-    /// Background channel delta & presence interval (ms).
-    pub channel_poll_ms: u64,
-    /// Optional external token file path (`TEAMS_TOKEN_FILE` or `config.toml`), read live on demand.
+    /// Background folders/unread poll interval (ms).
+    pub mail_poll_ms: u64,
+    /// Calendar & tasks background poll interval (ms).
+    pub calendar_poll_ms: u64,
+    /// Optional external token file path (`OUTLOOK_TOKEN_FILE` or `config.toml`), read live on demand.
     pub token_file: String,
-    /// Optional external token refresh command hook (`TEAMS_TOKEN_REFRESH_CMD` or `config.toml`), executed when token is missing or within `token_refresh_mins` of expiry.
-    pub token_refresh_mins: u64,
-    /// Refresh command string (`TEAMS_TOKEN_REFRESH_CMD`).
+    /// Refresh command string (`OUTLOOK_TOKEN_REFRESH_CMD` or `config.toml`), executed when token is missing or within `token_refresh_mins` of expiry.
     pub token_refresh_cmd: String,
-    /// CLI local cache TTL in seconds (`TEAMS_CLI_CACHE_SECS`, default `0`).
-    /// Defaults to `0` so CLI invocations fetch fresh unless `TEAMS_CLI_CACHE_SECS`, `cli_cache_ttl_secs`, or `--cached` is used.
+    /// Refresh threshold in minutes before token expiry (`OUTLOOK_TOKEN_REFRESH_MINS`, default `5`).
+    pub token_refresh_mins: u64,
+    /// Allow falling back to `TEAMS_TOKEN_FILE` or `teams-cli` stored M365 tokens when no `outlook-cli` token is configured (`OUTLOOK_SHARE_M365_AUTH`, default `true`).
+    pub share_m365_auth: bool,
+    /// CLI local cache TTL in seconds (`OUTLOOK_CLI_CACHE_SECS`, default `0`).
+    /// Defaults to `0` so CLI invocations fetch fresh unless `OUTLOOK_CLI_CACHE_SECS`, `cli_cache_ttl_secs`, or `--cached` is used.
     pub cli_cache_ttl_secs: u64,
-    /// Automatically start and attach to the lightweight background sync daemon (`TEAMS_AUTO_DAEMON=1|true`, default `false`).
+    /// Automatically start and attach to the lightweight background sync daemon (`OUTLOOK_AUTO_DAEMON=1|true`, default `false`).
     pub auto_daemon: bool,
     /// TUI message density (`cozy` or `compact`).
     pub density: DensityMode,
     /// TUI color theme preset (`auto`, `dark`, `light`, `ansi256`, `ansi16`, `nocolor`).
     pub theme: ThemePreset,
-    /// Pinned conversation keys (`conv_key`) shown at the top of the Chats sidebar.
-    pub pinned_convs: Vec<String>,
+    /// User-pinned mail folder IDs shown at the top of the Mail sidebar.
+    pub favorite_folders: Vec<String>,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            client_id: std::env::var("TEAMS_CLIENT_ID")
-                .or_else(|_| std::env::var("AZURE_CLIENT_ID"))
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| DEFAULT_PUBLIC_CLIENT_ID.to_string()),
-            tenant_id: std::env::var("TEAMS_TENANT_ID")
-                .or_else(|_| std::env::var("AZURE_TENANT_ID"))
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| DEFAULT_TENANT_ID.to_string()),
+            client_id: first_non_empty_env(&[
+                "OUTLOOK_CLIENT_ID",
+                "TEAMS_CLIENT_ID",
+                "AZURE_CLIENT_ID",
+            ])
+            .unwrap_or_else(|| DEFAULT_PUBLIC_CLIENT_ID.to_string()),
+            tenant_id: first_non_empty_env(&[
+                "OUTLOOK_TENANT_ID",
+                "TEAMS_TENANT_ID",
+                "AZURE_TENANT_ID",
+            ])
+            .unwrap_or_else(|| DEFAULT_TENANT_ID.to_string()),
             scopes: Vec::new(),
-            graph_base_url: std::env::var("TEAMS_GRAPH_BASE_URL")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
+            graph_base_url: first_non_empty_env(&["OUTLOOK_GRAPH_BASE_URL"])
                 .unwrap_or_else(|| DEFAULT_GRAPH_BASE_URL.to_string()),
-            auth_base_url: std::env::var("TEAMS_AUTH_BASE_URL")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
+            auth_base_url: first_non_empty_env(&["OUTLOOK_AUTH_BASE_URL"])
                 .unwrap_or_else(|| DEFAULT_AUTH_BASE_URL.to_string()),
-            github_repo: std::env::var("TEAMS_GITHUB_REPO")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
+            github_repo: first_non_empty_env(&["OUTLOOK_GITHUB_REPO"])
                 .unwrap_or_else(|| DEFAULT_GITHUB_REPO.to_string()),
             notify: true,
             show_nav_rail: true,
-            auto_thread_pane: true,
+            group_threads: true,
+            focused_only: false,
             inline_images: true,
-            image_protocol: std::env::var("TEAMS_IMAGE_PROTOCOL")
-                .ok()
-                .and_then(|s| ImageProtocolPreference::parse_str(&s))
-                .unwrap_or_default(),
+            image_protocol: first_non_empty_env(&[
+                "OUTLOOK_IMAGE_PROTOCOL",
+                "TEAMS_IMAGE_PROTOCOL",
+            ])
+            .and_then(|s| ImageProtocolPreference::parse_str(&s))
+            .unwrap_or_default(),
             download_dir: String::new(),
-            active_poll_ms: 2_500,
-            chat_poll_ms: 8_000,
-            channel_poll_ms: 30_000,
-            token_file: std::env::var("TEAMS_TOKEN_FILE")
+            active_poll_ms: 5_000,
+            mail_poll_ms: 15_000,
+            calendar_poll_ms: 60_000,
+            token_file: std::env::var("OUTLOOK_TOKEN_FILE")
                 .ok()
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default(),
-            token_refresh_cmd: std::env::var("TEAMS_TOKEN_REFRESH_CMD")
+            token_refresh_cmd: std::env::var("OUTLOOK_TOKEN_REFRESH_CMD")
                 .ok()
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default(),
-            token_refresh_mins: std::env::var("TEAMS_TOKEN_REFRESH_MINS")
+            token_refresh_mins: std::env::var("OUTLOOK_TOKEN_REFRESH_MINS")
                 .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .unwrap_or(5),
-            cli_cache_ttl_secs: std::env::var("TEAMS_CLI_CACHE_SECS")
+            share_m365_auth: std::env::var("OUTLOOK_SHARE_M365_AUTH")
+                .ok()
+                .and_then(|s| parse_env_bool(&s))
+                .unwrap_or(true),
+            cli_cache_ttl_secs: std::env::var("OUTLOOK_CLI_CACHE_SECS")
                 .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .unwrap_or(0),
-            auto_daemon: std::env::var("TEAMS_AUTO_DAEMON")
+            auto_daemon: std::env::var("OUTLOOK_AUTO_DAEMON")
                 .ok()
                 .and_then(|s| parse_env_bool(&s))
                 .unwrap_or(false),
             density: DensityMode::default(),
             theme: ThemePreset::default(),
-            pinned_convs: Vec::new(),
+            favorite_folders: Vec::new(),
         }
     }
 }
@@ -275,61 +284,56 @@ impl AppConfig {
             return Self::default();
         };
         // Environment variables take precedence over file values when set.
-        if let Ok(cid) = std::env::var("TEAMS_CLIENT_ID").or_else(|_| std::env::var("AZURE_CLIENT_ID")) {
-            if !cid.trim().is_empty() {
-                cfg.client_id = cid.trim().to_string();
-            }
+        if let Some(cid) =
+            first_non_empty_env(&["OUTLOOK_CLIENT_ID", "TEAMS_CLIENT_ID", "AZURE_CLIENT_ID"])
+        {
+            cfg.client_id = cid;
         }
-        if let Ok(tid) = std::env::var("TEAMS_TENANT_ID").or_else(|_| std::env::var("AZURE_TENANT_ID")) {
-            if !tid.trim().is_empty() {
-                cfg.tenant_id = tid.trim().to_string();
-            }
+        if let Some(tid) =
+            first_non_empty_env(&["OUTLOOK_TENANT_ID", "TEAMS_TENANT_ID", "AZURE_TENANT_ID"])
+        {
+            cfg.tenant_id = tid;
         }
-        if let Ok(gurl) = std::env::var("TEAMS_GRAPH_BASE_URL") {
-            if !gurl.trim().is_empty() {
-                cfg.graph_base_url = gurl.trim().to_string();
-            }
+        if let Some(gurl) = first_non_empty_env(&["OUTLOOK_GRAPH_BASE_URL"]) {
+            cfg.graph_base_url = gurl;
         }
-        if let Ok(aurl) = std::env::var("TEAMS_AUTH_BASE_URL") {
-            if !aurl.trim().is_empty() {
-                cfg.auth_base_url = aurl.trim().to_string();
-            }
+        if let Some(aurl) = first_non_empty_env(&["OUTLOOK_AUTH_BASE_URL"]) {
+            cfg.auth_base_url = aurl;
         }
-        if let Ok(repo) = std::env::var("TEAMS_GITHUB_REPO") {
-            if !repo.trim().is_empty() {
-                cfg.github_repo = repo.trim().to_string();
-            }
+        if let Some(repo) = first_non_empty_env(&["OUTLOOK_GITHUB_REPO"]) {
+            cfg.github_repo = repo;
         }
-        if let Ok(tf) = std::env::var("TEAMS_TOKEN_FILE") {
-            if !tf.trim().is_empty() {
-                cfg.token_file = tf.trim().to_string();
-            }
+        if let Some(tf) = first_non_empty_env(&["OUTLOOK_TOKEN_FILE"]) {
+            cfg.token_file = tf;
         }
-        if let Ok(rcmd) = std::env::var("TEAMS_TOKEN_REFRESH_CMD") {
-            if !rcmd.trim().is_empty() {
-                cfg.token_refresh_cmd = rcmd.trim().to_string();
-            }
+        if let Some(rcmd) = first_non_empty_env(&["OUTLOOK_TOKEN_REFRESH_CMD"]) {
+            cfg.token_refresh_cmd = rcmd;
         }
-        if let Ok(rmins) = std::env::var("TEAMS_TOKEN_REFRESH_MINS") {
+        if let Ok(rmins) = std::env::var("OUTLOOK_TOKEN_REFRESH_MINS") {
             if let Ok(parsed) = rmins.trim().parse::<u64>() {
                 cfg.token_refresh_mins = parsed;
             }
         }
-        if let Ok(ttl) = std::env::var("TEAMS_CLI_CACHE_SECS") {
+        if let Ok(share) = std::env::var("OUTLOOK_SHARE_M365_AUTH") {
+            if let Some(parsed) = parse_env_bool(&share) {
+                cfg.share_m365_auth = parsed;
+            }
+        }
+        if let Ok(ttl) = std::env::var("OUTLOOK_CLI_CACHE_SECS") {
             if let Ok(parsed) = ttl.trim().parse::<u64>() {
                 cfg.cli_cache_ttl_secs = parsed;
             }
         }
-        if let Ok(ad) = std::env::var("TEAMS_AUTO_DAEMON") {
+        if let Ok(ad) = std::env::var("OUTLOOK_AUTO_DAEMON") {
             if let Some(parsed) = parse_env_bool(&ad) {
                 cfg.auto_daemon = parsed;
             }
         }
-        if let Ok(proto) = std::env::var("TEAMS_IMAGE_PROTOCOL") {
-            if !proto.trim().is_empty() {
-                if let Some(parsed) = ImageProtocolPreference::parse_str(&proto) {
-                    cfg.image_protocol = parsed;
-                }
+        if let Some(proto) =
+            first_non_empty_env(&["OUTLOOK_IMAGE_PROTOCOL", "TEAMS_IMAGE_PROTOCOL"])
+        {
+            if let Some(parsed) = ImageProtocolPreference::parse_str(&proto) {
+                cfg.image_protocol = parsed;
             }
         }
         cfg
@@ -360,13 +364,11 @@ impl AppConfig {
             "offline_access".to_string(),
             "User.Read".to_string(),
             "User.ReadBasic.All".to_string(),
-            "Chat.ReadWrite".to_string(),
-            "Team.ReadBasic.All".to_string(),
-            "Channel.ReadBasic.All".to_string(),
-            "ChannelMessage.Read.All".to_string(),
-            "ChannelMessage.Send".to_string(),
-            "Files.ReadWrite.All".to_string(),
-            "Presence.ReadWrite".to_string(),
+            "Mail.ReadWrite".to_string(),
+            "Mail.Send".to_string(),
+            "Calendars.ReadWrite".to_string(),
+            "Contacts.ReadWrite".to_string(),
+            "Tasks.ReadWrite".to_string(),
         ]
     }
 
@@ -389,7 +391,7 @@ impl AppConfig {
 }
 
 pub fn config_dir() -> PathBuf {
-    if let Ok(override_dir) = std::env::var("TEAMS_CONFIG_DIR") {
+    if let Ok(override_dir) = std::env::var("OUTLOOK_CONFIG_DIR") {
         if !override_dir.trim().is_empty() {
             return PathBuf::from(override_dir.trim());
         }
@@ -400,7 +402,7 @@ pub fn config_dir() -> PathBuf {
 }
 
 pub fn data_dir() -> PathBuf {
-    if let Ok(override_dir) = std::env::var("TEAMS_DATA_DIR") {
+    if let Ok(override_dir) = std::env::var("OUTLOOK_DATA_DIR") {
         if !override_dir.trim().is_empty() {
             return PathBuf::from(override_dir.trim());
         }
@@ -408,6 +410,17 @@ pub fn data_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(APP_DIR_NAME)
+}
+
+/// Returns the legacy `teams-cli` config directory so `auth.rs` can inspect
+/// `teams-cli/config.toml` and `teams-cli/credentials.json` read-only when `share_m365_auth` is enabled.
+pub fn legacy_teams_config_dir() -> Option<PathBuf> {
+    if let Ok(override_dir) = std::env::var("TEAMS_CONFIG_DIR") {
+        if !override_dir.trim().is_empty() {
+            return Some(PathBuf::from(override_dir.trim()));
+        }
+    }
+    dirs::config_dir().map(|dir| dir.join(LEGACY_TEAMS_APP_DIR_NAME))
 }
 
 pub fn config_file_path() -> PathBuf {
@@ -428,7 +441,13 @@ pub fn db_path(user_id: Option<&str>) -> PathBuf {
         .unwrap_or("default");
     let sanitized: String = bucket
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     data_dir().join(sanitized).join("cache.db")
 }
@@ -437,7 +456,7 @@ pub fn default_download_dir() -> PathBuf {
     dirs::download_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("teams")
+        .join("outlook")
 }
 
 pub fn ensure_parent(path: &Path) -> Result<()> {
@@ -452,12 +471,15 @@ static ATOMIC_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Atomically writes `data` to `path` using a unique temp file (`create_new(true)`),
 /// flushing before rename and avoiding naked deletion of the destination before the
-/// replacement is ready. Files whose name contains `"credentials"` default to `0o600` on Unix.
+/// replacement is ready. Files whose name contains `"credentials"` or `"drafts"` default to `0o600` on Unix.
 pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     let is_secret = path
         .file_name()
         .and_then(|n| n.to_str())
-        .map(|n| n.to_ascii_lowercase().contains("credentials"))
+        .map(|n| {
+            let lower = n.to_ascii_lowercase();
+            lower.contains("credentials") || lower.contains("drafts")
+        })
         .unwrap_or(false);
     write_atomic_with_mode(path, data, is_secret)
 }
@@ -473,10 +495,7 @@ fn write_atomic_with_mode(path: &Path, data: &[u8], mode_0600: bool) -> Result<(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file");
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let pid = std::process::id();
     let seq = ATOMIC_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = parent.join(format!(".{name}.{pid}.{seq}.tmp"));
@@ -528,7 +547,8 @@ fn replace_existing_with_backup(
     original_err: std::io::Error,
 ) -> Result<()> {
     if path.symlink_metadata().is_err() {
-        return Err(original_err).with_context(|| format!("Failed to save file: {}", path.display()));
+        return Err(original_err)
+            .with_context(|| format!("Failed to save file: {}", path.display()));
     }
     let backup = parent.join(format!(".{name}.{pid}.{seq}.bak"));
     fs::rename(path, &backup)
@@ -545,7 +565,112 @@ fn replace_existing_with_backup(
     }
 }
 
-/// Draft key format: `"{conv_key}"` for conversation root or `"{conv_key}#thread:{root_msg_id}"` for thread replies.
+/// Structured draft entry for composing, replying to, or forwarding an email.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MailDraftEntry {
+    pub to: String,
+    pub cc: String,
+    pub bcc: String,
+    pub subject: String,
+    pub body: String,
+    pub reply_to_id: Option<String>,
+    pub forward_of_id: Option<String>,
+}
+
+impl MailDraftEntry {
+    pub fn is_empty(&self) -> bool {
+        self.to.trim().is_empty()
+            && self.cc.trim().is_empty()
+            && self.bcc.trim().is_empty()
+            && self.subject.trim().is_empty()
+            && self.body.trim().is_empty()
+    }
+}
+
+/// Persistent draft store backed by `drafts.json` (`0600` permissions on Unix).
+/// Supports structured `MailDraftEntry` records alongside simple string entries.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DraftStore {
+    pub mail: HashMap<String, MailDraftEntry>,
+    pub text: HashMap<String, String>,
+}
+
+impl DraftStore {
+    pub fn load() -> Self {
+        Self::load_from(&drafts_path()).unwrap_or_default()
+    }
+
+    pub fn load_from(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = fs::read_to_string(path)?;
+        if raw.trim().is_empty() {
+            return Ok(Self::default());
+        }
+        if let Ok(store) = serde_json::from_str::<Self>(&raw) {
+            if !store.mail.is_empty() || !store.text.is_empty() {
+                return Ok(store);
+            }
+        }
+        if let Ok(mail_map) = serde_json::from_str::<HashMap<String, MailDraftEntry>>(&raw) {
+            return Ok(Self {
+                mail: mail_map,
+                text: HashMap::new(),
+            });
+        }
+        if let Ok(text_map) = serde_json::from_str::<HashMap<String, String>>(&raw) {
+            return Ok(Self {
+                mail: HashMap::new(),
+                text: text_map,
+            });
+        }
+        Ok(serde_json::from_str::<Self>(&raw)?)
+    }
+
+    pub fn save(&self) -> Result<()> {
+        self.save_to(&drafts_path())
+    }
+
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        let bytes = serde_json::to_vec_pretty(self)?;
+        write_atomic_0600(path, &bytes)
+    }
+
+    pub fn get_mail(&self, key: &str) -> Option<&MailDraftEntry> {
+        self.mail.get(key)
+    }
+
+    pub fn set_mail(&mut self, key: impl Into<String>, draft: MailDraftEntry) {
+        let key = key.into();
+        if draft.is_empty() {
+            self.mail.remove(&key);
+        } else {
+            self.mail.insert(key, draft);
+        }
+    }
+
+    pub fn remove_mail(&mut self, key: &str) -> Option<MailDraftEntry> {
+        self.mail.remove(key)
+    }
+
+    pub fn get_text(&self, key: &str) -> Option<&str> {
+        self.text.get(key).map(String::as_str)
+    }
+
+    pub fn set_text(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        let key = key.into();
+        let value = value.into();
+        if value.trim().is_empty() {
+            self.text.remove(&key);
+        } else {
+            self.text.insert(key, value);
+        }
+    }
+}
+
 pub fn load_drafts() -> HashMap<String, String> {
     load_drafts_from(&drafts_path()).unwrap_or_default()
 }
@@ -558,7 +683,10 @@ pub fn load_drafts_from(path: &Path) -> Result<HashMap<String, String>> {
     if raw.trim().is_empty() {
         return Ok(HashMap::new());
     }
-    Ok(serde_json::from_str(&raw)?)
+    if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&raw) {
+        return Ok(map);
+    }
+    Ok(DraftStore::load_from(path)?.text)
 }
 
 pub fn save_drafts(drafts: &HashMap<String, String>) -> Result<()> {
@@ -567,7 +695,19 @@ pub fn save_drafts(drafts: &HashMap<String, String>) -> Result<()> {
 
 pub fn save_drafts_to(drafts: &HashMap<String, String>, path: &Path) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(drafts)?;
-    write_atomic(path, &bytes)
+    write_atomic_0600(path, &bytes)
+}
+
+fn first_non_empty_env(keys: &[&str]) -> Option<String> {
+    for &key in keys {
+        if let Ok(val) = std::env::var(key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn parse_env_bool(input: &str) -> Option<bool> {
@@ -582,7 +722,10 @@ fn expand_tilde(input: &str) -> PathBuf {
     if input == "~" {
         return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
     }
-    if let Some(rest) = input.strip_prefix("~/").or_else(|| input.strip_prefix("~\\")) {
+    if let Some(rest) = input
+        .strip_prefix("~/")
+        .or_else(|| input.strip_prefix("~\\"))
+    {
         if let Some(home) = dirs::home_dir() {
             return home.join(rest);
         }
@@ -591,96 +734,188 @@ fn expand_tilde(input: &str) -> PathBuf {
 }
 
 #[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+pub(crate) struct EnvVarGuard {
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+#[cfg(test)]
+impl EnvVarGuard {
+    pub(crate) fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+        let mut saved = Vec::with_capacity(vars.len());
+        for &(key, val) in vars {
+            saved.push((key, std::env::var(key).ok()));
+            match val {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        Self { saved }
+    }
+
+    pub(crate) fn clear_auth_env() -> Self {
+        Self::set(&[
+            ("OUTLOOK_CONFIG_DIR", None),
+            ("OUTLOOK_DATA_DIR", None),
+            ("OUTLOOK_CLIENT_ID", None),
+            ("OUTLOOK_TENANT_ID", None),
+            ("OUTLOOK_CLIENT_SECRET", None),
+            ("OUTLOOK_GRAPH_BASE_URL", None),
+            ("OUTLOOK_AUTH_BASE_URL", None),
+            ("OUTLOOK_GITHUB_REPO", None),
+            ("OUTLOOK_TOKEN_FILE", None),
+            ("OUTLOOK_TOKEN_REFRESH_CMD", None),
+            ("OUTLOOK_TOKEN_REFRESH_MINS", None),
+            ("OUTLOOK_SHARE_M365_AUTH", None),
+            ("OUTLOOK_CLI_CACHE_SECS", None),
+            ("OUTLOOK_AUTO_DAEMON", None),
+            ("OUTLOOK_IMAGE_PROTOCOL", None),
+            ("OUTLOOK_ACCESS_TOKEN", None),
+            ("OUTLOOK_DISABLE_KEYRING", None),
+            ("OUTLOOK_NO_BROWSER", None),
+            ("OUTLOOK_TOKEN_ORIGIN", None),
+            ("TEAMS_CONFIG_DIR", None),
+            ("TEAMS_DATA_DIR", None),
+            ("TEAMS_CLIENT_ID", None),
+            ("TEAMS_TENANT_ID", None),
+            ("TEAMS_IMAGE_PROTOCOL", None),
+            ("TEAMS_TOKEN_FILE", None),
+            ("TEAMS_NO_BROWSER", None),
+            ("TEAMS_ACCESS_TOKEN", None),
+            ("AZURE_CLIENT_ID", None),
+            ("AZURE_TENANT_ID", None),
+            ("AZURE_CLIENT_SECRET", None),
+        ])
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        for (key, orig) in self.saved.drain(..) {
+            match orig {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvVarGuard {
-        saved: Vec<(&'static str, Option<String>)>,
-    }
-
-    impl EnvVarGuard {
-        fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
-            let mut saved = Vec::with_capacity(vars.len());
-            for &(key, val) in vars {
-                saved.push((key, std::env::var(key).ok()));
-                match val {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
-            Self { saved }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            for (key, orig) in self.saved.drain(..) {
-                match orig {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-    }
 
     #[test]
-    fn test_app_config_toml_parses_legacy_unknown_keys_and_cli_cache_ttl() {
+    fn test_app_config_toml_parses_legacy_unknown_keys_and_outlook_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let legacy_path = dir.path().join("legacy.toml");
         fs::write(
             &legacy_path,
-            "notify = false\nactive_poll_ms = 3000\nbackground_all_personas = true\ncli_cache_ttl_secs = 45\n",
+            "notify = false\nactive_poll_ms = 7500\nbackground_all_personas = true\ncli_cache_ttl_secs = 45\ngroup_threads = false\nfocused_only = true\n",
         )
         .unwrap();
 
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = EnvVarGuard::set(&[("TEAMS_CLI_CACHE_SECS", None)]);
+        let _lock = TEST_ENV_LOCK.blocking_lock();
+        let _guard = EnvVarGuard::set(&[
+            ("OUTLOOK_CLI_CACHE_SECS", None),
+            ("OUTLOOK_SHARE_M365_AUTH", None),
+        ]);
 
-        let legacy_cfg = AppConfig::load_from(&legacy_path).unwrap();
-        assert!(!legacy_cfg.notify);
-        assert_eq!(legacy_cfg.active_poll_ms, 3000);
-        assert_eq!(legacy_cfg.cli_cache_ttl_secs, 45);
+        let cfg = AppConfig::load_from(&legacy_path).unwrap();
+        assert!(!cfg.notify);
+        assert_eq!(cfg.active_poll_ms, 7500);
+        assert_eq!(cfg.mail_poll_ms, 15_000);
+        assert_eq!(cfg.calendar_poll_ms, 60_000);
+        assert_eq!(cfg.cli_cache_ttl_secs, 45);
+        assert!(!cfg.group_threads);
+        assert!(cfg.focused_only);
+        assert!(cfg.share_m365_auth);
     }
 
     #[test]
-    fn test_app_config_env_overrides_cli_cache_ttl_and_pure_teams_scopes() {
+    fn test_app_config_env_overrides_and_fallbacks() {
         let dir = tempfile::tempdir().unwrap();
         let cfg_path = dir.path().join("config.toml");
-        fs::write(&cfg_path, "cli_cache_ttl_secs = 15\n").unwrap();
+        fs::write(
+            &cfg_path,
+            "cli_cache_ttl_secs = 15\nshare_m365_auth = true\n",
+        )
+        .unwrap();
 
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.blocking_lock();
         let dir_str = dir.path().to_string_lossy().into_owned();
 
         {
             let _guard = EnvVarGuard::set(&[
-                ("TEAMS_CONFIG_DIR", Some(&dir_str)),
-                ("TEAMS_CLI_CACHE_SECS", Some("120")),
+                ("OUTLOOK_CONFIG_DIR", Some(&dir_str)),
+                ("TEAMS_CONFIG_DIR", Some("/should/not/affect/outlook")),
+                ("OUTLOOK_CLI_CACHE_SECS", Some("120")),
+                ("OUTLOOK_CLIENT_ID", Some("outlook-cid")),
+                ("TEAMS_CLIENT_ID", Some("teams-cid")),
+                ("OUTLOOK_TENANT_ID", None),
+                ("TEAMS_TENANT_ID", Some("teams-tid")),
+                ("AZURE_TENANT_ID", Some("azure-tid")),
+                ("OUTLOOK_SHARE_M365_AUTH", Some("false")),
+                ("OUTLOOK_TOKEN_FILE", Some("/tmp/outlook-token.txt")),
             ]);
             let cfg = AppConfig::load();
+            assert_eq!(config_dir(), PathBuf::from(&dir_str));
             assert_eq!(cfg.cli_cache_ttl_secs, 120);
+            assert_eq!(cfg.client_id, "outlook-cid");
+            assert_eq!(cfg.tenant_id, "teams-tid");
+            assert!(!cfg.share_m365_auth);
+            assert_eq!(cfg.token_file, "/tmp/outlook-token.txt");
+            assert_eq!(
+                legacy_teams_config_dir(),
+                Some(PathBuf::from("/should/not/affect/outlook"))
+            );
         }
 
         {
             let _guard = EnvVarGuard::set(&[
-                ("TEAMS_CONFIG_DIR", Some(&dir_str)),
-                ("TEAMS_CLI_CACHE_SECS", None),
+                ("OUTLOOK_CONFIG_DIR", Some(&dir_str)),
+                ("OUTLOOK_DATA_DIR", Some(&dir_str)),
+                ("TEAMS_CONFIG_DIR", None),
+                ("TEAMS_DATA_DIR", Some("/should/not/affect/data")),
+                ("OUTLOOK_CLI_CACHE_SECS", None),
+                ("OUTLOOK_CLIENT_ID", None),
+                ("TEAMS_CLIENT_ID", None),
+                ("AZURE_CLIENT_ID", Some("azure-cid")),
+                ("OUTLOOK_SHARE_M365_AUTH", None),
             ]);
+            assert_eq!(data_dir(), PathBuf::from(&dir_str));
             let def = AppConfig::default();
             assert_eq!(def.cli_cache_ttl_secs, 0);
+            assert_eq!(def.client_id, "azure-cid");
+            assert!(def.share_m365_auth);
+            assert!(def.group_threads);
+            assert!(!def.focused_only);
             let scopes = def.effective_scopes();
-            assert!(scopes.iter().any(|s| s == "Chat.ReadWrite"));
-            assert!(scopes.iter().any(|s| s == "ChannelMessage.Read.All"));
-            assert!(!scopes.iter().any(|s| s.starts_with("Mail.")));
-            assert!(!scopes.iter().any(|s| s.starts_with("Calendars.")));
-            assert!(!scopes.iter().any(|s| s.starts_with("Contacts.")));
-            assert!(!scopes.iter().any(|s| s.starts_with("Tasks.")));
+            assert!(scopes.iter().any(|s| s == "Mail.ReadWrite"));
+            assert!(scopes.iter().any(|s| s == "Mail.Send"));
+            assert!(scopes.iter().any(|s| s == "Calendars.ReadWrite"));
+            assert!(scopes.iter().any(|s| s == "Contacts.ReadWrite"));
+            assert!(scopes.iter().any(|s| s == "Tasks.ReadWrite"));
+            assert!(!scopes.iter().any(|s| s.starts_with("Chat.")));
+            assert!(!scopes.iter().any(|s| s.starts_with("Channel")));
             assert!(!scopes.iter().any(|s| s.starts_with("Notes.")));
+
+            if let Some(legacy_dir) = legacy_teams_config_dir() {
+                assert_eq!(
+                    legacy_dir.file_name().and_then(|n| n.to_str()),
+                    Some(LEGACY_TEAMS_APP_DIR_NAME)
+                );
+            }
         }
-        assert_eq!(Persona::detect(), Persona::Teams);
-        assert_eq!(Persona::Teams.bin_name(), "teams");
+        assert_eq!(Persona::detect(), Persona::Outlook);
+        assert_eq!(Persona::Outlook.bin_name(), "outlook");
+        assert_eq!(DEFAULT_SERVE_PORT, 3939);
+        assert_eq!(
+            default_download_dir().file_name().and_then(|n| n.to_str()),
+            Some("outlook")
+        );
     }
 
     #[test]
@@ -694,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_atomic_and_0600_and_missing_config_load() {
+    fn test_write_atomic_and_draft_store_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("sub/settings.toml");
         write_atomic(&target, b"first = 1\n").unwrap();
@@ -703,9 +938,33 @@ mod tests {
         write_atomic(&target, b"second = 2\n").unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"second = 2\n");
 
-        let secret = dir.path().join("sub/credentials.json");
-        write_atomic_0600(&secret, b"{\"token\":\"abc\"}").unwrap();
-        assert_eq!(fs::read(&secret).unwrap(), b"{\"token\":\"abc\"}");
+        let drafts_file = dir.path().join("sub/drafts.json");
+        let mut store = DraftStore::default();
+        store.set_mail(
+            "compose",
+            MailDraftEntry {
+                to: "alice@example.com".to_string(),
+                cc: String::new(),
+                bcc: String::new(),
+                subject: "Quarterly update".to_string(),
+                body: "Hello Alice".to_string(),
+                reply_to_id: Some("msg-1".to_string()),
+                forward_of_id: None,
+            },
+        );
+        store.set_text("quick", "Note");
+        store.save_to(&drafts_file).unwrap();
+
+        let reloaded = DraftStore::load_from(&drafts_file).unwrap();
+        assert_eq!(reloaded, store);
+
+        let legacy_drafts_file = dir.path().join("sub/legacy_drafts.json");
+        let mut raw_map = HashMap::new();
+        raw_map.insert("inbox:m1".to_string(), "Reply text".to_string());
+        save_drafts_to(&raw_map, &legacy_drafts_file).unwrap();
+        assert_eq!(load_drafts_from(&legacy_drafts_file).unwrap(), raw_map);
+        let loaded_store = DraftStore::load_from(&legacy_drafts_file).unwrap();
+        assert_eq!(loaded_store.get_text("inbox:m1"), Some("Reply text"));
 
         let leftovers: Vec<_> = fs::read_dir(dir.path().join("sub"))
             .unwrap()
@@ -717,113 +976,28 @@ mod tests {
             })
             .collect();
         assert!(leftovers.is_empty());
-
-        let _lock = ENV_LOCK.lock().unwrap();
-        let missing_dir = dir.path().join("no-config-here");
-        let missing_str = missing_dir.to_string_lossy().into_owned();
-        let _guard = EnvVarGuard::set(&[
-            ("TEAMS_CONFIG_DIR", Some(&missing_str)),
-            ("TEAMS_CLI_CACHE_SECS", Some("77")),
-        ]);
-        let cfg = AppConfig::load();
-        assert_eq!(cfg.cli_cache_ttl_secs, 77);
     }
 
     #[test]
-    fn test_image_protocol_preference_parse_aliases_and_toml_roundtrip() {
-        assert_eq!(
-            ImageProtocolPreference::parse_str("auto"),
-            Some(ImageProtocolPreference::Auto)
-        );
-        assert_eq!(
-            ImageProtocolPreference::parse_str(""),
-            Some(ImageProtocolPreference::Auto)
-        );
-        assert_eq!(
-            ImageProtocolPreference::parse_str("KITTY"),
-            Some(ImageProtocolPreference::Kitty)
-        );
-        assert_eq!(
-            ImageProtocolPreference::parse_str("iterm2"),
-            Some(ImageProtocolPreference::Iterm2)
-        );
+    fn test_image_protocol_preference_and_outlook_env_override() {
         assert_eq!(
             ImageProtocolPreference::parse_str("iterm"),
             Some(ImageProtocolPreference::Iterm2)
         );
         assert_eq!(
-            ImageProtocolPreference::parse_str("sixel"),
-            Some(ImageProtocolPreference::Sixel)
-        );
-        assert_eq!(
-            ImageProtocolPreference::parse_str("halfblock"),
-            Some(ImageProtocolPreference::Halfblock)
-        );
-        assert_eq!(
             ImageProtocolPreference::parse_str("halfblocks"),
             Some(ImageProtocolPreference::Halfblock)
         );
-        assert_eq!(
-            ImageProtocolPreference::parse_str("ansi"),
-            Some(ImageProtocolPreference::Halfblock)
-        );
-        assert_eq!(ImageProtocolPreference::parse_str("unknown"), None);
-
-        assert_eq!(ImageProtocolPreference::Auto.as_str(), "auto");
-        assert_eq!(ImageProtocolPreference::Kitty.as_str(), "kitty");
-        assert_eq!(ImageProtocolPreference::Iterm2.as_str(), "iterm2");
-        assert_eq!(ImageProtocolPreference::Sixel.as_str(), "sixel");
-        assert_eq!(ImageProtocolPreference::Halfblock.as_str(), "halfblock");
-        assert_eq!(ImageProtocolPreference::Auto.label(), "Auto");
-        assert_eq!(ImageProtocolPreference::Kitty.label(), "Kitty");
-        assert_eq!(ImageProtocolPreference::Iterm2.label(), "iTerm2");
-        assert_eq!(ImageProtocolPreference::Sixel.label(), "Sixel");
-        assert_eq!(ImageProtocolPreference::Halfblock.label(), "Halfblock");
 
         let dir = tempfile::tempdir().unwrap();
-        let cfg_path = dir.path().join("config.toml");
-
-        let _lock = ENV_LOCK.lock().unwrap();
-        {
-            let _guard = EnvVarGuard::set(&[("TEAMS_IMAGE_PROTOCOL", None)]);
-            let mut cfg = AppConfig::default();
-            assert_eq!(cfg.image_protocol, ImageProtocolPreference::Auto);
-            cfg.image_protocol = ImageProtocolPreference::Sixel;
-            cfg.save_to(&cfg_path).unwrap();
-
-            let reloaded = AppConfig::load_from(&cfg_path).unwrap();
-            assert_eq!(reloaded.image_protocol, ImageProtocolPreference::Sixel);
-        }
-
-        // Verify serde aliases (`iterm`, `halfblocks`, `ansi`) deserialize cleanly
-        for (raw, expected) in [
-            ("image_protocol = \"iterm\"\n", ImageProtocolPreference::Iterm2),
-            (
-                "image_protocol = \"halfblocks\"\n",
-                ImageProtocolPreference::Halfblock,
-            ),
-            (
-                "image_protocol = \"ansi\"\n",
-                ImageProtocolPreference::Halfblock,
-            ),
-            (
-                "image_protocol = \"kitty\"\n",
-                ImageProtocolPreference::Kitty,
-            ),
-        ] {
-            let parsed: AppConfig = toml::from_str(raw).unwrap();
-            assert_eq!(parsed.image_protocol, expected);
-        }
-
-        // Verify TEAMS_IMAGE_PROTOCOL env override in AppConfig::load()
         let dir_str = dir.path().to_string_lossy().into_owned();
-        {
-            let _guard = EnvVarGuard::set(&[
-                ("TEAMS_CONFIG_DIR", Some(&dir_str)),
-                ("TEAMS_IMAGE_PROTOCOL", Some("iterm")),
-            ]);
-            let cfg = AppConfig::load();
-            assert_eq!(cfg.image_protocol, ImageProtocolPreference::Iterm2);
-        }
+        let _lock = TEST_ENV_LOCK.blocking_lock();
+        let _guard = EnvVarGuard::set(&[
+            ("OUTLOOK_CONFIG_DIR", Some(&dir_str)),
+            ("OUTLOOK_IMAGE_PROTOCOL", Some("kitty")),
+            ("TEAMS_IMAGE_PROTOCOL", Some("sixel")),
+        ]);
+        let cfg = AppConfig::load();
+        assert_eq!(cfg.image_protocol, ImageProtocolPreference::Kitty);
     }
 }

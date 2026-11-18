@@ -7,317 +7,192 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// Kind of Teams conversation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ConversationKind {
-    OneOnOne,
-    Group,
-    Meeting,
-    Channel,
-}
+/// Sentinel summary emitted via `CoreEvent::SyncStateChanged { busy: false, summary }`
+/// while background polling is silently retrying transient errors.
+pub const POLL_RETRY_SUMMARY: &str = "__poll_retrying__";
 
-impl ConversationKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::OneOnOne => "oneOnOne",
-            Self::Group => "group",
-            Self::Meeting => "meeting",
-            Self::Channel => "channel",
-        }
-    }
-
-    pub fn from_db_str(value: &str) -> Self {
-        match value {
-            "oneOnOne" | "one_on_one" => Self::OneOnOne,
-            "group" => Self::Group,
-            "meeting" => Self::Meeting,
-            "channel" => Self::Channel,
-            _ => Self::Group,
-        }
-    }
-
-    pub fn is_channel(self) -> bool {
-        matches!(self, Self::Channel)
-    }
-}
-
-/// Strongly typed address for either a 1:1/group/meeting Chat or a Team Channel.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "target_type", rename_all = "snake_case")]
-pub enum ConversationTarget {
-    Chat {
-        chat_id: String,
-    },
-    Channel {
-        team_id: String,
-        channel_id: String,
-    },
-}
-
-impl ConversationTarget {
-    /// Canonical primary key stored in SQLite and used in URLs (`chat:<chat_id>` or `chan:<team_id>:<channel_id>`).
-    pub fn conv_key(&self) -> String {
-        match self {
-            Self::Chat { chat_id } => format!("chat:{chat_id}"),
-            Self::Channel {
-                team_id,
-                channel_id,
-            } => format!("chan:{team_id}:{channel_id}"),
-        }
-    }
-
-    pub fn from_conv_key(key: &str) -> Option<Self> {
-        if let Some(chat_id) = key.strip_prefix("chat:") {
-            if !chat_id.is_empty() {
-                return Some(Self::Chat {
-                    chat_id: chat_id.to_string(),
-                });
-            }
-        }
-        if let Some(rest) = key.strip_prefix("chan:") {
-            let (team_id, channel_id) = rest.split_once(':')?;
-            if !team_id.is_empty() && !channel_id.is_empty() {
-                return Some(Self::Channel {
-                    team_id: team_id.to_string(),
-                    channel_id: channel_id.to_string(),
-                });
-            }
-        }
-        None
-    }
-
-    pub fn is_channel(&self) -> bool {
-        matches!(self, Self::Channel { .. })
-    }
-}
-
-/// Summary row for a chat or channel in navigation lists, CLI `chats`/`channels`, HTTP, and MCP.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConversationSummary {
-    pub conv_key: String,
-    pub target: ConversationTarget,
-    pub kind: ConversationKind,
-    pub team_id: Option<String>,
-    pub team_name: Option<String>,
-    pub title: String,
-    pub topic: Option<String>,
-    pub unread_count: i32,
-    pub last_read_at: Option<String>,
-    pub last_msg_id: Option<String>,
-    pub last_msg_author: Option<String>,
-    pub last_msg_preview: Option<String>,
-    pub last_updated_at: Option<String>,
-    pub pinned: bool,
-    /// For 1:1 chats, the other participant's Entra user ID (used for live presence dots).
-    pub peer_user_id: Option<String>,
-    pub web_url: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChannelSummary {
-    pub id: String,
-    pub team_id: String,
-    pub team_name: String,
-    pub display_name: String,
-    pub description: Option<String>,
-    pub membership_type: String,
-    pub web_url: Option<String>,
-}
-
-impl ChannelSummary {
-    pub fn target(&self) -> ConversationTarget {
-        ConversationTarget::Channel {
-            team_id: self.team_id.clone(),
-            channel_id: self.id.clone(),
-        }
-    }
-
-    pub fn conv_key(&self) -> String {
-        self.target().conv_key()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TeamSummary {
-    pub id: String,
-    pub display_name: String,
-    pub description: Option<String>,
-    pub channels: Vec<ChannelSummary>,
-}
-
-/// File, reference, inline hosted image, or Adaptive Card attached to a message.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AttachmentInfo {
-    pub id: String,
-    pub content_type: String,
-    pub content_url: Option<String>,
-    pub name: Option<String>,
-    /// JSON payload when `content_type` is `application/vnd.microsoft.card.adaptive` or similar.
-    pub content_json: Option<String>,
-    pub thumbnail_url: Option<String>,
-}
-
-/// `@mention` attached to a Teams message (`<at id="{id}">{display_name}</at>`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MentionInfo {
-    pub id: i32,
-    pub user_id: String,
-    pub display_name: String,
-}
-
-/// Aggregated reaction badge on a message.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReactionSummary {
-    /// Graph reactionType (`like`, `angry`, `sad`, `laugh`, `heart`, `surprised`, or unicode emoji).
-    pub reaction_type: String,
-    pub count: usize,
-    pub me_reacted: bool,
-    pub users: Vec<String>,
-}
-
-/// Normalized message item across 1:1 chats, group chats, channel root posts, and channel thread replies.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MessageItem {
-    /// Primary key `"{conv_key}|{msg_id}"`.
-    pub msg_key: String,
-    pub conv_key: String,
-    pub msg_id: String,
-    /// `Some(root_msg_id)` when this message is a reply inside a Team Channel thread; `None` for root posts & chats.
-    pub parent_msg_id: Option<String>,
-    /// Quoted message ID for 1:1 / group chat replies (`messageReference` / `blockquote`).
-    pub reply_to_id: Option<String>,
-    pub reply_to_author: Option<String>,
-    pub reply_to_preview: Option<String>,
-    /// Optional subject line on Team Channel root posts.
-    pub subject: Option<String>,
-    pub author_id: Option<String>,
-    pub author_name: String,
-    pub is_me: bool,
-    pub created_at: String,
-    pub last_modified_at: Option<String>,
-    pub deleted: bool,
-    pub importance: String,
-    pub message_type: String,
-    pub body_html: String,
-    pub body_plain: String,
-    pub attachments: Vec<AttachmentInfo>,
-    pub mentions: Vec<MentionInfo>,
-    pub reactions: Vec<ReactionSummary>,
-    /// Number of thread replies under a channel root post.
-    pub reply_count: usize,
-    pub web_url: Option<String>,
-}
-
-impl MessageItem {
-    pub fn make_msg_key(conv_key: &str, msg_id: &str) -> String {
-        format!("{conv_key}|{msg_id}")
-    }
-
-    /// Returns `self.attachments` augmented on-the-fly with any inline `<img src="...">` images
-    /// from `self.body_html` not already represented in `self.attachments`.
-    /// Fast path: returns `Cow::Borrowed(&self.attachments)` in O(1) when `self.body_html` contains no `<img`/`<IMG`.
-    pub fn effective_attachments(&self) -> std::borrow::Cow<'_, [AttachmentInfo]> {
-        if !self
-            .body_html
-            .as_bytes()
-            .windows(4)
-            .any(|w| w.eq_ignore_ascii_case(b"<img"))
-        {
-            return std::borrow::Cow::Borrowed(&self.attachments);
-        }
-        let extra = crate::parser::extract_inline_image_attachments(
-            &self.body_html,
-            &self.attachments,
-            &self.conv_key,
-            &self.msg_id,
-            self.parent_msg_id.as_deref(),
-        );
-        if extra.is_empty() {
-            std::borrow::Cow::Borrowed(&self.attachments)
-        } else {
-            let mut combined = Vec::with_capacity(self.attachments.len() + extra.len());
-            combined.extend(self.attachments.iter().cloned());
-            combined.extend(extra);
-            std::borrow::Cow::Owned(combined)
-        }
-    }
-}
-
-/// Thread bundle: root channel post + ordered replies.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ThreadView {
-    pub conv_key: String,
-    pub root: MessageItem,
-    pub replies: Vec<MessageItem>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PresenceStatus {
-    pub user_id: String,
-    /// `Available`, `Busy`, `DoNotDisturb`, `Away`, `BeRightBack`, `Offline`, `PresenceUnknown`.
-    pub availability: String,
-    pub activity: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserProfile {
     pub id: String,
     pub display_name: String,
-    pub mail: Option<String>,
-    pub user_principal_name: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MemberInfo {
-    pub user_id: String,
-    pub member_id: Option<String>,
-    pub display_name: String,
     pub email: Option<String>,
-    pub roles: Vec<String>,
-    pub presence: Option<PresenceStatus>,
+    pub job_title: Option<String>,
+    pub department: Option<String>,
 }
 
-/// Outgoing reference attachment after uploading to OneDrive / SharePoint.
+// ---------------------------------------------------------------------------
+// Mail Domain
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UploadedReferenceAttachment {
-    /// GUID extracted from DriveItem `eTag` (or generated UUID fallback if absent).
+pub struct EmailRecipient {
+    pub name: Option<String>,
+    pub address: String,
+}
+
+impl EmailRecipient {
+    pub fn display(&self) -> String {
+        match self
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(n) if !n.eq_ignore_ascii_case(&self.address) => {
+                format!("{n} <{}>", self.address)
+            }
+            _ => self.address.clone(),
+        }
+    }
+
+    pub fn short_display(&self) -> String {
+        match self
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(n) => n.to_string(),
+            None => self.address.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailFolder {
+    pub id: String,
+    pub display_name: String,
+    pub well_known_name: Option<String>,
+    pub parent_folder_id: Option<String>,
+    pub child_folder_count: i32,
+    pub unread_item_count: i32,
+    pub total_item_count: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailAttachment {
     pub id: String,
     pub name: String,
-    /// `webDavUrl` or sharing `webUrl` for Graph `reference` attachment.
-    pub content_url: String,
+    pub content_type: String,
     pub size: u64,
-    pub drive_item_id: Option<String>,
+    pub is_inline: bool,
+    pub content_id: Option<String>,
+    /// Optional inline base64 bytes when expanded from Graph (`fileAttachment`).
+    pub content_bytes_b64: Option<String>,
 }
 
-/// Outgoing inline image (`chatMessageHostedContent`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeetingRequestInfo {
+    pub meeting_message_type: Option<String>,
+    pub event_id: Option<String>,
+    pub start_iso: Option<String>,
+    pub end_iso: Option<String>,
+    pub location: Option<String>,
+    pub online_meeting_url: Option<String>,
+    pub response_status: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailMessage {
+    pub id: String,
+    pub internet_message_id: Option<String>,
+    pub conversation_id: Option<String>,
+    pub folder_id: Option<String>,
+    pub subject: String,
+    pub from: Option<EmailRecipient>,
+    pub to_recipients: Vec<EmailRecipient>,
+    pub cc_recipients: Vec<EmailRecipient>,
+    pub bcc_recipients: Vec<EmailRecipient>,
+    pub reply_to: Vec<EmailRecipient>,
+    pub received_at: String,
+    pub sent_at: Option<String>,
+    pub is_read: bool,
+    pub is_draft: bool,
+    pub flagged: bool,
+    pub importance: String,
+    pub inference_classification: Option<String>,
+    pub has_attachments: bool,
+    pub body_loaded: bool,
+    pub preview: String,
+    pub body_html: String,
+    pub body_plain: String,
+    pub attachments: Vec<MailAttachment>,
+    pub meeting_request: Option<MeetingRequestInfo>,
+    pub web_link: Option<String>,
+}
+
+impl MailMessage {
+    pub fn from_display(&self) -> String {
+        self.from
+            .as_ref()
+            .map(EmailRecipient::display)
+            .unwrap_or_else(|| "(unknown sender)".to_string())
+    }
+
+    pub fn from_short(&self) -> String {
+        self.from
+            .as_ref()
+            .map(EmailRecipient::short_display)
+            .unwrap_or_else(|| "(unknown sender)".to_string())
+    }
+
+    pub fn effective_subject(&self) -> &str {
+        let trimmed = self.subject.trim();
+        if trimmed.is_empty() {
+            "(No subject)"
+        } else {
+            &self.subject
+        }
+    }
+
+    pub fn is_focused(&self) -> bool {
+        self.inference_classification
+            .as_deref()
+            .map(|s| !s.eq_ignore_ascii_case("other"))
+            .unwrap_or(true)
+    }
+}
+
+/// Outgoing inline image (`fileAttachment` with `isInline = true` and `contentId`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InlineImageUpload {
-    /// Temporary integer/string identifier referenced as `../hostedContents/{temp_id}/$value`.
     pub temp_id: String,
-    pub mime_type: String,
+    pub content_id: String,
+    pub file_name: String,
+    pub content_type: String,
     pub bytes: Vec<u8>,
-    pub file_name: Option<String>,
 }
 
-/// Compiled outgoing payload ready to POST/PATCH to Microsoft Graph.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OutgoingMessage {
-    pub subject: Option<String>,
+pub struct OutgoingMail {
+    pub subject: String,
     pub body_html: String,
-    pub mentions: Vec<MentionInfo>,
-    pub attachments: Vec<UploadedReferenceAttachment>,
-    pub inline_images: Vec<InlineImageUpload>,
+    pub body_markdown: Option<String>,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
     pub importance: Option<String>,
-    /// Optional quoted message for 1:1/group chat replies.
-    pub quote_reply_to: Option<QuotedReply>,
+    pub attachments: Vec<PathBuf>,
+    pub inline_images: Vec<InlineImageUpload>,
+    pub in_reply_to_id: Option<String>,
+    pub reply_all: bool,
+    pub forward_of_id: Option<String>,
+    pub draft_id: Option<String>,
+    pub save_to_sent_items: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QuotedReply {
-    pub msg_id: String,
-    pub author_name: String,
-    pub preview_plain: String,
+pub struct MailSearchHit {
+    pub id: String,
+    pub conversation_id: Option<String>,
+    pub folder_id: Option<String>,
+    pub subject: String,
+    pub from_display: String,
+    pub received_at: String,
+    pub snippet: String,
+    pub has_attachments: bool,
+    pub is_read: bool,
+    pub flagged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,68 +202,202 @@ pub struct DownloadedFile {
     pub bytes_written: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Calendar Domain
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SearchHit {
-    pub conv_key: String,
-    pub conv_title: String,
-    pub kind: ConversationKind,
-    pub msg_id: String,
-    pub parent_msg_id: Option<String>,
-    pub author_name: String,
-    pub created_at: String,
-    pub snippet: String,
+pub struct EventAttendee {
+    pub name: Option<String>,
+    pub address: String,
+    /// `required`, `optional`, `resource`.
+    pub attendee_type: String,
+    /// `none`, `organizer`, `tentativelyAccepted`, `accepted`, `declined`, `notResponded`.
+    pub response_status: String,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EventRsvpAction {
+    Accept,
+    TentativelyAccept,
+    Decline,
+}
+
+impl EventRsvpAction {
+    pub fn as_graph_endpoint(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::TentativelyAccept => "tentativelyAccept",
+            Self::Decline => "decline",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalendarEvent {
+    pub id: String,
+    pub subject: String,
+    pub start_iso: String,
+    pub end_iso: String,
+    pub time_zone: String,
+    pub is_all_day: bool,
+    pub location: Option<String>,
+    pub organizer_name: Option<String>,
+    pub organizer_email: Option<String>,
+    pub attendees: Vec<EventAttendee>,
+    /// Current user's response (`accepted`, `tentativelyAccepted`, `declined`, `notResponded`, `organizer`, `none`).
+    pub response_status: String,
+    pub is_online_meeting: bool,
+    pub online_meeting_url: Option<String>,
+    pub body_html: String,
+    pub body_plain: String,
+    pub is_cancelled: bool,
+    pub web_link: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutgoingEvent {
+    pub subject: String,
+    pub start_iso: String,
+    pub end_iso: String,
+    pub time_zone: Option<String>,
+    pub is_all_day: bool,
+    pub location: Option<String>,
+    pub body_html: Option<String>,
+    pub attendees: Vec<String>,
+    pub is_online_meeting: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Contacts / People Domain
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactItem {
+    pub id: String,
+    pub display_name: String,
+    pub given_name: Option<String>,
+    pub surname: Option<String>,
+    pub email_addresses: Vec<String>,
+    pub mobile_phone: Option<String>,
+    pub business_phones: Vec<String>,
+    pub company_name: Option<String>,
+    pub job_title: Option<String>,
+    pub department: Option<String>,
+    pub notes: Option<String>,
+    /// `"contact"` (personal Outlook contact) or `"directory"` (Entra org directory user).
+    pub source: String,
+}
+
+impl ContactItem {
+    pub fn primary_email(&self) -> Option<&str> {
+        self.email_addresses.first().map(String::as_str)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutgoingContact {
+    pub display_name: String,
+    pub given_name: Option<String>,
+    pub surname: Option<String>,
+    pub email_addresses: Vec<String>,
+    pub mobile_phone: Option<String>,
+    pub company_name: Option<String>,
+    pub job_title: Option<String>,
+    pub department: Option<String>,
+    pub notes: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Tasks (Microsoft To Do) Domain
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoList {
+    pub id: String,
+    pub display_name: String,
+    pub wellknown_list_name: Option<String>,
+    pub is_owner: bool,
+    pub is_shared: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoTask {
+    pub id: String,
+    pub list_id: String,
+    pub title: String,
+    /// `notStarted`, `inProgress`, `completed`, `waitingOnOthers`, `deferred`.
+    pub status: String,
+    /// `low`, `normal`, `high`.
+    pub importance: String,
+    pub body_plain: Option<String>,
+    pub due_date_iso: Option<String>,
+    pub reminder_iso: Option<String>,
+    pub completed_at: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+impl TodoTask {
+    pub fn is_completed(&self) -> bool {
+        self.status.eq_ignore_ascii_case("completed")
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutgoingTodoTask {
+    pub title: String,
+    pub body_plain: Option<String>,
+    pub due_date_iso: Option<String>,
+    pub importance: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Sync & Notification Events
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncCursor {
     pub scope_key: String,
     pub delta_link: Option<String>,
-    pub oldest_msg_ts: Option<String>,
-    pub synced_at: String,
+    pub history_next_link: Option<String>,
+    pub last_synced_at: String,
 }
 
-impl SyncCursor {
-    pub const HISTORY_EOF: &'static str = "EOF";
-    pub const CHATS_LIST_SCOPE: &'static str = "chats_list";
-
-    pub fn history_scope(conv_key: &str) -> String {
-        format!("history:{conv_key}")
-    }
-
-    pub fn is_history_eof(&self) -> bool {
-        self.delta_link.is_none() && self.oldest_msg_ts.as_deref() == Some(Self::HISTORY_EOF)
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationCandidate {
+    pub item_id: String,
+    pub folder_name: String,
+    pub sender: String,
+    pub subject: String,
+    pub preview: String,
 }
-
-/// Sentinel summary emitted via `CoreEvent::SyncStateChanged { busy: false, summary }`
-/// while background polling is silently retrying transient errors.
-pub const POLL_RETRY_SUMMARY: &str = "__poll_retrying__";
 
 /// Asynchronous events pushed from `SyncEngine` to TUI or live subscribers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum CoreEvent {
-    ConversationsUpdated(Vec<ConversationSummary>),
-    TeamsUpdated(Vec<TeamSummary>),
-    MessagesUpdated {
-        conv_key: String,
-        parent_msg_id: Option<String>,
-        messages: Vec<MessageItem>,
+    ProfileLoaded(UserProfile),
+    MailFoldersUpdated(Vec<MailFolder>),
+    MailMessagesUpdated {
+        folder_id: String,
+        messages: Vec<MailMessage>,
         notify_candidate: Option<NotificationCandidate>,
     },
-    PresenceUpdated(Vec<PresenceStatus>),
+    MailMessageHydrated(Box<MailMessage>),
+    CalendarEventsUpdated(Vec<CalendarEvent>),
+    ContactsUpdated(Vec<ContactItem>),
+    TodoListsUpdated(Vec<TodoList>),
+    TodoTasksUpdated {
+        list_id: String,
+        tasks: Vec<TodoTask>,
+    },
     SyncStateChanged {
         busy: bool,
         summary: String,
     },
     SyncError(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NotificationCandidate {
-    pub conv_key: String,
-    pub conv_title: String,
-    pub sender: String,
-    pub preview: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -434,20 +443,23 @@ pub enum RichBlock {
         code: String,
     },
     BulletList(Vec<Vec<RichSpan>>),
-    Card {
-        title: Option<String>,
-        subtitle: Option<String>,
-        facts: Vec<(String, String)>,
-        body_lines: Vec<String>,
-        actions: Vec<(String, String)>,
+    Table {
+        headers: Vec<Vec<RichSpan>>,
+        rows: Vec<Vec<Vec<RichSpan>>>,
     },
+    Divider,
     AttachmentChip {
         id: String,
         name: Option<String>,
     },
     InlineImageChip {
         src: String,
+        content_id: Option<String>,
         index: usize,
+    },
+    QuotedHistory {
+        line_count: usize,
+        blocks: Vec<RichBlock>,
     },
 }
 
@@ -470,75 +482,106 @@ pub struct UpdateCheckResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::borrow::Cow;
 
-    fn sample_message(conv_key: &str, msg_id: &str, body_html: &str) -> MessageItem {
-        MessageItem {
-            msg_key: MessageItem::make_msg_key(conv_key, msg_id),
-            conv_key: conv_key.to_string(),
-            msg_id: msg_id.to_string(),
-            parent_msg_id: None,
-            reply_to_id: None,
-            reply_to_author: None,
-            reply_to_preview: None,
-            subject: None,
-            author_id: None,
-            author_name: "Alice".to_string(),
-            is_me: false,
-            created_at: "2026-11-18T00:00:00Z".to_string(),
-            last_modified_at: None,
-            deleted: false,
+    fn sample_mail(
+        from: Option<EmailRecipient>,
+        subject: &str,
+        inference: Option<&str>,
+    ) -> MailMessage {
+        MailMessage {
+            id: "msg-1".to_string(),
+            internet_message_id: Some("<msg-1@example.com>".to_string()),
+            conversation_id: Some("conv-1".to_string()),
+            folder_id: Some("inbox".to_string()),
+            subject: subject.to_string(),
+            from,
+            to_recipients: Vec::new(),
+            cc_recipients: Vec::new(),
+            bcc_recipients: Vec::new(),
+            reply_to: Vec::new(),
+            received_at: "2026-11-18T00:00:00Z".to_string(),
+            sent_at: None,
+            is_read: false,
+            is_draft: false,
+            flagged: false,
             importance: "normal".to_string(),
-            message_type: "message".to_string(),
-            body_html: body_html.to_string(),
-            body_plain: String::new(),
+            inference_classification: inference.map(str::to_string),
+            has_attachments: false,
+            body_loaded: true,
+            preview: "Hello".to_string(),
+            body_html: "<p>Hello</p>".to_string(),
+            body_plain: "Hello".to_string(),
             attachments: Vec::new(),
-            mentions: Vec::new(),
-            reactions: Vec::new(),
-            reply_count: 0,
-            web_url: None,
+            meeting_request: None,
+            web_link: None,
         }
     }
 
     #[test]
-    fn effective_attachments_fast_path_and_inline_synthesis() {
-        let plain_msg = sample_message("chat:19:abc", "m1", "<p>hello</p>");
-        assert!(matches!(plain_msg.effective_attachments(), Cow::Borrowed(_)));
-        assert!(plain_msg.effective_attachments().is_empty());
+    fn test_email_recipient_display_and_short_display() {
+        let named = EmailRecipient {
+            name: Some("Alice Smith".to_string()),
+            address: "alice@example.com".to_string(),
+        };
+        assert_eq!(named.display(), "Alice Smith <alice@example.com>");
+        assert_eq!(named.short_display(), "Alice Smith");
 
-        let hosted_msg = sample_message(
-            "chat:19:abc",
-            "m1",
-            r#"<p><img src="https://graph.microsoft.com/v1.0/chats/19:abc/messages/m1/hostedContents/aWQ9MQ==/$value"></p>"#,
+        let same = EmailRecipient {
+            name: Some("alice@example.com".to_string()),
+            address: "alice@example.com".to_string(),
+        };
+        assert_eq!(same.display(), "alice@example.com");
+        assert_eq!(same.short_display(), "alice@example.com");
+
+        let blank_name = EmailRecipient {
+            name: Some("   ".to_string()),
+            address: "bob@example.com".to_string(),
+        };
+        assert_eq!(blank_name.display(), "bob@example.com");
+        assert_eq!(blank_name.short_display(), "bob@example.com");
+    }
+
+    #[test]
+    fn test_mail_message_helpers_and_rsvp_endpoint() {
+        let msg = sample_mail(
+            Some(EmailRecipient {
+                name: Some("Alice".to_string()),
+                address: "alice@example.com".to_string(),
+            }),
+            "Quarterly Review",
+            Some("focused"),
         );
-        let eff = hosted_msg.effective_attachments();
-        assert!(matches!(eff, Cow::Owned(_)));
-        assert_eq!(eff.len(), 1);
-        assert_eq!(eff[0].id, "hosted:aWQ9MQ==");
-        assert_eq!(eff[0].content_type, "hostedContent");
-        assert!(crate::img_preview::is_image_mime_or_name(
-            &eff[0].content_type,
-            eff[0].name.as_deref()
-        ));
+        assert_eq!(msg.from_display(), "Alice <alice@example.com>");
+        assert_eq!(msg.from_short(), "Alice");
+        assert_eq!(msg.effective_subject(), "Quarterly Review");
+        assert!(msg.is_focused());
 
-        // When already persisted in `attachments`, effective_attachments borrows without duplicating.
-        let owned = eff.into_owned();
-        let mut persisted = hosted_msg;
-        persisted.attachments = owned;
-        assert!(matches!(persisted.effective_attachments(), Cow::Borrowed(_)));
-        assert_eq!(persisted.effective_attachments().len(), 1);
+        let unknown = sample_mail(None, "   ", Some("Other"));
+        assert_eq!(unknown.from_display(), "(unknown sender)");
+        assert_eq!(unknown.from_short(), "(unknown sender)");
+        assert_eq!(unknown.effective_subject(), "(No subject)");
+        assert!(!unknown.is_focused());
 
-        // Relative ../hostedContents/1/$value resolution for chats
-        let rel_msg = sample_message(
-            "chat:19:abc",
-            "m1",
-            r#"<p><img src="../hostedContents/1/$value"></p>"#,
-        );
-        let rel_eff = rel_msg.effective_attachments();
-        assert_eq!(rel_eff.len(), 1);
+        let default_focused = sample_mail(None, "Hi", None);
+        assert!(default_focused.is_focused());
+
+        assert_eq!(EventRsvpAction::Accept.as_graph_endpoint(), "accept");
         assert_eq!(
-            rel_eff[0].content_url.as_deref(),
-            Some("/chats/19%3Aabc/messages/m1/hostedContents/1/$value")
+            EventRsvpAction::TentativelyAccept.as_graph_endpoint(),
+            "tentativelyAccept"
         );
+        assert_eq!(EventRsvpAction::Decline.as_graph_endpoint(), "decline");
+    }
+
+    #[test]
+    fn test_core_event_tagged_serialization() {
+        let evt = CoreEvent::SyncStateChanged {
+            busy: false,
+            summary: POLL_RETRY_SUMMARY.to_string(),
+        };
+        let json = serde_json::to_value(&evt).unwrap();
+        assert_eq!(json["event"], "sync_state_changed");
+        assert_eq!(json["data"]["busy"], false);
+        assert_eq!(json["data"]["summary"], POLL_RETRY_SUMMARY);
     }
 }

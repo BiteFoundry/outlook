@@ -1,38 +1,37 @@
 openapi: 3.1.0
 info:
-  title: teams HTTP JSON API
-  version: 0.7.3
+  title: outlook-cli local HTTP API (Mail · Calendar · To Do · Contacts)
+  version: 0.1.0
   description: |
-    Local HTTP/JSON contract exposed by `teams serve` (alias `api`).
+    Local HTTP/JSON contract exposed by `outlook serve` (alias `api`).
 
     Backed by Microsoft Graph v1.0, local SQLite WAL/FTS5 caching, and the
-    background sync engine. Binds to `127.0.0.1:8788` by default (non-loopback
-    binds require `--token <SECRET>` or `TEAMS_ALLOW_INSECURE_SERVE=1`). When
-    started with `--token`, every endpoint except `GET /health` requires
-    `Authorization: Bearer <token>`.
+    background sync engine. Binds to `127.0.0.1:3939` by default (non-loopback
+    binds require `--api-key <KEY>` / `--token <KEY>` or
+    `OUTLOOK_ALLOW_INSECURE_SERVE=1`). When an API key is configured, every
+    endpoint except `GET /health` requires `Authorization: Bearer <key>` or
+    `x-api-key: <key>`.
 
     All errors return `{"error": "<message>"}` with an appropriate HTTP status.
 servers:
-  - url: http://127.0.0.1:8788
+  - url: http://127.0.0.1:3939
     description: Default loopback listener
 security:
   - bearerAuth: []
+  - apiKeyHeader: []
   - {}
 tags:
-  - name: health
-  - name: conversations
-  - name: teams
-  - name: messages
-  - name: threads
-  - name: files
-  - name: search
-  - name: presence
+  - name: system
+  - name: mail
+  - name: calendar
+  - name: todo
+  - name: contacts
 paths:
   /health:
     get:
-      tags: [health]
-      summary: Liveness probe
-      description: Always public, even when `--token` is set.
+      tags: [system]
+      summary: Health check (public)
+      description: Always public, even when `--api-key` is set.
       security: []
       responses:
         "200":
@@ -41,10 +40,26 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
-  /conversations:
+  /openapi.json:
     get:
-      tags: [conversations]
-      summary: List cached chats and channels
+      tags: [system]
+      summary: OpenAPI 3.1 specification
+      responses:
+        "200":
+          description: OpenAPI 3.1.0 JSON document
+  /v1/whoami:
+    get:
+      tags: [system]
+      summary: Current user profile, auth source, and token status
+      responses:
+        "200":
+          description: User identity and token diagnostics
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/mail/folders:
+    get:
+      tags: [mail]
+      summary: List Outlook mail folders
       parameters:
         - name: refresh
           in: query
@@ -52,122 +67,6 @@ paths:
           schema:
             type: boolean
             default: false
-        - name: kind
-          in: query
-          required: false
-          schema:
-            type: string
-            enum: [oneOnOne, group, meeting, channel]
-        - name: limit
-          in: query
-          required: false
-          description: Optional maximum number of conversations to return (and chats to fetch when `refresh=true`).
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 1000
-      responses:
-        "200":
-          description: Conversation list
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [conversations]
-                properties:
-                  conversations:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/ConversationSummary"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
-        "500":
-          $ref: "#/components/responses/InternalError"
-  /chats:
-    post:
-      tags: [conversations]
-      summary: Create a 1:1 or group chat
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/CreateChatRequest"
-      responses:
-        "200":
-          description: Chat created
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [ok, conversation]
-                properties:
-                  ok:
-                    type: boolean
-                  conversation:
-                    $ref: "#/components/schemas/ConversationSummary"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
-        "500":
-          $ref: "#/components/responses/InternalError"
-  /teams:
-    get:
-      tags: [teams]
-      summary: List joined Teams and their channels
-      parameters:
-        - name: refresh
-          in: query
-          required: false
-          schema:
-            type: boolean
-            default: false
-      responses:
-        "200":
-          description: Teams list
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [teams]
-                properties:
-                  teams:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/TeamSummary"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
-        "500":
-          $ref: "#/components/responses/InternalError"
-  /conversations/{key}/messages:
-    parameters:
-      - $ref: "#/components/parameters/ConversationKey"
-    get:
-      tags: [messages]
-      summary: Read messages from a chat or channel (supports cursor pagination via `before`)
-      parameters:
-        - $ref: "#/components/parameters/Limit"
-        - name: before
-          in: query
-          required: false
-          description: Return older messages strictly preceding this ISO 8601 timestamp or `msg_id` (walks Graph `@odata.nextLink` when needed).
-          schema:
-            type: string
-        - name: fetch_older
-          in: query
-          required: false
-          description: Whether to fetch older pages from Microsoft Graph when local history has fewer than `limit` messages (defaults to `true` when `before` is set).
-          schema:
-            type: boolean
         - name: offline
           in: query
           required: false
@@ -176,25 +75,58 @@ paths:
             default: false
       responses:
         "200":
-          description: Messages in chronological order
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [conversation, messages]
-                properties:
-                  conversation:
-                    $ref: "#/components/schemas/ConversationSummary"
-                  messages:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/MessageItem"
-                  has_more:
-                    type: boolean
-                  next_before:
-                    type: [string, "null"]
-        "400":
-          $ref: "#/components/responses/BadRequest"
+          description: Mail folders list
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/mail/messages:
+    get:
+      tags: [mail]
+      summary: List messages in a folder
+      parameters:
+        - name: folder
+          in: query
+          required: false
+          schema:
+            type: string
+            default: inbox
+        - $ref: "#/components/parameters/Limit"
+        - name: unread
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: flagged
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: focused
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: refresh
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: offline
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Folder metadata and matching messages
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -203,252 +135,122 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalError"
-    post:
-      tags: [messages]
-      summary: Send a Markdown message
+  /v1/mail/messages/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ItemId"
+    get:
+      tags: [mail]
+      summary: Read a mail message
+      parameters:
+        - name: offline
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Full mail message with body and attachment metadata
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [mail]
+      summary: Update (read/flag/move) a mail message
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/SendMessageRequest"
+              $ref: "#/components/schemas/PatchMailRequest"
       responses:
         "200":
-          description: Message sent
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/SendMessageResult"
+          description: Message updated
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "500":
-          $ref: "#/components/responses/InternalError"
-  /conversations/{key}/threads/{root_id}:
+    delete:
+      tags: [mail]
+      summary: Delete a mail message
+      responses:
+        "200":
+          description: Message deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /v1/mail/send:
+    post:
+      tags: [mail]
+      summary: Send a new email
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendMailRequest"
+      responses:
+        "200":
+          description: Email sent
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /v1/mail/messages/{id}/reply:
     parameters:
-      - $ref: "#/components/parameters/ConversationKey"
-      - name: root_id
+      - $ref: "#/components/parameters/ItemId"
+    post:
+      tags: [mail]
+      summary: Reply to a mail message
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReplyMailRequest"
+      responses:
+        "200":
+          description: Reply sent
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/mail/messages/{id}/forward:
+    parameters:
+      - $ref: "#/components/parameters/ItemId"
+    post:
+      tags: [mail]
+      summary: Forward a mail message
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ForwardMailRequest"
+      responses:
+        "200":
+          description: Forward sent
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/mail/messages/{id}/attachments/{att_id}/download:
+    parameters:
+      - $ref: "#/components/parameters/ItemId"
+      - name: att_id
         in: path
         required: true
         schema:
           type: string
-    get:
-      tags: [threads]
-      summary: Get a channel root post and its thread replies
-      parameters:
-        - $ref: "#/components/parameters/Limit"
-        - name: offline
-          in: query
-          required: false
-          schema:
-            type: boolean
-            default: false
-      responses:
-        "200":
-          description: Thread view
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [thread]
-                properties:
-                  thread:
-                    $ref: "#/components/schemas/ThreadView"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "500":
-          $ref: "#/components/responses/InternalError"
-  /conversations/{key}/messages/{msg_id}/replies:
-    parameters:
-      - $ref: "#/components/parameters/ConversationKey"
-      - $ref: "#/components/parameters/MessageId"
     post:
-      tags: [messages, threads]
-      summary: Reply to a channel thread or quote-reply a chat message
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/ReplyRequest"
-      responses:
-        "200":
-          description: Reply sent
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [ok, conversation, reply_to, message]
-                properties:
-                  ok:
-                    type: boolean
-                  conversation:
-                    $ref: "#/components/schemas/ConversationSummary"
-                  reply_to:
-                    type: string
-                  message:
-                    $ref: "#/components/schemas/MessageItem"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "500":
-          $ref: "#/components/responses/InternalError"
-  /conversations/{key}/files:
-    parameters:
-      - $ref: "#/components/parameters/ConversationKey"
-    post:
-      tags: [files]
-      summary: Upload a local file to OneDrive/SharePoint and post a reference attachment (or inline image)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/SendFileRequest"
-      responses:
-        "200":
-          description: File uploaded and posted
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/SendMessageResult"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "500":
-          $ref: "#/components/responses/InternalError"
-  /conversations/{key}/messages/{msg_id}/attachments/download:
-    parameters:
-      - $ref: "#/components/parameters/ConversationKey"
-      - $ref: "#/components/parameters/MessageId"
-    post:
-      tags: [files]
-      summary: Download an attachment from a message
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/DownloadRequest"
-      responses:
-        "200":
-          description: File downloaded
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/DownloadResult"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "500":
-          $ref: "#/components/responses/InternalError"
-  /conversations/{key}/messages/{msg_id}/reactions:
-    parameters:
-      - $ref: "#/components/parameters/ConversationKey"
-      - $ref: "#/components/parameters/MessageId"
-    post:
-      tags: [messages]
-      summary: Set or unset a reaction on a message
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/ReactionRequest"
-      responses:
-        "200":
-          description: Reaction updated
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [ok, conv_key, msg_id, reaction, enable]
-                properties:
-                  ok:
-                    type: boolean
-                  conv_key:
-                    type: string
-                  msg_id:
-                    type: string
-                  reaction:
-                    type: string
-                  enable:
-                    type: boolean
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "500":
-          $ref: "#/components/responses/InternalError"
-  /conversations/{key}/messages/{msg_id}:
-    parameters:
-      - $ref: "#/components/parameters/ConversationKey"
-      - $ref: "#/components/parameters/MessageId"
-    patch:
-      tags: [messages]
-      summary: Edit a message sent by the authenticated user
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/EditMessageRequest"
-      responses:
-        "200":
-          description: Message edited
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/MessageMutationResult"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "500":
-          $ref: "#/components/responses/InternalError"
-    delete:
-      tags: [messages]
-      summary: Soft-delete a message sent by the authenticated user
-      parameters:
-        - name: thread_root_id
-          in: query
-          required: false
-          schema:
-            type: string
+      tags: [mail]
+      summary: Download a mail attachment to disk
       requestBody:
         required: false
         content:
@@ -456,201 +258,278 @@ paths:
             schema:
               type: object
               properties:
-                thread_root_id:
-                  type: [string, "null"]
+                out_dir:
+                  type: string
       responses:
         "200":
-          description: Message deleted
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/MessageMutationResult"
-        "400":
-          $ref: "#/components/responses/BadRequest"
+          description: Attachment saved
         "401":
           $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
-        "500":
-          $ref: "#/components/responses/InternalError"
-  /conversations/{key}/read:
-    parameters:
-      - $ref: "#/components/parameters/ConversationKey"
-    post:
-      tags: [conversations]
-      summary: Mark a conversation as read
-      responses:
-        "200":
-          description: Marked read
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [ok, conv_key]
-                properties:
-                  ok:
-                    type: boolean
-                  conv_key:
-                    type: string
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "500":
-          $ref: "#/components/responses/InternalError"
-  /conversations/{key}/members:
-    parameters:
-      - $ref: "#/components/parameters/ConversationKey"
+  /v1/mail/search:
     get:
-      tags: [conversations]
-      summary: List members of a chat or channel
-      responses:
-        "200":
-          description: Member list
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [conv_key, title, members]
-                properties:
-                  conv_key:
-                    type: string
-                  title:
-                    type: string
-                  members:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/MemberInfo"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "500":
-          $ref: "#/components/responses/InternalError"
-  /search:
-    get:
-      tags: [search]
-      summary: Search cached messages via SQLite FTS5
+      tags: [mail]
+      summary: Search mail messages locally (SQLite FTS5) or remotely (Graph KQL)
       parameters:
         - name: q
           in: query
           required: true
           schema:
             type: string
-            minLength: 1
+        - name: folder
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: remote
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
         - $ref: "#/components/parameters/Limit"
-        - name: target
-          in: query
-          required: false
-          schema:
-            type: string
       responses:
         "200":
-          description: Search hits
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [query, hits]
-                properties:
-                  query:
-                    type: string
-                  hits:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/SearchHit"
+          description: Local search hits and optional remote Graph matches
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "500":
-          $ref: "#/components/responses/InternalError"
-  /presence:
+  /v1/calendar/events:
     get:
-      tags: [presence]
-      summary: Get presence for self or specified user IDs
+      tags: [calendar]
+      summary: List calendar events
       parameters:
-        - name: user_ids
+        - name: from
           in: query
           required: false
-          description: Comma-separated Entra user IDs. Omit for current user presence.
           schema:
             type: string
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: days
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 7
+        - $ref: "#/components/parameters/Limit"
+        - name: offline
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
       responses:
         "200":
-          description: Presence response
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  presence:
-                    $ref: "#/components/schemas/PresenceStatus"
-                  presences:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/PresenceStatus"
-        "400":
-          $ref: "#/components/responses/BadRequest"
+          description: Calendar events in the requested window
         "401":
           $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
-        "500":
-          $ref: "#/components/responses/InternalError"
     post:
-      tags: [presence]
-      summary: Set preferred presence for current user
+      tags: [calendar]
+      summary: Create a new calendar event
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/SetPresenceRequest"
+              $ref: "#/components/schemas/CreateCalendarEventRequest"
       responses:
         "200":
-          description: Presence updated
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [ok, availability, activity]
-                properties:
-                  ok:
-                    type: boolean
-                  availability:
-                    type: string
-                  activity:
-                    type: string
-                  expiration_mins:
-                    type: [integer, "null"]
+          description: Event created
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
-        "500":
-          $ref: "#/components/responses/InternalError"
-  /openapi.json:
+  /v1/calendar/events/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ItemId"
     get:
-      tags: [health]
-      summary: Runtime OpenAPI 3.0 specification JSON
+      tags: [calendar]
+      summary: Read a calendar event
+      parameters:
+        - name: offline
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
       responses:
         "200":
-          description: OpenAPI 3.0.3 document
-          content:
-            application/json:
-              schema:
-                type: object
+          description: Event details
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [calendar]
+      summary: Delete a calendar event
+      responses:
+        "200":
+          description: Event deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/calendar/events/{id}/rsvp:
+    parameters:
+      - $ref: "#/components/parameters/ItemId"
+    post:
+      tags: [calendar]
+      summary: Respond (accept/tentative/decline) to a calendar event
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [response]
+              properties:
+                response:
+                  type: string
+                  enum: [accept, tentative, decline]
+                comment:
+                  type: string
+      responses:
+        "200":
+          description: RSVP recorded
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/todo/lists:
+    get:
+      tags: [todo]
+      summary: List Microsoft To Do task lists
+      parameters:
+        - name: refresh
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: offline
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: To Do task lists
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/todo/tasks:
+    get:
+      tags: [todo]
+      summary: List To Do tasks
+      parameters:
+        - name: list
+          in: query
+          required: false
+          schema:
+            type: string
+            default: tasks
+        - name: all
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - $ref: "#/components/parameters/Limit"
+        - name: refresh
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: offline
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: To Do tasks
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [todo]
+      summary: Create a To Do task
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTodoTaskRequest"
+      responses:
+        "200":
+          description: Task created
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/todo/tasks/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ItemId"
+    patch:
+      tags: [todo]
+      summary: Complete or reopen a To Do task
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [completed]
+              properties:
+                list:
+                  type: string
+                completed:
+                  type: boolean
+      responses:
+        "200":
+          description: Task updated
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    delete:
+      tags: [todo]
+      summary: Delete a To Do task
+      parameters:
+        - name: list
+          in: query
+          required: false
+          schema:
+            type: string
+            default: tasks
+      responses:
+        "200":
+          description: Task deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/contacts:
+    get:
+      tags: [contacts]
+      summary: List or search Outlook contacts and Entra directory
+      parameters:
+        - name: q
+          in: query
+          required: false
+          schema:
+            type: string
+        - $ref: "#/components/parameters/Limit"
+        - name: offline
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Contacts list
         "401":
           $ref: "#/components/responses/Unauthorized"
 components:
@@ -658,17 +537,13 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
-      description: Required when `teams serve --token <secret>` is set.
+    apiKeyHeader:
+      type: apiKey
+      in: header
+      name: x-api-key
   parameters:
-    ConversationKey:
-      name: key
-      in: path
-      required: true
-      description: URL-encoded `conv_key`, raw `chat_id`, `"Team/Channel"`, or fuzzy conversation title.
-      schema:
-        type: string
-    MessageId:
-      name: msg_id
+    ItemId:
+      name: id
       in: path
       required: true
       schema:
@@ -681,40 +556,39 @@ components:
         type: integer
         minimum: 1
         maximum: 1000
-        default: 50
   responses:
     BadRequest:
-      description: Invalid parameters or malformed JSON body
+      description: Invalid request
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/Error"
+            $ref: "#/components/schemas/ErrorResponse"
     Unauthorized:
-      description: Missing or invalid bearer token
+      description: Missing or invalid API key
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/Error"
+            $ref: "#/components/schemas/ErrorResponse"
     Forbidden:
-      description: Insufficient Microsoft Graph permissions or missing token scopes
+      description: Microsoft Graph 403 Forbidden (missing delegated scopes)
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/Error"
+            $ref: "#/components/schemas/ErrorResponse"
     NotFound:
-      description: Target conversation or cached thread not found
+      description: Resource not found
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/Error"
+            $ref: "#/components/schemas/ErrorResponse"
     InternalError:
-      description: Upstream Graph or SQLite error
+      description: Server or upstream Graph error
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/Error"
+            $ref: "#/components/schemas/ErrorResponse"
   schemas:
-    Error:
+    ErrorResponse:
       type: object
       required: [error]
       properties:
@@ -730,390 +604,102 @@ components:
           type: [string, "null"]
         version:
           type: string
-    ConversationTarget:
+    SendMailRequest:
       type: object
-      required: [target_type]
+      required: [to, subject, markdown]
       properties:
-        target_type:
-          type: string
-          enum: [chat, channel]
-        chat_id:
-          type: string
-        team_id:
-          type: string
-        channel_id:
-          type: string
-    ConversationSummary:
-      type: object
-      required: [conv_key, target, kind, title, unread_count, pinned]
-      properties:
-        conv_key:
-          type: string
-        target:
-          $ref: "#/components/schemas/ConversationTarget"
-        kind:
-          type: string
-          enum: [oneOnOne, group, meeting, channel]
-        team_id:
-          type: [string, "null"]
-        team_name:
-          type: [string, "null"]
-        title:
-          type: string
-        topic:
-          type: [string, "null"]
-        unread_count:
-          type: integer
-        last_read_at:
-          type: [string, "null"]
-        last_msg_id:
-          type: [string, "null"]
-        last_msg_author:
-          type: [string, "null"]
-        last_msg_preview:
-          type: [string, "null"]
-        last_updated_at:
-          type: [string, "null"]
-        pinned:
-          type: boolean
-        peer_user_id:
-          type: [string, "null"]
-        web_url:
-          type: [string, "null"]
-    ChannelSummary:
-      type: object
-      required: [id, team_id, team_name, display_name, membership_type]
-      properties:
-        id:
-          type: string
-        team_id:
-          type: string
-        team_name:
-          type: string
-        display_name:
-          type: string
-        description:
-          type: [string, "null"]
-        membership_type:
-          type: string
-        web_url:
-          type: [string, "null"]
-    TeamSummary:
-      type: object
-      required: [id, display_name, channels]
-      properties:
-        id:
-          type: string
-        display_name:
-          type: string
-        description:
-          type: [string, "null"]
-        channels:
-          type: array
-          items:
-            $ref: "#/components/schemas/ChannelSummary"
-    AttachmentInfo:
-      type: object
-      required: [id, content_type]
-      properties:
-        id:
-          type: string
-        content_type:
-          type: string
-        content_url:
-          type: [string, "null"]
-        name:
-          type: [string, "null"]
-        content_json:
-          type: [string, "null"]
-        thumbnail_url:
-          type: [string, "null"]
-    MentionInfo:
-      type: object
-      required: [id, user_id, display_name]
-      properties:
-        id:
-          type: integer
-        user_id:
-          type: string
-        display_name:
-          type: string
-    ReactionSummary:
-      type: object
-      required: [reaction_type, count, me_reacted, users]
-      properties:
-        reaction_type:
-          type: string
-        count:
-          type: integer
-        me_reacted:
-          type: boolean
-        users:
+        to:
           type: array
           items:
             type: string
-    MessageItem:
-      type: object
-      required:
-        [msg_key, conv_key, msg_id, author_name, is_me, created_at, deleted, importance, message_type, body_html, body_plain, attachments, mentions, reactions, reply_count]
-      properties:
-        msg_key:
-          type: string
-        conv_key:
-          type: string
-        msg_id:
-          type: string
-        parent_msg_id:
-          type: [string, "null"]
-        reply_to_id:
-          type: [string, "null"]
-        reply_to_author:
-          type: [string, "null"]
-        reply_to_preview:
-          type: [string, "null"]
+        cc:
+          type: array
+          items:
+            type: string
+        bcc:
+          type: array
+          items:
+            type: string
         subject:
-          type: [string, "null"]
-        author_id:
-          type: [string, "null"]
-        author_name:
           type: string
-        is_me:
-          type: boolean
-        created_at:
+        markdown:
           type: string
-        last_modified_at:
-          type: [string, "null"]
-        deleted:
-          type: boolean
         importance:
           type: string
-        message_type:
-          type: string
-        body_html:
-          type: string
-        body_plain:
-          type: string
+          enum: [low, normal, high]
         attachments:
           type: array
           items:
-            $ref: "#/components/schemas/AttachmentInfo"
-        mentions:
-          type: array
-          items:
-            $ref: "#/components/schemas/MentionInfo"
-        reactions:
-          type: array
-          items:
-            $ref: "#/components/schemas/ReactionSummary"
-        reply_count:
-          type: integer
-        web_url:
-          type: [string, "null"]
-    ThreadView:
-      type: object
-      required: [conv_key, root, replies]
-      properties:
-        conv_key:
-          type: string
-        root:
-          $ref: "#/components/schemas/MessageItem"
-        replies:
-          type: array
-          items:
-            $ref: "#/components/schemas/MessageItem"
-    PresenceStatus:
-      type: object
-      required: [user_id, availability, activity]
-      properties:
-        user_id:
-          type: string
-        availability:
-          type: string
-        activity:
-          type: string
-    MemberInfo:
-      type: object
-      required: [user_id, display_name, roles]
-      properties:
-        user_id:
-          type: string
-        member_id:
-          type: [string, "null"]
-        display_name:
-          type: string
-        email:
-          type: [string, "null"]
-        roles:
-          type: array
-          items:
             type: string
-        presence:
-          oneOf:
-            - $ref: "#/components/schemas/PresenceStatus"
-            - type: "null"
-    SearchHit:
-      type: object
-      required: [conv_key, conv_title, kind, msg_id, author_name, created_at, snippet]
-      properties:
-        conv_key:
-          type: string
-        conv_title:
-          type: string
-        kind:
-          type: string
-          enum: [oneOnOne, group, meeting, channel]
-        msg_id:
-          type: string
-        parent_msg_id:
-          type: [string, "null"]
-        author_name:
-          type: string
-        created_at:
-          type: string
-        snippet:
-          type: string
-    CreateChatRequest:
-      type: object
-      required: [members]
-      properties:
-        members:
-          type: array
-          minItems: 1
-          items:
-            type: string
-        topic:
-          type: [string, "null"]
-    MentionInput:
-      oneOf:
-        - type: string
-          description: Format `user_id:DisplayName`
-        - type: object
-          required: [user_id, display_name]
-          properties:
-            id:
-              type: [integer, "null"]
-            user_id:
-              type: string
-            display_name:
-              type: string
-    SendMessageRequest:
-      type: object
-      required: [markdown]
-      properties:
-        markdown:
-          type: string
-          minLength: 1
-        subject:
-          type: [string, "null"]
-        mentions:
-          type: array
-          items:
-            $ref: "#/components/schemas/MentionInput"
-        important:
-          type: boolean
-          default: false
-    SendMessageResult:
-      type: object
-      required: [ok, conversation, message]
-      properties:
-        ok:
-          type: boolean
-        conversation:
-          $ref: "#/components/schemas/ConversationSummary"
-        message:
-          $ref: "#/components/schemas/MessageItem"
-    ReplyRequest:
-      type: object
-      required: [markdown]
-      properties:
-        markdown:
-          type: string
-          minLength: 1
-        mentions:
-          type: array
-          items:
-            $ref: "#/components/schemas/MentionInput"
-        important:
-          type: boolean
-          default: false
-    SendFileRequest:
-      type: object
-      required: [path]
-      properties:
-        path:
-          type: string
-          minLength: 1
-        caption:
-          type: [string, "null"]
-        thread_root_id:
-          type: [string, "null"]
-        inline:
-          type: boolean
-          default: false
-    DownloadRequest:
-      type: object
-      properties:
-        index:
-          type: integer
-          minimum: 0
-          default: 0
-        out_dir:
-          type: [string, "null"]
-        thread_root_id:
-          type: [string, "null"]
-    DownloadResult:
-      type: object
-      required: [ok, path, file_name, bytes_written]
-      properties:
-        ok:
-          type: boolean
-        path:
-          type: string
-        file_name:
-          type: string
-        bytes_written:
-          type: integer
-    ReactionRequest:
-      type: object
-      required: [reaction]
-      properties:
-        reaction:
-          type: string
-          description: "`like`, `heart`, `laugh`, `surprised`, `sad`, `angry`, or unicode emoji"
-        enable:
+        save_to_sent_items:
           type: boolean
           default: true
-        thread_root_id:
-          type: [string, "null"]
-    EditMessageRequest:
+    ReplyMailRequest:
       type: object
       required: [markdown]
       properties:
         markdown:
           type: string
-          minLength: 1
-        thread_root_id:
-          type: [string, "null"]
-    MessageMutationResult:
-      type: object
-      required: [ok, conv_key, msg_id]
-      properties:
-        ok:
+        reply_all:
           type: boolean
-        conv_key:
-          type: string
-        msg_id:
-          type: string
-    SetPresenceRequest:
+          default: false
+    ForwardMailRequest:
       type: object
-      required: [availability]
+      required: [to]
       properties:
-        availability:
+        to:
+          type: array
+          items:
+            type: string
+        markdown:
           type: string
-          enum: [Available, Busy, DoNotDisturb, BeRightBack, Away, Reset]
-        activity:
-          type: [string, "null"]
-        expiration_mins:
-          type: [integer, "null"]
-          minimum: 1
-          maximum: 1440
+    PatchMailRequest:
+      type: object
+      properties:
+        is_read:
+          type: boolean
+        flagged:
+          type: boolean
+        destination_folder_id:
+          type: string
+    CreateCalendarEventRequest:
+      type: object
+      required: [subject, start_iso, end_iso]
+      properties:
+        subject:
+          type: string
+        start_iso:
+          type: string
+        end_iso:
+          type: string
+        time_zone:
+          type: string
+        is_all_day:
+          type: boolean
+          default: false
+        location:
+          type: string
+        markdown:
+          type: string
+        attendees:
+          type: array
+          items:
+            type: string
+        is_online_meeting:
+          type: boolean
+          default: false
+    CreateTodoTaskRequest:
+      type: object
+      required: [title]
+      properties:
+        list:
+          type: string
+        title:
+          type: string
+        body_plain:
+          type: string
+        due_date_iso:
+          type: string
+        importance:
+          type: string
+          enum: [low, normal, high]

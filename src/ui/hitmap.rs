@@ -4,95 +4,98 @@
 
 use ratatui::layout::{Position, Rect};
 
-/// Toolbar & header button identifiers.
+use crate::models::EventRsvpAction;
+
+/// Toolbar, header, and modal button identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonId {
     Search,
-    SendFile,
-    Attachments,
-    RoomInfo,
-    Refresh,
-    Settings,
-    NewChat,
-    Presence,
-    CloseThread,
-    ComposerTargetToggle,
-    SubjectToggle,
-    NarrowToggle,
-    NarrowList,
-    NarrowChat,
-    NarrowThread,
-    ImagePreview,
     CommandPalette,
     DensityToggle,
     Help,
     FilterToggle,
+    FocusedToggle,
+    ThreadGroupToggle,
+    Settings,
+    Refresh,
+    // Mail toolbar actions
+    NewMail,
+    MailReply,
+    MailReplyAll,
+    MailForward,
+    MailToggleRead,
+    MailToggleFlag,
+    MailArchive,
+    MailDelete,
+    MailMove,
+    Attachments,
+    ImagePreview,
+    ExpandQuoted,
+    // Calendar toolbar actions
+    NewEvent,
+    JoinMeeting,
+    RsvpAccept,
+    RsvpTentative,
+    RsvpDecline,
+    DeleteEvent,
+    // Tasks toolbar actions
+    NewTodoList,
+    NewTodoTask,
+    DeleteTodoTask,
+    // Narrow responsive bar pills
+    NarrowFolders,
+    NarrowList,
+    NarrowRead,
+    // Compose overlay buttons
+    ComposeSend,
+    ComposeAttach,
+    ComposeSaveDraft,
+    ComposeCancel,
+    // Confirm dialog
     ConfirmOk,
     ConfirmCancel,
-}
-
-/// Inline quick actions shown on the selected message row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InlineActionKind {
-    Reply,
-    Thread,
-    React,
-    More,
-}
-
-/// Identifies which list a message belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MessageScope {
-    Chat,
-    ThreadRoot,
-    ThreadReply,
 }
 
 /// Clickable targets on the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitTarget {
-    /// Navigation tab (`0` = Chats, `1` = Teams, `2` = Activity).
+    /// Primary navigation tab (`0` = Mail, `1` = Calendar, `2` = Tasks).
     NavTab(usize),
-    /// A row in the active navigation pane list.
+    /// A row in the left sidebar (`nav_pane`).
     NavRow(usize),
-    /// Any rendered line belonging to message `msg_index`.
-    Message { scope: MessageScope, msg_index: usize },
-    /// Clickable inline action chip on the selected message (`Reply`, `Thread`, `React`, `More`).
-    InlineAction {
-        scope: MessageScope,
-        msg_index: usize,
-        action: InlineActionKind,
-    },
-    /// Clickable attachment or inline image chip.
+    /// A day cell inside Tab 2's mini month calendar grid.
+    MiniCalDay { year: i32, month: u32, day: u32 },
+    /// A row in the middle pane list (Mail message/thread, Calendar event, or To Do task).
+    ListItem(usize),
+    /// Checkbox on a To Do task row in Tab 3.
+    TodoCheckbox(usize),
+    /// Collapsible thread message header in Reading Pane when thread-grouped.
+    ThreadItem(usize),
+    /// Clickable attachment or inline image chip in Reading Pane (`thread_pos` = message index in active thread).
     Attachment {
-        scope: MessageScope,
-        msg_index: usize,
+        thread_pos: usize,
         attach_index: usize,
     },
-    /// Clickable reaction badge on a message.
-    Reaction {
-        scope: MessageScope,
-        msg_index: usize,
-        reaction_index: usize,
-    },
-    /// Channel post thread indicator (`↳ N replies · Enter to open`).
-    OpenThread { msg_index: usize },
-    /// Clickable top history banner / retry prompt (`[ ↑ Scroll up or press o / H to load older messages ]`).
-    LoadOlderMessages,
-    /// Header / toolbar / footer button.
+    /// Toggle quoted reply chain in Reading Pane (`thread_pos` = message index in active thread).
+    QuotedToggle(usize),
+    /// Meeting invite RSVP button in Mail Reading Pane (`Accept`, `Tentative`, `Decline`).
+    MeetingRsvp(EventRsvpAction),
+    /// Clickable `[Join Online]` link in Mail meeting banner or Calendar detail.
+    JoinMeetingUrl,
+    /// Clickable `[Open in Browser]` link in Mail or Calendar detail.
+    WebLinkUrl,
+    /// Clickable banner to load older mail messages.
+    LoadOlderMail,
+    /// Header / toolbar / status / modal button.
     Button(ButtonId),
-    /// Subject field inside composer.
-    SubjectInput,
-    /// Composer body area.
-    Composer,
-    /// Thread-anchored composer body area (in Wide layout when thread drawer is open).
-    ThreadComposer,
+    /// Field inside `MailComposeOverlay` (`0`=To, `1`=Cc, `2`=Bcc, `3`=Subject, `4`=Body).
+    ComposeField(usize),
+    /// Autocomplete dropdown suggestion row inside `MailComposeOverlay`.
+    ComposeContactSuggestion(usize),
     /// Modal / overlay outer frame (prevents clicks inside modal padding from closing the modal).
     OverlayBody,
     /// Item inside the top overlay.
     OverlayItem { index: usize },
-    /// Candidate row inside the `@mention` autocomplete popup.
-    MentionCandidate(usize),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -171,76 +174,41 @@ mod tests {
     #[test]
     fn later_region_wins_overlap() {
         let mut map = HitMap::new();
-        map.add(
-            Rect::new(0, 0, 20, 4),
-            HitTarget::Message {
-                scope: MessageScope::Chat,
-                msg_index: 1,
-            },
-        );
+        map.add(Rect::new(0, 0, 20, 4), HitTarget::ListItem(1));
         map.add_line(
             2,
             2,
             8,
             HitTarget::Attachment {
-                scope: MessageScope::Chat,
-                msg_index: 1,
+                thread_pos: 0,
                 attach_index: 0,
             },
         );
-        map.add_line(
-            12,
-            2,
-            5,
-            HitTarget::Reaction {
-                scope: MessageScope::Chat,
-                msg_index: 1,
-                reaction_index: 0,
-            },
-        );
+        map.add_line(12, 2, 7, HitTarget::QuotedToggle(0));
 
         assert_eq!(
             map.hit(2, 3),
             Some(HitTarget::Attachment {
-                scope: MessageScope::Chat,
-                msg_index: 1,
+                thread_pos: 0,
                 attach_index: 0,
             })
         );
-        assert_eq!(
-            map.hit(2, 14),
-            Some(HitTarget::Reaction {
-                scope: MessageScope::Chat,
-                msg_index: 1,
-                reaction_index: 0,
-            })
-        );
-        assert_eq!(
-            map.hit(0, 0),
-            Some(HitTarget::Message {
-                scope: MessageScope::Chat,
-                msg_index: 1,
-            })
-        );
+        assert_eq!(map.hit(2, 14), Some(HitTarget::QuotedToggle(0)));
+        assert_eq!(map.hit(0, 0), Some(HitTarget::ListItem(1)));
     }
 
     #[test]
-    fn thread_indicator_and_zero_sized_regions() {
+    fn zero_sized_regions_ignored_and_rsvp_target_works() {
         let mut map = HitMap::new();
-        map.add(Rect::new(0, 0, 0, 5), HitTarget::Composer);
-        map.add(Rect::new(0, 0, 5, 0), HitTarget::Composer);
+        map.add(Rect::new(0, 0, 0, 5), HitTarget::LoadOlderMail);
+        map.add(Rect::new(0, 0, 5, 0), HitTarget::LoadOlderMail);
         assert!(map.is_empty());
 
-        map.add_line(4, 10, 24, HitTarget::OpenThread { msg_index: 3 });
-        assert_eq!(map.hit(10, 8), Some(HitTarget::OpenThread { msg_index: 3 }));
-        assert_eq!(map.hit(10, 28), None);
-    }
-
-    #[test]
-    fn load_older_messages_banner_is_clickable() {
-        let mut map = HitMap::new();
-        map.add_line(2, 1, 36, HitTarget::LoadOlderMessages);
-        assert_eq!(map.hit(1, 10), Some(HitTarget::LoadOlderMessages));
-        assert_eq!(map.hit(1, 40), None);
+        map.add_line(4, 10, 12, HitTarget::MeetingRsvp(EventRsvpAction::Accept));
+        assert_eq!(
+            map.hit(10, 8),
+            Some(HitTarget::MeetingRsvp(EventRsvpAction::Accept))
+        );
+        assert_eq!(map.hit(10, 16), None);
     }
 }

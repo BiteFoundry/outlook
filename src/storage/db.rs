@@ -1,13 +1,13 @@
-//! SQLite schema initialization, WAL pragmas, and FTS5 setup.
+//! Pure Outlook SQLite schema initialization, WAL pragmas, and FTS5 setup.
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-const SCHEMA_USER_VERSION_UNICODE61: i32 = 52;
-const SCHEMA_USER_VERSION_TRIGRAM: i32 = 53;
+const SCHEMA_USER_VERSION_UNICODE61: i32 = 60;
+const SCHEMA_USER_VERSION_TRIGRAM: i32 = 61;
 
 /// Initializes SQLite PRAGMAs, tables, indexes, and FTS5 virtual table.
-/// Returns `true` if `messages_fts` uses the `trigram` tokenizer, `false` if using `unicode61`.
+/// Returns `true` if `mail_fts` uses the `trigram` tokenizer, `false` if using `unicode61`.
 pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
     conn.set_prepared_statement_cache_capacity(64);
     if !is_memory {
@@ -28,6 +28,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
         ",
     )
     .context("Failed to configure SQLite PRAGMAs")?;
+
     if !is_memory {
         let _ = conn.execute_batch("PRAGMA mmap_size = 67108864;");
         let user_version: i32 = conn
@@ -38,10 +39,10 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
         {
             let intact: bool = conn
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts')
-                     AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_conv_root_created_id')
-                     AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_has_mentions')
-                     AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_conversations_sort_v2')",
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='mail_fts')
+                     AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='mail_messages')
+                     AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_mail_messages_folder_received')
+                     AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_calendar_events_start')",
                     [],
                     |row| row.get(0),
                 )
@@ -50,16 +51,16 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
                 return Ok(user_version == SCHEMA_USER_VERSION_TRIGRAM);
             }
         }
+
         if user_version < SCHEMA_USER_VERSION_UNICODE61 {
             conn.execute_batch(
                 "
-                DROP TABLE IF EXISTS mail_fts;
-                DROP TABLE IF EXISTS mail_messages;
-                DROP TABLE IF EXISTS mail_folders;
-                DROP TABLE IF EXISTS calendar_events;
-                DROP TABLE IF EXISTS contacts;
-                DROP TABLE IF EXISTS todo_tasks;
-                DROP TABLE IF EXISTS todo_lists;
+                DROP TABLE IF EXISTS messages_fts;
+                DROP TABLE IF EXISTS messages;
+                DROP TABLE IF EXISTS conversations;
+                DROP TABLE IF EXISTS teams;
+                DROP TABLE IF EXISTS members;
+                DROP TABLE IF EXISTS presences;
                 DROP TABLE IF EXISTS onenote_fts;
                 DROP TABLE IF EXISTS onenote_page_details;
                 DROP TABLE IF EXISTS onenote_pages;
@@ -68,160 +69,192 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
                 DROP TABLE IF EXISTS onenote_notebooks;
                 ",
             )
-            .context("Failed to drop legacy Outlook/OneNote tables")?;
+            .context("Failed to drop legacy Teams/OneNote tables")?;
+
+            // Recreate sync_cursors if upgrading from legacy schema lacking `history_next_link`.
+            if table_exists(conn, "sync_cursors") && !column_exists(conn, "sync_cursors", "history_next_link") {
+                conn.execute_batch("DROP TABLE IF EXISTS sync_cursors;")
+                    .context("Failed to upgrade sync_cursors schema")?;
+            }
         }
     }
 
     conn.execute_batch(
         "
-        CREATE TABLE IF NOT EXISTS conversations (
-            conv_key TEXT PRIMARY KEY,
-            target_json TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            team_id TEXT,
-            team_name TEXT,
-            title TEXT NOT NULL,
-            topic TEXT,
-            unread_count INTEGER NOT NULL DEFAULT 0,
-            last_read_at TEXT,
-            last_msg_id TEXT,
-            last_msg_author TEXT,
-            last_msg_preview TEXT,
-            last_updated_at TEXT,
-            pinned INTEGER NOT NULL DEFAULT 0,
-            peer_user_id TEXT,
-            web_url TEXT
-        );
-
-        DROP INDEX IF EXISTS idx_conversations_sort;
-
-        CREATE INDEX IF NOT EXISTS idx_conversations_sort_v2
-            ON conversations(pinned DESC, COALESCE(last_updated_at, '') DESC, title ASC);
-
-        CREATE TABLE IF NOT EXISTS teams (
-            team_id TEXT PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS mail_folders (
+            id TEXT PRIMARY KEY,
             display_name TEXT NOT NULL,
-            description TEXT,
-            channels_json TEXT NOT NULL
+            well_known_name TEXT,
+            parent_folder_id TEXT,
+            child_folder_count INTEGER NOT NULL DEFAULT 0,
+            unread_item_count INTEGER NOT NULL DEFAULT 0,
+            total_item_count INTEGER NOT NULL DEFAULT 0
         );
 
-        CREATE TABLE IF NOT EXISTS messages (
-            msg_key TEXT PRIMARY KEY,
-            conv_key TEXT NOT NULL,
-            msg_id TEXT NOT NULL,
-            parent_msg_id TEXT,
-            reply_to_id TEXT,
-            reply_to_author TEXT,
-            reply_to_preview TEXT,
-            subject TEXT,
-            author_id TEXT,
-            author_name TEXT NOT NULL,
-            is_me INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            last_modified_at TEXT,
-            deleted INTEGER NOT NULL DEFAULT 0,
+        CREATE TABLE IF NOT EXISTS mail_messages (
+            id TEXT PRIMARY KEY,
+            internet_message_id TEXT,
+            conversation_id TEXT,
+            folder_id TEXT,
+            subject TEXT NOT NULL,
+            from_json TEXT,
+            to_json TEXT NOT NULL,
+            cc_json TEXT NOT NULL,
+            bcc_json TEXT NOT NULL,
+            reply_to_json TEXT NOT NULL DEFAULT '[]',
+            from_display TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            sent_at TEXT,
+            is_read INTEGER NOT NULL DEFAULT 0,
+            is_draft INTEGER NOT NULL DEFAULT 0,
+            flagged INTEGER NOT NULL DEFAULT 0,
             importance TEXT NOT NULL,
-            message_type TEXT NOT NULL,
+            inference_classification TEXT,
+            has_attachments INTEGER NOT NULL DEFAULT 0,
+            body_loaded INTEGER NOT NULL DEFAULT 0,
+            preview TEXT NOT NULL,
             body_html TEXT NOT NULL,
             body_plain TEXT NOT NULL,
             attachments_json TEXT NOT NULL,
-            mentions_json TEXT NOT NULL,
-            reactions_json TEXT NOT NULL,
-            reply_count INTEGER NOT NULL DEFAULT 0,
-            web_url TEXT,
-            has_mentions INTEGER NOT NULL DEFAULT 0
+            meeting_request_json TEXT,
+            web_link TEXT
         );
 
-        DROP INDEX IF EXISTS idx_messages_conv_parent_created;
+        CREATE TABLE IF NOT EXISTS calendar_events (
+            id TEXT PRIMARY KEY,
+            subject TEXT NOT NULL,
+            start_iso TEXT NOT NULL,
+            end_iso TEXT NOT NULL,
+            time_zone TEXT NOT NULL,
+            is_all_day INTEGER NOT NULL DEFAULT 0,
+            location TEXT,
+            organizer_name TEXT,
+            organizer_email TEXT,
+            attendees_json TEXT NOT NULL,
+            response_status TEXT NOT NULL,
+            is_online_meeting INTEGER NOT NULL DEFAULT 0,
+            online_meeting_url TEXT,
+            body_html TEXT NOT NULL,
+            body_plain TEXT NOT NULL,
+            is_cancelled INTEGER NOT NULL DEFAULT 0,
+            web_link TEXT
+        );
 
-        CREATE INDEX IF NOT EXISTS idx_messages_conv_root_created_id
-            ON messages(conv_key, parent_msg_id, created_at DESC, msg_id DESC);
+        CREATE INDEX IF NOT EXISTS idx_calendar_events_start
+            ON calendar_events(start_iso ASC);
 
-        CREATE INDEX IF NOT EXISTS idx_messages_conv_msg
-            ON messages(conv_key, msg_id);
-
-        CREATE INDEX IF NOT EXISTS idx_messages_created
-            ON messages(created_at DESC);
-
-        CREATE TABLE IF NOT EXISTS members (
-            conv_key TEXT NOT NULL,
-            user_id TEXT NOT NULL,
-            member_id TEXT,
+        CREATE TABLE IF NOT EXISTS contacts (
+            id TEXT PRIMARY KEY,
             display_name TEXT NOT NULL,
-            email TEXT,
-            roles_json TEXT NOT NULL,
-            PRIMARY KEY (conv_key, user_id)
+            given_name TEXT,
+            surname TEXT,
+            emails_json TEXT NOT NULL,
+            mobile_phone TEXT,
+            business_phones_json TEXT NOT NULL,
+            company_name TEXT,
+            job_title TEXT,
+            department TEXT,
+            notes TEXT,
+            source TEXT NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS presences (
-            user_id TEXT PRIMARY KEY,
-            availability TEXT NOT NULL,
-            activity TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+        CREATE INDEX IF NOT EXISTS idx_contacts_display_name
+            ON contacts(display_name COLLATE NOCASE ASC);
+
+        CREATE TABLE IF NOT EXISTS todo_lists (
+            id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            wellknown_list_name TEXT,
+            is_owner INTEGER NOT NULL DEFAULT 1,
+            is_shared INTEGER NOT NULL DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS todo_tasks (
+            id TEXT PRIMARY KEY,
+            list_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL,
+            importance TEXT NOT NULL,
+            body_plain TEXT,
+            due_date_iso TEXT,
+            reminder_iso TEXT,
+            completed_at TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_todo_tasks_list_status
+            ON todo_tasks(list_id, status);
 
         CREATE TABLE IF NOT EXISTS sync_cursors (
             scope_key TEXT PRIMARY KEY,
             delta_link TEXT,
-            oldest_msg_ts TEXT,
-            synced_at TEXT NOT NULL
+            history_next_link TEXT,
+            last_synced_at TEXT NOT NULL
         );
         ",
     )
-    .context("Failed to create base SQLite schema")?;
+    .context("Failed to create Outlook SQLite schema")?;
 
-    let has_mentions_col: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('messages') WHERE name = 'has_mentions')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-    if !has_mentions_col {
-        conn.execute_batch(
-            "
-            ALTER TABLE messages ADD COLUMN has_mentions INTEGER NOT NULL DEFAULT 0;
-            UPDATE messages SET has_mentions = 1 WHERE mentions_json != '[]' AND mentions_json != '';
-            ",
-        )
-        .context("Failed to migrate messages.has_mentions column")?;
-    }
+    migrate_legacy_outlook_columns(conn)?;
+
     conn.execute_batch(
         "
-        CREATE INDEX IF NOT EXISTS idx_messages_has_mentions
-            ON messages(created_at DESC, msg_id DESC)
-            WHERE deleted = 0 AND has_mentions = 1;
+        CREATE INDEX IF NOT EXISTS idx_mail_messages_folder_received
+            ON mail_messages(folder_id, received_at DESC, id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_mail_messages_received
+            ON mail_messages(received_at DESC, id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_mail_messages_conv
+            ON mail_messages(conversation_id, received_at DESC);
         ",
     )
-    .context("Failed to create idx_messages_has_mentions index")?;
+    .context("Failed to create mail_messages indexes")?;
 
-    let messages_trigram = ensure_fts5_table(
+    let mail_trigram = ensure_fts5_table(
         conn,
-        "messages_fts",
+        "mail_fts",
         "
-        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-            msg_key UNINDEXED,
-            conv_key UNINDEXED,
-            author_name,
-            body_plain,
+        CREATE VIRTUAL TABLE IF NOT EXISTS mail_fts USING fts5(
+            msg_id UNINDEXED,
+            folder_id UNINDEXED,
             subject,
+            from_display,
+            body_plain,
             tokenize='trigram'
         );
         ",
         "
-        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-            msg_key UNINDEXED,
-            conv_key UNINDEXED,
-            author_name,
-            body_plain,
+        CREATE VIRTUAL TABLE IF NOT EXISTS mail_fts USING fts5(
+            msg_id UNINDEXED,
+            folder_id UNINDEXED,
             subject,
+            from_display,
+            body_plain,
             tokenize='unicode61'
         );
         ",
     )?;
 
     if !is_memory {
-        let version = if messages_trigram {
+        // Align FTS rowids with mail_messages.rowid when upgrading from pre-v60 schemas.
+        let prev_ver: i32 = conn
+            .query_row("PRAGMA user_version;", [], |row| row.get(0))
+            .unwrap_or(0);
+        if prev_ver > 0 && prev_ver < SCHEMA_USER_VERSION_UNICODE61 {
+            conn.execute_batch(
+                "
+                DELETE FROM mail_fts;
+                INSERT INTO mail_fts(rowid, msg_id, folder_id, subject, from_display, body_plain)
+                SELECT rowid, id, COALESCE(folder_id, ''), subject, from_display, body_plain
+                FROM mail_messages;
+                ",
+            )
+            .context("Failed to rebuild mail_fts rowids during upgrade")?;
+        }
+
+        let version = if mail_trigram {
             SCHEMA_USER_VERSION_TRIGRAM
         } else {
             SCHEMA_USER_VERSION_UNICODE61
@@ -230,7 +263,45 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             .context("Failed to set SQLite user_version")?;
     }
 
-    Ok(messages_trigram)
+    Ok(mail_trigram)
+}
+
+fn table_exists(conn: &Connection, table_name: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table_name],
+        |row| row.get(0),
+    )
+    .unwrap_or(false)
+}
+
+fn column_exists(conn: &Connection, table_name: &str, col_name: &str) -> bool {
+    let sql = format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table_name}') WHERE name = ?1)");
+    conn.query_row(&sql, [col_name], |row| row.get(0))
+        .unwrap_or(false)
+}
+
+fn migrate_legacy_outlook_columns(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "mail_folders", "child_folder_count") {
+        conn.execute_batch(
+            "ALTER TABLE mail_folders ADD COLUMN child_folder_count INTEGER NOT NULL DEFAULT 0;",
+        )
+        .context("Failed to migrate mail_folders.child_folder_count")?;
+    }
+    let mail_migrations = [
+        ("internet_message_id", "ALTER TABLE mail_messages ADD COLUMN internet_message_id TEXT;"),
+        ("reply_to_json", "ALTER TABLE mail_messages ADD COLUMN reply_to_json TEXT NOT NULL DEFAULT '[]';"),
+        ("inference_classification", "ALTER TABLE mail_messages ADD COLUMN inference_classification TEXT;"),
+        ("body_loaded", "ALTER TABLE mail_messages ADD COLUMN body_loaded INTEGER NOT NULL DEFAULT 0;"),
+        ("meeting_request_json", "ALTER TABLE mail_messages ADD COLUMN meeting_request_json TEXT;"),
+    ];
+    for (col, ddl) in mail_migrations {
+        if !column_exists(conn, "mail_messages", col) {
+            conn.execute_batch(ddl)
+                .with_context(|| format!("Failed to migrate mail_messages.{col}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Configures a read-only WAL reader connection for concurrent UI reads.
@@ -261,8 +332,9 @@ fn ensure_fts5_table(
     unicode61_sql: &str,
 ) -> Result<bool> {
     if conn.execute_batch(trigram_sql).is_err() {
-        conn.execute_batch(unicode61_sql)
-            .with_context(|| format!("Failed to create FTS5 virtual table ({table_name}, unicode61)"))?;
+        conn.execute_batch(unicode61_sql).with_context(|| {
+            format!("Failed to create FTS5 virtual table ({table_name}, unicode61)")
+        })?;
         return Ok(false);
     }
 
@@ -284,14 +356,13 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    const LEGACY_TABLES: &[&str] = &[
-        "mail_fts",
-        "mail_messages",
-        "mail_folders",
-        "calendar_events",
-        "contacts",
-        "todo_tasks",
-        "todo_lists",
+    const LEGACY_TEAMS_ONENOTE_TABLES: &[&str] = &[
+        "conversations",
+        "teams",
+        "messages",
+        "messages_fts",
+        "members",
+        "presences",
         "onenote_fts",
         "onenote_page_details",
         "onenote_pages",
@@ -300,30 +371,11 @@ mod tests {
         "onenote_notebooks",
     ];
 
-    fn table_exists(conn: &Connection, name: &str) -> bool {
-        conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
-            [name],
-            |row| row.get(0),
-        )
-        .unwrap()
-    }
-
-    fn index_exists(conn: &Connection, name: &str) -> bool {
-        conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
-            [name],
-            |row| row.get(0),
-        )
-        .unwrap()
-    }
-
     #[test]
-    fn test_pure_teams_schema_and_user_version_fast_path() {
+    fn test_pure_outlook_schema_and_user_version_fast_path() {
         let dir = tempdir().unwrap();
-        let db_path = dir.path().join("fastpath.db");
+        let db_path = dir.path().join("outlook_fastpath.db");
 
-        // First open initializes pure-Teams schema and stamps user_version
         let first_trigram = {
             let conn = Connection::open(&db_path).unwrap();
             let trigram = init_connection(&conn, false).unwrap();
@@ -338,48 +390,27 @@ mod tests {
                     SCHEMA_USER_VERSION_UNICODE61
                 }
             );
-            let cache_size: i32 = conn
-                .query_row("PRAGMA cache_size;", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(cache_size, -8000);
-
             for required in [
-                "conversations",
-                "teams",
-                "messages",
-                "members",
-                "presences",
+                "mail_folders",
+                "mail_messages",
+                "mail_fts",
+                "calendar_events",
+                "contacts",
+                "todo_lists",
+                "todo_tasks",
                 "sync_cursors",
-                "messages_fts",
             ] {
                 assert!(table_exists(&conn, required), "{required} should exist");
             }
-            assert!(index_exists(&conn, "idx_messages_conv_root_created_id"));
-            for legacy in LEGACY_TABLES {
-                assert!(
-                    !table_exists(&conn, legacy),
-                    "legacy table {legacy} must not exist"
-                );
+            for legacy in LEGACY_TEAMS_ONENOTE_TABLES {
+                assert!(!table_exists(&conn, legacy), "legacy {legacy} must not exist");
             }
             trigram
         };
 
-        // Second open takes user_version fast-path and preserves trigram_enabled
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            let second_trigram = init_connection(&conn, false).unwrap();
-            assert_eq!(second_trigram, first_trigram);
+        let conn2 = Connection::open(&db_path).unwrap();
+        assert_eq!(init_connection(&conn2, false).unwrap(), first_trigram);
 
-            // Force unicode61 user_version stamp and verify fast-path returns false without running DDL
-            conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_USER_VERSION_UNICODE61};"))
-                .unwrap();
-        }
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            assert!(!init_connection(&conn, false).unwrap());
-        }
-
-        // Reader connection uses -4000 cache cap
         let reader = Connection::open_with_flags(
             &db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -393,182 +424,33 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_outlook_onenote_tables_dropped_on_upgrade() {
+    fn test_drops_legacy_teams_and_onenote_tables_on_upgrade() {
         let dir = tempdir().unwrap();
-        let db_path = dir.path().join("legacy_v41.db");
-
+        let db_path = dir.path().join("legacy_teams.db");
         {
             let conn = Connection::open(&db_path).unwrap();
             conn.execute_batch(
                 "
-                CREATE TABLE conversations (
-                    conv_key TEXT PRIMARY KEY,
-                    target_json TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    team_id TEXT,
-                    team_name TEXT,
-                    title TEXT NOT NULL,
-                    topic TEXT,
-                    unread_count INTEGER NOT NULL DEFAULT 0,
-                    last_read_at TEXT,
-                    last_msg_id TEXT,
-                    last_msg_author TEXT,
-                    last_msg_preview TEXT,
-                    last_updated_at TEXT,
-                    pinned INTEGER NOT NULL DEFAULT 0,
-                    peer_user_id TEXT,
-                    web_url TEXT
-                );
-                INSERT INTO conversations (conv_key, target_json, kind, title)
-                VALUES ('chat:c1', '{\"target_type\":\"chat\",\"chat_id\":\"c1\"}', 'oneOnOne', 'Alice');
-
-                CREATE TABLE mail_folders (id TEXT PRIMARY KEY);
-                CREATE TABLE mail_messages (id TEXT PRIMARY KEY);
-                CREATE VIRTUAL TABLE mail_fts USING fts5(msg_id UNINDEXED, body_plain);
-                CREATE TABLE calendar_events (id TEXT PRIMARY KEY);
-                CREATE TABLE contacts (id TEXT PRIMARY KEY);
-                CREATE TABLE todo_lists (id TEXT PRIMARY KEY);
-                CREATE TABLE todo_tasks (id TEXT PRIMARY KEY);
+                CREATE TABLE conversations (conv_key TEXT PRIMARY KEY);
+                CREATE TABLE teams (team_id TEXT PRIMARY KEY);
+                CREATE TABLE messages (msg_key TEXT PRIMARY KEY);
+                CREATE VIRTUAL TABLE messages_fts USING fts5(msg_key UNINDEXED, body_plain);
+                CREATE TABLE members (conv_key TEXT, user_id TEXT);
+                CREATE TABLE presences (user_id TEXT PRIMARY KEY);
                 CREATE TABLE onenote_notebooks (notebook_key TEXT PRIMARY KEY);
-                CREATE TABLE onenote_section_groups (section_group_key TEXT PRIMARY KEY);
-                CREATE TABLE onenote_sections (section_key TEXT PRIMARY KEY);
-                CREATE TABLE onenote_pages (page_key TEXT PRIMARY KEY);
-                CREATE TABLE onenote_page_details (page_key TEXT PRIMARY KEY);
-                CREATE VIRTUAL TABLE onenote_fts USING fts5(page_key UNINDEXED, body_plain);
-                PRAGMA user_version = 41;
-                ",
-            )
-            .unwrap();
-            for legacy in LEGACY_TABLES {
-                assert!(table_exists(&conn, legacy), "setup expected {legacy}");
-            }
-        }
-
-        // Upgrade via init_connection drops all legacy tables while keeping Teams data intact
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            let trigram = init_connection(&conn, false).unwrap();
-            let ver: i32 = conn
-                .query_row("PRAGMA user_version;", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(
-                ver,
-                if trigram {
-                    SCHEMA_USER_VERSION_TRIGRAM
-                } else {
-                    SCHEMA_USER_VERSION_UNICODE61
-                }
-            );
-            for legacy in LEGACY_TABLES {
-                assert!(
-                    !table_exists(&conn, legacy),
-                    "legacy table {legacy} should have been dropped on upgrade"
-                );
-            }
-            assert!(index_exists(&conn, "idx_messages_conv_root_created_id"));
-            let title: String = conn
-                .query_row(
-                    "SELECT title FROM conversations WHERE conv_key = 'chat:c1'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(title, "Alice");
-        }
-    }
-
-    #[test]
-    fn test_v51_migration_adds_has_mentions_and_aligns_indexes() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("v51_upgrade.db");
-
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "
-                CREATE TABLE conversations (
-                    conv_key TEXT PRIMARY KEY,
-                    target_json TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    team_id TEXT,
-                    team_name TEXT,
-                    title TEXT NOT NULL,
-                    topic TEXT,
-                    unread_count INTEGER NOT NULL DEFAULT 0,
-                    last_read_at TEXT,
-                    last_msg_id TEXT,
-                    last_msg_author TEXT,
-                    last_msg_preview TEXT,
-                    last_updated_at TEXT,
-                    pinned INTEGER NOT NULL DEFAULT 0,
-                    peer_user_id TEXT,
-                    web_url TEXT
-                );
-                CREATE INDEX idx_conversations_sort ON conversations(pinned DESC, last_updated_at DESC);
-                CREATE TABLE messages (
-                    msg_key TEXT PRIMARY KEY,
-                    conv_key TEXT NOT NULL,
-                    msg_id TEXT NOT NULL,
-                    parent_msg_id TEXT,
-                    reply_to_id TEXT,
-                    reply_to_author TEXT,
-                    reply_to_preview TEXT,
-                    subject TEXT,
-                    author_id TEXT,
-                    author_name TEXT NOT NULL,
-                    is_me INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    last_modified_at TEXT,
-                    deleted INTEGER NOT NULL DEFAULT 0,
-                    importance TEXT NOT NULL,
-                    message_type TEXT NOT NULL,
-                    body_html TEXT NOT NULL,
-                    body_plain TEXT NOT NULL,
-                    attachments_json TEXT NOT NULL,
-                    mentions_json TEXT NOT NULL,
-                    reactions_json TEXT NOT NULL,
-                    reply_count INTEGER NOT NULL DEFAULT 0,
-                    web_url TEXT
-                );
-                CREATE INDEX idx_messages_conv_parent_created ON messages(conv_key, parent_msg_id, created_at);
-                INSERT INTO messages (
-                    msg_key, conv_key, msg_id, author_name, created_at, importance,
-                    message_type, body_html, body_plain, attachments_json, mentions_json, reactions_json
-                ) VALUES
-                    ('chat:c1|m1', 'chat:c1', 'm1', 'Alice', '2026-11-15T10:00:00Z', 'normal', 'message', '<p>hi</p>', 'hi', '[]', '[{\"id\":0,\"user_id\":\"u1\",\"display_name\":\"Bob\"}]', '[]'),
-                    ('chat:c1|m2', 'chat:c1', 'm2', 'Bob', '2026-11-15T10:01:00Z', 'normal', 'message', '<p>yo</p>', 'yo', '[]', '[]', '[]');
-                PRAGMA user_version = 51;
+                CREATE TABLE sync_cursors (scope_key TEXT PRIMARY KEY, delta_link TEXT, oldest_msg_ts TEXT, synced_at TEXT NOT NULL);
+                PRAGMA user_version = 53;
                 ",
             )
             .unwrap();
         }
 
         let conn = Connection::open(&db_path).unwrap();
-        let trigram = init_connection(&conn, false).unwrap();
-        let ver: i32 = conn
-            .query_row("PRAGMA user_version;", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(
-            ver,
-            if trigram {
-                SCHEMA_USER_VERSION_TRIGRAM
-            } else {
-                SCHEMA_USER_VERSION_UNICODE61
-            }
-        );
-
-        assert!(index_exists(&conn, "idx_messages_has_mentions"));
-        assert!(index_exists(&conn, "idx_conversations_sort_v2"));
-        assert!(!index_exists(&conn, "idx_conversations_sort"));
-        assert!(!index_exists(&conn, "idx_messages_conv_parent_created"));
-
-        let hm1: i32 = conn
-            .query_row("SELECT has_mentions FROM messages WHERE msg_key = 'chat:c1|m1'", [], |r| r.get(0))
-            .unwrap();
-        let hm2: i32 = conn
-            .query_row("SELECT has_mentions FROM messages WHERE msg_key = 'chat:c1|m2'", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(hm1, 1);
-        assert_eq!(hm2, 0);
+        init_connection(&conn, false).unwrap();
+        for legacy in LEGACY_TEAMS_ONENOTE_TABLES {
+            assert!(!table_exists(&conn, legacy));
+        }
+        assert!(column_exists(&conn, "sync_cursors", "history_next_link"));
+        assert!(column_exists(&conn, "mail_messages", "body_loaded"));
     }
 }

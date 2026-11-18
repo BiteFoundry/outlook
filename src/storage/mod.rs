@@ -1,11 +1,10 @@
-//! Local SQLite WAL persistence + FTS5 (`trigram` + `LIKE` hybrid) search repository.
+//! Local SQLite WAL persistence + 4-reader pool + FTS5 (`trigram` + `LIKE` hybrid) search repository.
 
 pub mod db;
-pub mod repo;
+pub mod outlook;
 pub mod search;
 
 use std::{
-    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -13,8 +12,8 @@ use std::{
 use anyhow::Result;
 
 use crate::models::{
-    ConversationSummary, MemberInfo, MessageItem, PresenceStatus, SearchHit, SyncCursor,
-    TeamSummary, ThreadView,
+    CalendarEvent, ContactItem, MailFolder, MailMessage, MailSearchHit, SyncCursor, TodoList,
+    TodoTask,
 };
 
 const MAX_READER_POOL_SIZE: usize = 4;
@@ -22,7 +21,7 @@ const MAX_READER_POOL_SIZE: usize = 4;
 #[derive(Clone)]
 pub struct Storage {
     path: PathBuf,
-    conn: Arc<Mutex<rusqlite::Connection>>,
+    writer: Arc<Mutex<rusqlite::Connection>>,
     readers: Option<Arc<Mutex<Vec<rusqlite::Connection>>>>,
     trigram_enabled: bool,
 }
@@ -71,7 +70,7 @@ impl Storage {
         let trigram_enabled = db::init_connection(&conn, false)?;
         Ok(Self {
             path: path.to_path_buf(),
-            conn: Arc::new(Mutex::new(conn)),
+            writer: Arc::new(Mutex::new(conn)),
             readers: Some(Arc::new(Mutex::new(Vec::with_capacity(
                 MAX_READER_POOL_SIZE,
             )))),
@@ -84,7 +83,7 @@ impl Storage {
         let trigram_enabled = db::init_connection(&conn, true)?;
         Ok(Self {
             path: PathBuf::from(":memory:"),
-            conn: Arc::new(Mutex::new(conn)),
+            writer: Arc::new(Mutex::new(conn)),
             readers: None,
             trigram_enabled,
         })
@@ -98,7 +97,7 @@ impl Storage {
         db::init_reader_connection(&conn)?;
         let trigram_enabled: bool = conn
             .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'",
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mail_fts'",
                 [],
                 |row| row.get::<_, String>(0),
             )
@@ -106,7 +105,7 @@ impl Storage {
             .unwrap_or(false);
         Ok(Self {
             path: path.to_path_buf(),
-            conn: Arc::new(Mutex::new(conn)),
+            writer: Arc::new(Mutex::new(conn)),
             readers: None,
             trigram_enabled,
         })
@@ -117,7 +116,7 @@ impl Storage {
     }
 
     pub fn conn(&self) -> &Arc<Mutex<rusqlite::Connection>> {
-        &self.conn
+        &self.writer
     }
 
     pub fn trigram_enabled(&self) -> bool {
@@ -126,7 +125,7 @@ impl Storage {
 
     /// Releases unused SQLite page-cache memory back to the OS (`PRAGMA shrink_memory`) and runs `PRAGMA optimize`.
     pub fn shrink_memory(&self) {
-        if let Ok(conn) = self.conn.lock() {
+        if let Ok(conn) = self.writer.lock() {
             let _ = conn.execute_batch("PRAGMA optimize;");
             db::shrink_connection_memory(&conn);
         }
@@ -140,7 +139,7 @@ impl Storage {
     }
 
     fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>> {
-        self.conn
+        self.writer
             .lock()
             .map_err(|_| anyhow::anyhow!("Failed to acquire SQLite connection lock (poisoned mutex)"))
     }
@@ -172,570 +171,426 @@ impl Storage {
         }
     }
 
-    // --- Conversations & Teams ---
-    pub fn upsert_conversations(&self, items: &[ConversationSummary]) -> Result<()> {
+    // --- Mail ---
+
+    pub fn upsert_mail_folders(&self, folders: &[MailFolder]) -> Result<()> {
         let mut conn = self.lock_conn()?;
-        repo::upsert_conversations(&mut conn, items)
+        outlook::upsert_mail_folders(&mut conn, folders)
     }
 
-    pub fn upsert_teams(&self, teams: &[TeamSummary]) -> Result<()> {
+    pub fn list_mail_folders(&self) -> Result<Vec<MailFolder>> {
+        let conn = self.read_conn()?;
+        outlook::list_mail_folders(&conn)
+    }
+
+    pub fn find_well_known_folder_id(&self, well_known: &str) -> Result<Option<String>> {
+        let conn = self.read_conn()?;
+        outlook::find_well_known_folder_id(&conn, well_known)
+    }
+
+    pub fn upsert_mail_messages(&self, msgs: &[MailMessage]) -> Result<usize> {
         let mut conn = self.lock_conn()?;
-        repo::upsert_teams(&mut conn, teams)
+        outlook::upsert_mail_messages(&mut conn, msgs)
     }
 
-    pub fn list_conversations(&self) -> Result<Vec<ConversationSummary>> {
+    pub fn list_mail_messages(
+        &self,
+        folder_id: Option<&str>,
+        unread_only: bool,
+        flagged_only: bool,
+        focused_only: bool,
+        limit: usize,
+    ) -> Result<Vec<MailMessage>> {
         let conn = self.read_conn()?;
-        repo::list_conversations(&conn)
+        outlook::list_mail_messages(&conn, folder_id, unread_only, flagged_only, focused_only, limit)
     }
 
-    pub fn list_teams(&self) -> Result<Vec<TeamSummary>> {
+    pub fn list_mail_summaries(
+        &self,
+        folder_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MailMessage>> {
         let conn = self.read_conn()?;
-        repo::list_teams(&conn)
+        outlook::list_mail_summaries(&conn, folder_id, limit)
     }
 
-    pub fn get_conversation(&self, conv_key: &str) -> Result<Option<ConversationSummary>> {
+    pub fn get_mail_message(&self, id: &str) -> Result<Option<MailMessage>> {
         let conn = self.read_conn()?;
-        repo::get_conversation(&conn, conv_key)
+        outlook::get_mail_message(&conn, id)
     }
 
-    pub fn mark_conversation_read(&self, conv_key: &str, read_at: &str) -> Result<()> {
+    pub fn set_mail_read_local(&self, id: &str, is_read: bool) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        outlook::set_mail_read_local(&mut conn, id, is_read)
+    }
+
+    pub fn set_mail_flagged_local(&self, id: &str, flagged: bool) -> Result<()> {
         let conn = self.lock_conn()?;
-        repo::mark_conversation_read(&conn, conv_key, read_at)
+        outlook::set_mail_flagged_local(&conn, id, flagged)
     }
 
-    // --- Messages & Threads ---
-    pub fn upsert_messages(&self, messages: &[MessageItem]) -> Result<usize> {
+    pub fn move_mail_folder_local(&self, id: &str, target_folder_id: &str) -> Result<()> {
         let mut conn = self.lock_conn()?;
-        repo::upsert_messages(&mut conn, messages)
+        outlook::move_mail_folder_local(&mut conn, id, target_folder_id)
     }
 
-    /// Lists root messages in chronological order (oldest first, newest last), limited to newest `limit`.
-    pub fn list_root_messages(
-        &self,
-        conv_key: &str,
-        limit: usize,
-        before_created_at: Option<&str>,
-    ) -> Result<Vec<MessageItem>> {
-        let conn = self.read_conn()?;
-        repo::list_root_messages(&conn, conv_key, limit, before_created_at)
-    }
-
-    pub fn list_thread_replies(
-        &self,
-        conv_key: &str,
-        root_msg_id: &str,
-        limit: usize,
-    ) -> Result<Vec<MessageItem>> {
-        let conn = self.read_conn()?;
-        repo::list_thread_replies(&conn, conv_key, root_msg_id, limit)
-    }
-
-    pub fn get_message(&self, conv_key: &str, msg_id: &str) -> Result<Option<MessageItem>> {
-        let conn = self.read_conn()?;
-        repo::get_message(&conn, conv_key, msg_id)
-    }
-
-    pub fn get_thread(
-        &self,
-        conv_key: &str,
-        root_msg_id: &str,
-        limit: usize,
-    ) -> Result<Option<ThreadView>> {
-        let conn = self.read_conn()?;
-        repo::get_thread(&conn, conv_key, root_msg_id, limit)
-    }
-
-    /// Lists messages across all conversations where `@me` is mentioned.
-    pub fn list_mentions_for_user(
-        &self,
-        my_user_id: &str,
-        limit: usize,
-    ) -> Result<Vec<MessageItem>> {
-        let conn = self.read_conn()?;
-        repo::list_mentions_for_user(&conn, my_user_id, limit)
-    }
-
-    // --- Members & Presence ---
-    pub fn upsert_members(&self, conv_key: &str, members: &[MemberInfo]) -> Result<()> {
+    pub fn delete_mail_messages_by_ids(&self, ids: &[String]) -> Result<()> {
         let mut conn = self.lock_conn()?;
-        repo::upsert_members(&mut conn, conv_key, members)
+        outlook::delete_mail_messages_by_ids(&mut conn, ids)
     }
 
-    pub fn list_members(&self, conv_key: &str) -> Result<Vec<MemberInfo>> {
-        let conn = self.read_conn()?;
-        repo::list_members(&conn, conv_key)
-    }
-
-    pub fn upsert_presences(&self, presences: &[PresenceStatus]) -> Result<()> {
-        let mut conn = self.lock_conn()?;
-        repo::upsert_presences(&mut conn, presences)
-    }
-
-    pub fn get_presences(&self) -> Result<HashMap<String, PresenceStatus>> {
-        let conn = self.read_conn()?;
-        repo::get_presences(&conn)
-    }
-
-    // --- Search & Sync Cursors ---
-    pub fn search_messages(
+    pub fn search_mail(
         &self,
         query: &str,
-        conv_key_filter: Option<&str>,
+        folder_id: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<SearchHit>> {
+    ) -> Result<Vec<MailSearchHit>> {
         let conn = self.read_conn()?;
-        search::search_messages(&conn, query, conv_key_filter, limit)
+        search::search_mail(&conn, query, folder_id, limit, self.trigram_enabled)
     }
 
-    /// Lists older root messages strictly preceding `(before_created_at, before_msg_id)` in chronological order (oldest first).
-    pub fn list_older_root_messages(
-        &self,
-        conv_key: &str,
-        limit: usize,
-        before_created_at: &str,
-        before_msg_id: Option<&str>,
-    ) -> Result<Vec<MessageItem>> {
-        let conn = self.read_conn()?;
-        repo::list_older_root_messages(&conn, conv_key, limit, before_created_at, before_msg_id)
+    // --- Calendar ---
+
+    pub fn upsert_calendar_events(&self, events: &[CalendarEvent]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        outlook::upsert_calendar_events(&mut conn, events)
     }
+
+    pub fn list_calendar_events(
+        &self,
+        start_iso: Option<&str>,
+        end_iso: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CalendarEvent>> {
+        let conn = self.read_conn()?;
+        outlook::list_calendar_events(&conn, start_iso, end_iso, limit)
+    }
+
+    pub fn get_calendar_event(&self, id: &str) -> Result<Option<CalendarEvent>> {
+        let conn = self.read_conn()?;
+        outlook::get_calendar_event(&conn, id)
+    }
+
+    pub fn update_event_response_local(&self, id: &str, response_status: &str) -> Result<()> {
+        let conn = self.lock_conn()?;
+        outlook::update_event_response_local(&conn, id, response_status)
+    }
+
+    pub fn delete_calendar_event(&self, id: &str) -> Result<()> {
+        let conn = self.lock_conn()?;
+        outlook::delete_calendar_event(&conn, id)
+    }
+
+    pub fn delete_calendar_events_by_ids(&self, ids: &[String]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        outlook::delete_calendar_events_by_ids(&mut conn, ids)
+    }
+
+    // --- Contacts ---
+
+    pub fn upsert_contacts(&self, contacts: &[ContactItem]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        outlook::upsert_contacts(&mut conn, contacts)
+    }
+
+    pub fn list_contacts(&self, query: Option<&str>, limit: usize) -> Result<Vec<ContactItem>> {
+        let conn = self.read_conn()?;
+        outlook::list_contacts(&conn, query, limit)
+    }
+
+    pub fn delete_contact(&self, id: &str) -> Result<()> {
+        let conn = self.lock_conn()?;
+        outlook::delete_contact(&conn, id)
+    }
+
+    // --- To Do ---
+
+    pub fn upsert_todo_lists(&self, lists: &[TodoList]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        outlook::upsert_todo_lists(&mut conn, lists)
+    }
+
+    pub fn list_todo_lists(&self) -> Result<Vec<TodoList>> {
+        let conn = self.read_conn()?;
+        outlook::list_todo_lists(&conn)
+    }
+
+    pub fn upsert_todo_tasks(&self, tasks: &[TodoTask]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        outlook::upsert_todo_tasks(&mut conn, tasks)
+    }
+
+    pub fn list_todo_tasks(
+        &self,
+        list_id: Option<&str>,
+        include_completed: bool,
+    ) -> Result<Vec<TodoTask>> {
+        let conn = self.read_conn()?;
+        outlook::list_todo_tasks(&conn, list_id, include_completed)
+    }
+
+    pub fn set_todo_task_completed_local(&self, task_id: &str, completed: bool) -> Result<()> {
+        let conn = self.lock_conn()?;
+        outlook::set_todo_task_completed_local(&conn, task_id, completed)
+    }
+
+    pub fn delete_todo_task(&self, task_id: &str) -> Result<()> {
+        let conn = self.lock_conn()?;
+        outlook::delete_todo_task(&conn, task_id)
+    }
+
+    // --- Sync Cursors ---
 
     pub fn get_sync_cursor(&self, scope_key: &str) -> Result<Option<SyncCursor>> {
         let conn = self.read_conn()?;
-        repo::get_sync_cursor(&conn, scope_key)
+        outlook::get_sync_cursor(&conn, scope_key)
+    }
+
+    pub fn upsert_sync_cursor(&self, cursor: &SyncCursor) -> Result<()> {
+        let conn = self.lock_conn()?;
+        outlook::upsert_sync_cursor(&conn, cursor)
     }
 
     pub fn save_sync_cursor(&self, cursor: &SyncCursor) -> Result<()> {
-        let conn = self.lock_conn()?;
-        repo::save_sync_cursor(&conn, cursor)
+        self.upsert_sync_cursor(cursor)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ChannelSummary, ConversationKind, ConversationTarget, MentionInfo};
+    use crate::models::{EmailRecipient, EventAttendee, MailAttachment};
 
-    fn sample_chat(id: &str, title: &str, pinned: bool, updated: Option<&str>) -> ConversationSummary {
-        let target = ConversationTarget::Chat {
-            chat_id: id.to_string(),
-        };
-        ConversationSummary {
-            conv_key: target.conv_key(),
-            target,
-            kind: ConversationKind::OneOnOne,
-            team_id: None,
-            team_name: None,
-            title: title.to_string(),
-            topic: None,
-            unread_count: 2,
-            last_read_at: None,
-            last_msg_id: None,
-            last_msg_author: None,
-            last_msg_preview: None,
-            last_updated_at: updated.map(str::to_string),
-            pinned,
-            peer_user_id: Some(format!("user-{id}")),
-            web_url: None,
-        }
-    }
-
-    fn sample_msg(
-        conv_key: &str,
-        msg_id: &str,
-        parent_msg_id: Option<&str>,
-        author: &str,
+    fn sample_mail(
+        id: &str,
+        folder_id: &str,
+        subject: &str,
+        from_name: &str,
+        from_addr: &str,
+        received_at: &str,
+        body_loaded: bool,
+        body_html: &str,
         body_plain: &str,
-        subject: Option<&str>,
-        created_at: &str,
-    ) -> MessageItem {
-        MessageItem {
-            msg_key: MessageItem::make_msg_key(conv_key, msg_id),
-            conv_key: conv_key.to_string(),
-            msg_id: msg_id.to_string(),
-            parent_msg_id: parent_msg_id.map(str::to_string),
-            reply_to_id: None,
-            reply_to_author: None,
-            reply_to_preview: None,
-            subject: subject.map(str::to_string),
-            author_id: Some("u1".to_string()),
-            author_name: author.to_string(),
-            is_me: false,
-            created_at: created_at.to_string(),
-            last_modified_at: None,
-            deleted: false,
+    ) -> MailMessage {
+        MailMessage {
+            id: id.to_string(),
+            internet_message_id: Some(format!("<{id}@example.com>")),
+            conversation_id: Some(format!("conv-{id}")),
+            folder_id: Some(folder_id.to_string()),
+            subject: subject.to_string(),
+            from: Some(EmailRecipient {
+                name: Some(from_name.to_string()),
+                address: from_addr.to_string(),
+            }),
+            to_recipients: vec![EmailRecipient {
+                name: Some("Me".to_string()),
+                address: "me@example.com".to_string(),
+            }],
+            cc_recipients: Vec::new(),
+            bcc_recipients: Vec::new(),
+            reply_to: Vec::new(),
+            received_at: received_at.to_string(),
+            sent_at: Some(received_at.to_string()),
+            is_read: false,
+            is_draft: false,
+            flagged: false,
             importance: "normal".to_string(),
-            message_type: "message".to_string(),
-            body_html: format!("<p>{body_plain}</p>"),
+            inference_classification: Some("focused".to_string()),
+            has_attachments: false,
+            body_loaded,
+            preview: body_plain.chars().take(40).collect(),
+            body_html: body_html.to_string(),
             body_plain: body_plain.to_string(),
             attachments: Vec::new(),
-            mentions: Vec::new(),
-            reactions: Vec::new(),
-            reply_count: 0,
-            web_url: None,
+            meeting_request: None,
+            web_link: Some(format!("https://outlook.office.com/mail/{id}")),
         }
     }
 
     #[test]
-    fn test_teams_upsert_preserves_existing_channel_state() {
+    fn test_header_first_upsert_preserves_hydrated_body_and_fts5_search() {
         let storage = Storage::open_in_memory().unwrap();
-        let ch = ChannelSummary {
-            id: "ch-1".to_string(),
-            team_id: "team-1".to_string(),
-            team_name: "Engineering".to_string(),
-            display_name: "General".to_string(),
-            description: Some("General channel".to_string()),
-            membership_type: "standard".to_string(),
-            web_url: None,
-        };
-        let conv_key = ch.conv_key();
-
-        let existing = ConversationSummary {
-            conv_key: conv_key.clone(),
-            target: ch.target(),
-            kind: ConversationKind::Channel,
-            team_id: Some("team-1".to_string()),
-            team_name: Some("Engineering".to_string()),
-            title: "General".to_string(),
-            topic: None,
-            unread_count: 7,
-            last_read_at: Some("2026-11-01T00:00:00Z".to_string()),
-            last_msg_id: Some("m-10".to_string()),
-            last_msg_author: Some("Bob".to_string()),
-            last_msg_preview: Some("Deploy complete".to_string()),
-            last_updated_at: Some("2026-11-02T10:00:00Z".to_string()),
-            pinned: true,
-            peer_user_id: None,
-            web_url: None,
-        };
-        storage.upsert_conversations(&[existing]).unwrap();
-
-        let team = TeamSummary {
-            id: "team-1".to_string(),
-            display_name: "Engineering".to_string(),
-            description: Some("Team description".to_string()),
-            channels: vec![ChannelSummary {
-                display_name: "General-Renamed".to_string(),
-                ..ch
-            }],
-        };
-        storage.upsert_teams(&[team]).unwrap();
-
-        let loaded = storage.get_conversation(&conv_key).unwrap().unwrap();
-        assert_eq!(loaded.title, "General-Renamed");
-        assert_eq!(loaded.unread_count, 7);
-        assert_eq!(loaded.last_msg_id.as_deref(), Some("m-10"));
-        assert!(loaded.pinned);
-    }
-
-    #[test]
-    fn test_conversation_ordering_and_mark_read() {
-        let storage = Storage::open_in_memory().unwrap();
-        let c1 = sample_chat("c1", "Charlie", false, Some("2026-11-15T10:00:00Z"));
-        let c2 = sample_chat("c2", "Alice", true, Some("2026-11-14T10:00:00Z"));
-        let c3 = sample_chat("c3", "Bob", false, Some("2026-11-15T12:00:00Z"));
-        storage.upsert_conversations(&[c1, c2, c3]).unwrap();
-
-        let list = storage.list_conversations().unwrap();
-        assert_eq!(list.len(), 3);
-        assert_eq!(list[0].title, "Alice"); // pinned first
-        assert_eq!(list[1].title, "Bob"); // newer timestamp
-        assert_eq!(list[2].title, "Charlie");
-
         storage
-            .mark_conversation_read("chat:c3", "2026-11-15T12:05:00Z")
+            .upsert_mail_folders(&[
+                MailFolder {
+                    id: "fld-inbox".to_string(),
+                    display_name: "Inbox".to_string(),
+                    well_known_name: Some("inbox".to_string()),
+                    parent_folder_id: None,
+                    child_folder_count: 0,
+                    unread_item_count: 2,
+                    total_item_count: 5,
+                },
+                MailFolder {
+                    id: "fld-archive".to_string(),
+                    display_name: "Archive".to_string(),
+                    well_known_name: Some("archive".to_string()),
+                    parent_folder_id: None,
+                    child_folder_count: 0,
+                    unread_item_count: 0,
+                    total_item_count: 1,
+                },
+            ])
             .unwrap();
-        let c3_after = storage.get_conversation("chat:c3").unwrap().unwrap();
-        assert_eq!(c3_after.unread_count, 0);
+
         assert_eq!(
-            c3_after.last_read_at.as_deref(),
-            Some("2026-11-15T12:05:00Z")
+            storage.find_well_known_folder_id("inbox").unwrap().as_deref(),
+            Some("fld-inbox")
         );
-    }
+        assert_eq!(
+            storage.find_well_known_folder_id("archive").unwrap().as_deref(),
+            Some("fld-archive")
+        );
 
-    #[test]
-    fn test_root_messages_ordering_thread_reply_count_and_last_msg() {
-        let storage = Storage::open_in_memory().unwrap();
-        let team = TeamSummary {
-            id: "t1".to_string(),
-            display_name: "Engineering".to_string(),
-            description: None,
-            channels: vec![ChannelSummary {
-                id: "ch1".to_string(),
-                team_id: "t1".to_string(),
-                team_name: "Engineering".to_string(),
-                display_name: "Deploy".to_string(),
-                description: None,
-                membership_type: "standard".to_string(),
-                web_url: None,
-            }],
-        };
-        storage.upsert_teams(&[team]).unwrap();
-        let conv_key = "chan:t1:ch1";
-
-        let r1 = sample_msg(
-            conv_key,
+        let mut full_msg = sample_mail(
             "m1",
-            None,
-            "Bob",
-            "First root",
-            Some("Announcement"),
-            "2026-11-15T09:00:00Z",
-        );
-        let r2 = sample_msg(
-            conv_key,
-            "m2",
-            None,
-            "Carol",
-            "Second root",
-            None,
-            "2026-11-15T10:00:00Z",
-        );
-        let r3 = sample_msg(
-            conv_key,
-            "m3",
-            None,
-            "Dave",
-            "Third root",
-            None,
-            "2026-11-15T11:00:00Z",
-        );
-        let rep1 = sample_msg(
-            conv_key,
-            "m1-r1",
-            Some("m1"),
+            "fld-inbox",
+            "Q4 Budget Review",
             "Alice",
-            "Reply 1",
-            None,
-            "2026-11-15T11:30:00Z",
+            "alice@example.com",
+            "2026-11-18T10:00:00Z",
+            true,
+            "<p>Full body with Kubernetes rollout details</p>",
+            "Full body with Kubernetes rollout details",
         );
-        let rep2 = sample_msg(
-            conv_key,
-            "m1-r2",
-            Some("m1"),
-            "Bob",
-            "Reply 2",
-            None,
-            "2026-11-15T12:00:00Z",
-        );
+        full_msg.preview = "Full body with...".to_string();
+        full_msg.has_attachments = true;
+        full_msg.attachments = vec![MailAttachment {
+            id: "att-1".to_string(),
+            name: "budget.xlsx".to_string(),
+            content_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                .to_string(),
+            size: 4096,
+            is_inline: false,
+            content_id: None,
+            content_bytes_b64: None,
+        }];
 
-        storage.upsert_messages(&[r1, r2, r3, rep1, rep2]).unwrap();
+        assert_eq!(storage.upsert_mail_messages(&[full_msg.clone()]).unwrap(), 1);
 
-        // Newest 2 root messages, returned oldest-first (m2, m3)
-        let roots = storage.list_root_messages(conv_key, 2, None).unwrap();
-        assert_eq!(roots.len(), 2);
-        assert_eq!(roots[0].msg_id, "m2");
-        assert_eq!(roots[1].msg_id, "m3");
+        // Identical re-upsert returns 0 changed rows and performs 0 SQLite changes.
+        let before_noop = storage.conn().lock().unwrap().total_changes();
+        assert_eq!(storage.upsert_mail_messages(&[full_msg]).unwrap(), 0);
+        assert_eq!(storage.conn().lock().unwrap().total_changes() - before_noop, 0);
 
-        // Pagination before m3 returns m1, m2
-        let older = storage
-            .list_root_messages(conv_key, 10, Some("2026-11-15T11:00:00Z"))
-            .unwrap();
-        assert_eq!(older.len(), 2);
-        assert_eq!(older[0].msg_id, "m1");
-        assert_eq!(older[0].reply_count, 2);
-        assert_eq!(older[1].msg_id, "m2");
-
-        // Thread view
-        let thread = storage.get_thread(conv_key, "m1", 20).unwrap().unwrap();
-        assert_eq!(thread.root.msg_id, "m1");
-        assert_eq!(thread.root.reply_count, 2);
-        assert_eq!(thread.replies.len(), 2);
-        assert_eq!(thread.replies[0].msg_id, "m1-r1");
-        assert_eq!(thread.replies[1].msg_id, "m1-r2");
-
-        // Conversation last_msg updated from newest reply
-        let conv = storage.get_conversation(conv_key).unwrap().unwrap();
-        assert_eq!(conv.last_msg_id.as_deref(), Some("m1-r2"));
-        assert_eq!(conv.last_msg_author.as_deref(), Some("Bob"));
-        assert_eq!(conv.last_msg_preview.as_deref(), Some("Reply 2"));
-    }
-
-    #[test]
-    fn test_fts5_trigram_and_two_char_korean_like_fallback() {
-        let storage = Storage::open_in_memory().unwrap();
-        let chat = sample_chat("c1", "프로젝트방", false, None);
-        let conv_key = chat.conv_key.clone();
-        storage.upsert_conversations(&[chat]).unwrap();
-
-        let m1 = sample_msg(
-            &conv_key,
+        // Header-only delta update (`body_loaded == false`) must NOT overwrite cached body/attachments,
+        // while updating mutable metadata (`is_read`, `flagged`, `importance`, `inference_classification`, `preview`).
+        let mut header_update = sample_mail(
             "m1",
-            None,
-            "홍길동",
-            "오늘 오후 3시에 배포 일정 회의가 있습니다. Kubernetes rollout 점검 부탁드립니다.",
-            Some("주간 배포"),
-            "2026-11-15T09:00:00Z",
+            "fld-inbox",
+            "Q4 Budget Review",
+            "Alice",
+            "alice@example.com",
+            "2026-11-18T10:00:00Z",
+            false,
+            "",
+            "",
         );
-        let mut m2 = sample_msg(
-            &conv_key,
-            "m2",
-            None,
-            "김영희",
-            "삭제될 메시지입니다",
-            None,
-            "2026-11-15T10:00:00Z",
-        );
-        m2.deleted = true;
-        storage.upsert_messages(&[m1, m2]).unwrap();
+        header_update.is_read = true;
+        header_update.flagged = true;
+        header_update.importance = "high".to_string();
+        header_update.inference_classification = Some("other".to_string());
+        header_update.preview = "Updated preview".to_string();
+        header_update.to_recipients.clear();
+        header_update.has_attachments = false;
 
-        // >= 3 chars Korean trigram
-        let hits = storage.search_messages("배포 일정", None, 10).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].msg_id, "m1");
-        assert_eq!(hits[0].conv_title, "프로젝트방");
+        assert_eq!(storage.upsert_mail_messages(&[header_update.clone()]).unwrap(), 1);
+        // Repeating the exact same header-only poll returns 0 changed rows.
+        assert_eq!(storage.upsert_mail_messages(&[header_update]).unwrap(), 0);
 
-        // >= 3 chars English case-insensitive
-        let eng_hits = storage.search_messages("kubernetes", Some(&conv_key), 10).unwrap();
-        assert_eq!(eng_hits.len(), 1);
-        assert!(eng_hits[0].snippet.contains("Kubernetes"));
-
-        // < 3 chars Korean 2-character fallback
-        let two_char_ko = storage.search_messages("회의", None, 10).unwrap();
-        assert_eq!(two_char_ko.len(), 1);
-        assert_eq!(two_char_ko[0].msg_id, "m1");
-
-        let two_char_subj = storage.search_messages("주간", None, 10).unwrap();
-        assert_eq!(two_char_subj.len(), 1);
-
-        // Deleted message must not appear in search
-        let deleted_hits = storage.search_messages("삭제될", None, 10).unwrap();
-        assert!(deleted_hits.is_empty());
-
-        // Re-upsert m1 with updated body keeps FTS synchronized without duplicate rows
-        let mut m1_updated = sample_msg(
-            &conv_key,
-            "m1",
-            None,
-            "홍길동",
-            "새로운 내용으로 수정됨",
-            None,
-            "2026-11-15T09:00:00Z",
-        );
-        m1_updated.last_modified_at = Some("2026-11-15T09:10:00Z".to_string());
-        storage.upsert_messages(&[m1_updated]).unwrap();
-        assert!(storage.search_messages("Kubernetes", None, 10).unwrap().is_empty());
-        assert_eq!(storage.search_messages("수정됨", None, 10).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn test_members_presence_mentions_and_cursors() {
-        let storage = Storage::open_in_memory().unwrap();
-        let conv_key = "chat:c1";
-        storage
-            .upsert_members(
-                conv_key,
-                &[MemberInfo {
-                    user_id: "u1".to_string(),
-                    member_id: Some("mem1".to_string()),
-                    display_name: "Alice".to_string(),
-                    email: Some("alice@example.com".to_string()),
-                    roles: vec!["owner".to_string()],
-                    presence: None,
-                }],
-            )
-            .unwrap();
-        storage
-            .upsert_presences(&[PresenceStatus {
-                user_id: "u1".to_string(),
-                availability: "Available".to_string(),
-                activity: "Available".to_string(),
-            }])
-            .unwrap();
-
-        let members = storage.list_members(conv_key).unwrap();
-        assert_eq!(members.len(), 1);
+        let loaded = storage.get_mail_message("m1").unwrap().unwrap();
+        assert!(loaded.body_loaded);
+        assert!(loaded.is_read);
+        assert!(loaded.flagged);
+        assert_eq!(loaded.importance, "high");
+        assert_eq!(loaded.inference_classification.as_deref(), Some("other"));
+        assert_eq!(loaded.preview, "Updated preview");
         assert_eq!(
-            members[0].presence.as_ref().map(|p| p.availability.as_str()),
-            Some("Available")
+            loaded.body_html,
+            "<p>Full body with Kubernetes rollout details</p>"
         );
-
-        let mut msg = sample_msg(
-            conv_key,
-            "m10",
-            None,
-            "Bob",
-            "@Alice please check",
-            None,
-            "2026-11-15T12:00:00Z",
+        assert_eq!(
+            loaded.body_plain,
+            "Full body with Kubernetes rollout details"
         );
-        msg.mentions.push(MentionInfo {
-            id: 0,
-            user_id: "u1".to_string(),
-            display_name: "Alice".to_string(),
-        });
-        storage.upsert_messages(&[msg]).unwrap();
-        let mentions = storage.list_mentions_for_user("u1", 10).unwrap();
-        assert_eq!(mentions.len(), 1);
-        assert_eq!(mentions[0].msg_id, "m10");
+        assert_eq!(loaded.attachments.len(), 1);
+        assert_eq!(loaded.attachments[0].name, "budget.xlsx");
+        assert_eq!(loaded.to_recipients.len(), 1);
 
-        let cursor = SyncCursor {
-            scope_key: "chan:t1:ch1".to_string(),
-            delta_link: Some("https://graph.microsoft.com/v1.0/delta?token=abc".to_string()),
-            oldest_msg_ts: Some("2026-11-01T00:00:00Z".to_string()),
-            synced_at: "2026-11-15T12:00:00Z".to_string(),
-        };
-        storage.save_sync_cursor(&cursor).unwrap();
-        let loaded = storage.get_sync_cursor("chan:t1:ch1").unwrap().unwrap();
-        assert_eq!(loaded, cursor);
-    }
+        // FTS5 search still finds the preserved full body & respects filters
+        let hits = storage.search_mail("Kubernetes", Some("inbox"), 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "m1");
+        assert!(hits[0].flagged);
+        assert!(hits[0].is_read);
 
-    #[test]
-    fn test_file_backed_wal_persistence() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_file = dir.path().join("teams.db");
-        {
-            let storage = Storage::open(&db_file).unwrap();
-            let chat = sample_chat("c-disk", "Disk Room", false, Some("2026-11-15T12:00:00Z"));
-            storage.upsert_conversations(&[chat]).unwrap();
-        }
-        let reopened = Storage::open(&db_file).unwrap();
-        let loaded = reopened.get_conversation("chat:c-disk").unwrap().unwrap();
-        assert_eq!(loaded.title, "Disk Room");
+        // Focused filter excludes `other`
+        let focused = storage
+            .list_mail_messages(Some("inbox"), false, false, true, 10)
+            .unwrap();
+        assert!(focused.is_empty());
+
+        let flagged = storage
+            .list_mail_messages(Some("inbox"), false, true, false, 10)
+            .unwrap();
+        assert_eq!(flagged.len(), 1);
+
+        // Delete removes both row and FTS index via O(1) rowid path
+        storage
+            .delete_mail_messages_by_ids(&["m1".to_string()])
+            .unwrap();
+        assert!(storage.get_mail_message("m1").unwrap().is_none());
+        assert!(storage
+            .search_mail("Kubernetes", None, 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
     fn test_file_backed_reader_pool_concurrent_with_writer() {
         let dir = tempfile::tempdir().unwrap();
-        let db_file = dir.path().join("teams-concurrent.db");
+        let db_file = dir.path().join("outlook-concurrent.db");
         let storage = Storage::open(&db_file).unwrap();
 
-        let chat = sample_chat("c-wal", "Concurrency Test Room", true, Some("2026-11-15T12:00:00Z"));
-        let conv_key = chat.conv_key.clone();
-        storage.upsert_conversations(&[chat]).unwrap();
-        let m1 = sample_msg(
-            &conv_key,
-            "m1",
-            None,
-            "Alice",
-            "WAL reader pool concurrent read verification message",
-            Some("Performance test"),
-            "2026-11-15T12:00:00Z",
-        );
-        storage.upsert_messages(&[m1]).unwrap();
+        storage
+            .upsert_mail_folders(&[MailFolder {
+                id: "fld-inbox".to_string(),
+                display_name: "Inbox".to_string(),
+                well_known_name: Some("inbox".to_string()),
+                parent_folder_id: None,
+                child_folder_count: 0,
+                unread_item_count: 1,
+                total_item_count: 1,
+            }])
+            .unwrap();
 
-        // Hold the writer mutex while 6 reader threads query concurrently via the WAL reader pool.
+        let m1 = sample_mail(
+            "m-wal",
+            "fld-inbox",
+            "WAL Concurrent Read",
+            "Bob",
+            "bob@example.com",
+            "2026-11-18T12:00:00Z",
+            true,
+            "<p>Concurrent WAL reader verification body</p>",
+            "Concurrent WAL reader verification body",
+        );
+        storage.upsert_mail_messages(&[m1]).unwrap();
+
         {
             let _writer_guard = storage.conn().lock().unwrap();
             std::thread::scope(|s| {
                 for _ in 0..6 {
                     s.spawn(|| {
-                        let convs = storage.list_conversations().unwrap();
-                        assert_eq!(convs.len(), 1);
-                        assert_eq!(convs[0].title, "Concurrency Test Room");
-
-                        let roots = storage.list_root_messages(&conv_key, 10, None).unwrap();
-                        assert_eq!(roots.len(), 1);
-                        assert_eq!(roots[0].msg_id, "m1");
-
-                        let msg = storage.get_message(&conv_key, "m1").unwrap().unwrap();
-                        assert_eq!(
-                            msg.body_plain,
-                            "WAL reader pool concurrent read verification message"
-                        );
-
-                        let hits = storage.search_messages("concurrent read", None, 10).unwrap();
+                        let folders = storage.list_mail_folders().unwrap();
+                        assert_eq!(folders.len(), 1);
+                        let msgs = storage
+                            .list_mail_messages(Some("inbox"), false, false, false, 10)
+                            .unwrap();
+                        assert_eq!(msgs.len(), 1);
+                        assert_eq!(msgs[0].id, "m-wal");
+                        let hits = storage.search_mail("verification", None, 10).unwrap();
                         assert_eq!(hits.len(), 1);
-                        assert_eq!(hits[0].msg_id, "m1");
                     });
                 }
             });
@@ -744,256 +599,103 @@ mod tests {
         let pooled_count = storage.readers.as_ref().unwrap().lock().unwrap().len();
         assert!((1..=MAX_READER_POOL_SIZE).contains(&pooled_count));
 
-        // Subsequent write is visible to pooled readers.
-        let m2 = sample_msg(
-            &conv_key,
-            "m2",
-            None,
-            "Bob",
-            "Second committed message",
-            None,
-            "2026-11-15T12:05:00Z",
-        );
-        storage.upsert_messages(&[m2]).unwrap();
-        let roots_after = storage.list_root_messages(&conv_key, 10, None).unwrap();
-        assert_eq!(roots_after.len(), 2);
-        assert_eq!(roots_after[1].msg_id, "m2");
-    }
-
-    #[test]
-    fn test_upsert_messages_idempotency_and_partial_fts_skip() {
-        let storage = Storage::open_in_memory().unwrap();
-        let chat = sample_chat("c-idem", "Idempotency Test", false, None);
-        let conv_key = chat.conv_key.clone();
-        storage.upsert_conversations(&[chat]).unwrap();
-
-        let mut m1 = sample_msg(
-            &conv_key,
-            "m1",
-            None,
-            "Alice",
-            "Initial body Kubernetes deployment notice",
-            Some("Deploy notice"),
-            "2026-11-15T09:00:00Z",
-        );
-        assert_eq!(storage.upsert_messages(&[m1.clone()]).unwrap(), 1);
-        assert_eq!(
-            storage.search_messages("Kubernetes", None, 10).unwrap().len(),
-            1
-        );
-
-        // 1) Identical re-upsert must skip both messages and messages_fts writes (0 SQLite changes).
-        let changes_before_noop = storage.conn().lock().unwrap().total_changes();
-        assert_eq!(storage.upsert_messages(&[m1.clone()]).unwrap(), 0);
-        let changes_after_noop = storage.conn().lock().unwrap().total_changes();
-        assert_eq!(changes_after_noop - changes_before_noop, 0);
-        assert_eq!(
-            storage.search_messages("Kubernetes", None, 10).unwrap().len(),
-            1
-        );
-
-        // 2) Metadata-only change (reply_count / last_modified_at) updates messages without FTS churn.
-        m1.reply_count = 3;
-        m1.last_modified_at = Some("2026-11-15T09:02:00Z".to_string());
-        let changes_before_meta = storage.conn().lock().unwrap().total_changes();
-        assert_eq!(storage.upsert_messages(&[m1.clone()]).unwrap(), 1);
-        let changes_after_meta = storage.conn().lock().unwrap().total_changes();
-        assert_eq!(changes_after_meta - changes_before_meta, 1);
-        assert_eq!(
-            storage.get_message(&conv_key, "m1").unwrap().unwrap().reply_count,
-            3
-        );
-        assert_eq!(
-            storage.search_messages("Kubernetes", None, 10).unwrap().len(),
-            1
-        );
-
-        // 3) Body change updates both messages and messages_fts.
-        m1.body_plain = "Edited body PostgreSQL check".to_string();
-        m1.last_modified_at = Some("2026-11-15T09:05:00Z".to_string());
-        storage.upsert_messages(&[m1.clone()]).unwrap();
-        assert!(storage.search_messages("Kubernetes", None, 10).unwrap().is_empty());
-        assert_eq!(
-            storage.search_messages("PostgreSQL", None, 10).unwrap().len(),
-            1
-        );
-
-        // 4) Soft delete removes from messages_fts while updating messages.
-        m1.deleted = true;
-        m1.last_modified_at = Some("2026-11-15T09:10:00Z".to_string());
-        storage.upsert_messages(&[m1]).unwrap();
-        assert!(storage.get_message(&conv_key, "m1").unwrap().unwrap().deleted);
-        assert!(storage.search_messages("PostgreSQL", None, 10).unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_shrink_memory_in_memory_and_file_backed_with_reader_pool() {
-        // 1) In-memory Storage (writer connection only)
-        let mem = Storage::open_in_memory().unwrap();
-        let chat = sample_chat("c-mem-shrink", "Memory Shrink", false, None);
-        mem.upsert_conversations(&[chat]).unwrap();
-        mem.shrink_memory();
-        assert_eq!(mem.list_conversations().unwrap().len(), 1);
-
-        // 2) File-backed WAL Storage with active pooled reader connections
-        let dir = tempfile::tempdir().unwrap();
-        let db_file = dir.path().join("shrink.db");
-        let wal = Storage::open(&db_file).unwrap();
-        let wal_chat = sample_chat("c-wal-shrink", "WAL Shrink", false, None);
-        let conv_key = wal_chat.conv_key.clone();
-        wal.upsert_conversations(&[wal_chat]).unwrap();
-        let msg = sample_msg(
-            &conv_key,
-            "m1",
-            None,
-            "Alice",
-            "SQLite shrink_memory test body",
-            None,
-            "2026-11-15T12:00:00Z",
-        );
-        wal.upsert_messages(&[msg]).unwrap();
-
-        // Populate pooled reader connections before calling shrink_memory
-        assert_eq!(wal.list_conversations().unwrap().len(), 1);
-        assert_eq!(wal.list_root_messages(&conv_key, 10, None).unwrap().len(), 1);
-        let pooled_count = wal.readers.as_ref().unwrap().lock().unwrap().len();
-        assert!(pooled_count >= 1);
-
-        wal.shrink_memory();
-
-        // Both writer and pooled readers continue operating cleanly afterwards
-        let msg2 = sample_msg(
-            &conv_key,
-            "m2",
-            None,
-            "Bob",
-            "Verify subsequent read/write after shrink_memory",
-            None,
-            "2026-11-15T12:05:00Z",
-        );
-        wal.upsert_messages(&[msg2]).unwrap();
-        assert_eq!(wal.list_root_messages(&conv_key, 10, None).unwrap().len(), 2);
-    }
-
-    #[test]
-    fn test_list_older_root_messages_tie_breaking_same_timestamp() {
-        let storage = Storage::open_in_memory().unwrap();
-        let chat = sample_chat("c-tie", "Same Timestamp Room", false, None);
-        let conv_key = chat.conv_key.clone();
-        storage.upsert_conversations(&[chat]).unwrap();
-
-        let ts = "2026-11-15T10:00:00Z";
-        let m0 = sample_msg(&conv_key, "m0", None, "Bob", "earlier", None, "2026-11-15T09:59:59Z");
-        let m1 = sample_msg(&conv_key, "m1", None, "Bob", "first", None, ts);
-        let m2 = sample_msg(&conv_key, "m2", None, "Carol", "second", None, ts);
-        let m3 = sample_msg(&conv_key, "m3", None, "Dave", "third", None, ts);
-        // Thread reply with the same timestamp must not appear in root queries
-        let reply = sample_msg(&conv_key, "m2-r1", Some("m2"), "Alice", "reply", None, ts);
-        storage.upsert_messages(&[m3, m1, m0, m2, reply]).unwrap();
-
-        // Newest 2 root messages in chronological order -> ["m2", "m3"]
-        let latest = storage.list_root_messages(&conv_key, 2, None).unwrap();
-        let latest_ids: Vec<&str> = latest.iter().map(|m| m.msg_id.as_str()).collect();
-        assert_eq!(latest_ids, vec!["m2", "m3"]);
-
-        // Paginate backwards 1 by 1 with identical created_at tie-breaker
-        let page1 = storage
-            .list_older_root_messages(&conv_key, 1, ts, Some("m3"))
-            .unwrap();
-        assert_eq!(page1.len(), 1);
-        assert_eq!(page1[0].msg_id, "m2");
-
-        let page2 = storage
-            .list_older_root_messages(&conv_key, 1, ts, Some("m2"))
-            .unwrap();
-        assert_eq!(page2.len(), 1);
-        assert_eq!(page2[0].msg_id, "m1");
-
-        let page3 = storage
-            .list_older_root_messages(&conv_key, 1, ts, Some("m1"))
-            .unwrap();
-        assert_eq!(page3.len(), 1);
-        assert_eq!(page3[0].msg_id, "m0");
-
-        assert!(storage
-            .list_older_root_messages(&conv_key, 1, "2026-11-15T09:59:59Z", Some("m0"))
-            .unwrap()
-            .is_empty());
-
-        // Multi-item page with before_msg_id = Some("m3") preserves chronological order
-        let batch = storage
-            .list_older_root_messages(&conv_key, 2, ts, Some("m3"))
-            .unwrap();
-        let batch_ids: Vec<&str> = batch.iter().map(|m| m.msg_id.as_str()).collect();
-        assert_eq!(batch_ids, vec!["m1", "m2"]);
-
-        // Without before_msg_id, strict created_at < ts skips same-timestamp roots and returns m0
-        let without_id = storage
-            .list_older_root_messages(&conv_key, 10, ts, None)
-            .unwrap();
-        let without_ids: Vec<&str> = without_id.iter().map(|m| m.msg_id.as_str()).collect();
-        assert_eq!(without_ids, vec!["m0"]);
-    }
-
-    #[test]
-    fn test_open_readonly_does_not_create_file_and_reads_existing() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing_db = dir.path().join("nonexistent/cache.db");
-        assert!(Storage::open_readonly(&missing_db).is_err());
-        assert!(!missing_db.exists());
-
-        let db_file = dir.path().join("existing.db");
-        {
-            let rw = Storage::open(&db_file).unwrap();
-            let chat = sample_chat("c-ro", "Readonly Room", false, Some("2026-11-15T12:00:00Z"));
-            rw.upsert_conversations(&[chat]).unwrap();
-        }
+        // Open readonly handle and shrink_memory work cleanly
         let ro = Storage::open_readonly(&db_file).unwrap();
-        let convs = ro.list_conversations().unwrap();
-        assert_eq!(convs.len(), 1);
-        assert_eq!(convs[0].title, "Readonly Room");
+        assert_eq!(ro.get_mail_message("m-wal").unwrap().unwrap().subject, "WAL Concurrent Read");
+        storage.shrink_memory();
     }
 
     #[test]
-    fn test_upsert_attachment_mention_edit_and_soft_delete_reply_count() {
-        use crate::models::AttachmentInfo;
-
+    fn test_calendar_contacts_todo_and_cursors() {
         let storage = Storage::open_in_memory().unwrap();
-        let chat = sample_chat("c-att", "Mentions & Replies", false, None);
-        let conv_key = chat.conv_key.clone();
-        storage.upsert_conversations(&[chat]).unwrap();
 
-        let mut root = sample_msg(&conv_key, "root1", None, "Alice", "Root", None, "2026-11-15T09:00:00Z");
-        let rep1 = sample_msg(&conv_key, "r1", Some("root1"), "Bob", "Reply 1", None, "2026-11-15T09:01:00Z");
-        let mut rep2 = sample_msg(&conv_key, "r2", Some("root1"), "Carol", "Reply 2", None, "2026-11-15T09:02:00Z");
-        assert_eq!(storage.upsert_messages(&[root.clone(), rep1, rep2.clone()]).unwrap(), 3);
-        assert_eq!(storage.get_message(&conv_key, "root1").unwrap().unwrap().reply_count, 2);
+        let ev = CalendarEvent {
+            id: "ev-1".to_string(),
+            subject: "Design Sync".to_string(),
+            start_iso: "2026-11-18T15:00:00Z".to_string(),
+            end_iso: "2026-11-18T15:30:00Z".to_string(),
+            time_zone: "UTC".to_string(),
+            is_all_day: false,
+            location: Some("Room 1".to_string()),
+            organizer_name: Some("Alice".to_string()),
+            organizer_email: Some("alice@example.com".to_string()),
+            attendees: vec![EventAttendee {
+                name: Some("Bob".to_string()),
+                address: "bob@example.com".to_string(),
+                attendee_type: "required".to_string(),
+                response_status: "accepted".to_string(),
+            }],
+            response_status: "notResponded".to_string(),
+            is_online_meeting: true,
+            online_meeting_url: None,
+            body_html: String::new(),
+            body_plain: String::new(),
+            is_cancelled: false,
+            web_link: None,
+        };
+        storage.upsert_calendar_events(&[ev]).unwrap();
+        storage
+            .update_event_response_local("ev-1", "accepted")
+            .unwrap();
+        let loaded_ev = storage.get_calendar_event("ev-1").unwrap().unwrap();
+        assert_eq!(loaded_ev.response_status, "accepted");
 
-        // Soft-deleting rep2 updates root reply_count accurately from 2 -> 1
-        rep2.deleted = true;
-        assert_eq!(storage.upsert_messages(&[rep2]).unwrap(), 1);
-        assert_eq!(storage.get_message(&conv_key, "root1").unwrap().unwrap().reply_count, 1);
+        storage
+            .upsert_contacts(&[ContactItem {
+                id: "c1".to_string(),
+                display_name: "Alice Smith".to_string(),
+                given_name: Some("Alice".to_string()),
+                surname: Some("Smith".to_string()),
+                email_addresses: vec!["alice@example.com".to_string()],
+                mobile_phone: None,
+                business_phones: Vec::new(),
+                company_name: Some("Contoso".to_string()),
+                job_title: None,
+                department: None,
+                notes: None,
+                source: "contact".to_string(),
+            }])
+            .unwrap();
+        assert_eq!(storage.list_contacts(Some("contoso"), 10).unwrap().len(), 1);
 
-        // Editing attachments & mentions without changing last_modified_at is NOT skipped
-        root.attachments.push(AttachmentInfo {
-            id: "att1".to_string(),
-            content_type: "reference".to_string(),
-            content_url: None,
-            name: Some("doc.pdf".to_string()),
-            content_json: None,
-            thumbnail_url: None,
-        });
-        assert_eq!(storage.upsert_messages(&[root.clone()]).unwrap(), 1);
-        assert_eq!(storage.get_message(&conv_key, "root1").unwrap().unwrap().attachments.len(), 1);
+        storage
+            .upsert_todo_lists(&[TodoList {
+                id: "list-1".to_string(),
+                display_name: "Tasks".to_string(),
+                wellknown_list_name: Some("defaultList".to_string()),
+                is_owner: true,
+                is_shared: false,
+            }])
+            .unwrap();
+        storage
+            .upsert_todo_tasks(&[TodoTask {
+                id: "t-1".to_string(),
+                list_id: "list-1".to_string(),
+                title: "Ship Outlook".to_string(),
+                status: "notStarted".to_string(),
+                importance: "high".to_string(),
+                body_plain: None,
+                due_date_iso: None,
+                reminder_iso: None,
+                completed_at: None,
+                created_at: None,
+                updated_at: None,
+            }])
+            .unwrap();
+        storage.set_todo_task_completed_local("t-1", true).unwrap();
+        assert!(storage.list_todo_tasks(None, false).unwrap().is_empty());
+        assert_eq!(storage.list_todo_tasks(Some("list-1"), true).unwrap().len(), 1);
 
-        root.mentions.push(MentionInfo {
-            id: 0,
-            user_id: "u-target".to_string(),
-            display_name: "Target".to_string(),
-        });
-        assert_eq!(storage.upsert_messages(&[root]).unwrap(), 1);
-        let mentioned = storage.list_mentions_for_user("u-target", 10).unwrap();
-        assert_eq!(mentioned.len(), 1);
-        assert_eq!(mentioned[0].msg_id, "root1");
+        let cursor = SyncCursor {
+            scope_key: "mail_delta:inbox".to_string(),
+            delta_link: Some("https://graph.microsoft.com/v1.0/delta?t=1".to_string()),
+            history_next_link: None,
+            last_synced_at: "2026-11-18T15:00:00Z".to_string(),
+        };
+        storage.upsert_sync_cursor(&cursor).unwrap();
+        assert_eq!(
+            storage.get_sync_cursor("mail_delta:inbox").unwrap(),
+            Some(cursor)
+        );
     }
 }

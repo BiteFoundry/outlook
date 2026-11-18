@@ -100,11 +100,11 @@ pub fn show(summary: &str, body: &str) {
     let summary = summary.to_string();
     let body = body.to_string();
     let _ = std::thread::Builder::new()
-        .name("teams-notify".to_string())
+        .name("outlook-notify".to_string())
         .spawn(move || {
             let _guard = guard;
             let _ = notify_rust::Notification::new()
-                .appname("teams")
+                .appname("outlook")
                 .summary(&summary)
                 .body(&body)
                 .timeout(notify_rust::Timeout::Milliseconds(6000))
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn truncate_strips_newlines_and_limits_chars() {
         assert_eq!(truncate("hello\nworld", 100), "hello world");
-        assert_eq!(truncate("가나다라마", 3), "가나다…");
+        assert_eq!(truncate("αβγδε", 3), "αβγ…");
         assert_eq!(truncate("abc", 3), "abc");
     }
 

@@ -1,18 +1,19 @@
-//! Root UI module: 3-tier responsive layout, rendering pipeline, and shared helpers.
+//! Root UI module: 3-tier responsive 3-pane layout, rendering pipeline, and shared helpers.
 
 pub mod action;
 pub mod app;
-pub mod chat_view;
+pub mod calendar_view;
 pub mod composer;
 pub mod event;
 pub mod hitmap;
 pub mod keymap;
+pub mod mail_view;
 pub mod nav_pane;
 pub mod notification;
 pub mod overlays;
 pub mod theme;
-pub mod thread_view;
 pub mod toast;
+pub mod todo_view;
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -25,16 +26,17 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use self::app::{AppState, Focus, NarrowPane, UiState};
 use self::hitmap::{ButtonId, HitMap, HitTarget};
+use self::nav_pane::{TAB_CALENDAR, TAB_MAIL, TAB_TASKS};
 use self::toast::ToastKind;
 
 /// 3-tier responsive terminal width modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutMode {
-    /// >= 120 columns: Nav rail + Nav pane + Chat + optional Right Thread Drawer.
+    /// >= 120 columns: Left Nav + Middle List + Right Reading/Detail Pane.
     Wide,
-    /// 80..=119 columns: Nav pane + Main (Chat or Thread drawer split/swap).
+    /// 80..=119 columns: Left Nav + stacked List (40%) / Reader (60%) or Reader fullscreen.
     Medium,
-    /// < 80 columns: Single active pane (`NarrowPane`) with compact top bar.
+    /// < 80 columns: Compact top switcher + single active pane (`NarrowPane`).
     Narrow,
 }
 
@@ -48,381 +50,230 @@ pub fn layout_mode(width: u16) -> LayoutMode {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LayoutPlan {
     pub mode: Option<LayoutMode>,
-    pub top_bar: Option<Rect>,
     pub compact_bar: Option<Rect>,
-    pub rail: Option<Rect>,
     pub nav: Option<Rect>,
-    pub chat: Option<Rect>,
-    pub thread: Option<Rect>,
-    pub composer: Option<Rect>,
+    pub list: Option<Rect>,
+    pub reader: Option<Rect>,
     pub status: Rect,
 }
+
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub fn compute_layout(
     area: Rect,
     show_nav_rail: bool,
-    thread_open: bool,
-    auto_thread_pane: bool,
+    medium_reader_fullscreen: bool,
     narrow_pane: NarrowPane,
-    composer_height: u16,
 ) -> LayoutPlan {
-    compute_layout_with_options(
-        area,
-        show_nav_rail,
-        thread_open,
-        auto_thread_pane,
-        narrow_pane,
-        composer_height,
-        true,
-        false,
-    )
-}
+    if area.width < 10 || area.height < 4 {
+        return LayoutPlan {
+            status: Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
+            ..Default::default()
+        };
+    }
 
-#[allow(clippy::too_many_arguments)]
-pub fn compute_layout_with_options(
-    area: Rect,
-    show_nav_rail: bool,
-    thread_open: bool,
-    _auto_thread_pane: bool,
-    narrow_pane: NarrowPane,
-    composer_height: u16,
-    show_composer: bool,
-    _show_top_bar: bool,
-) -> LayoutPlan {
     let mode = layout_mode(area.width);
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
         .split(area);
     let body = rows[0];
     let status = rows[1];
 
-    let comp_h = if show_composer {
-        composer_height.clamp(2, (body.height / 2).clamp(4, 12))
-    } else {
-        0
-    };
-
     match mode {
         LayoutMode::Wide => {
-            let nav_w = if show_nav_rail { 28u16 } else { 0 };
-            let nav_sep_w = if nav_w > 0 { 1u16 } else { 0 };
-            let avail_after_nav = body.width.saturating_sub(nav_w + nav_sep_w);
-            let thread_w = if thread_open {
-                (avail_after_nav * 40 / 100).clamp(38, 52)
-            } else {
-                0
-            };
-            let thread_sep_w = if thread_w > 0 { 1u16 } else { 0 };
+            let nav_w = if show_nav_rail { 24 } else { 0 };
+            let nav_sep = if nav_w > 0 { 1 } else { 0 };
+            let remaining = area.width.saturating_sub(nav_w + nav_sep);
+            let list_w = remaining.saturating_sub(34).clamp(28, 42);
 
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
                     Constraint::Length(nav_w),
-                    Constraint::Length(nav_sep_w),
-                    Constraint::Min(20),
-                    Constraint::Length(thread_sep_w),
-                    Constraint::Length(thread_w),
+                    Constraint::Length(nav_sep),
+                    Constraint::Length(list_w),
+                    Constraint::Length(1),
+                    Constraint::Min(24),
                 ])
                 .split(body);
 
-            let (chat_rect, comp_rect) = if show_composer {
-                let center_rows = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(4), Constraint::Length(comp_h)])
-                    .split(cols[2]);
-                (Some(center_rows[0]), Some(center_rows[1]))
-            } else {
-                (Some(cols[2]), None)
-            };
-
             LayoutPlan {
                 mode: Some(mode),
-                top_bar: None,
                 compact_bar: None,
-                rail: None,
                 nav: (nav_w > 0).then_some(cols[0]),
-                chat: chat_rect,
-                thread: (thread_w > 0).then_some(cols[4]),
-                composer: comp_rect,
+                list: Some(cols[2]),
+                reader: Some(cols[4]),
                 status,
             }
         }
         LayoutMode::Medium => {
-            let nav_w = if show_nav_rail {
-                if area.width >= 100 {
-                    26u16
-                } else {
-                    24u16
-                }
-            } else {
-                0
-            };
-            let nav_sep_w = if nav_w > 0 { 1u16 } else { 0 };
+            let nav_w = if show_nav_rail { 22 } else { 0 };
+            let nav_sep = if nav_w > 0 { 1 } else { 0 };
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
                     Constraint::Length(nav_w),
-                    Constraint::Length(nav_sep_w),
-                    Constraint::Min(20),
+                    Constraint::Length(nav_sep),
+                    Constraint::Min(30),
                 ])
                 .split(body);
 
-            let (main_rect, comp_rect) = if show_composer {
-                let main_rows = Layout::default()
+            let right = cols[2];
+            let (list, reader) = if medium_reader_fullscreen || right.height < 8 {
+                (None, Some(right))
+            } else {
+                let split = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(4), Constraint::Length(comp_h)])
-                    .split(cols[2]);
-                (main_rows[0], Some(main_rows[1]))
-            } else {
-                (cols[2], None)
-            };
-
-            let (chat, thread) = if thread_open {
-                (None, Some(main_rect))
-            } else {
-                (Some(main_rect), None)
+                    .constraints([
+                        Constraint::Percentage(40),
+                        Constraint::Length(1),
+                        Constraint::Min(4),
+                    ])
+                    .split(right);
+                (Some(split[0]), Some(split[2]))
             };
 
             LayoutPlan {
                 mode: Some(mode),
-                top_bar: None,
                 compact_bar: None,
-                rail: None,
                 nav: (nav_w > 0).then_some(cols[0]),
-                chat,
-                thread,
-                composer: comp_rect,
+                list,
+                reader,
                 status,
             }
         }
         LayoutMode::Narrow => {
-            let v = Layout::default()
+            let split = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Min(3)])
                 .split(body);
-            let compact_bar = Some(v[0]);
-            let content = v[1];
+            let compact_bar = Some(split[0]);
+            let content = split[1];
 
             match narrow_pane {
-                NarrowPane::List => LayoutPlan {
+                NarrowPane::Folders => LayoutPlan {
                     mode: Some(mode),
-                    top_bar: None,
                     compact_bar,
-                    rail: None,
                     nav: Some(content),
-                    chat: None,
-                    thread: None,
-                    composer: None,
+                    list: None,
+                    reader: None,
                     status,
                 },
-                NarrowPane::Chat => {
-                    let (chat_rect, comp_rect) = if show_composer {
-                        let split = Layout::default()
-                            .direction(Direction::Vertical)
-                            .constraints([Constraint::Min(4), Constraint::Length(comp_h)])
-                            .split(content);
-                        (Some(split[0]), Some(split[1]))
-                    } else {
-                        (Some(content), None)
-                    };
-                    LayoutPlan {
-                        mode: Some(mode),
-                        top_bar: None,
-                        compact_bar,
-                        rail: None,
-                        nav: None,
-                        chat: chat_rect,
-                        thread: None,
-                        composer: comp_rect,
-                        status,
-                    }
-                }
-                NarrowPane::Thread => {
-                    let (thread_rect, comp_rect) = if show_composer {
-                        let split = Layout::default()
-                            .direction(Direction::Vertical)
-                            .constraints([Constraint::Min(4), Constraint::Length(comp_h)])
-                            .split(content);
-                        (Some(split[0]), Some(split[1]))
-                    } else {
-                        (Some(content), None)
-                    };
-                    LayoutPlan {
-                        mode: Some(mode),
-                        top_bar: None,
-                        compact_bar,
-                        rail: None,
-                        nav: None,
-                        chat: None,
-                        thread: thread_rect,
-                        composer: comp_rect,
-                        status,
-                    }
-                }
+                NarrowPane::List => LayoutPlan {
+                    mode: Some(mode),
+                    compact_bar,
+                    nav: None,
+                    list: Some(content),
+                    reader: None,
+                    status,
+                },
+                NarrowPane::Read => LayoutPlan {
+                    mode: Some(mode),
+                    compact_bar,
+                    nav: None,
+                    list: None,
+                    reader: Some(content),
+                    status,
+                },
             }
         }
     }
 }
 
-/// Truncates `text` to fit within `max_width` terminal columns, appending `…` if cut.
-pub fn truncate_width(text: &str, max_width: usize) -> String {
-    if max_width == 0 {
+pub fn truncate_width(s: &str, max_w: usize) -> String {
+    if max_w == 0 {
         return String::new();
     }
-    if text.width() <= max_width {
-        return text.to_string();
+    if s.width() <= max_w {
+        return s.to_string();
     }
     let mut out = String::new();
-    let mut w = 0usize;
-    for ch in text.chars() {
+    let mut used = 0;
+    let budget = max_w.saturating_sub(1);
+    for ch in s.chars() {
         let cw = ch.width().unwrap_or(0);
-        if w + cw >= max_width {
+        if used + cw > budget {
             break;
         }
         out.push(ch);
-        w += cw;
+        used += cw;
     }
     out.push('…');
     out
 }
 
-/// Renders one complete frame, rebuilding `ui.hitmap` cleanly from scratch.
-/// Returns the composer terminal cursor position `(x, y)` if focused.
 pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(u16, u16)> {
-    ui.pending_pixel_graphic = None;
     let area = frame.area();
     ui.term_width = area.width;
     ui.term_height = area.height;
-    ui.hitmap.clear();
-    if area.width == 0 || area.height == 0 {
-        ui.thread_composer_area = Rect::default();
-        return None;
-    }
+    let base_bg = if ui.theme.no_color {
+        Style::default()
+    } else {
+        Style::default()
+            .bg(ui.theme.bg_canvas)
+            .fg(ui.theme.fg_primary)
+    };
+    frame.render_widget(Paragraph::new("").style(base_bg), area);
 
-    let row_count = nav_pane::nav_row_count(app, ui);
-    if row_count == 0 {
-        ui.nav_selected = 0;
-    } else if ui.nav_selected >= row_count {
-        ui.nav_selected = row_count - 1;
-    }
-
-    let thread_open = ui.thread_drawer_open && app.active_thread.is_some();
-    let show_subject = ui.show_subject
-        && app
-            .active_target
-            .as_ref()
-            .is_some_and(|t| t.is_channel())
-        && !(thread_open && ui.composer_target_thread);
-    let comp_h = ui.composer.desired_height(show_subject, ui.inline_images);
-    let plan = compute_layout_with_options(
+    let plan = compute_layout(
         area,
         ui.show_nav_rail,
-        thread_open,
-        ui.auto_thread_pane,
+        ui.medium_reader_fullscreen,
         ui.narrow_pane,
-        comp_h,
-        true,
-        false,
     );
+    ui.nav_area = plan.nav.unwrap_or_default();
 
-    let mut hitmap = std::mem::take(&mut ui.hitmap);
+    let mut hitmap = HitMap::default();
+    let mut cursor_pos = None;
 
     if let Some(bar_area) = plan.compact_bar {
-        draw_compact_bar(frame, bar_area, app, ui, thread_open, &mut hitmap);
+        draw_compact_bar(frame, bar_area, app, ui, &mut hitmap);
     }
 
     if let Some(nav_area) = plan.nav {
         nav_pane::draw(frame, nav_area, app, ui, &mut hitmap);
     }
 
-    let thread_anchored_composer = plan.mode == Some(LayoutMode::Wide)
-        && thread_open
-        && ui.composer_target_thread
-        && plan.thread.is_some()
-        && plan.chat.is_some()
-        && plan.composer.is_some();
-
-    let mut cursor_pos = None;
-
-    if thread_anchored_composer {
-        let chat_r = plan.chat.unwrap();
-        let comp_r = plan.composer.unwrap();
-        let thread_r = plan.thread.unwrap();
-        let full_chat = Rect::new(
-            chat_r.x,
-            chat_r.y,
-            chat_r.width,
-            chat_r.height.saturating_add(comp_r.height),
-        );
-        if full_chat.height >= 2 {
-            let chat_draw = Rect::new(
-                full_chat.x,
-                full_chat.y,
-                full_chat.width,
-                full_chat.height - 1,
-            );
-            let footer_rect = Rect::new(
-                full_chat.x,
-                full_chat.bottom().saturating_sub(1),
-                full_chat.width,
-                1,
-            );
-            chat_view::draw(frame, chat_draw, app, ui, &mut hitmap);
-            draw_chat_switch_footer(frame, footer_rect, app, ui, &mut hitmap);
-        } else {
-            chat_view::draw(frame, full_chat, app, ui, &mut hitmap);
+    match ui.active_nav_tab {
+        TAB_MAIL => {
+            if let Some(list_area) = plan.list {
+                mail_view::draw_list(frame, list_area, app, ui, &mut hitmap);
+            }
+            if let Some(reader_area) = plan.reader {
+                mail_view::draw_reader(frame, reader_area, app, ui, &mut hitmap);
+            }
         }
-
-        let t_comp_h = comp_r.height.min(thread_r.height.saturating_sub(2)).max(1);
-        if thread_r.height >= 3 {
-            let thread_draw = Rect::new(
-                thread_r.x,
-                thread_r.y,
-                thread_r.width,
-                thread_r.height - t_comp_h,
-            );
-            let thread_comp = Rect::new(
-                thread_r.x,
-                thread_r.bottom().saturating_sub(t_comp_h),
-                thread_r.width,
-                t_comp_h,
-            );
-            ui.thread_composer_area = thread_comp;
-            thread_view::draw(frame, thread_draw, app, ui, &mut hitmap);
-            cursor_pos = composer::draw(frame, thread_comp, app, ui, &mut hitmap);
-        } else {
-            ui.thread_composer_area = Rect::default();
-            thread_view::draw(frame, thread_r, app, ui, &mut hitmap);
+        TAB_CALENDAR => {
+            if let Some(list_area) = plan.list {
+                calendar_view::draw_list(frame, list_area, app, ui, &mut hitmap);
+            }
+            if let Some(reader_area) = plan.reader {
+                calendar_view::draw_detail(frame, reader_area, app, ui, &mut hitmap);
+            }
         }
-    } else {
-        ui.thread_composer_area = Rect::default();
-        if let Some(chat_area) = plan.chat {
-            chat_view::draw(frame, chat_area, app, ui, &mut hitmap);
+        TAB_TASKS => {
+            if let Some(list_area) = plan.list {
+                todo_view::draw_list(frame, list_area, app, ui, &mut hitmap);
+            }
+            if let Some(reader_area) = plan.reader {
+                todo_view::draw_detail(frame, reader_area, app, ui, &mut hitmap);
+            }
         }
-        if let Some(thread_area) = plan.thread {
-            thread_view::draw(frame, thread_area, app, ui, &mut hitmap);
-        }
-        if let Some(comp_area) = plan.composer {
-            cursor_pos = composer::draw(frame, comp_area, app, ui, &mut hitmap);
-        }
+        _ => {}
     }
 
     // 1-cell vertical hairline separators between adjacent panes
+    let focus = ui.focus();
     if let Some(nav_r) = plan.nav {
-        if let Some(right_r) = plan.chat.or(plan.thread) {
+        if let Some(right_r) = plan.list.or(plan.reader) {
             let sep_x = nav_r.right();
             if sep_x < right_r.x && sep_x < area.right() {
-                let sep_focused = match ui.focus() {
-                    Focus::Nav => true,
-                    Focus::Chat => plan.chat.is_some(),
-                    Focus::Thread => plan.mode == Some(LayoutMode::Medium) && plan.chat.is_none(),
-                    Focus::Composer => !thread_anchored_composer,
-                    Focus::Overlay => false,
-                };
+                let sep_focused = matches!(focus, Focus::Nav | Focus::List)
+                    || (focus == Focus::Reader && plan.list.is_none());
                 let sep_style = if sep_focused {
                     ui.theme.accent_style()
                 } else {
@@ -433,34 +284,51 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
         }
     }
 
-    if let (Some(chat_r), Some(thread_r)) = (plan.chat, plan.thread) {
-        let sep_x = chat_r.right();
-        if sep_x < thread_r.x && sep_x < area.right() {
-            let sep_focused = matches!(
-                ui.focus(),
-                Focus::Chat | Focus::Thread | Focus::Composer
-            );
-            let sep_style = if sep_focused {
-                ui.theme.accent_style()
-            } else {
-                ui.theme.subtle_style()
-            };
-            draw_vertical_hairline(frame, sep_x, thread_r.y, thread_r.height, sep_style);
+    if let (Some(list_r), Some(reader_r)) = (plan.list, plan.reader) {
+        if plan.mode == Some(LayoutMode::Wide) {
+            let sep_x = list_r.right();
+            if sep_x < reader_r.x && sep_x < area.right() {
+                let sep_focused = matches!(focus, Focus::List | Focus::Reader);
+                let sep_style = if sep_focused {
+                    ui.theme.accent_style()
+                } else {
+                    ui.theme.subtle_style()
+                };
+                draw_vertical_hairline(frame, sep_x, list_r.y, list_r.height, sep_style);
+            }
+        } else if plan.mode == Some(LayoutMode::Medium) {
+            let sep_y = list_r.bottom();
+            if sep_y < reader_r.y && sep_y < area.bottom() {
+                let sep_focused = matches!(focus, Focus::List | Focus::Reader);
+                let sep_style = if sep_focused {
+                    ui.theme.accent_style()
+                } else {
+                    ui.theme.subtle_style()
+                };
+                draw_horizontal_hairline(frame, list_r.x, sep_y, list_r.width, sep_style);
+            }
         }
     }
 
     draw_status_bar(frame, plan.status, app, ui, &mut hitmap);
     draw_toasts(frame, area, ui);
 
-    let overlays = std::mem::take(&mut ui.overlays);
-    for overlay in &overlays {
+    let mut overlays = std::mem::take(&mut ui.overlays);
+    let last_idx = overlays.len().saturating_sub(1);
+    for (idx, overlay) in overlays.iter_mut().enumerate() {
         match overlay {
             overlays::Overlay::ImagePreview(preview) => {
                 preview.draw_sync(frame, area, app, ui, &mut hitmap);
+                if idx == last_idx {
+                    cursor_pos = None;
+                }
             }
             other => {
                 ui.pending_pixel_graphic = None;
-                other.draw(frame, area, app, ui, &mut hitmap);
+                let overlay_cursor = other.draw(frame, area, app, ui, &mut hitmap);
+                if idx == last_idx {
+                    cursor_pos = overlay_cursor;
+                }
             }
         }
     }
@@ -470,41 +338,36 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
     cursor_pos
 }
 
-fn draw_vertical_hairline(frame: &mut Frame, x: u16, y: u16, height: u16, style: Style) {
-    let buf_area = frame.area();
-    if height == 0 || x < buf_area.left() || x >= buf_area.right() {
+fn draw_vertical_hairline(
+    frame: &mut Frame,
+    x: u16,
+    y: u16,
+    height: u16,
+    style: Style,
+) {
+    if height == 0 {
         return;
     }
-    let start_y = y.max(buf_area.top());
-    let end_y = y.saturating_add(height).min(buf_area.bottom());
-    let buf = frame.buffer_mut();
-    for row_y in start_y..end_y {
-        buf[(x, row_y)].set_symbol("│").set_style(style);
-    }
+    let rect = Rect::new(x, y, 1, height);
+    let lines: Vec<Line<'static>> = (0..height)
+        .map(|_| Line::from(Span::styled("│", style)))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), rect);
 }
 
-fn draw_chat_switch_footer(
+fn draw_horizontal_hairline(
     frame: &mut Frame,
-    area: Rect,
-    app: &AppState,
-    ui: &UiState,
-    hitmap: &mut HitMap,
+    x: u16,
+    y: u16,
+    width: u16,
+    style: Style,
 ) {
-    if area.width == 0 || area.height == 0 {
+    if width == 0 {
         return;
     }
-    let target_name = app.active_title();
-    let label = format!("─ Message {target_name} (Alt+T to switch) ");
-    let mut line = truncate_width(&label, area.width as usize);
-    let used = UnicodeWidthStr::width(line.as_str());
-    for _ in used..(area.width as usize) {
-        line.push('─');
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(line, ui.theme.subtle_style()))),
-        area,
-    );
-    hitmap.add(area, HitTarget::Button(ButtonId::ComposerTargetToggle));
+    let rect = Rect::new(x, y, width, 1);
+    let rule = "─".repeat(width as usize);
+    frame.render_widget(Paragraph::new(Line::from(Span::styled(rule, style))), rect);
 }
 
 fn draw_compact_bar(
@@ -512,96 +375,124 @@ fn draw_compact_bar(
     area: Rect,
     app: &AppState,
     ui: &UiState,
-    thread_open: bool,
     hitmap: &mut HitMap,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let header_style = if ui.theme.no_color {
+    let bar_style = if ui.theme.no_color {
         Style::default()
     } else {
         Style::default()
             .bg(ui.theme.bg_header)
             .fg(ui.theme.fg_primary)
     };
-    frame.render_widget(Paragraph::new("").style(header_style), area);
+    frame.render_widget(Paragraph::new("").style(bar_style), area);
 
-    let mut pills: Vec<(&'static str, HitTarget, bool)> = vec![
-        (
-            " List ",
-            HitTarget::Button(ButtonId::NarrowList),
-            ui.narrow_pane == NarrowPane::List,
-        ),
-        (
-            " Chat ",
-            HitTarget::Button(ButtonId::NarrowChat),
-            ui.narrow_pane == NarrowPane::Chat,
-        ),
-    ];
-    if thread_open {
-        pills.push((
-            " Thread ",
-            HitTarget::Button(ButtonId::NarrowThread),
-            ui.narrow_pane == NarrowPane::Thread,
-        ));
-    }
-    pills.push((
-        " [Jump] ",
-        HitTarget::Button(ButtonId::CommandPalette),
-        false,
-    ));
-    pills.push((" [Search] ", HitTarget::Button(ButtonId::Search), false));
+    let tab_label = match ui.active_nav_tab {
+        TAB_CALENDAR => "Cal",
+        TAB_TASKS => "Tasks",
+        _ => "Mail",
+    };
 
-    let mut x = area.x;
-    for (label, target, active) in pills {
-        let w = label.width() as u16;
-        if x.saturating_add(w) > area.right() {
-            break;
-        }
-        let r = Rect {
-            x,
-            y: area.y,
-            width: w,
-            height: 1,
-        };
-        let st = if active {
+    let mut segments: Vec<(String, Style, Option<HitTarget>)> = Vec::new();
+    let pill = |active: bool| -> Style {
+        if active {
             if ui.theme.no_color {
                 Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
             } else {
                 Style::default()
-                    .fg(ui.theme.accent)
-                    .bg(ui.theme.bg_selected)
+                    .bg(ui.theme.accent)
+                    .fg(ui.theme.bg_canvas)
                     .add_modifier(Modifier::BOLD)
             }
         } else {
-            header_style
-        };
-        frame.render_widget(Paragraph::new(label).style(st), r);
-        hitmap.add(r, target);
-        x = x.saturating_add(w + 1);
+            bar_style.fg(ui.theme.fg_secondary)
+        }
+    };
+
+    segments.push((
+        format!(" 1-3:{tab_label} "),
+        bar_style.fg(ui.theme.accent_soft).add_modifier(Modifier::BOLD),
+        None,
+    ));
+    segments.push((
+        " Folders ".to_string(),
+        pill(ui.narrow_pane == NarrowPane::Folders),
+        Some(HitTarget::Button(ButtonId::NarrowFolders)),
+    ));
+    segments.push((" ".to_string(), bar_style, None));
+    segments.push((
+        " List ".to_string(),
+        pill(ui.narrow_pane == NarrowPane::List),
+        Some(HitTarget::Button(ButtonId::NarrowList)),
+    ));
+    segments.push((" ".to_string(), bar_style, None));
+    segments.push((
+        " Read ".to_string(),
+        pill(ui.narrow_pane == NarrowPane::Read),
+        Some(HitTarget::Button(ButtonId::NarrowRead)),
+    ));
+
+    let unread = app.unread_inbox_count();
+    if unread > 0 && area.width >= 48 {
+        segments.push((
+            format!(" · {unread}u"),
+            bar_style.fg(ui.theme.unread),
+            None,
+        ));
     }
 
-    if x + 4 < area.right() {
-        let title = truncate_width(&app.active_title(), (area.right() - x) as usize);
-        let title_style = if ui.theme.no_color {
-            ui.theme.muted_style()
+    let mut x = area.x;
+    let mut spans = Vec::new();
+    for (text, style, target) in segments {
+        let w = text.width() as u16;
+        if x + w > area.right() {
+            break;
+        }
+        if let Some(hit) = target {
+            hitmap.add_line(x, area.y, w, hit);
+        }
+        spans.push(Span::styled(text, style));
+        x = x.saturating_add(w);
+    }
+
+    // Right-aligned Jump & New buttons if room remains
+    let right_buttons: &[(&str, ButtonId)] = &[
+        ("[Ctrl+K]", ButtonId::CommandPalette),
+        (" ", ButtonId::CommandPalette),
+        ("[+New]", match ui.active_nav_tab {
+            TAB_CALENDAR => ButtonId::NewEvent,
+            TAB_TASKS => ButtonId::NewTodoTask,
+            _ => ButtonId::NewMail,
+        }),
+    ];
+    let right_w: u16 = right_buttons.iter().map(|(s, _)| s.width() as u16).sum();
+    if x + 1 + right_w <= area.right() {
+        let pad = (area.right() - x - right_w) as usize;
+        if pad > 0 {
+            spans.push(Span::styled(" ".repeat(pad), bar_style));
+            x = x.saturating_add(pad as u16);
+        }
+        let btn_style = if ui.theme.no_color {
+            Style::default().add_modifier(Modifier::UNDERLINED)
         } else {
-            ui.theme.muted_style().bg(ui.theme.bg_header)
+            Style::default()
+                .fg(ui.theme.accent_soft)
+                .bg(ui.theme.bg_header)
         };
-        frame.render_widget(
-            Paragraph::new(title).style(title_style),
-            Rect {
-                x,
-                y: area.y,
-                width: area.right() - x,
-                height: 1,
-            },
-        );
+        for (idx, (label, btn)) in right_buttons.iter().enumerate() {
+            let w = label.width() as u16;
+            spans.push(Span::styled((*label).to_string(), btn_style));
+            if idx != 1 {
+                hitmap.add_line(x, area.y, w, HitTarget::Button(*btn));
+            }
+            x = x.saturating_add(w);
+        }
     }
-}
 
-const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(bar_style), area);
+}
 
 fn draw_status_bar(
     frame: &mut Frame,
@@ -624,29 +515,52 @@ fn draw_status_bar(
 
     let spinner_glyph = SPINNER_FRAMES[(ui.spinner_tick as usize) % SPINNER_FRAMES.len()];
     let (sync_glyph, sync_glyph_color, sync_tail) = if app.syncing {
-        (spinner_glyph, Some(ui.theme.accent), format!(" {}", app.sync_summary))
+        (
+            spinner_glyph,
+            Some(ui.theme.accent),
+            format!(" {}", app.sync_summary),
+        )
     } else if ui.poll_retrying {
+        // Quiet status-bar design: tiny 1-cell amber spinner without scary error banners.
         (spinner_glyph, Some(ui.theme.warning), String::new())
     } else {
-        ("✓", None, format!(" {}", app.sync_summary))
+        ("✓", Some(ui.theme.success), format!(" {}", app.sync_summary))
     };
-    let sync_tag = format!("{sync_glyph}{sync_tail}");
-    let (dot, dot_color) = ui
-        .theme
-        .presence_indicator(app.my_presence.as_ref().map(|p| p.availability.as_str()));
-    let avail = app
-        .my_presence
-        .as_ref()
-        .map(|p| p.availability.as_str())
-        .unwrap_or("Offline");
 
     let focus = ui.focus();
     let mode_badge = match focus {
-        Focus::Composer => " [COMPOSE] ",
-        Focus::Chat => " [CHAT] ",
         Focus::Nav => " [NAV] ",
-        Focus::Thread => " [THREAD] ",
+        Focus::List => " [LIST] ",
+        Focus::Reader => " [READ] ",
         Focus::Overlay => " [MODAL] ",
+    };
+
+    let context_label = match ui.active_nav_tab {
+        TAB_CALENDAR => format!("Cal · {}", ui.cal_range.label()),
+        TAB_TASKS => {
+            let list_name = app
+                .active_todo_list_id
+                .as_deref()
+                .and_then(|id| app.todo_lists.iter().find(|l| l.id == id))
+                .map(|l| l.display_name.as_str())
+                .unwrap_or("Tasks");
+            format!("Tasks · {list_name}")
+        }
+        _ => {
+            let mut label = format!("Mail · {}", app.active_folder_display_name());
+            if ui.mail_unread_only {
+                label.push_str(" (Unread)");
+            } else if ui.focused_only {
+                label.push_str(" (Focused)");
+            }
+            label
+        }
+    };
+
+    let account_label = if !app.my_email.is_empty() {
+        format!("{} · ", app.my_email)
+    } else {
+        String::new()
     };
 
     let task_note = ui
@@ -656,45 +570,36 @@ fn draw_status_bar(
         .unwrap_or_default();
 
     let density_hint = format!("Ctrl+D {}", ui.density.label());
-    let full_segments: Vec<(&str, Option<ButtonId>)> = match focus {
-        Focus::Composer => vec![
-            ("Enter Send · PgUp/↑↓ Scroll · Alt+1-3 Tab · ", None),
+    let full_segments: Vec<(&str, Option<ButtonId>)> = match (focus, ui.active_nav_tab) {
+        (Focus::Overlay, _) => vec![("↑↓ Select · Enter Confirm · Esc Close ", None)],
+        (_, TAB_CALENDAR) => vec![
+            ("1-3 Tab · j/k Event · n New · a/t/d RSVP · J Join · ", None),
             (density_hint.as_str(), Some(ButtonId::DensityToggle)),
             (" · ", None),
             ("Ctrl+K Jump", Some(ButtonId::CommandPalette)),
-            (" · Esc Browse ", None),
+            (" · ", None),
+            ("?", Some(ButtonId::Help)),
+            (" ", None),
         ],
-        Focus::Chat => vec![
-            ("1-3 Tab · j/k Select · i Compose · r Reply · t Thread · + React · ", None),
+        (_, TAB_TASKS) => vec![
+            ("1-3 Tab · Space Done · n Task · N List · x Del · ", None),
+            (density_hint.as_str(), Some(ButtonId::DensityToggle)),
+            (" · ", None),
             ("Ctrl+K Jump", Some(ButtonId::CommandPalette)),
             (" · ", None),
             ("?", Some(ButtonId::Help)),
             (" ", None),
         ],
-        Focus::Nav => vec![
-            ("1-3 Tab · j/k Move · Enter Open · u Unread · p Pin · f Filter · ", None),
+        _ => vec![
+            ("1-3 Tab · j/k Move · r Reply · c Compose · a Archive · u Read · ", None),
             ("Ctrl+K Jump", Some(ButtonId::CommandPalette)),
             (" · ", None),
             ("?", Some(ButtonId::Help)),
             (" ", None),
         ],
-        Focus::Thread => vec![
-            ("j/k Select · i Reply · Alt+T Target · Esc Close · ", None),
-            ("Ctrl+K Jump", Some(ButtonId::CommandPalette)),
-            (" · ", None),
-            ("?", Some(ButtonId::Help)),
-            (" ", None),
-        ],
-        Focus::Overlay => vec![("↑↓ Select · Enter Confirm · Esc Close ", None)],
     };
 
     let compact_segments: Vec<(&str, Option<ButtonId>)> = match focus {
-        Focus::Composer => vec![
-            (density_hint.as_str(), Some(ButtonId::DensityToggle)),
-            (" · ", None),
-            ("Ctrl+K Jump", Some(ButtonId::CommandPalette)),
-            (" ", None),
-        ],
         Focus::Overlay => vec![("Esc Close ", None)],
         _ => vec![
             ("Ctrl+K Jump", Some(ButtonId::CommandPalette)),
@@ -705,9 +610,9 @@ fn draw_status_bar(
     };
 
     let badge_w = mode_badge.width() as u16;
-    let presence_prefix = format!("{dot} ");
-    let left_rest = format!("{avail} · {sync_tag}{task_note}");
-    let full_left_w = badge_w + presence_prefix.width() as u16 + left_rest.width() as u16;
+    let sync_tag = format!("{sync_glyph}{sync_tail}");
+    let left_rest = format!(" {account_label}{context_label} · {sync_tag}{task_note}");
+    let full_left_w = badge_w + left_rest.width() as u16;
 
     let seg_width = |segs: &[(&str, Option<ButtonId>)]| -> u16 {
         segs.iter().map(|(s, _)| s.width() as u16).sum()
@@ -718,7 +623,7 @@ fn draw_status_bar(
     let chosen_right: &[(&str, Option<ButtonId>)] =
         if full_left_w + 2 + full_right_w <= area.width {
             &full_segments
-        } else if badge_w + 12 + full_right_w <= area.width {
+        } else if badge_w + 14 + full_right_w <= area.width {
             &full_segments
         } else if badge_w + 10 + compact_right_w <= area.width {
             &compact_segments
@@ -729,10 +634,9 @@ fn draw_status_bar(
     let right_w = seg_width(chosen_right);
     let left_budget = area
         .width
-        .saturating_sub(badge_w + presence_prefix.width() as u16 + right_w + 1)
-        as usize;
+        .saturating_sub(badge_w + right_w + 1) as usize;
     let left_trimmed = truncate_width(&left_rest, left_budget);
-    let left_total_w = badge_w + presence_prefix.width() as u16 + left_trimmed.width() as u16;
+    let left_total_w = badge_w + left_trimmed.width() as u16;
     let pad = area.width.saturating_sub(left_total_w + right_w) as usize;
 
     let badge_style = if ui.theme.no_color {
@@ -743,11 +647,6 @@ fn draw_status_bar(
             .bg(ui.theme.bg_header)
             .add_modifier(Modifier::BOLD)
     };
-    let dot_style = if ui.theme.no_color {
-        bar_style
-    } else {
-        bar_style.fg(dot_color)
-    };
     let hint_style = if ui.theme.no_color {
         ui.theme.muted_style()
     } else {
@@ -756,20 +655,17 @@ fn draw_status_bar(
             .bg(ui.theme.bg_header)
     };
 
-    let mut spans = vec![
-        Span::styled(mode_badge, badge_style),
-        Span::styled(presence_prefix, dot_style),
-    ];
-    let avail_sep = format!("{avail} · ");
-    let avail_sep_w = avail_sep.width();
+    let mut spans = vec![Span::styled(mode_badge, badge_style)];
+    let prefix = format!(" {account_label}{context_label} · ");
+    let prefix_w = prefix.width();
     let glyph_w = sync_glyph.width();
     if let Some(glyph_color) = sync_glyph_color {
-        if !ui.theme.no_color && left_budget >= avail_sep_w + glyph_w {
+        if !ui.theme.no_color && left_budget >= prefix_w + glyph_w {
             let after_glyph = truncate_width(
                 &format!("{sync_tail}{task_note}"),
-                left_budget.saturating_sub(avail_sep_w + glyph_w),
+                left_budget.saturating_sub(prefix_w + glyph_w),
             );
-            spans.push(Span::styled(avail_sep, bar_style));
+            spans.push(Span::styled(prefix, bar_style));
             spans.push(Span::styled(sync_glyph, bar_style.fg(glyph_color)));
             if !after_glyph.is_empty() {
                 spans.push(Span::styled(after_glyph, bar_style));
@@ -862,8 +758,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn responsive_layout_breakpoints() {
-        assert_eq!(layout_mode(140), LayoutMode::Wide);
+    fn responsive_3pane_layout_breakpoints() {
+        assert_eq!(layout_mode(160), LayoutMode::Wide);
         assert_eq!(layout_mode(120), LayoutMode::Wide);
         assert_eq!(layout_mode(119), LayoutMode::Medium);
         assert_eq!(layout_mode(80), LayoutMode::Medium);
@@ -871,77 +767,78 @@ mod tests {
     }
 
     #[test]
-    fn wide_layout_includes_thread_drawer_when_open() {
+    fn wide_3pane_layout_allocates_nav_list_and_reader_with_hairlines() {
         let area = Rect::new(0, 0, 140, 40);
-        let closed = compute_layout(area, true, false, true, NarrowPane::Chat, 4);
-        assert!(closed.top_bar.is_none());
-        assert!(closed.rail.is_none());
-        assert_eq!(closed.nav.map(|r| r.width), Some(28));
-        assert!(closed.chat.is_some());
-        assert_eq!(
-            closed.nav.unwrap().right() + 1,
-            closed.chat.unwrap().x
-        );
-        assert!(closed.thread.is_none());
+        let plan = compute_layout(area, true, false, NarrowPane::List);
+        assert_eq!(plan.mode, Some(LayoutMode::Wide));
+        assert!(plan.compact_bar.is_none());
 
-        let open = compute_layout(area, true, true, true, NarrowPane::Chat, 4);
-        assert!(open.chat.is_some());
-        assert!(open.thread.is_some());
-        assert_eq!(
-            open.chat.unwrap().right() + 1,
-            open.thread.unwrap().x
-        );
-        assert!(open.composer.is_some());
+        let nav = plan.nav.expect("wide mode includes nav pane");
+        let list = plan.list.expect("wide mode includes middle list pane");
+        let reader = plan.reader.expect("wide mode includes right reading pane");
+
+        assert_eq!(nav.width, 24);
+        assert_eq!(nav.right() + 1, list.x, "1-cell vertical hairline between nav and list");
+        assert_eq!(list.width, 42);
+        assert_eq!(list.right() + 1, reader.x, "1-cell vertical hairline between list and reader");
+        assert!(reader.width >= 70);
+        assert_eq!(plan.status.y, 39);
+        assert_eq!(plan.status.height, 1);
+
+        // Hiding left nav gives full space to list + reader.
+        let hidden = compute_layout(area, false, false, NarrowPane::List);
+        assert!(hidden.nav.is_none());
+        assert!(hidden.list.is_some());
+        assert!(hidden.reader.is_some());
+        assert_eq!(hidden.list.unwrap().x, 0);
     }
 
     #[test]
-    fn minimal_chrome_layout_supports_two_row_composer_and_medium_breakpoints() {
-        let wide = Rect::new(0, 0, 140, 40);
-        let min_comp = compute_layout_with_options(
-            wide,
-            false,
-            false,
-            true,
-            NarrowPane::Chat,
-            2,
-            true,
-            true,
-        );
-        assert!(min_comp.top_bar.is_none());
-        assert!(min_comp.rail.is_none());
-        assert!(min_comp.nav.is_none());
-        assert_eq!(min_comp.composer.map(|r| r.height), Some(2));
+    fn medium_layout_splits_list_and_reader_or_fullscreen() {
+        let area = Rect::new(0, 0, 100, 32);
+        let stacked = compute_layout(area, true, false, NarrowPane::List);
+        assert_eq!(stacked.mode, Some(LayoutMode::Medium));
+        let nav = stacked.nav.expect("medium nav visible");
+        let list = stacked.list.expect("medium list visible on top");
+        let reader = stacked.reader.expect("medium reader visible below");
 
-        let med100 = compute_layout(Rect::new(0, 0, 100, 30), true, false, true, NarrowPane::Chat, 2);
-        assert_eq!(med100.nav.map(|r| r.width), Some(26));
-        assert_eq!(med100.nav.unwrap().right() + 1, med100.chat.unwrap().x);
+        assert_eq!(nav.width, 22);
+        assert_eq!(nav.right() + 1, list.x);
+        assert_eq!(list.x, reader.x);
+        assert_eq!(list.bottom() + 1, reader.y, "1-row horizontal hairline between list and reader");
+        assert!(reader.height > list.height);
 
-        let med85 = compute_layout(Rect::new(0, 0, 85, 30), true, false, true, NarrowPane::Chat, 2);
-        assert_eq!(med85.nav.map(|r| r.width), Some(24));
-        assert_eq!(med85.nav.unwrap().right() + 1, med85.chat.unwrap().x);
+        let full = compute_layout(area, true, true, NarrowPane::Read);
+        assert!(full.list.is_none());
+        assert!(full.reader.is_some());
+        assert_eq!(full.reader.unwrap().height, area.height - 1);
     }
 
     #[test]
-    fn narrow_layout_switches_single_pane() {
+    fn narrow_layout_switches_single_pane_with_compact_bar() {
         let area = Rect::new(0, 0, 72, 24);
-        let list = compute_layout(area, true, true, true, NarrowPane::List, 3);
-        assert!(list.nav.is_some());
-        assert!(list.chat.is_none());
-        assert!(list.composer.is_none());
+        let folders = compute_layout(area, true, false, NarrowPane::Folders);
+        assert_eq!(folders.mode, Some(LayoutMode::Narrow));
+        assert_eq!(folders.compact_bar.map(|r| r.height), Some(1));
+        assert!(folders.nav.is_some());
+        assert!(folders.list.is_none());
+        assert!(folders.reader.is_none());
 
-        let chat = compute_layout(area, true, true, true, NarrowPane::Chat, 3);
-        assert!(chat.nav.is_none());
-        assert!(chat.chat.is_some());
-        assert!(chat.composer.is_some());
+        let list = compute_layout(area, true, false, NarrowPane::List);
+        assert!(list.nav.is_none());
+        assert!(list.list.is_some());
+        assert!(list.reader.is_none());
 
-        let thread = compute_layout(area, true, true, true, NarrowPane::Thread, 3);
-        assert!(thread.thread.is_some());
-        assert!(thread.composer.is_some());
+        let read = compute_layout(area, true, false, NarrowPane::Read);
+        assert!(read.nav.is_none());
+        assert!(read.list.is_none());
+        assert!(read.reader.is_some());
     }
 
     #[test]
-    fn truncate_width_handles_multibyte_korean() {
-        assert_eq!(truncate_width("안녕하세요", 4), "안…");
+    fn truncate_width_handles_multibyte_unicode() {
+        assert_eq!(truncate_width("αβγδε", 4), "αβγ…");
+        assert_eq!(truncate_width("FullWidth：日本語", 12), "FullWidth：…");
         assert_eq!(truncate_width("abc", 5), "abc");
     }
 }

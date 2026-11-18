@@ -1,16 +1,16 @@
 [package]
-name = "teams-cli"
-version = "0.7.3"
+name = "outlook-cli"
+version = "0.1.0"
 edition = "2021"
-description = "Microsoft Teams terminal client & AI agent toolkit (CLI, TUI, HTTP API, MCP)"
+description = "Microsoft Outlook terminal client & AI agent toolkit — Mail, Calendar, Tasks & Contacts (CLI, TUI, HTTP API, MCP)"
 license = "MIT"
 
 [lib]
-name = "teams_cli"
+name = "outlook_cli"
 path = "src/lib.rs"
 
 [[bin]]
-name = "teams"
+name = "outlook"
 path = "src/main.rs"
 
 [dependencies]
