@@ -1243,6 +1243,18 @@ fn env_access_token_from_str(raw: &str, config: &AppConfig) -> Option<StoredToke
     ))
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenScopeDiagnostics {
+    pub scopes: Vec<String>,
+    pub roles: Vec<String>,
+    pub has_scope_claims: bool,
+    pub can_read_chats: bool,
+    pub chat_read_basic_only: bool,
+    pub can_send_chats: bool,
+    pub can_read_channels: bool,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct JwtClaims {
     exp: Option<i64>,
@@ -1251,6 +1263,112 @@ struct JwtClaims {
     user_email: Option<String>,
     tenant_id: Option<String>,
     client_id: Option<String>,
+    scopes: Vec<String>,
+    roles: Vec<String>,
+}
+
+/// Inspects JWT `scp` / `roles` claims on an access token to detect missing or restricted Teams Graph permissions.
+pub fn diagnose_access_token_scopes(access_token: &str) -> TokenScopeDiagnostics {
+    let Some(claims) = parse_jwt_claims(access_token) else {
+        return TokenScopeDiagnostics::default();
+    };
+    let has_scope_claims = !claims.scopes.is_empty() || !claims.roles.is_empty();
+    let has_any = |candidates: &[&str]| -> bool {
+        candidates.iter().any(|target| {
+            claims
+                .scopes
+                .iter()
+                .chain(claims.roles.iter())
+                .any(|s| s.eq_ignore_ascii_case(target))
+        })
+    };
+
+    let can_read_chats = has_any(&["Chat.Read", "Chat.ReadWrite", "Chat.Read.All", "Chat.ReadWrite.All"]);
+    let has_chat_basic = has_any(&["Chat.ReadBasic", "Chat.ReadBasic.All"]);
+    let chat_read_basic_only = has_chat_basic && !can_read_chats;
+    let can_send_chats = has_any(&["Chat.ReadWrite", "Chat.ReadWrite.All", "ChatMessage.Send"]);
+    let can_read_channels = has_any(&["ChannelMessage.Read.All", "ChannelMessage.ReadWrite"]);
+
+    let mut warnings = Vec::new();
+    if has_scope_claims {
+        if chat_read_basic_only {
+            warnings.push(
+                "현재 토큰에 `Chat.ReadBasic` 권한만 있고 `Chat.Read` / `Chat.ReadWrite`가 없어 대화 메시지 본문 및 이전 메시지 조회가 제한됩니다.".to_string(),
+            );
+        } else if !can_read_chats {
+            warnings.push(
+                "현재 토큰에 `Chat.Read` 또는 `Chat.ReadWrite` 권한이 없어 1:1/그룹 채팅 메시지 조회가 거부될 수 있습니다.".to_string(),
+            );
+        }
+        if !can_read_channels {
+            warnings.push(
+                "현재 토큰에 `ChannelMessage.Read.All` 권한이 없어 팀 채널 메시지/과거 기록 조회가 제한될 수 있습니다.".to_string(),
+            );
+        }
+    }
+
+    TokenScopeDiagnostics {
+        scopes: claims.scopes,
+        roles: claims.roles,
+        has_scope_claims,
+        can_read_chats,
+        chat_read_basic_only,
+        can_send_chats,
+        can_read_channels,
+        warnings,
+    }
+}
+
+fn contains_http_403_token(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        if &bytes[i..i + 3] == b"403" {
+            let prev_ok = if i == 0 {
+                true
+            } else {
+                let p = bytes[i - 1];
+                !p.is_ascii_alphanumeric() && p != b':' && p != b'/'
+            };
+            let next_ok = if i + 3 == bytes.len() {
+                true
+            } else {
+                !bytes[i + 3].is_ascii_alphanumeric()
+            };
+            if prev_ok && next_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Converts a raw Graph 403 / insufficient-privileges error into an actionable Korean explanation with token scope context.
+pub fn explain_graph_permission_error(err_msg: &str, access_token: Option<&str>) -> Option<String> {
+    let detail = err_msg
+        .split_once("): ")
+        .map(|(_, d)| d)
+        .unwrap_or(err_msg);
+    let lower = detail.to_ascii_lowercase();
+    let looks_forbidden = contains_http_403_token(&lower)
+        || lower.contains("forbidden")
+        || lower.contains("authorization_requestdenied")
+        || lower.contains("insufficient privileges")
+        || lower.contains("missing scope")
+        || lower.contains("aclcheckfailed");
+    if !looks_forbidden {
+        return None;
+    }
+    if let Some(tok) = access_token {
+        let diag = diagnose_access_token_scopes(tok);
+        if let Some(first) = diag.warnings.first() {
+            return Some(format!("권한 부족 (403): {first}"));
+        }
+    }
+    Some(
+        "권한 부족 (403): 현재 토큰에 메시지 조회 권한(`Chat.Read` / `ChannelMessage.Read.All`)이 없거나 접근이 제한된 대화입니다.".to_string(),
+    )
 }
 
 fn strip_bearer_prefix(raw: &str) -> &str {
@@ -1291,6 +1409,37 @@ fn parse_jwt_claims(token: &str) -> Option<JwtClaims> {
         .get("exp")
         .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)));
 
+    let scopes = match val.get("scp") {
+        Some(serde_json::Value::String(s)) => s
+            .split_whitespace()
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    };
+    let roles = match val.get("roles") {
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Some(serde_json::Value::String(s)) => s
+            .split_whitespace()
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    };
+
     Some(JwtClaims {
         exp,
         user_id: claim_str("oid").or_else(|| claim_str("sub")),
@@ -1300,6 +1449,8 @@ fn parse_jwt_claims(token: &str) -> Option<JwtClaims> {
             .or_else(|| claim_str("email")),
         tenant_id: claim_str("tid"),
         client_id: claim_str("appid").or_else(|| claim_str("azp")),
+        scopes,
+        roles,
     })
 }
 
@@ -2384,6 +2535,132 @@ mod tests {
             log.lines().count(),
             1,
             "concurrent refresh_cmd calls must coalesce into one execution"
+        );
+    }
+
+    #[test]
+    fn test_diagnose_access_token_scopes_chat_read_basic_only() {
+        let jwt = make_test_jwt_with_encoder(
+            &serde_json::json!({
+                "scp": "User.Read Chat.ReadBasic",
+                "oid": "u-1"
+            }),
+            false,
+        );
+        let diag = diagnose_access_token_scopes(&jwt);
+        assert!(diag.has_scope_claims);
+        assert!(diag.chat_read_basic_only);
+        assert!(!diag.can_read_chats);
+        assert!(!diag.can_send_chats);
+        assert!(!diag.can_read_channels);
+        assert!(diag.warnings.iter().any(|w| w.contains("Chat.ReadBasic")));
+    }
+
+    #[test]
+    fn test_diagnose_access_token_scopes_full_delegated_and_app_roles() {
+        let delegated_jwt = make_test_jwt_with_encoder(
+            &serde_json::json!({
+                "scp": "User.Read Chat.ReadWrite ChannelMessage.Read.All",
+                "oid": "u-2"
+            }),
+            false,
+        );
+        let diag_del = diagnose_access_token_scopes(&delegated_jwt);
+        assert!(diag_del.has_scope_claims);
+        assert!(diag_del.can_read_chats);
+        assert!(!diag_del.chat_read_basic_only);
+        assert!(diag_del.can_send_chats);
+        assert!(diag_del.can_read_channels);
+        assert!(diag_del.warnings.is_empty());
+
+        let app_jwt = make_test_jwt_with_encoder(
+            &serde_json::json!({
+                "roles": ["Chat.Read.All", "ChannelMessage.Read.All"],
+                "appid": "app-1"
+            }),
+            false,
+        );
+        let diag_app = diagnose_access_token_scopes(&app_jwt);
+        assert!(diag_app.has_scope_claims);
+        assert!(diag_app.can_read_chats);
+        assert!(!diag_app.chat_read_basic_only);
+        assert!(!diag_app.can_send_chats);
+        assert!(diag_app.can_read_channels);
+        assert!(diag_app.warnings.is_empty());
+
+        let app_rw_jwt = make_test_jwt_with_encoder(
+            &serde_json::json!({
+                "roles": ["Chat.ReadWrite.All", "ChannelMessage.Read.All"],
+                "appid": "app-2"
+            }),
+            false,
+        );
+        let diag_app_rw = diagnose_access_token_scopes(&app_rw_jwt);
+        assert!(diag_app_rw.can_read_chats);
+        assert!(diag_app_rw.can_send_chats);
+        assert!(diag_app_rw.can_read_channels);
+        assert!(diag_app_rw.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_diagnose_access_token_scopes_opaque_and_no_claims() {
+        let opaque = diagnose_access_token_scopes("opaque-non-jwt-token");
+        assert!(!opaque.has_scope_claims);
+        assert!(opaque.warnings.is_empty());
+
+        let no_scope_jwt = make_test_jwt_with_encoder(
+            &serde_json::json!({
+                "oid": "u-3",
+                "exp": 1_900_000_000
+            }),
+            false,
+        );
+        let no_scope = diagnose_access_token_scopes(&no_scope_jwt);
+        assert!(!no_scope.has_scope_claims);
+        assert!(no_scope.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_explain_graph_permission_error_403_vs_network() {
+        let basic_jwt = make_test_jwt_with_encoder(
+            &serde_json::json!({
+                "scp": "User.Read Chat.ReadBasic"
+            }),
+            false,
+        );
+        let full_jwt = make_test_jwt_with_encoder(
+            &serde_json::json!({
+                "scp": "User.Read Chat.ReadWrite ChannelMessage.Read.All"
+            }),
+            false,
+        );
+
+        let explained_basic = explain_graph_permission_error(
+            "Graph API 오류 (GET https://graph.microsoft.com/v1.0/chats/c1/messages): 403 Forbidden [Forbidden] Missing scope",
+            Some(&basic_jwt),
+        )
+        .expect("403 must be explained");
+        assert!(explained_basic.contains("403"));
+        assert!(explained_basic.contains("Chat.ReadBasic"));
+
+        let explained_full = explain_graph_permission_error(
+            "Graph API 오류 (GET https://graph.microsoft.com/v1.0/chats/c1/messages): 403 Forbidden",
+            Some(&full_jwt),
+        )
+        .expect("403 with full token falls back to generic explanation");
+        assert!(explained_full.contains("403"));
+        assert!(!explained_full.contains("Chat.ReadBasic"));
+
+        assert_eq!(
+            explain_graph_permission_error(
+                "Graph HTTP 요청 실패 (GET http://127.0.0.1:40312/v1.0/chats/c1/messages): connection refused",
+                Some(&basic_jwt),
+            ),
+            None
+        );
+        assert_eq!(
+            explain_graph_permission_error("dns resolution failed", Some(&basic_jwt)),
+            None
         );
     }
 }

@@ -1,8 +1,6 @@
 //! Local SQLite WAL persistence + FTS5 (`trigram` + `LIKE` hybrid) search repository.
 
 pub mod db;
-pub mod onenote;
-pub mod outlook;
 pub mod repo;
 pub mod search;
 
@@ -15,10 +13,8 @@ use std::{
 use anyhow::Result;
 
 use crate::models::{
-    CalendarEvent, ContactItem, ConversationSummary, MailFolder, MailMessage, MailSearchHit,
-    MemberInfo, MessageItem, OnenoteNotebook, OnenotePageDetail, OnenotePageSummary,
-    OnenoteSearchHit, OnenoteSection, OnenoteSectionGroup, PresenceStatus, SearchHit, SyncCursor,
-    TeamSummary, ThreadView, TodoList, TodoTask,
+    ConversationSummary, MemberInfo, MessageItem, PresenceStatus, SearchHit, SyncCursor,
+    TeamSummary, ThreadView,
 };
 
 const MAX_READER_POOL_SIZE: usize = 4;
@@ -268,6 +264,18 @@ impl Storage {
         search::search_messages(&conn, query, conv_key_filter, limit)
     }
 
+    /// Lists older root messages strictly preceding `(before_created_at, before_msg_id)` in chronological order (oldest first).
+    pub fn list_older_root_messages(
+        &self,
+        conv_key: &str,
+        limit: usize,
+        before_created_at: &str,
+        before_msg_id: Option<&str>,
+    ) -> Result<Vec<MessageItem>> {
+        let conn = self.read_conn()?;
+        repo::list_older_root_messages(&conn, conv_key, limit, before_created_at, before_msg_id)
+    }
+
     pub fn get_sync_cursor(&self, scope_key: &str) -> Result<Option<SyncCursor>> {
         let conn = self.read_conn()?;
         repo::get_sync_cursor(&conn, scope_key)
@@ -276,229 +284,6 @@ impl Storage {
     pub fn save_sync_cursor(&self, cursor: &SyncCursor) -> Result<()> {
         let conn = self.lock_conn()?;
         repo::save_sync_cursor(&conn, cursor)
-    }
-
-    // --- Outlook Mail, Calendar, Contacts, & Microsoft To Do ---
-    pub fn upsert_mail_folders(&self, folders: &[MailFolder]) -> Result<()> {
-        let mut conn = self.lock_conn()?;
-        outlook::upsert_mail_folders(&mut conn, folders)
-    }
-
-    pub fn list_mail_folders(&self) -> Result<Vec<MailFolder>> {
-        let conn = self.read_conn()?;
-        outlook::list_mail_folders(&conn)
-    }
-
-    pub fn upsert_mail_messages(&self, messages: &[MailMessage]) -> Result<usize> {
-        let mut conn = self.lock_conn()?;
-        outlook::upsert_mail_messages(&mut conn, messages)
-    }
-
-    pub fn list_mail_messages(
-        &self,
-        folder_id_or_wellknown: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<MailMessage>> {
-        let conn = self.read_conn()?;
-        outlook::list_mail_messages(&conn, folder_id_or_wellknown, limit)
-    }
-
-    /// Lightweight header-only projection for TUI/CLI folder lists (skips reading large HTML/plain/attachment blobs).
-    pub fn list_mail_summaries(
-        &self,
-        folder_id_or_wellknown: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<MailMessage>> {
-        let conn = self.read_conn()?;
-        outlook::list_mail_summaries(&conn, folder_id_or_wellknown, limit)
-    }
-
-    pub fn get_mail_message(&self, message_id: &str) -> Result<Option<MailMessage>> {
-        let conn = self.read_conn()?;
-        outlook::get_mail_message(&conn, message_id)
-    }
-
-    pub fn set_mail_read_local(&self, message_id: &str, is_read: bool) -> Result<()> {
-        let mut conn = self.lock_conn()?;
-        outlook::set_mail_read_local(&mut conn, message_id, is_read)
-    }
-
-    pub fn set_mail_flagged_local(&self, message_id: &str, flagged: bool) -> Result<()> {
-        let conn = self.lock_conn()?;
-        outlook::set_mail_flagged_local(&conn, message_id, flagged)
-    }
-
-    pub fn move_mail_folder_local(&self, message_id: &str, target_folder_id: &str) -> Result<()> {
-        let mut conn = self.lock_conn()?;
-        outlook::move_mail_folder_local(&mut conn, message_id, target_folder_id)
-    }
-
-    pub fn delete_mail_messages_by_ids(&self, ids: &[String]) -> Result<()> {
-        let mut conn = self.lock_conn()?;
-        outlook::delete_mail_messages_by_ids(&mut conn, ids)
-    }
-
-    pub fn search_mail_messages(
-        &self,
-        query: &str,
-        folder_filter: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<MailSearchHit>> {
-        let conn = self.read_conn()?;
-        outlook::search_mail_messages(&conn, query, folder_filter, limit, self.trigram_enabled)
-    }
-
-    pub fn upsert_calendar_events(&self, events: &[CalendarEvent]) -> Result<()> {
-        let mut conn = self.lock_conn()?;
-        outlook::upsert_calendar_events(&mut conn, events)
-    }
-
-    pub fn list_calendar_events(
-        &self,
-        start_iso: Option<&str>,
-        end_iso: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<CalendarEvent>> {
-        let conn = self.read_conn()?;
-        outlook::list_calendar_events(&conn, start_iso, end_iso, limit)
-    }
-
-    pub fn delete_calendar_event(&self, event_id: &str) -> Result<()> {
-        let conn = self.lock_conn()?;
-        outlook::delete_calendar_event(&conn, event_id)
-    }
-
-    pub fn delete_calendar_events_by_ids(&self, ids: &[String]) -> Result<()> {
-        let mut conn = self.lock_conn()?;
-        outlook::delete_calendar_events_by_ids(&mut conn, ids)
-    }
-
-    pub fn upsert_contacts(&self, contacts: &[ContactItem]) -> Result<()> {
-        let mut conn = self.lock_conn()?;
-        outlook::upsert_contacts(&mut conn, contacts)
-    }
-
-    pub fn list_contacts(&self, query: Option<&str>, limit: usize) -> Result<Vec<ContactItem>> {
-        let conn = self.read_conn()?;
-        outlook::list_contacts(&conn, query, limit)
-    }
-
-    pub fn delete_contact(&self, contact_id: &str) -> Result<()> {
-        let conn = self.lock_conn()?;
-        outlook::delete_contact(&conn, contact_id)
-    }
-
-    pub fn upsert_todo_lists(&self, lists: &[TodoList]) -> Result<()> {
-        let mut conn = self.lock_conn()?;
-        outlook::upsert_todo_lists(&mut conn, lists)
-    }
-
-    pub fn list_todo_lists(&self) -> Result<Vec<TodoList>> {
-        let conn = self.read_conn()?;
-        outlook::list_todo_lists(&conn)
-    }
-
-    pub fn upsert_todo_tasks(&self, tasks: &[TodoTask]) -> Result<()> {
-        let mut conn = self.lock_conn()?;
-        outlook::upsert_todo_tasks(&mut conn, tasks)
-    }
-
-    pub fn list_todo_tasks(
-        &self,
-        list_id: &str,
-        include_completed: bool,
-        limit: usize,
-    ) -> Result<Vec<TodoTask>> {
-        let conn = self.read_conn()?;
-        outlook::list_todo_tasks(&conn, list_id, include_completed, limit)
-    }
-
-    pub fn delete_todo_task(&self, task_id: &str) -> Result<()> {
-        let conn = self.lock_conn()?;
-        outlook::delete_todo_task(&conn, task_id)
-    }
-
-    // --- Microsoft OneNote ---
-    pub fn upsert_onenote_notebooks(&self, items: &[OnenoteNotebook]) -> Result<()> {
-        let mut conn = self.lock_conn()?;
-        onenote::upsert_onenote_notebooks(&mut conn, items)
-    }
-
-    pub fn list_onenote_notebooks(&self) -> Result<Vec<OnenoteNotebook>> {
-        let conn = self.read_conn()?;
-        onenote::list_onenote_notebooks(&conn)
-    }
-
-    pub fn upsert_onenote_section_groups(&self, items: &[OnenoteSectionGroup]) -> Result<()> {
-        let mut conn = self.lock_conn()?;
-        onenote::upsert_onenote_section_groups(&mut conn, items)
-    }
-
-    pub fn list_onenote_section_groups(&self) -> Result<Vec<OnenoteSectionGroup>> {
-        let conn = self.read_conn()?;
-        onenote::list_onenote_section_groups(&conn)
-    }
-
-    pub fn upsert_onenote_sections(&self, items: &[OnenoteSection]) -> Result<()> {
-        let mut conn = self.lock_conn()?;
-        onenote::upsert_onenote_sections(&mut conn, items)
-    }
-
-    pub fn list_onenote_sections(
-        &self,
-        notebook_key_filter: Option<&str>,
-    ) -> Result<Vec<OnenoteSection>> {
-        let conn = self.read_conn()?;
-        onenote::list_onenote_sections(&conn, notebook_key_filter)
-    }
-
-    pub fn upsert_onenote_pages(&self, items: &[OnenotePageSummary]) -> Result<()> {
-        let mut conn = self.lock_conn()?;
-        onenote::upsert_onenote_pages(&mut conn, items)
-    }
-
-    pub fn list_onenote_pages(&self, section_key: &str) -> Result<Vec<OnenotePageSummary>> {
-        let conn = self.read_conn()?;
-        onenote::list_onenote_pages(&conn, section_key)
-    }
-
-    pub fn upsert_onenote_page_detail(&self, detail: &OnenotePageDetail) -> Result<()> {
-        let mut conn = self.lock_conn()?;
-        onenote::upsert_onenote_page_detail(&mut conn, detail)
-    }
-
-    pub fn get_onenote_page_detail(&self, page_key_or_id: &str) -> Result<Option<OnenotePageDetail>> {
-        let conn = self.read_conn()?;
-        onenote::get_onenote_page_detail(&conn, page_key_or_id)
-    }
-
-    pub fn get_onenote_page_summary(
-        &self,
-        page_key_or_id: &str,
-    ) -> Result<Option<OnenotePageSummary>> {
-        let conn = self.read_conn()?;
-        onenote::get_onenote_page_summary(&conn, page_key_or_id)
-    }
-
-    pub fn delete_onenote_page(&self, page_key_or_id: &str) -> Result<()> {
-        let mut conn = self.lock_conn()?;
-        onenote::delete_onenote_page(&mut conn, page_key_or_id)
-    }
-
-    pub fn search_onenote_pages(
-        &self,
-        query: &str,
-        section_key_filter: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<OnenoteSearchHit>> {
-        let conn = self.read_conn()?;
-        onenote::search_onenote_pages(
-            &conn,
-            query,
-            section_key_filter,
-            limit,
-            self.trigram_enabled,
-        )
     }
 }
 
@@ -1062,5 +847,65 @@ mod tests {
         );
         wal.upsert_messages(&[msg2]).unwrap();
         assert_eq!(wal.list_root_messages(&conv_key, 10, None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_list_older_root_messages_tie_breaking_same_timestamp() {
+        let storage = Storage::open_in_memory().unwrap();
+        let chat = sample_chat("c-tie", "동일타임스탬프방", false, None);
+        let conv_key = chat.conv_key.clone();
+        storage.upsert_conversations(&[chat]).unwrap();
+
+        let ts = "2026-11-15T10:00:00Z";
+        let m0 = sample_msg(&conv_key, "m0", None, "김철수", "이전", None, "2026-11-15T09:59:59Z");
+        let m1 = sample_msg(&conv_key, "m1", None, "김철수", "첫째", None, ts);
+        let m2 = sample_msg(&conv_key, "m2", None, "이영희", "둘째", None, ts);
+        let m3 = sample_msg(&conv_key, "m3", None, "박민수", "셋째", None, ts);
+        // Thread reply with the same timestamp must not appear in root queries
+        let reply = sample_msg(&conv_key, "m2-r1", Some("m2"), "홍길동", "답글", None, ts);
+        storage.upsert_messages(&[m3, m1, m0, m2, reply]).unwrap();
+
+        // Newest 2 root messages in chronological order -> ["m2", "m3"]
+        let latest = storage.list_root_messages(&conv_key, 2, None).unwrap();
+        let latest_ids: Vec<&str> = latest.iter().map(|m| m.msg_id.as_str()).collect();
+        assert_eq!(latest_ids, vec!["m2", "m3"]);
+
+        // Paginate backwards 1 by 1 with identical created_at tie-breaker
+        let page1 = storage
+            .list_older_root_messages(&conv_key, 1, ts, Some("m3"))
+            .unwrap();
+        assert_eq!(page1.len(), 1);
+        assert_eq!(page1[0].msg_id, "m2");
+
+        let page2 = storage
+            .list_older_root_messages(&conv_key, 1, ts, Some("m2"))
+            .unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].msg_id, "m1");
+
+        let page3 = storage
+            .list_older_root_messages(&conv_key, 1, ts, Some("m1"))
+            .unwrap();
+        assert_eq!(page3.len(), 1);
+        assert_eq!(page3[0].msg_id, "m0");
+
+        assert!(storage
+            .list_older_root_messages(&conv_key, 1, "2026-11-15T09:59:59Z", Some("m0"))
+            .unwrap()
+            .is_empty());
+
+        // Multi-item page with before_msg_id = Some("m3") preserves chronological order
+        let batch = storage
+            .list_older_root_messages(&conv_key, 2, ts, Some("m3"))
+            .unwrap();
+        let batch_ids: Vec<&str> = batch.iter().map(|m| m.msg_id.as_str()).collect();
+        assert_eq!(batch_ids, vec!["m1", "m2"]);
+
+        // Without before_msg_id, strict created_at < ts skips same-timestamp roots and returns m0
+        let without_id = storage
+            .list_older_root_messages(&conv_key, 10, ts, None)
+            .unwrap();
+        let without_ids: Vec<&str> = without_id.iter().map(|m| m.msg_id.as_str()).collect();
+        assert_eq!(without_ids, vec!["m0"]);
     }
 }

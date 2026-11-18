@@ -1,7 +1,0 @@
-#!/usr/bin/env sh
-# Unix launcher for outlook (sets TEAMS_PERSONA=outlook and delegates to ./teams).
-set -eu
-
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-export TEAMS_PERSONA=outlook
-exec "$ROOT/teams" "$@"

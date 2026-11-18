@@ -9,8 +9,6 @@ pub mod hitmap;
 pub mod keymap;
 pub mod nav_pane;
 pub mod notification;
-pub mod onenote_view;
-pub mod outlook_view;
 pub mod overlays;
 pub mod theme;
 pub mod thread_view;
@@ -25,11 +23,9 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::config::Persona;
-
 use self::app::{AppState, NarrowPane, UiState};
 use self::hitmap::{ButtonId, HitTarget};
-use self::nav_pane::{ONENOTE_BRAND_BG, ONENOTE_PURPLE, TAB_LABELS, TAB_MAIL, TAB_NOTES};
+use self::nav_pane::TAB_LABELS;
 use self::toast::ToastKind;
 
 /// 3-tier responsive terminal width modes.
@@ -310,20 +306,14 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
         ui.nav_selected = row_count - 1;
     }
 
-    let is_non_teams_tab = ui.active_nav_tab >= TAB_MAIL;
-    let thread_open = !is_non_teams_tab && ui.thread_drawer_open && app.active_thread.is_some();
-    let show_subject = !is_non_teams_tab
-        && ui.show_subject
+    let thread_open = ui.thread_drawer_open && app.active_thread.is_some();
+    let show_subject = ui.show_subject
         && app
             .active_target
             .as_ref()
             .is_some_and(|t| t.is_channel())
         && !(thread_open && ui.composer_target_thread);
-    let comp_h = if is_non_teams_tab {
-        0
-    } else {
-        ui.composer.desired_height(show_subject)
-    };
+    let comp_h = ui.composer.desired_height(show_subject);
     let plan = compute_layout_with_options(
         area,
         ui.show_nav_rail,
@@ -331,7 +321,7 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
         ui.auto_thread_pane,
         ui.narrow_pane,
         comp_h,
-        !is_non_teams_tab,
+        true,
         true,
     );
 
@@ -354,13 +344,7 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
     }
 
     if let Some(chat_area) = plan.chat {
-        if ui.active_nav_tab == TAB_NOTES {
-            onenote_view::draw(frame, chat_area, app, ui, &mut hitmap);
-        } else if is_non_teams_tab {
-            outlook_view::draw(frame, chat_area, app, ui, &mut hitmap);
-        } else {
-            chat_view::draw(frame, chat_area, app, ui, &mut hitmap);
-        }
+        chat_view::draw(frame, chat_area, app, ui, &mut hitmap);
     }
 
     if let Some(thread_area) = plan.thread {
@@ -387,43 +371,26 @@ fn draw_top_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState)
     let bar_style = Style::default().bg(ui.theme.selection_bg).fg(ui.theme.fg);
     frame.render_widget(Paragraph::new("").style(bar_style), area);
 
-    let (persona_label, persona_target) = match ui.persona {
-        Persona::Teams => (" [Teams] ", Persona::Outlook),
-        Persona::Outlook => (" [Outlook] ", Persona::OneNote),
-        Persona::OneNote => (" [OneNote] ", Persona::Teams),
-    };
+    let persona_label = " [Teams] ";
     let mut x = area.x;
     let badge_w = persona_label.width() as u16;
     if x + badge_w <= area.x + area.width {
         let rect = Rect::new(x, area.y, badge_w, 1);
-        let badge_style = if ui.persona == Persona::OneNote {
-            Style::default()
-                .fg(ratatui::style::Color::White)
-                .bg(ONENOTE_BRAND_BG)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            ui.theme
-                .accent_style()
-                .bg(ui.theme.selection_bg)
-                .add_modifier(Modifier::BOLD)
-        };
+        let badge_style = ui
+            .theme
+            .accent_style()
+            .bg(ui.theme.selection_bg)
+            .add_modifier(Modifier::BOLD);
         frame.render_widget(Paragraph::new(Span::styled(persona_label, badge_style)), rect);
-        let _ = persona_target;
         x = x.saturating_add(badge_w + 1);
     }
 
     let chat_unread = app.unread_chat_count();
     let channel_unread = app.unread_channel_count();
-    let mail_unread = app.unread_mail_count();
-    let tabs: [(&str, i32, usize); 8] = [
+    let tabs: [(&str, i32, usize); 3] = [
         ("1:채팅", chat_unread, 0),
         ("2:팀", channel_unread, 1),
         ("3:활동", 0, 2),
-        ("4:메일", mail_unread, 3),
-        ("5:캘린더", 0, 4),
-        ("6:연락처", 0, 5),
-        ("7:할일", 0, 6),
-        ("8:노트", 0, 7),
     ];
 
     for (name, unread, tab_idx) in tabs {
@@ -437,15 +404,8 @@ fn draw_top_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState)
             break;
         }
         let active = ui.active_nav_tab == tab_idx;
-        let style = if active && tab_idx == TAB_NOTES {
-            Style::default()
-                .fg(ratatui::style::Color::White)
-                .bg(ONENOTE_BRAND_BG)
-                .add_modifier(Modifier::BOLD)
-        } else if active {
+        let style = if active {
             ui.theme.selection().add_modifier(Modifier::BOLD)
-        } else if tab_idx == TAB_NOTES {
-            bar_style.fg(ONENOTE_PURPLE)
         } else {
             bar_style
         };
@@ -470,15 +430,10 @@ fn draw_rail(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState) {
         .theme
         .presence_indicator(app.my_presence.as_ref().map(|p| p.availability.as_str()));
 
-    let items: [(&str, HitTarget, Option<ratatui::style::Color>); 11] = [
+    let items: [(&str, HitTarget, Option<ratatui::style::Color>); 6] = [
         ("💬", HitTarget::NavTab(0), None),
         ("👥", HitTarget::NavTab(1), None),
         ("🔔", HitTarget::NavTab(2), None),
-        ("✉", HitTarget::NavTab(3), None),
-        ("📅", HitTarget::NavTab(4), None),
-        ("👤", HitTarget::NavTab(5), None),
-        ("☑", HitTarget::NavTab(6), None),
-        ("📓", HitTarget::NavTab(7), Some(ONENOTE_PURPLE)),
         ("🔍", HitTarget::Button(ButtonId::Search), None),
         (
             presence_dot,
@@ -558,16 +513,7 @@ fn draw_compact_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSt
     }
 
     if x + 4 < area.right() {
-        let raw_title = if ui.active_nav_tab == TAB_NOTES {
-            app.active_page_detail
-                .as_ref()
-                .map(|d| d.summary.title.clone())
-                .or_else(|| app.active_onenote_section().map(|s| s.display_name.clone()))
-                .unwrap_or_else(|| "OneNote".to_string())
-        } else {
-            app.active_title()
-        };
-        let title = truncate_width(&raw_title, (area.right() - x) as usize);
+        let title = truncate_width(&app.active_title(), (area.right() - x) as usize);
         frame.render_widget(
             Paragraph::new(title).style(ui.theme.muted_style()),
             Rect {
@@ -613,22 +559,10 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState) 
         .map(|t| format!(" | ⏳ {}", t.display()))
         .unwrap_or_default();
 
-    let persona_tag = match ui.persona {
-        Persona::Teams => "Teams",
-        Persona::Outlook => "Outlook",
-        Persona::OneNote => "OneNote",
-    };
     let tab_tag = TAB_LABELS.get(ui.active_nav_tab).copied().unwrap_or("채팅");
 
-    let left = format!(" [{persona_tag}·{tab_tag}·{focus_label}] {avail} | {sync_tag}{task_note}");
-    let right = match ui.active_nav_tab {
-        3 => " c 새메일  r 답장  v 이미지  Ctrl+K 팔레트 ",
-        4 => " j 회의참가  n 새일정  y/t/x 응답  ? 도움말 ",
-        5 => " m 메일  c 채팅  n 추가  Ctrl+F 검색 ",
-        6 => " Space 완료  n 빠른추가  [/] 목록  ? 도움말 ",
-        7 => " Space 체크  n 새페이지  a 추가  e/E 편집  [/] 섹션 ",
-        _ => " v 이미지  Ctrl+K 팔레트  Ctrl+F 검색  ? 도움말 ",
-    };
+    let left = format!(" [Teams·{tab_tag}·{focus_label}] {avail} | {sync_tag}{task_note}");
+    let right = " o/H 이전대화  v 이미지  Ctrl+K 팔레트  Ctrl+F 검색  ? 도움말 ";
 
     let right_w = right.width() as u16;
     let left_w = area.width.saturating_sub(right_w + 3) as usize;

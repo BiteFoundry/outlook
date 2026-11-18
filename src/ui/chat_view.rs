@@ -139,10 +139,26 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut AppState, ui: &mut UiState,
         return;
     }
     if app.messages.is_empty() {
-        frame.render_widget(
-            Paragraph::new("메시지가 없습니다").style(theme.muted_style()),
-            message_area,
-        );
+        let mut empty_lines = Vec::new();
+        if let Some(banner) = build_history_banner_line(
+            app.loading_older,
+            app.oldest_reached,
+            app.history_error.as_deref(),
+            false,
+            theme,
+            message_area.width as usize,
+        ) {
+            empty_lines.push(banner);
+        }
+        empty_lines.push(RenderedLine::plain(Line::from(Span::styled(
+            "메시지가 없습니다",
+            theme.muted_style(),
+        ))));
+        let height = message_area.height as usize;
+        ui.chat_scroll.total_lines = empty_lines.len();
+        ui.chat_scroll.offset = 0;
+        ui.pending_prepend_anchor = None;
+        render_scrolled_lines(frame, message_area, &empty_lines, 0, height, hitmap);
         return;
     }
 
@@ -152,11 +168,73 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut AppState, ui: &mut UiState,
     }
 
     let height = message_area.height as usize;
+    apply_prepend_anchor(ui, lines.len(), height);
     ui.chat_scroll.total_lines = lines.len();
     let offset = ui.chat_scroll.offset(height);
     ui.chat_scroll.offset = offset;
 
     render_scrolled_lines(frame, message_area, &lines, offset, height, hitmap);
+}
+
+pub(crate) fn apply_prepend_anchor(ui: &mut UiState, new_total_lines: usize, height: usize) {
+    if let Some((old_total_lines, old_offset)) = ui.pending_prepend_anchor.take() {
+        if !ui.chat_scroll.follow_tail && old_total_lines > 0 && new_total_lines > old_total_lines
+        {
+            let delta = new_total_lines - old_total_lines;
+            let new_max_off = new_total_lines.saturating_sub(height);
+            let anchored_offset = old_offset.saturating_add(delta).min(new_max_off);
+            ui.chat_scroll.scroll_up = new_max_off
+                .saturating_sub(anchored_offset)
+                .min(u16::MAX as usize) as u16;
+        }
+    }
+}
+
+pub(crate) fn build_history_banner_line(
+    loading_older: bool,
+    oldest_reached: bool,
+    history_error: Option<&str>,
+    has_messages: bool,
+    theme: &Theme,
+    width: usize,
+) -> Option<RenderedLine> {
+    let width = width.max(12);
+    if loading_older {
+        return Some(RenderedLine::plain(Line::from(Span::styled(
+            truncate("  ⟳ 이전 메시지를 서버에서 불러오는 중...", width),
+            theme.accent_style().add_modifier(Modifier::BOLD),
+        ))));
+    }
+    if let Some(err) = history_error {
+        let text = format!("  ⚠ {err}  [o / 클릭하여 재시도]");
+        return Some(RenderedLine::clickable(
+            Line::from(Span::styled(
+                truncate(&text, width),
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            HitTarget::LoadOlderMessages,
+        ));
+    }
+    if oldest_reached {
+        if has_messages {
+            let label = "── 대화의 첫 메시지입니다 ──";
+            let label_w = UnicodeWidthStr::width(label);
+            let left_pad = width.saturating_sub(label_w) / 2;
+            let centered = format!("{}{}", " ".repeat(left_pad), label);
+            return Some(RenderedLine::plain(Line::from(Span::styled(
+                truncate(&centered, width),
+                theme.muted_style(),
+            ))));
+        }
+        return None;
+    }
+    let pill = "  [ ↑ 위로 스크롤하거나 o · H 키로 이전 메시지 더 불러오기 ]";
+    Some(RenderedLine::clickable(
+        Line::from(Span::styled(truncate(pill, width), theme.muted_style())),
+        HitTarget::LoadOlderMessages,
+    ))
 }
 
 pub fn render_scrolled_lines(
@@ -405,6 +483,7 @@ pub(crate) fn hash_message_sig(h: &mut DualHasher, msg: &MessageItem) {
     h.write_str(&msg.importance);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_chat_lines_sig(
     conv_key: Option<&str>,
     view: &ChatRender,
@@ -412,6 +491,9 @@ fn compute_chat_lines_sig(
     hyperlinks: bool,
     inline_images: bool,
     image_cache_len: usize,
+    loading_older: bool,
+    oldest_reached: bool,
+    history_error: Option<&str>,
     theme: &Theme,
 ) -> (u64, u64) {
     let mut h = DualHasher::new(0x4348_4154_5f4c_494e);
@@ -428,6 +510,15 @@ fn compute_chat_lines_sig(
     h.write_hash(&hyperlinks);
     h.write_hash(&inline_images);
     h.write_hash(&image_cache_len);
+    h.write_hash(&loading_older);
+    h.write_hash(&oldest_reached);
+    match history_error {
+        Some(err) => {
+            h.write_hash(&1u8);
+            h.write_str(err);
+        }
+        None => h.write_hash(&0u8),
+    }
     hash_theme_sig(&mut h, theme);
     h.write_hash(&view.messages.len());
     for msg in view.messages {
@@ -472,6 +563,9 @@ pub(crate) fn build_lines_with_images_cached(
         hyperlinks,
         ui.inline_images,
         app.image_cache.len(),
+        app.loading_older,
+        app.oldest_reached,
+        app.history_error.as_deref(),
         &ui.theme,
     );
 
@@ -500,6 +594,18 @@ pub(crate) fn build_lines_with_images_cached(
 
     let view = ChatRender::from_app(app, ui);
     let mut out = Vec::new();
+    if app.active_conv_key.is_some() {
+        if let Some(banner) = build_history_banner_line(
+            app.loading_older,
+            app.oldest_reached,
+            app.history_error.as_deref(),
+            !view.messages.is_empty(),
+            &ui.theme,
+            width,
+        ) {
+            out.push(banner);
+        }
+    }
     let mut last_date: Option<String> = None;
 
     for (msg_index, msg) in view.messages.iter().enumerate() {
@@ -916,7 +1022,7 @@ fn emit_inline_thumb(
     }
 }
 
-/// Shared `RichBlock` renderer used by both Teams chat/thread views and Outlook Mail/Calendar detail views.
+/// Shared `RichBlock` renderer used by Teams chat and thread views.
 #[allow(clippy::too_many_arguments)]
 pub fn render_rich_blocks(
     out: &mut Vec<RenderedLine>,
@@ -1365,7 +1471,18 @@ mod tests {
                 is_channel: true,
                 selected_index: Some(0),
             };
-            compute_chat_lines_sig(Some("chan:t1:c1"), &view, 80, false, true, 0, &theme)
+            compute_chat_lines_sig(
+                Some("chan:t1:c1"),
+                &view,
+                80,
+                false,
+                true,
+                0,
+                false,
+                false,
+                None,
+                &theme,
+            )
         };
 
         // Same inputs produce identical signature and cache hit returns identical lines.
@@ -1384,7 +1501,7 @@ mod tests {
         let hit = cache.get(sig_base).expect("expected cache hit");
         assert_eq!(hit.len(), lines.len());
 
-        // Selection, width, reaction me_reacted, and image_cache_len changes invalidate signature.
+        // Selection, width, reaction me_reacted, and history state changes invalidate signature.
         let sig_sel = compute_chat_lines_sig(
             Some("chan:t1:c1"),
             &ChatRender {
@@ -1396,6 +1513,9 @@ mod tests {
             false,
             true,
             0,
+            false,
+            false,
+            None,
             &theme,
         );
         assert_ne!(sig_base, sig_sel);
@@ -1411,9 +1531,30 @@ mod tests {
             false,
             true,
             0,
+            false,
+            false,
+            None,
             &theme,
         );
         assert_ne!(sig_base, sig_width);
+
+        let sig_loading = compute_chat_lines_sig(
+            Some("chan:t1:c1"),
+            &ChatRender {
+                messages: &msgs,
+                is_channel: true,
+                selected_index: Some(0),
+            },
+            80,
+            false,
+            true,
+            0,
+            true,
+            false,
+            None,
+            &theme,
+        );
+        assert_ne!(sig_base, sig_loading);
 
         msgs[0].reactions[0].me_reacted = false;
         let sig_react = compute_chat_lines_sig(
@@ -1427,6 +1568,9 @@ mod tests {
             false,
             true,
             0,
+            false,
+            false,
+            None,
             &theme,
         );
         assert_ne!(sig_base, sig_react);
@@ -1436,5 +1580,46 @@ mod tests {
         cache.insert(sig_width, Arc::clone(&lines));
         assert!(cache.get(sig_base).is_none());
         assert!(cache.get(sig_width).is_some());
+    }
+
+    #[test]
+    fn prepend_anchor_preserves_viewport_offset_without_jump() {
+        let mut ui = UiState::new();
+        ui.chat_scroll.follow_tail = false;
+        ui.chat_scroll.total_lines = 100;
+        ui.chat_scroll.offset = 0;
+        ui.chat_scroll.scroll_up = 120; // oversaturated past max_off=80
+        ui.pending_prepend_anchor = Some((100, 0));
+
+        // 50 new lines prepended at top -> total_lines=150, viewport height=20
+        apply_prepend_anchor(&mut ui, 150, 20);
+        ui.chat_scroll.total_lines = 150;
+        assert_eq!(ui.chat_scroll.offset(20), 50);
+        assert!(ui.pending_prepend_anchor.is_none());
+    }
+
+    #[test]
+    fn history_banner_renders_all_states_and_registers_click_target() {
+        let theme = Theme::default();
+
+        let loading = build_history_banner_line(true, false, None, true, &theme, 80).unwrap();
+        let loading_text: String = loading.line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(loading_text.contains("불러오는 중"));
+        assert_eq!(loading.target, None);
+
+        let err = build_history_banner_line(false, false, Some("권한 부족"), true, &theme, 80).unwrap();
+        let err_text: String = err.line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(err_text.contains("권한 부족"));
+        assert_eq!(err.target, Some(HitTarget::LoadOlderMessages));
+
+        let eof = build_history_banner_line(false, true, None, true, &theme, 80).unwrap();
+        let eof_text: String = eof.line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(eof_text.contains("첫 메시지입니다"));
+        assert_eq!(eof.target, None);
+
+        let more = build_history_banner_line(false, false, None, true, &theme, 80).unwrap();
+        let more_text: String = more.line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(more_text.contains("o · H"));
+        assert_eq!(more.target, Some(HitTarget::LoadOlderMessages));
     }
 }

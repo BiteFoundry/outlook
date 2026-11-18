@@ -20,50 +20,23 @@ pub const DEFAULT_PUBLIC_CLIENT_ID: &str = "14d82eec-204b-4c2f-b7e8-296a70dab67e
 pub const DEFAULT_TENANT_ID: &str = "common";
 pub const DEFAULT_GITHUB_REPO: &str = "shinick-dev/teams";
 
-/// Entry persona (`teams`, `outlook`, or `onenote`), sharing the exact same Entra OAuth token, Graph client, and SQLite DB.
+/// Entry persona (`teams`), kept as an enum for stable configuration/caller ergonomics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Persona {
     #[default]
     Teams,
-    Outlook,
-    OneNote,
 }
 
 impl Persona {
-    /// Detects whether the user invoked `onenote`, `outlook`, or `teams` (via `TEAMS_PERSONA` or `argv[0]` stem).
+    /// Detects entry persona (pure Microsoft Teams).
     pub fn detect() -> Self {
-        if let Ok(env_val) = std::env::var("TEAMS_PERSONA") {
-            let trimmed = env_val.trim();
-            if trimmed.eq_ignore_ascii_case("onenote") || trimmed.eq_ignore_ascii_case("note") {
-                return Self::OneNote;
-            }
-            if trimmed.eq_ignore_ascii_case("outlook") {
-                return Self::Outlook;
-            }
-            if trimmed.eq_ignore_ascii_case("teams") {
-                return Self::Teams;
-            }
-        }
-        if let Some(arg0) = std::env::args_os().next() {
-            if let Some(stem) = Path::new(&arg0).file_stem().and_then(|s| s.to_str()) {
-                let lower = stem.to_ascii_lowercase();
-                if lower.starts_with("onenote") || lower == "note" {
-                    return Self::OneNote;
-                }
-                if lower.starts_with("outlook") {
-                    return Self::Outlook;
-                }
-            }
-        }
         Self::Teams
     }
 
     pub fn bin_name(self) -> &'static str {
         match self {
             Self::Teams => "teams",
-            Self::Outlook => "outlook",
-            Self::OneNote => "onenote",
         }
     }
 }
@@ -75,13 +48,13 @@ pub struct AppConfig {
     pub client_id: String,
     /// Entra ID Tenant ID (`common`, `organizations`, domain, or tenant GUID).
     pub tenant_id: String,
-    /// Optional OAuth scopes override. Empty uses the standard Teams + Outlook M365 delegated scope set.
+    /// Optional OAuth scopes override. Empty uses the standard Microsoft Teams delegated scope set.
     pub scopes: Vec<String>,
     /// Base URL for Microsoft Graph v1.0 (overridable for sovereign clouds or mock testing).
     pub graph_base_url: String,
     /// Base URL for Entra OAuth2 endpoints (overridable for sovereign clouds or mock testing).
     pub auth_base_url: String,
-    /// GitHub `owner/repo` used by `teams update` / `outlook update`.
+    /// GitHub `owner/repo` used by `teams update`.
     pub github_repo: String,
     /// Enable desktop toast/bell notifications in TUI.
     pub notify: bool,
@@ -89,7 +62,7 @@ pub struct AppConfig {
     pub show_nav_rail: bool,
     /// Automatically open right thread/info pane on wide terminals.
     pub auto_thread_pane: bool,
-    /// Render inline image thumbnails directly inside terminal Chat/Mail views.
+    /// Render inline image thumbnails directly inside terminal Chat views.
     pub inline_images: bool,
     /// Custom download directory. Empty defaults to `Downloads/teams`.
     pub download_dir: String,
@@ -97,17 +70,14 @@ pub struct AppConfig {
     pub active_poll_ms: u64,
     /// Background chat preview diff interval (ms).
     pub chat_poll_ms: u64,
-    /// Background channel delta, Outlook mail/calendar, & presence interval (ms).
+    /// Background channel delta & presence interval (ms).
     pub channel_poll_ms: u64,
     /// Optional external token file path (`TEAMS_TOKEN_FILE` or `config.toml`), read live on demand.
     pub token_file: String,
     /// Optional external token refresh command hook (`TEAMS_TOKEN_REFRESH_CMD` or `config.toml`), executed when token is missing or within `token_refresh_mins` of expiry.
-    pub token_refresh_cmd: String,
-    /// Refresh threshold in minutes before token `exp` to trigger `token_refresh_cmd` (`TEAMS_TOKEN_REFRESH_MINS`, default 5).
     pub token_refresh_mins: u64,
-    /// When `false` (default), TUI only background-polls workspaces/domains that have been activated in the session.
-    /// Overrideable via `TEAMS_BACKGROUND_ALL=1|true` or `config.toml` (`background_all_personas = true`).
-    pub background_all_personas: bool,
+    /// Refresh command string (`TEAMS_TOKEN_REFRESH_CMD`).
+    pub token_refresh_cmd: String,
     /// CLI local cache TTL in seconds (`TEAMS_CLI_CACHE_SECS`, default `0`).
     /// Defaults to `0` so CLI invocations fetch fresh unless `TEAMS_CLI_CACHE_SECS`, `cli_cache_ttl_secs`, or `--cached` is used.
     pub cli_cache_ttl_secs: u64,
@@ -161,10 +131,6 @@ impl Default for AppConfig {
                 .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .unwrap_or(5),
-            background_all_personas: std::env::var("TEAMS_BACKGROUND_ALL")
-                .ok()
-                .and_then(|s| parse_env_bool(&s))
-                .unwrap_or(false),
             cli_cache_ttl_secs: std::env::var("TEAMS_CLI_CACHE_SECS")
                 .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok())
@@ -221,11 +187,6 @@ impl AppConfig {
                 cfg.token_refresh_mins = parsed;
             }
         }
-        if let Ok(bg_all) = std::env::var("TEAMS_BACKGROUND_ALL") {
-            if let Some(parsed) = parse_env_bool(&bg_all) {
-                cfg.background_all_personas = parsed;
-            }
-        }
         if let Ok(ttl) = std::env::var("TEAMS_CLI_CACHE_SECS") {
             if let Ok(parsed) = ttl.trim().parse::<u64>() {
                 cfg.cli_cache_ttl_secs = parsed;
@@ -270,13 +231,6 @@ impl AppConfig {
             "ChannelMessage.Send".to_string(),
             "Files.ReadWrite.All".to_string(),
             "Presence.ReadWrite".to_string(),
-            "Mail.ReadWrite".to_string(),
-            "Mail.Send".to_string(),
-            "Calendars.ReadWrite".to_string(),
-            "Contacts.ReadWrite".to_string(),
-            "Tasks.ReadWrite".to_string(),
-            "Notes.ReadWrite".to_string(),
-            "Notes.ReadWrite.All".to_string(),
         ]
     }
 
@@ -458,43 +412,29 @@ mod tests {
     }
 
     #[test]
-    fn test_app_config_toml_parses_background_all_and_cli_cache_ttl() {
+    fn test_app_config_toml_parses_legacy_unknown_keys_and_cli_cache_ttl() {
         let dir = tempfile::tempdir().unwrap();
         let legacy_path = dir.path().join("legacy.toml");
-        fs::write(&legacy_path, "notify = false\nactive_poll_ms = 3000\n").unwrap();
+        fs::write(
+            &legacy_path,
+            "notify = false\nactive_poll_ms = 3000\nbackground_all_personas = true\ncli_cache_ttl_secs = 45\n",
+        )
+        .unwrap();
 
         let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = EnvVarGuard::set(&[
-            ("TEAMS_BACKGROUND_ALL", None),
-            ("TEAMS_CLI_CACHE_SECS", None),
-        ]);
+        let _guard = EnvVarGuard::set(&[("TEAMS_CLI_CACHE_SECS", None)]);
 
         let legacy_cfg = AppConfig::load_from(&legacy_path).unwrap();
         assert!(!legacy_cfg.notify);
         assert_eq!(legacy_cfg.active_poll_ms, 3000);
-        assert!(!legacy_cfg.background_all_personas);
-        assert_eq!(legacy_cfg.cli_cache_ttl_secs, 0);
-
-        let custom_path = dir.path().join("custom.toml");
-        fs::write(
-            &custom_path,
-            "background_all_personas = true\ncli_cache_ttl_secs = 45\n",
-        )
-        .unwrap();
-        let custom_cfg = AppConfig::load_from(&custom_path).unwrap();
-        assert!(custom_cfg.background_all_personas);
-        assert_eq!(custom_cfg.cli_cache_ttl_secs, 45);
+        assert_eq!(legacy_cfg.cli_cache_ttl_secs, 45);
     }
 
     #[test]
-    fn test_app_config_env_overrides_background_all_and_cli_cache_ttl() {
+    fn test_app_config_env_overrides_cli_cache_ttl_and_pure_teams_scopes() {
         let dir = tempfile::tempdir().unwrap();
         let cfg_path = dir.path().join("config.toml");
-        fs::write(
-            &cfg_path,
-            "background_all_personas = false\ncli_cache_ttl_secs = 15\n",
-        )
-        .unwrap();
+        fs::write(&cfg_path, "cli_cache_ttl_secs = 15\n").unwrap();
 
         let _lock = ENV_LOCK.lock().unwrap();
         let dir_str = dir.path().to_string_lossy().into_owned();
@@ -502,35 +442,30 @@ mod tests {
         {
             let _guard = EnvVarGuard::set(&[
                 ("TEAMS_CONFIG_DIR", Some(&dir_str)),
-                ("TEAMS_BACKGROUND_ALL", Some("1")),
                 ("TEAMS_CLI_CACHE_SECS", Some("120")),
             ]);
             let cfg = AppConfig::load();
-            assert!(cfg.background_all_personas);
             assert_eq!(cfg.cli_cache_ttl_secs, 120);
         }
 
         {
             let _guard = EnvVarGuard::set(&[
                 ("TEAMS_CONFIG_DIR", Some(&dir_str)),
-                ("TEAMS_BACKGROUND_ALL", Some("true")),
-                ("TEAMS_CLI_CACHE_SECS", Some("0")),
-            ]);
-            let cfg = AppConfig::load();
-            assert!(cfg.background_all_personas);
-            assert_eq!(cfg.cli_cache_ttl_secs, 0);
-        }
-
-        {
-            let _guard = EnvVarGuard::set(&[
-                ("TEAMS_CONFIG_DIR", Some(&dir_str)),
-                ("TEAMS_BACKGROUND_ALL", None),
                 ("TEAMS_CLI_CACHE_SECS", None),
             ]);
             let def = AppConfig::default();
-            assert!(!def.background_all_personas);
             assert_eq!(def.cli_cache_ttl_secs, 0);
+            let scopes = def.effective_scopes();
+            assert!(scopes.iter().any(|s| s == "Chat.ReadWrite"));
+            assert!(scopes.iter().any(|s| s == "ChannelMessage.Read.All"));
+            assert!(!scopes.iter().any(|s| s.starts_with("Mail.")));
+            assert!(!scopes.iter().any(|s| s.starts_with("Calendars.")));
+            assert!(!scopes.iter().any(|s| s.starts_with("Contacts.")));
+            assert!(!scopes.iter().any(|s| s.starts_with("Tasks.")));
+            assert!(!scopes.iter().any(|s| s.starts_with("Notes.")));
         }
+        assert_eq!(Persona::detect(), Persona::Teams);
+        assert_eq!(Persona::Teams.bin_name(), "teams");
     }
 
     #[test]

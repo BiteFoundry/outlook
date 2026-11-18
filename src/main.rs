@@ -52,7 +52,6 @@ mod tests {
     #[test]
     fn detects_multi_thread_commands_only_for_tui_serve_mcp() {
         assert!(needs_multi_thread_runtime(["teams"]));
-        assert!(needs_multi_thread_runtime(["outlook"]));
         assert!(needs_multi_thread_runtime(["teams", "tui"]));
         assert!(needs_multi_thread_runtime(["teams", "chat"]));
         assert!(needs_multi_thread_runtime(["teams", "serve"]));
@@ -60,8 +59,6 @@ mod tests {
         assert!(needs_multi_thread_runtime(["teams", "mcp"]));
         assert!(needs_multi_thread_runtime(["teams", "mcp-server"]));
         assert!(needs_multi_thread_runtime(["teams", "daemon", "run"]));
-        assert!(needs_multi_thread_runtime(["outlook", "daemon", "run"]));
-        assert!(needs_multi_thread_runtime(["onenote", "daemon", "run"]));
 
         for sub in ["status", "stop", "start", "restart"] {
             assert!(
@@ -71,8 +68,8 @@ mod tests {
         }
 
         for cmd in [
-            "inbox", "chats", "mail", "cal", "todo", "contacts", "read", "send", "whoami",
-            "--help", "-h", "--version", "-V",
+            "chats", "teams", "channels", "read", "thread", "send", "reply", "sync", "search",
+            "whoami", "doctor", "--help", "-h", "--version", "-V",
         ] {
             assert!(!needs_multi_thread_runtime(["teams", cmd]), "{cmd}");
         }

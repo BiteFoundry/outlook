@@ -168,14 +168,30 @@ fn handle_terminal_event(
             MouseEventKind::ScrollUp => {
                 notify_activity_throttled(app, last_activity_sent);
                 *dirty = true;
-                if action::dispatch(Action::ScrollUp, app, ui) {
+                if action::dispatch(
+                    Action::MouseScroll {
+                        delta: -3,
+                        column: mouse.column,
+                        row: mouse.row,
+                    },
+                    app,
+                    ui,
+                ) {
                     return LoopStep::Quit;
                 }
             }
             MouseEventKind::ScrollDown => {
                 notify_activity_throttled(app, last_activity_sent);
                 *dirty = true;
-                if action::dispatch(Action::ScrollDown, app, ui) {
+                if action::dispatch(
+                    Action::MouseScroll {
+                        delta: 3,
+                        column: mouse.column,
+                        row: mouse.row,
+                    },
+                    app,
+                    ui,
+                ) {
                     return LoopStep::Quit;
                 }
             }
@@ -333,7 +349,7 @@ pub async fn run(
 
 pub async fn run_with_persona(
     config: AppConfig,
-    persona: Persona,
+    _persona: Persona,
     auth: AuthManager,
     graph: GraphClient,
     storage: Storage,
@@ -347,23 +363,18 @@ pub async fn run_with_persona(
 
     let (proxy_focus_tx, proxy_focus_rx) = watch::channel(FocusTarget::default());
     let (proxy_nudge_tx, proxy_nudge_rx) = mpsc::unbounded_channel::<SyncCommand>();
-    let sync_ctrl = SyncController::from_channels(
-        proxy_focus_tx,
-        proxy_nudge_tx,
-        config.background_all_personas,
-    );
+    let sync_ctrl = SyncController::from_channels(proxy_focus_tx, proxy_nudge_tx, false);
 
-    let mut ui = UiState::from_config_with_persona(&config, persona);
-    let mut app = AppState::new_with_persona(
+    let mut ui = UiState::from_config(&config);
+    let mut app = AppState::new(
         config.clone(),
-        persona,
         auth.clone(),
         graph.clone(),
         storage.clone(),
         sync_ctrl.clone(),
         ui_tx.clone(),
     );
-    app.load_cached_for_persona();
+    app.load_cached_teams();
     draw_frame(&mut terminal, &mut app, &mut ui)?;
 
     spawn_sync_supervisor(
@@ -411,43 +422,6 @@ pub async fn run_with_persona(
                 Ok(edited) => {
                     ui.composer.load_text(&edited);
                     ui.info("외부 편집기 내용을 반영했습니다");
-                }
-                Err(err) => {
-                    ui.error(format!("외부 편집기 실행 실패: {err}"));
-                }
-            }
-        }
-
-        if let Some((page_key, initial_md)) = ui.onenote_external_edit.take() {
-            guard.restore();
-            let result = composer::external_edit(&initial_md);
-            let mut stdout = io::stdout();
-            enable_raw_mode()?;
-            execute!(
-                stdout,
-                EnterAlternateScreen,
-                EnableMouseCapture,
-                EnableBracketedPaste
-            )?;
-            if guard.keyboard_enhanced {
-                let _ = execute!(
-                    stdout,
-                    PushKeyboardEnhancementFlags(
-                        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                            | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-                    )
-                );
-            }
-            terminal.clear()?;
-            dirty = true;
-
-            match result {
-                Ok(edited) => {
-                    if edited.trim() != initial_md.trim() {
-                        app.replace_onenote_page_body(&mut ui, page_key, edited);
-                    } else {
-                        ui.info("변경 사항이 없어 저장하지 않았습니다");
-                    }
                 }
                 Err(err) => {
                     ui.error(format!("외부 편집기 실행 실패: {err}"));
@@ -504,10 +478,7 @@ pub async fn run_with_persona(
 
         // Coalesce burst events (scroll wheel, fast typing, sync batches) before redrawing.
         let mut drained = 0usize;
-        while drained < MAX_COALESCED_EVENTS
-            && !ui.editor_requested
-            && ui.onenote_external_edit.is_none()
-        {
+        while drained < MAX_COALESCED_EVENTS && !ui.editor_requested {
             let mut progressed = false;
             while drained < MAX_COALESCED_EVENTS {
                 match core_rx.try_recv() {
@@ -538,10 +509,7 @@ pub async fn run_with_persona(
                     Err(_) => break,
                 }
             }
-            while drained < MAX_COALESCED_EVENTS
-                && !ui.editor_requested
-                && ui.onenote_external_edit.is_none()
-            {
+            while drained < MAX_COALESCED_EVENTS && !ui.editor_requested {
                 match events.next().now_or_never() {
                     Some(Some(Ok(ev))) => {
                         drained += 1;

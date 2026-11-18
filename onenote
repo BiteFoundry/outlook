@@ -1,7 +1,0 @@
-#!/usr/bin/env sh
-# Unix launcher for onenote (sets TEAMS_PERSONA=onenote and delegates to ./teams).
-set -eu
-
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-export TEAMS_PERSONA=onenote
-exec "$ROOT/teams" "$@"

@@ -1,7 +1,7 @@
 //! Microsoft Graph v1.0 endpoints for Joined Teams, Channels, Delta Sync, Threads,
 //! and unified Send / Reply / Edit / Delete / Reaction operations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -168,6 +168,94 @@ impl GraphClient {
         Ok(members)
     }
 
+    /// Fetches a single page of channel root posts (with inline expanded replies), automatically
+    /// advancing up to 5 consecutive pages if a non-empty raw Graph page contains only system noise.
+    pub async fn list_channel_messages_page(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        top: usize,
+        next_link: Option<&str>,
+    ) -> Result<(Vec<MessageItem>, Option<String>)> {
+        let my_id = self.resolve_my_user_id().await;
+        let conv_key = ConversationTarget::Channel {
+            team_id: team_id.to_string(),
+            channel_id: channel_id.to_string(),
+        }
+        .conv_key();
+
+        let page_top = top.clamp(1, 50);
+        let mut url = next_link
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                format!(
+                    "/teams/{}/channels/{}/messages?$expand=replies&$top={page_top}",
+                    urlencoding::encode(team_id),
+                    urlencoding::encode(channel_id)
+                )
+            });
+
+        let mut items = Vec::new();
+        let mut current_next_link;
+        let mut empty_noise_pages = 0usize;
+
+        loop {
+            let page: GraphListPage<GraphChatMessage> = self.get_json(&url).await?;
+            let raw_non_empty = !page.value.is_empty();
+
+            for raw in page.value {
+                let root_id = raw.id.clone();
+                let inline_replies: Vec<GraphChatMessage> = raw
+                    .replies
+                    .as_deref()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|val| serde_json::from_value::<GraphChatMessage>(val.clone()).ok())
+                    .filter(is_expanded_reply_payload)
+                    .collect();
+
+                let normalized_root =
+                    normalize_chat_message(&conv_key, None, my_id.as_deref(), raw);
+                if !is_pure_system_noise(&normalized_root) {
+                    items.push(normalized_root);
+                }
+
+                for raw_reply in inline_replies {
+                    let normalized_reply = normalize_chat_message(
+                        &conv_key,
+                        Some(root_id.clone()),
+                        my_id.as_deref(),
+                        raw_reply,
+                    );
+                    if !is_pure_system_noise(&normalized_reply) {
+                        items.push(normalized_reply);
+                    }
+                }
+            }
+
+            current_next_link = page
+                .next_link
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            if items.is_empty()
+                && raw_non_empty
+                && current_next_link.is_some()
+                && empty_noise_pages < 5
+            {
+                empty_noise_pages += 1;
+                url = current_next_link.take().unwrap();
+                continue;
+            }
+            break;
+        }
+
+        sort_messages_chronologically(&mut items);
+        Ok((items, current_next_link))
+    }
+
     pub async fn list_channel_messages(
         &self,
         team_id: &str,
@@ -177,37 +265,50 @@ impl GraphClient {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let my_id = self.resolve_my_user_id().await;
-        let conv_key = ConversationTarget::Channel {
-            team_id: team_id.to_string(),
-            channel_id: channel_id.to_string(),
-        }
-        .conv_key();
 
-        let top = limit.min(50);
-        let mut next_url = Some(format!(
-            "/teams/{}/channels/{}/messages?$expand=replies&$top={top}",
-            urlencoding::encode(team_id),
-            urlencoding::encode(channel_id)
-        ));
         let mut items = Vec::new();
+        let mut seen_ids = HashSet::new();
+        let mut root_count = 0usize;
+        let mut next_link: Option<String> = None;
 
-        while let Some(url) = next_url {
-            let page: GraphListPage<GraphChatMessage> = self.get_json(&url).await?;
-            for raw in page.value {
-                let normalized = normalize_chat_message(&conv_key, None, my_id.as_deref(), raw);
-                if !is_pure_system_noise(&normalized) {
-                    items.push(normalized);
+        loop {
+            let (page_items, next) = self
+                .list_channel_messages_page(
+                    team_id,
+                    channel_id,
+                    limit.min(50),
+                    next_link.as_deref(),
+                )
+                .await?;
+            for item in page_items {
+                if seen_ids.insert(item.msg_id.clone()) {
+                    if item.parent_msg_id.is_none() {
+                        root_count += 1;
+                    }
+                    items.push(item);
                 }
             }
-            if items.len() >= limit {
+            if root_count >= limit || next.is_none() {
                 break;
             }
-            next_url = page.next_link;
+            next_link = next;
         }
 
         sort_messages_chronologically(&mut items);
-        truncate_to_newest(&mut items, limit);
+        if root_count > limit {
+            let mut roots: Vec<MessageItem> = items
+                .iter()
+                .filter(|m| m.parent_msg_id.is_none())
+                .cloned()
+                .collect();
+            truncate_to_newest(&mut roots, limit);
+            let kept_root_ids: HashSet<String> =
+                roots.iter().map(|r| r.msg_id.clone()).collect();
+            items.retain(|m| match m.parent_msg_id.as_deref() {
+                None => kept_root_ids.contains(&m.msg_id),
+                Some(pid) => kept_root_ids.contains(pid),
+            });
+        }
         Ok(items)
     }
 
@@ -287,7 +388,7 @@ impl GraphClient {
         }
         .conv_key();
 
-        let top = limit.min(50);
+        let top = limit.clamp(1, 50);
         let mut next_url = Some(format!(
             "/teams/{}/channels/{}/messages/{}/replies?$top={top}",
             urlencoding::encode(team_id),
@@ -295,6 +396,7 @@ impl GraphClient {
             urlencoding::encode(root_msg_id)
         ));
         let mut replies = Vec::new();
+        let mut seen_ids = HashSet::new();
 
         while let Some(url) = next_url {
             let page: GraphListPage<GraphChatMessage> = self.get_json(&url).await?;
@@ -305,14 +407,18 @@ impl GraphClient {
                     my_id.as_deref(),
                     raw,
                 );
-                if !is_pure_system_noise(&normalized) {
+                if !is_pure_system_noise(&normalized) && seen_ids.insert(normalized.msg_id.clone())
+                {
                     replies.push(normalized);
                 }
             }
             if replies.len() >= limit {
                 break;
             }
-            next_url = page.next_link;
+            next_url = page
+                .next_link
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
         }
 
         sort_messages_chronologically(&mut replies);
@@ -525,6 +631,15 @@ impl GraphClient {
         let body = serde_json::json!({ "reactionType": reaction_type });
         self.post_json_empty(&path, &body).await
     }
+}
+
+fn is_expanded_reply_payload(raw: &GraphChatMessage) -> bool {
+    !raw.id.trim().is_empty()
+        && (raw.created_date_time.is_some()
+            || raw.deleted_date_time.is_some()
+            || raw.from.is_some()
+            || raw.body.is_some()
+            || !raw.attachments.is_empty())
 }
 
 fn message_item_path(
@@ -754,5 +869,165 @@ mod tests {
             message_item_path(&chan, "r1", Some("m1")),
             "/teams/t1/channels/ch1/messages/m1/replies/r1"
         );
+    }
+
+    #[tokio::test]
+    async fn test_channel_messages_page_inline_replies_and_thread_multipage() {
+        use axum::{extract::RawQuery, routing::get, Json, Router};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}/v1.0");
+        let ch_p2 = format!("{base}/teams/t1/channels/ch1/messages?page=2");
+        let rep_p2 = format!("{base}/teams/t1/channels/ch1/messages/root-2/replies?page=2");
+        let ch_p2_c = ch_p2.clone();
+        let rep_p2_c = rep_p2.clone();
+
+        let app = Router::new()
+            .route(
+                "/v1.0/teams/t1/channels/ch1/messages",
+                get(move |RawQuery(q): RawQuery| {
+                    let ch_p2 = ch_p2_c.clone();
+                    async move {
+                        let query = q.unwrap_or_default();
+                        if query.contains("page=2") {
+                            Json(serde_json::json!({
+                                "value": [
+                                    {
+                                        "id": "root-1",
+                                        "messageType": "message",
+                                        "createdDateTime": "2026-11-18T10:00:00Z",
+                                        "from": { "user": { "id": "u1", "displayName": "A" } },
+                                        "body": { "contentType": "text", "content": "oldest root" },
+                                        "replies": [
+                                            {
+                                                "id": "rep-1a",
+                                                "messageType": "message",
+                                                "createdDateTime": "2026-11-18T10:00:30Z",
+                                                "from": { "user": { "id": "u2", "displayName": "B" } },
+                                                "body": { "contentType": "text", "content": "reply 1a" }
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }))
+                        } else {
+                            Json(serde_json::json!({
+                                "value": [
+                                    {
+                                        "id": "root-3",
+                                        "messageType": "message",
+                                        "createdDateTime": "2026-11-18T10:03:00Z",
+                                        "from": { "user": { "id": "u1", "displayName": "A" } },
+                                        "body": { "contentType": "text", "content": "newest root" },
+                                        "replies": []
+                                    },
+                                    {
+                                        "id": "root-2",
+                                        "messageType": "message",
+                                        "createdDateTime": "2026-11-18T10:01:00Z",
+                                        "from": { "user": { "id": "u1", "displayName": "A" } },
+                                        "body": { "contentType": "text", "content": "middle root" },
+                                        "replies": [
+                                            {
+                                                "id": "rep-2a",
+                                                "messageType": "message",
+                                                "createdDateTime": "2026-11-18T10:02:00Z",
+                                                "from": { "user": { "id": "u2", "displayName": "B" } },
+                                                "body": { "contentType": "text", "content": "reply 2a" }
+                                            }
+                                        ]
+                                    }
+                                ],
+                                "@odata.nextLink": ch_p2
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/teams/t1/channels/ch1/messages/root-2/replies",
+                get(move |RawQuery(q): RawQuery| {
+                    let rep_p2 = rep_p2_c.clone();
+                    async move {
+                        let query = q.unwrap_or_default();
+                        if query.contains("page=2") {
+                            Json(serde_json::json!({
+                                "value": [
+                                    {
+                                        "id": "rep-2a",
+                                        "messageType": "message",
+                                        "createdDateTime": "2026-11-18T10:01:30Z",
+                                        "from": { "user": { "id": "u2", "displayName": "B" } },
+                                        "body": { "contentType": "text", "content": "first reply" }
+                                    }
+                                ]
+                            }))
+                        } else {
+                            Json(serde_json::json!({
+                                "value": [
+                                    {
+                                        "id": "rep-2c",
+                                        "messageType": "message",
+                                        "createdDateTime": "2026-11-18T10:03:00Z",
+                                        "from": { "user": { "id": "u2", "displayName": "B" } },
+                                        "body": { "contentType": "text", "content": "third reply" }
+                                    },
+                                    {
+                                        "id": "rep-2b",
+                                        "messageType": "message",
+                                        "createdDateTime": "2026-11-18T10:02:00Z",
+                                        "from": { "user": { "id": "u1", "displayName": "A" } },
+                                        "body": { "contentType": "text", "content": "second reply" }
+                                    }
+                                ],
+                                "@odata.nextLink": rep_p2
+                            }))
+                        }
+                    }
+                }),
+            );
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.graph_base_url = base;
+        let tok = crate::auth::StoredTokens {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("me-1".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = crate::auth::AuthManager::from_tokens(cfg.clone(), tok);
+        let client = GraphClient::new(cfg, auth).unwrap().with_my_user_id("me-1");
+
+        let (p1, next) = client
+            .list_channel_messages_page("t1", "ch1", 50, None)
+            .await
+            .unwrap();
+        let p1_ids: Vec<&str> = p1.iter().map(|m| m.msg_id.as_str()).collect();
+        assert_eq!(p1_ids, vec!["root-2", "rep-2a", "root-3"]);
+        assert_eq!(p1[1].parent_msg_id.as_deref(), Some("root-2"));
+        assert_eq!(next.as_deref(), Some(ch_p2.as_str()));
+
+        // limit = 2 root posts preserves inline expanded reply rep-2a as well
+        let limited = client.list_channel_messages("t1", "ch1", 2).await.unwrap();
+        let limited_ids: Vec<&str> = limited.iter().map(|m| m.msg_id.as_str()).collect();
+        assert_eq!(limited_ids, vec!["root-2", "rep-2a", "root-3"]);
+
+        // Multi-page thread replies
+        let replies = client
+            .list_thread_replies("t1", "ch1", "root-2", 100)
+            .await
+            .unwrap();
+        let reply_ids: Vec<&str> = replies.iter().map(|m| m.msg_id.as_str()).collect();
+        assert_eq!(reply_ids, vec!["rep-2a", "rep-2b", "rep-2c"]);
     }
 }

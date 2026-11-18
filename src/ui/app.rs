@@ -7,19 +7,15 @@ use chrono::Utc;
 use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
-use crate::auth::AuthManager;
-use crate::config::{self, AppConfig, Persona};
+use crate::auth::{self, AuthManager};
+use crate::config::{self, AppConfig};
 use crate::graph::GraphClient;
 use crate::img_preview::{self, RenderedTerminalImage};
 use crate::models::{
-    AttachmentInfo, CalendarEvent, ChannelSummary, ContactItem, ConversationKind,
-    ConversationSummary, ConversationTarget, CoreEvent, DownloadedFile, InlineImageUpload,
-    MailAttachment, MailFolder, MailMessage, MailSearchHit, MemberInfo, MessageItem,
-    NotificationCandidate, OnenoteNotebook, OnenotePageDetail, OnenotePageSummary, OnenoteResource,
-    OnenoteScope, OnenoteSearchHit, OnenoteSection, OutgoingContact, OutgoingEvent, OutgoingMail,
-    OutgoingMessage, OutgoingOnenotePage, OutgoingTodoTask, PresenceStatus, QuotedReply,
-    ReactionSummary, SearchHit, TeamSummary, ThreadView, TodoList, TodoTask, UpdateCheckResult,
-    UserProfile,
+    AttachmentInfo, ChannelSummary, ConversationKind, ConversationSummary, ConversationTarget,
+    CoreEvent, DownloadedFile, MemberInfo, MessageItem, NotificationCandidate, OutgoingMessage,
+    PresenceStatus, QuotedReply, ReactionSummary, SearchHit, SyncCursor, TeamSummary, ThreadView,
+    UpdateCheckResult, UserProfile,
 };
 use crate::parser;
 use crate::storage::Storage;
@@ -31,8 +27,6 @@ use super::keymap::Keymap;
 use super::nav_pane::{self, NavRow};
 use super::notification;
 use super::overlays::image_preview::PreviewTarget;
-use super::overlays::mail_compose::MailComposeMode;
-use super::overlays::onenote_form::OnenoteFormOverlay;
 use super::overlays::{Overlay, OverlayKind};
 use super::theme::Theme;
 use super::toast::{TaskBoard, ToastKind, ToastQueue};
@@ -123,6 +117,7 @@ pub enum UiMsg {
         teams: Vec<TeamSummary>,
         mentions: Vec<MessageItem>,
         presences: HashMap<String, PresenceStatus>,
+        scope_warning: Option<String>,
     },
     MessagesLoaded {
         conv_key: String,
@@ -132,8 +127,18 @@ pub enum UiMsg {
     OlderMessagesLoaded {
         conv_key: String,
         messages: Vec<MessageItem>,
-        reached_end: bool,
+        reached_eof: bool,
     },
+    OlderMessagesFailed {
+        conv_key: String,
+        local_messages: Vec<MessageItem>,
+        error: String,
+    },
+    OlderChatsLoaded {
+        conversations: Vec<ConversationSummary>,
+        reached_eof: bool,
+    },
+    OlderChatsFailed,
     ThreadLoaded {
         conv_key: String,
         root_msg_id: String,
@@ -177,102 +182,6 @@ pub enum UiMsg {
     },
     ChatCreated(ConversationSummary),
     PresenceUpdated(PresenceStatus),
-    OutlookBootstrapDone {
-        mail_folders: Vec<MailFolder>,
-        mails: Vec<MailMessage>,
-        calendar_events: Vec<CalendarEvent>,
-        contacts: Vec<ContactItem>,
-        todo_lists: Vec<TodoList>,
-        todo_tasks: Vec<TodoTask>,
-        active_todo_list_id: Option<String>,
-    },
-    MailFolderLoaded {
-        folder_id: String,
-        mails: Vec<MailMessage>,
-    },
-    MailDetailLoaded {
-        mail: MailMessage,
-    },
-    MailDetailFailed {
-        mail_id: String,
-    },
-    MailPrefetchFailed {
-        mail_id: String,
-    },
-    MailReadRollback {
-        mail_id: String,
-        prev_read: bool,
-        folder_prev_unread: Option<(String, i32)>,
-    },
-    MailFlagRollback {
-        mail_id: String,
-        prev_flagged: bool,
-    },
-    MailRemoveRollback {
-        folder_id: String,
-        index: Option<usize>,
-        mail: MailMessage,
-    },
-    OutlookCachedSecondaryLoaded {
-        calendar_events: Vec<CalendarEvent>,
-        contacts: Vec<ContactItem>,
-        todo_lists: Vec<TodoList>,
-        todo_tasks: Vec<TodoTask>,
-        active_todo_list_id: Option<String>,
-    },
-    MailUpdated {
-        mail: MailMessage,
-    },
-    MailRemoved {
-        mail_id: String,
-    },
-    TodoStatusRollback {
-        task_id: String,
-        prev_status: String,
-    },
-    CalendarLoaded {
-        events: Vec<CalendarEvent>,
-    },
-    CalendarEventCreated {
-        event: CalendarEvent,
-    },
-    CalendarEventDeleted {
-        event_id: String,
-    },
-    CalendarEventResponded {
-        event_id: String,
-        response: String,
-    },
-    ContactsLoaded {
-        contacts: Vec<ContactItem>,
-    },
-    ContactCreated {
-        contact: ContactItem,
-    },
-    ContactDeleted {
-        contact_id: String,
-    },
-    TodoListsLoaded {
-        lists: Vec<TodoList>,
-    },
-    TodoTasksLoaded {
-        list_id: String,
-        tasks: Vec<TodoTask>,
-    },
-    TodoTaskUpserted {
-        task: TodoTask,
-    },
-    TodoTaskDeleted {
-        task_id: String,
-    },
-    MailSearchResults {
-        query: String,
-        hits: Vec<MailSearchHit>,
-    },
-    ContactSearchResults {
-        query: String,
-        contacts: Vec<ContactItem>,
-    },
     ImageDecoded {
         cache_key: String,
         rendered: RenderedTerminalImage,
@@ -281,14 +190,6 @@ pub enum UiMsg {
         cache_key: String,
         owner_id: String,
         att_id: String,
-        error: String,
-    },
-    OnenoteImageDecoded {
-        cache_key: String,
-        rendered: RenderedTerminalImage,
-    },
-    OnenoteImageDecodeFailed {
-        cache_key: String,
         error: String,
     },
     UpdateChecked(UpdateCheckResult),
@@ -301,6 +202,7 @@ pub enum UiMsg {
     ProfileLoaded {
         me: Option<UserProfile>,
         presence: Option<PresenceStatus>,
+        scope_warning: Option<String>,
     },
     TaskDone {
         label: String,
@@ -310,7 +212,6 @@ pub enum UiMsg {
 }
 
 pub struct UiState {
-    pub persona: Persona,
     pub focus: Focus,
     pub overlays: Vec<Overlay>,
     pub composer: ComposerState,
@@ -321,12 +222,13 @@ pub struct UiState {
     pub theme: Theme,
     pub active_nav_tab: usize,
     pub nav_selected: usize,
+    pub nav_area: Rect,
     pub collapsed_team_ids: HashSet<String>,
     pub chat_scroll: ScrollState,
     pub thread_scroll: ScrollState,
-    pub mail_scroll: ScrollState,
+    /// `(old_total_lines, old_offset)` recorded right before prepending older messages.
+    pub pending_prepend_anchor: Option<(usize, usize)>,
     pub attach_index: usize,
-    pub mail_attach_index: usize,
     pub show_nav_rail: bool,
     pub auto_thread_pane: bool,
     pub inline_images: bool,
@@ -336,19 +238,8 @@ pub struct UiState {
     pub notify: bool,
     pub composer_target_thread: bool,
     pub show_subject: bool,
-    pub active_mail_folder_id: String,
-    pub active_mail_folder_name: String,
-    pub active_todo_list_id: Option<String>,
-    pub todo_input: String,
-    pub todo_input_active: bool,
-    pub todo_include_completed: bool,
     pub term_width: u16,
     pub term_height: u16,
-    pub collapsed_notebook_keys: HashSet<String>,
-    pub onenote_selected_block: usize,
-    pub onenote_scroll: ScrollState,
-    pub onenote_follow_selection: bool,
-    pub onenote_external_edit: Option<(String, String)>,
 }
 
 impl Default for UiState {
@@ -359,17 +250,7 @@ impl Default for UiState {
 
 impl UiState {
     pub fn new() -> Self {
-        Self::new_with_persona(Persona::Teams)
-    }
-
-    pub fn new_with_persona(persona: Persona) -> Self {
-        let active_nav_tab = match persona {
-            Persona::Teams => 0,
-            Persona::Outlook => 3,
-            Persona::OneNote => 7,
-        };
         Self {
-            persona,
             focus: Focus::Nav,
             overlays: Vec::new(),
             composer: ComposerState::new(),
@@ -378,14 +259,14 @@ impl UiState {
             tasks: TaskBoard::default(),
             keymap: Keymap::default_teams(),
             theme: Theme::default(),
-            active_nav_tab,
+            active_nav_tab: 0,
             nav_selected: 0,
+            nav_area: Rect::default(),
             collapsed_team_ids: HashSet::new(),
             chat_scroll: ScrollState::default(),
             thread_scroll: ScrollState::default(),
-            mail_scroll: ScrollState::default(),
+            pending_prepend_anchor: None,
             attach_index: 0,
-            mail_attach_index: 0,
             show_nav_rail: true,
             auto_thread_pane: true,
             inline_images: true,
@@ -395,28 +276,13 @@ impl UiState {
             notify: true,
             composer_target_thread: false,
             show_subject: false,
-            active_mail_folder_id: "inbox".to_string(),
-            active_mail_folder_name: "받은 편지함".to_string(),
-            active_todo_list_id: None,
-            todo_input: String::new(),
-            todo_input_active: false,
-            todo_include_completed: false,
             term_width: 120,
             term_height: 40,
-            collapsed_notebook_keys: HashSet::new(),
-            onenote_selected_block: 0,
-            onenote_scroll: ScrollState::default(),
-            onenote_follow_selection: false,
-            onenote_external_edit: None,
         }
     }
 
     pub fn from_config(config: &AppConfig) -> Self {
-        Self::from_config_with_persona(config, Persona::Teams)
-    }
-
-    pub fn from_config_with_persona(config: &AppConfig, persona: Persona) -> Self {
-        let mut s = Self::new_with_persona(persona);
+        let mut s = Self::new();
         s.show_nav_rail = config.show_nav_rail;
         s.auto_thread_pane = config.auto_thread_pane;
         s.notify = config.notify;
@@ -434,9 +300,6 @@ impl UiState {
 
     pub fn accepts_text_input(&self) -> bool {
         matches!(self.focus(), Focus::Composer)
-            || (matches!(self.focus(), Focus::Chat)
-                && self.active_nav_tab == 6
-                && self.todo_input_active)
             || self.overlays.last().is_some_and(Overlay::accepts_text)
     }
 
@@ -481,7 +344,6 @@ impl UiState {
 
 pub struct AppState {
     pub config: AppConfig,
-    pub persona: Persona,
     pub auth: AuthManager,
     pub graph: GraphClient,
     pub storage: Storage,
@@ -501,7 +363,10 @@ pub struct AppState {
     pub drafts: HashMap<String, String>,
     pub download_dir: PathBuf,
     pub loading_messages: bool,
+    pub loading_older: bool,
     pub loading_thread: bool,
+    pub loading_older_chats: bool,
+    pub chats_oldest_reached: bool,
     pub syncing: bool,
     pub sync_summary: String,
     pub daemon_attached: bool,
@@ -509,45 +374,11 @@ pub struct AppState {
     pub searching: bool,
     pub search_query: String,
     pub search_results: Vec<SearchHit>,
-    pub mail_search_results: Vec<MailSearchHit>,
-    pub contact_search_results: Vec<ContactItem>,
     pub user_searching: bool,
     pub user_search_results: Vec<UserProfile>,
     pub oldest_reached: bool,
-    // Lazy domain activation flags
-    pub activated_teams: bool,
-    pub activated_outlook: bool,
-    pub activated_onenote: bool,
-    // Outlook Unified Workspace state
-    pub mail_folders: Vec<MailFolder>,
-    pub mails: Vec<MailMessage>,
-    pub active_mail_id: Option<String>,
-    pub active_mail: Option<MailMessage>,
-    pub loading_mail: bool,
-    pub mail_prefetch_pending: HashSet<String>,
-    pub calendar_events: Vec<CalendarEvent>,
-    pub active_event_id: Option<String>,
-    pub contacts: Vec<ContactItem>,
-    pub active_contact_id: Option<String>,
-    pub todo_lists: Vec<TodoList>,
-    pub todo_tasks: Vec<TodoTask>,
-    pub active_todo_task_id: Option<String>,
-    // Microsoft OneNote workspace state
-    pub onenote_notebooks: Vec<OnenoteNotebook>,
-    pub onenote_sections: Vec<OnenoteSection>,
-    pub onenote_pages: Vec<OnenotePageSummary>,
-    pub onenote_search_results: Vec<OnenoteSearchHit>,
-    pub active_notebook_key: Option<String>,
-    pub active_section_key: Option<String>,
-    pub active_page_key: Option<String>,
-    pub active_page_detail: Option<OnenotePageDetail>,
-    pub loading_onenote_pages: bool,
-    pub loading_onenote_detail: bool,
-    pub onenote_image_cache: HashMap<String, RenderedTerminalImage>,
-    pub onenote_image_cache_order: VecDeque<String>,
-    pub onenote_image_cache_bytes: usize,
-    pub onenote_image_pending: HashSet<String>,
-    pub onenote_image_errors: HashSet<String>,
+    pub history_error: Option<String>,
+    pub scope_warned: bool,
     // Terminal inline image preview cache (bounded LRU-style FIFO + 8 MiB byte budget)
     pub image_cache: HashMap<String, RenderedTerminalImage>,
     pub image_cache_order: VecDeque<String>,
@@ -566,31 +397,10 @@ impl AppState {
         sync_ctrl: SyncController,
         ui_tx: mpsc::UnboundedSender<UiMsg>,
     ) -> Self {
-        Self::new_with_persona(
-            config,
-            Persona::Teams,
-            auth,
-            graph,
-            storage,
-            sync_ctrl,
-            ui_tx,
-        )
-    }
-
-    pub fn new_with_persona(
-        config: AppConfig,
-        persona: Persona,
-        auth: AuthManager,
-        graph: GraphClient,
-        storage: Storage,
-        sync_ctrl: SyncController,
-        ui_tx: mpsc::UnboundedSender<UiMsg>,
-    ) -> Self {
         let download_dir = config.resolved_download_dir();
         let drafts = config::load_drafts();
         Self {
             config,
-            persona,
             auth,
             graph,
             storage,
@@ -610,7 +420,10 @@ impl AppState {
             drafts,
             download_dir,
             loading_messages: false,
+            loading_older: false,
             loading_thread: false,
+            loading_older_chats: false,
+            chats_oldest_reached: false,
             syncing: false,
             sync_summary: "준비".to_string(),
             daemon_attached: false,
@@ -618,42 +431,11 @@ impl AppState {
             searching: false,
             search_query: String::new(),
             search_results: Vec::new(),
-            mail_search_results: Vec::new(),
-            contact_search_results: Vec::new(),
             user_searching: false,
             user_search_results: Vec::new(),
             oldest_reached: false,
-            activated_teams: false,
-            activated_outlook: false,
-            activated_onenote: false,
-            mail_folders: Vec::new(),
-            mails: Vec::new(),
-            active_mail_id: None,
-            active_mail: None,
-            loading_mail: false,
-            mail_prefetch_pending: HashSet::new(),
-            calendar_events: Vec::new(),
-            active_event_id: None,
-            contacts: Vec::new(),
-            active_contact_id: None,
-            todo_lists: Vec::new(),
-            todo_tasks: Vec::new(),
-            active_todo_task_id: None,
-            onenote_notebooks: Vec::new(),
-            onenote_sections: Vec::new(),
-            onenote_pages: Vec::new(),
-            onenote_search_results: Vec::new(),
-            active_notebook_key: None,
-            active_section_key: None,
-            active_page_key: None,
-            active_page_detail: None,
-            loading_onenote_pages: false,
-            loading_onenote_detail: false,
-            onenote_image_cache: HashMap::new(),
-            onenote_image_cache_order: VecDeque::new(),
-            onenote_image_cache_bytes: 0,
-            onenote_image_pending: HashSet::new(),
-            onenote_image_errors: HashSet::new(),
+            history_error: None,
+            scope_warned: false,
             image_cache: HashMap::new(),
             image_cache_order: VecDeque::new(),
             image_cache_bytes: 0,
@@ -781,7 +563,7 @@ impl AppState {
         ui.composer.reset_after_send();
     }
 
-    fn load_cached_teams(&mut self) {
+    pub fn load_cached_teams(&mut self) {
         if let Ok(convs) = self.storage.list_conversations() {
             self.conversations = convs;
         }
@@ -796,280 +578,19 @@ impl AppState {
                 self.activity_mentions = mentions;
             }
         }
-    }
-
-    fn load_cached_outlook_initial(&mut self) {
-        if let Ok(folders) = self.storage.list_mail_folders() {
-            self.mail_folders = folders;
-        }
-        if let Ok(mails) = self.storage.list_mail_summaries(Some("inbox"), 100) {
-            self.mails = mails;
-        }
-    }
-
-    fn load_cached_outlook_full(&mut self) {
-        self.load_cached_outlook_initial();
-        if let Ok(events) = self.storage.list_calendar_events(None, None, 100) {
-            self.calendar_events = events;
-        }
-        if let Ok(contacts) = self.storage.list_contacts(None, 200) {
-            self.contacts = contacts;
-        }
-        if let Ok(lists) = self.storage.list_todo_lists() {
-            if let Some(first) = lists.first() {
-                if let Ok(tasks) = self.storage.list_todo_tasks(&first.id, false, 200) {
-                    self.todo_tasks = tasks;
-                }
-            }
-            self.todo_lists = lists;
-        }
-    }
-
-    fn load_cached_onenote(&mut self) {
-        if let Ok(notebooks) = self.storage.list_onenote_notebooks() {
-            self.onenote_notebooks = notebooks;
-        }
-        if let Ok(sections) = self.storage.list_onenote_sections(None) {
-            self.onenote_sections = sections;
-        }
-        if self.active_notebook_key.is_none() {
-            self.active_notebook_key = self
-                .onenote_notebooks
-                .first()
-                .map(|nb| nb.notebook_key.clone());
-        }
-        if self.active_section_key.is_none() {
-            self.active_section_key = self
-                .sections_for_active_notebook()
-                .first()
-                .map(|sec| sec.section_key.clone())
-                .or_else(|| self.onenote_sections.first().map(|sec| sec.section_key.clone()));
-        }
-        if let Some(sec_key) = self.active_section_key.clone() {
-            if let Ok(pages) = self.storage.list_onenote_pages(&sec_key) {
-                if let Some(first_page) = pages.first() {
-                    self.active_page_key = Some(first_page.page_key.clone());
-                    self.active_page_detail = self
-                        .storage
-                        .get_onenote_page_detail(&first_page.page_key)
-                        .unwrap_or(None);
-                }
-                self.onenote_pages = pages;
-            }
-        }
+        self.chats_oldest_reached = self
+            .storage
+            .get_sync_cursor(SyncCursor::CHATS_LIST_SCOPE)
+            .ok()
+            .flatten()
+            .is_some_and(|c| c.is_history_eof());
     }
 
     pub fn load_cached_initial(&mut self) {
         self.load_cached_teams();
-        self.load_cached_outlook_full();
-        self.load_cached_onenote();
     }
 
-    pub fn load_cached_for_persona(&mut self) {
-        match self.persona {
-            Persona::Teams => {
-                self.load_cached_teams();
-                self.activated_teams = true;
-            }
-            Persona::Outlook => {
-                self.load_cached_outlook_initial();
-                self.activated_outlook = true;
-            }
-            Persona::OneNote => {
-                self.load_cached_onenote();
-                self.activated_onenote = true;
-            }
-        }
-    }
-
-    fn send_active_domains(&self) {
-        self.sync_ctrl.request(SyncCommand::SetActiveDomains {
-            teams: self.activated_teams,
-            outlook: self.activated_outlook,
-            onenote: self.activated_onenote,
-        });
-    }
-
-    pub fn ensure_tab_domain_activated(&mut self, ui: &mut UiState, tab: usize) {
-        const ONENOTE_TAB_LEAVE_MAX_BYTES: usize = 2 * 1024 * 1024;
-        const SHRINK_MEMORY_EVICT_THRESHOLD_BYTES: usize = 1024 * 1024;
-
-        if tab != nav_pane::TAB_NOTES
-            && self.onenote_image_cache_bytes > ONENOTE_TAB_LEAVE_MAX_BYTES
-        {
-            let evicted_bytes = self.trim_onenote_image_cache_to(ONENOTE_TAB_LEAVE_MAX_BYTES);
-            if evicted_bytes > SHRINK_MEMORY_EVICT_THRESHOLD_BYTES
-                && tokio::runtime::Handle::try_current().is_ok()
-            {
-                let storage = self.storage.clone();
-                tokio::task::spawn_blocking(move || {
-                    storage.shrink_memory();
-                });
-            }
-        }
-
-        if tab <= nav_pane::TAB_ACTIVITY {
-            if !self.activated_teams {
-                self.activated_teams = true;
-                self.load_cached_teams();
-                self.send_active_domains();
-                if self.daemon_attached {
-                    self.sync_ctrl.request(SyncCommand::RefreshConversations);
-                } else {
-                    self.spawn_teams_bootstrap(None);
-                }
-            }
-        } else if (nav_pane::TAB_MAIL..=nav_pane::TAB_TODO).contains(&tab) {
-            if !self.activated_outlook {
-                self.activated_outlook = true;
-                self.load_cached_outlook_full();
-                if ui.active_todo_list_id.is_none() {
-                    ui.active_todo_list_id = self.todo_lists.first().map(|l| l.id.clone());
-                }
-                self.send_active_domains();
-                if self.daemon_attached {
-                    self.sync_ctrl.request(SyncCommand::RefreshOutlook);
-                } else {
-                    self.spawn_outlook_bootstrap(None);
-                }
-            }
-        } else if tab == nav_pane::TAB_NOTES && !self.activated_onenote {
-            self.activated_onenote = true;
-            self.load_cached_onenote();
-            self.send_active_domains();
-            self.spawn_onenote_bootstrap();
-        }
-    }
-
-    fn spawn_onenote_bootstrap(&self) {
-        self.sync_ctrl.request(SyncCommand::RefreshOneNote);
-        if let Some(sec_key) = self.active_section_key.clone() {
-            self.sync_ctrl.request(SyncCommand::SyncOneNoteSection {
-                section_key: sec_key,
-            });
-        }
-        if let Some(page_key) = self.active_page_key.clone() {
-            self.sync_ctrl
-                .request(SyncCommand::SyncOneNotePage { page_key });
-        }
-    }
-
-    fn spawn_outlook_cached_secondary(&self) {
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        let storage = self.storage.clone();
-        let tx = self.ui_tx.clone();
-        tokio::spawn(async move {
-            let snapshot = tokio::task::spawn_blocking(move || {
-                let calendar_events = storage
-                    .list_calendar_events(None, None, 100)
-                    .unwrap_or_default();
-                let contacts = storage.list_contacts(None, 200).unwrap_or_default();
-                let todo_lists = storage.list_todo_lists().unwrap_or_default();
-                let active_todo_list_id = todo_lists.first().map(|l| l.id.clone());
-                let todo_tasks = if let Some(ref lid) = active_todo_list_id {
-                    storage.list_todo_tasks(lid, false, 200).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                (
-                    calendar_events,
-                    contacts,
-                    todo_lists,
-                    todo_tasks,
-                    active_todo_list_id,
-                )
-            })
-            .await;
-
-            if let Ok((
-                calendar_events,
-                contacts,
-                todo_lists,
-                todo_tasks,
-                active_todo_list_id,
-            )) = snapshot
-            {
-                let _ = tx.send(UiMsg::OutlookCachedSecondaryLoaded {
-                    calendar_events,
-                    contacts,
-                    todo_lists,
-                    todo_tasks,
-                    active_todo_list_id,
-                });
-            }
-        });
-    }
-
-    fn spawn_outlook_bootstrap(&self, task_label: Option<String>) {
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        let outlook_graph = self.graph.clone();
-        let outlook_storage = self.storage.clone();
-        let outlook_tx = self.ui_tx.clone();
-        tokio::spawn(async move {
-            let _ = sync::bootstrap_outlook(&outlook_graph, &outlook_storage).await;
-            let snapshot = tokio::task::spawn_blocking(move || {
-                let mail_folders = outlook_storage.list_mail_folders().unwrap_or_default();
-                let mails = outlook_storage
-                    .list_mail_summaries(Some("inbox"), 100)
-                    .unwrap_or_default();
-                let calendar_events = outlook_storage
-                    .list_calendar_events(None, None, 100)
-                    .unwrap_or_default();
-                let contacts = outlook_storage.list_contacts(None, 200).unwrap_or_default();
-                let todo_lists = outlook_storage.list_todo_lists().unwrap_or_default();
-                let active_todo_list_id = todo_lists.first().map(|l| l.id.clone());
-                let todo_tasks = if let Some(ref lid) = active_todo_list_id {
-                    outlook_storage
-                        .list_todo_tasks(lid, false, 200)
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                (
-                    mail_folders,
-                    mails,
-                    calendar_events,
-                    contacts,
-                    todo_lists,
-                    todo_tasks,
-                    active_todo_list_id,
-                )
-            })
-            .await;
-
-            if let Ok((
-                mail_folders,
-                mails,
-                calendar_events,
-                contacts,
-                todo_lists,
-                todo_tasks,
-                active_todo_list_id,
-            )) = snapshot
-            {
-                let _ = outlook_tx.send(UiMsg::OutlookBootstrapDone {
-                    mail_folders,
-                    mails,
-                    calendar_events,
-                    contacts,
-                    todo_lists,
-                    todo_tasks,
-                    active_todo_list_id,
-                });
-            }
-            if let Some(label) = task_label {
-                let _ = outlook_tx.send(UiMsg::TaskDone {
-                    label,
-                    error: None,
-                    toast: None,
-                });
-            }
-        });
-    }
+    pub fn ensure_tab_domain_activated(&mut self, _ui: &mut UiState, _tab: usize) {}
 
     fn spawn_teams_bootstrap(&self, task_label: Option<String>) {
         if tokio::runtime::Handle::try_current().is_err() {
@@ -1080,12 +601,19 @@ impl AppState {
         let auth = self.auth.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
-            let (token_uid, me_res, presence_res, _conv_res) = tokio::join!(
-                async { auth.current_tokens().await.and_then(|t| t.user_id) },
+            let (tok, me_res, presence_res, _conv_res) = tokio::join!(
+                auth.current_tokens(),
                 graph.get_me(),
                 graph.get_my_presence(),
                 sync::bootstrap_conversations(&graph, &storage),
             );
+            let scope_warning = tok.as_ref().and_then(|t| {
+                auth::diagnose_access_token_scopes(&t.access_token)
+                    .warnings
+                    .into_iter()
+                    .next()
+            });
+            let token_uid = tok.and_then(|t| t.user_id);
             let me = me_res.ok();
             if let Some(ref u) = me {
                 let _ = auth
@@ -1152,6 +680,7 @@ impl AppState {
                 teams,
                 mentions,
                 presences,
+                scope_warning,
             });
             if let Some(label) = task_label {
                 let _ = tx.send(UiMsg::TaskDone {
@@ -1171,7 +700,17 @@ impl AppState {
         let auth = self.auth.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
-            let (me_res, presence_res) = tokio::join!(graph.get_me(), graph.get_my_presence());
+            let (tok, me_res, presence_res) = tokio::join!(
+                auth.current_tokens(),
+                graph.get_me(),
+                graph.get_my_presence()
+            );
+            let scope_warning = tok.as_ref().and_then(|t| {
+                auth::diagnose_access_token_scopes(&t.access_token)
+                    .warnings
+                    .into_iter()
+                    .next()
+            });
             let me = me_res.ok();
             if let Some(ref u) = me {
                 let _ = auth
@@ -1179,39 +718,20 @@ impl AppState {
                     .await;
             }
             let presence = presence_res.ok();
-            let _ = tx.send(UiMsg::ProfileLoaded { me, presence });
+            let _ = tx.send(UiMsg::ProfileLoaded {
+                me,
+                presence,
+                scope_warning,
+            });
         });
     }
 
     pub fn spawn_bootstrap(&mut self, ui: &mut UiState) {
-        if ui.active_todo_list_id.is_none() {
-            ui.active_todo_list_id = self.todo_lists.first().map(|l| l.id.clone());
-        }
-
-        match self.persona {
-            Persona::Teams => self.activated_teams = true,
-            Persona::Outlook => self.activated_outlook = true,
-            Persona::OneNote => self.activated_onenote = true,
-        }
-        self.send_active_domains();
-
         let task_label = "초기 동기화".to_string();
         ui.tasks.begin(task_label.clone());
         self.syncing = true;
         self.sync_summary = "동기화 중...".to_string();
-
-        match self.persona {
-            Persona::Teams => {
-                self.spawn_teams_bootstrap(Some(task_label));
-            }
-            Persona::Outlook => {
-                self.spawn_outlook_cached_secondary();
-                self.spawn_outlook_bootstrap(Some(task_label));
-            }
-            Persona::OneNote => {
-                self.spawn_onenote_bootstrap();
-            }
-        }
+        self.spawn_teams_bootstrap(Some(task_label));
     }
 
     pub fn select_conversation(&mut self, ui: &mut UiState, target: ConversationTarget) {
@@ -1226,7 +746,14 @@ impl AppState {
         self.active_conv_key = Some(new_key.clone());
         self.active_target = Some(target.clone());
         self.active_thread = None;
-        self.oldest_reached = false;
+        self.loading_older = false;
+        self.history_error = None;
+        self.oldest_reached = self
+            .storage
+            .get_sync_cursor(&SyncCursor::history_scope(&new_key))
+            .ok()
+            .flatten()
+            .is_some_and(|c| c.is_history_eof());
         ui.thread_drawer_open = false;
         ui.composer_target_thread = false;
         ui.show_subject = false;
@@ -1235,6 +762,7 @@ impl AppState {
         ui.composer.close_mentions();
         ui.chat_scroll = ScrollState::default();
         ui.thread_scroll = ScrollState::default();
+        ui.pending_prepend_anchor = None;
         self.loading_messages = true;
 
         self.messages = self
@@ -1352,42 +880,6 @@ impl AppState {
                     }
                 }
             }
-            NavRow::MailFolderItem {
-                folder_id,
-                display_name,
-                ..
-            } => {
-                self.select_mail_folder(ui, folder_id, display_name);
-            }
-            NavRow::MailItem { mail_id, .. } => {
-                self.select_mail(ui, mail_id);
-                self.focus_conversation_pane(ui);
-            }
-            NavRow::CalendarItem { event_id, .. } => {
-                self.select_calendar_event(ui, event_id);
-                self.focus_conversation_pane(ui);
-            }
-            NavRow::ContactRow { contact_id, .. } => {
-                self.select_contact(ui, contact_id);
-                self.focus_conversation_pane(ui);
-            }
-            NavRow::TodoListChip { list_id, .. } => {
-                self.select_todo_list(ui, list_id);
-            }
-            NavRow::TodoTaskRow { task_id, .. } => {
-                self.select_todo_task(ui, task_id);
-                self.focus_conversation_pane(ui);
-            }
-            NavRow::OnenoteGroupHeader { .. } => {}
-            NavRow::OnenoteNotebook { notebook_key, .. } => {
-                self.active_notebook_key = Some(notebook_key.clone());
-                self.toggle_onenote_notebook(ui, notebook_key);
-            }
-            NavRow::OnenoteSectionGroup { .. } => {}
-            NavRow::OnenoteSection { section_key, .. } => {
-                self.open_onenote_section(ui, section_key);
-                self.focus_conversation_pane(ui);
-            }
         }
     }
 
@@ -1426,7 +918,7 @@ impl AppState {
 
         self.stash_draft(ui);
         self.loading_thread = true;
-        if let Ok(Some(cached)) = self.storage.get_thread(&conv_key, &root_msg_id, 100) {
+        if let Ok(Some(cached)) = self.storage.get_thread(&conv_key, &root_msg_id, 200) {
             self.active_thread = Some(cached);
         } else if let Some(root) = self
             .messages
@@ -1450,12 +942,15 @@ impl AppState {
         self.sync_ctrl
             .set_focus(self.active_target.clone(), Some(root_msg_id.clone()));
 
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
         let graph = self.graph.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
             if let Ok(thread) = graph
-                .get_thread(&team_id, &channel_id, &root_msg_id, 100)
+                .get_thread(&team_id, &channel_id, &root_msg_id, 200)
                 .await
             {
                 let mut all = Vec::with_capacity(1 + thread.replies.len());
@@ -1470,6 +965,73 @@ impl AppState {
                     root_msg_id,
                     thread,
                 });
+            }
+        });
+    }
+
+    pub fn refresh_active_thread(&mut self, ui: &mut UiState) {
+        let Some(ConversationTarget::Channel {
+            team_id,
+            channel_id,
+        }) = self.active_target.clone()
+        else {
+            return;
+        };
+        let Some(conv_key) = self.active_conv_key.clone() else {
+            return;
+        };
+        let Some(root_msg_id) = self.active_thread.as_ref().map(|t| t.root.msg_id.clone()) else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+
+        self.loading_thread = true;
+        let task_label = "스레드 답글 동기화".to_string();
+        ui.tasks.begin(task_label.clone());
+
+        let graph = self.graph.clone();
+        let storage = self.storage.clone();
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            match graph
+                .list_thread_replies(&team_id, &channel_id, &root_msg_id, 200)
+                .await
+            {
+                Ok(replies) => {
+                    let db_storage = storage.clone();
+                    let db_conv = conv_key.clone();
+                    let db_root = root_msg_id.clone();
+                    let thread_opt = tokio::task::spawn_blocking(move || {
+                        if !replies.is_empty() {
+                            let _ = db_storage.upsert_messages(&replies);
+                        }
+                        db_storage.get_thread(&db_conv, &db_root, 200).ok().flatten()
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    if let Some(thread) = thread_opt {
+                        let _ = tx.send(UiMsg::ThreadLoaded {
+                            conv_key,
+                            root_msg_id,
+                            thread,
+                        });
+                    }
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: None,
+                        toast: None,
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: Some(err.to_string()),
+                        toast: Some((format!("스레드 동기화 실패: {err}"), ToastKind::Error)),
+                    });
+                }
             }
         });
     }
@@ -1642,38 +1204,286 @@ impl AppState {
     }
 
     pub fn load_older(&mut self, ui: &mut UiState) {
-        if self.oldest_reached || self.loading_messages {
+        self.load_older_internal(ui, 50, true);
+    }
+
+    pub fn load_older_auto(&mut self, ui: &mut UiState) {
+        self.load_older_internal(ui, 50, false);
+    }
+
+    pub fn load_older_with_depth(&mut self, ui: &mut UiState, batch_size: usize) {
+        self.load_older_internal(ui, batch_size.max(1), true);
+    }
+
+    fn load_older_internal(&mut self, ui: &mut UiState, batch_size: usize, explicit: bool) {
+        if self.loading_older {
+            return;
+        }
+        if self.oldest_reached && batch_size <= 50 && !(explicit && self.history_error.is_some()) {
+            if explicit {
+                ui.info("이미 대화의 첫 메시지까지 모두 불러왔습니다.");
+            }
             return;
         }
         let Some(conv_key) = self.active_conv_key.clone() else {
             return;
         };
-        let before = self.messages.first().map(|m| m.created_at.clone());
-        let storage = self.storage.clone();
-        let tx = self.ui_tx.clone();
+        let Some(target) = self
+            .active_target
+            .clone()
+            .or_else(|| ConversationTarget::from_conv_key(&conv_key))
+        else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+
+        let earliest = self
+            .messages
+            .iter()
+            .find(|m| !m.msg_id.starts_with("optimistic-"));
+        let oldest_ts = earliest.map(|m| m.created_at.clone());
+        let oldest_id = earliest.map(|m| m.msg_id.clone());
+
+        self.loading_older = true;
+        self.history_error = None;
         let task_label = "이전 메시지 로드".to_string();
         ui.tasks.begin(task_label.clone());
 
+        let graph = self.graph.clone();
+        let storage = self.storage.clone();
+        let tx = self.ui_tx.clone();
+        let force_deep = batch_size > 50;
+
         tokio::spawn(async move {
-            let db_conv_key = conv_key.clone();
-            let older = tokio::task::spawn_blocking(move || {
-                storage
-                    .list_root_messages(&db_conv_key, 50, before.as_deref())
-                    .unwrap_or_default()
+            let db_storage = storage.clone();
+            let db_conv = conv_key.clone();
+            let db_ts = oldest_ts.clone();
+            let db_id = oldest_id.clone();
+            let (local_older, cursor) = tokio::task::spawn_blocking(move || {
+                let older = match db_ts.as_deref() {
+                    Some(ts) => db_storage
+                        .list_older_root_messages(&db_conv, batch_size, ts, db_id.as_deref())
+                        .unwrap_or_default(),
+                    None => db_storage
+                        .list_root_messages(&db_conv, batch_size, None)
+                        .unwrap_or_default(),
+                };
+                let cur = db_storage
+                    .get_sync_cursor(&SyncCursor::history_scope(&db_conv))
+                    .ok()
+                    .flatten();
+                (older, cur)
             })
             .await
             .unwrap_or_default();
-            let reached_end = older.is_empty();
-            let _ = tx.send(UiMsg::OlderMessagesLoaded {
-                conv_key,
-                messages: older,
-                reached_end,
-            });
-            let _ = tx.send(UiMsg::TaskDone {
-                label: task_label,
-                error: None,
-                toast: None,
-            });
+
+            let cursor_is_eof = cursor.as_ref().is_some_and(|c| c.is_history_eof());
+            if local_older.len() >= batch_size || (!force_deep && cursor_is_eof) {
+                let reached_eof = if !cursor_is_eof {
+                    false
+                } else if local_older.len() < batch_size {
+                    true
+                } else {
+                    let check_storage = storage.clone();
+                    let check_conv = conv_key.clone();
+                    let earliest_in_batch = local_older
+                        .first()
+                        .map(|m| (m.created_at.clone(), m.msg_id.clone()));
+                    tokio::task::spawn_blocking(move || match earliest_in_batch {
+                        Some((ts, id)) => check_storage
+                            .list_older_root_messages(&check_conv, 1, &ts, Some(&id))
+                            .map(|v| v.is_empty())
+                            .unwrap_or(true),
+                        None => true,
+                    })
+                    .await
+                    .unwrap_or(true)
+                };
+                let _ = tx.send(UiMsg::OlderMessagesLoaded {
+                    conv_key,
+                    messages: local_older,
+                    reached_eof,
+                });
+                let _ = tx.send(UiMsg::TaskDone {
+                    label: task_label,
+                    error: None,
+                    toast: None,
+                });
+                return;
+            }
+
+            let saved_link = cursor.and_then(|c| c.delta_link);
+            let needed = batch_size.saturating_sub(local_older.len()).max(30);
+            match graph
+                .fetch_older_messages(&target, saved_link.as_deref(), oldest_ts.as_deref(), needed)
+                .await
+            {
+                Ok((fetched_msgs, new_next_link)) => {
+                    let write_storage = storage.clone();
+                    let db_conv = conv_key.clone();
+                    let db_ts = oldest_ts.clone();
+                    let db_id = oldest_id.clone();
+                    let next_link_clone = new_next_link.clone();
+                    let (combined_older, reached_eof) = tokio::task::spawn_blocking(move || {
+                        if !fetched_msgs.is_empty() {
+                            let _ = write_storage.upsert_messages(&fetched_msgs);
+                        }
+                        let oldest_fetched_ts = if next_link_clone.is_none() {
+                            Some(SyncCursor::HISTORY_EOF.to_string())
+                        } else {
+                            fetched_msgs
+                                .iter()
+                                .filter(|m| m.parent_msg_id.is_none())
+                                .map(|m| m.created_at.clone())
+                                .min()
+                        };
+                        let updated_cursor = SyncCursor {
+                            scope_key: SyncCursor::history_scope(&db_conv),
+                            delta_link: next_link_clone.clone(),
+                            oldest_msg_ts: oldest_fetched_ts,
+                            synced_at: Utc::now().to_rfc3339(),
+                        };
+                        let _ = write_storage.save_sync_cursor(&updated_cursor);
+
+                        let combined = match db_ts.as_deref() {
+                            Some(ts) => write_storage
+                                .list_older_root_messages(&db_conv, batch_size, ts, db_id.as_deref())
+                                .unwrap_or_default(),
+                            None => write_storage
+                                .list_root_messages(&db_conv, batch_size, None)
+                                .unwrap_or_default(),
+                        };
+                        let reached_eof = if next_link_clone.is_some() {
+                            false
+                        } else if combined.len() < batch_size {
+                            true
+                        } else if let Some(earliest) = combined.first() {
+                            write_storage
+                                .list_older_root_messages(
+                                    &db_conv,
+                                    1,
+                                    &earliest.created_at,
+                                    Some(&earliest.msg_id),
+                                )
+                                .map(|v| v.is_empty())
+                                .unwrap_or(true)
+                        } else {
+                            true
+                        };
+                        (combined, reached_eof)
+                    })
+                    .await
+                    .unwrap_or_default();
+
+                    let _ = tx.send(UiMsg::OlderMessagesLoaded {
+                        conv_key,
+                        messages: combined_older,
+                        reached_eof,
+                    });
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: None,
+                        toast: None,
+                    });
+                }
+                Err(err) => {
+                    let raw_err = err.to_string();
+                    let tok = graph.auth().current_tokens().await.map(|t| t.access_token);
+                    let friendly_err =
+                        auth::explain_graph_permission_error(&raw_err, tok.as_deref())
+                            .unwrap_or_else(|| format!("이전 메시지 조회 실패: {raw_err}"));
+                    let _ = tx.send(UiMsg::OlderMessagesFailed {
+                        conv_key,
+                        local_messages: local_older,
+                        error: friendly_err.clone(),
+                    });
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: Some(raw_err),
+                        toast: Some((friendly_err, ToastKind::Error)),
+                    });
+                }
+            }
+        });
+    }
+
+    pub fn load_older_chats(&mut self) {
+        if self.loading_older_chats || self.chats_oldest_reached {
+            return;
+        }
+        let cursor = self
+            .storage
+            .get_sync_cursor(SyncCursor::CHATS_LIST_SCOPE)
+            .ok()
+            .flatten();
+        if cursor.as_ref().is_some_and(|c| c.is_history_eof()) {
+            self.chats_oldest_reached = true;
+            return;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        self.loading_older_chats = true;
+        let saved_next_link = cursor.and_then(|c| c.delta_link);
+        let fallback_target_count = self.conversations.len() + 50;
+        let graph = self.graph.clone();
+        let storage = self.storage.clone();
+        let tx = self.ui_tx.clone();
+
+        tokio::spawn(async move {
+            let res: anyhow::Result<(Vec<ConversationSummary>, Option<String>, bool)> =
+                if let Some(ref link) = saved_next_link {
+                    graph
+                        .list_chats_page(50, Some(link))
+                        .await
+                        .map(|(chats, next)| {
+                            let eof = next.is_none();
+                            (chats, next, eof)
+                        })
+                } else {
+                    graph
+                        .list_chats(fallback_target_count)
+                        .await
+                        .map(|chats| {
+                            let eof = chats.len() < fallback_target_count;
+                            (chats, None, eof)
+                        })
+                };
+
+            match res {
+                Ok((chats, next_link, reached_eof)) => {
+                    let conversations = tokio::task::spawn_blocking(move || {
+                        if !chats.is_empty() {
+                            let _ = storage.upsert_conversations(&chats);
+                        }
+                        if next_link.is_some() || reached_eof {
+                            let cursor = SyncCursor {
+                                scope_key: SyncCursor::CHATS_LIST_SCOPE.to_string(),
+                                delta_link: next_link,
+                                oldest_msg_ts: if reached_eof {
+                                    Some(SyncCursor::HISTORY_EOF.to_string())
+                                } else {
+                                    None
+                                },
+                                synced_at: Utc::now().to_rfc3339(),
+                            };
+                            let _ = storage.save_sync_cursor(&cursor);
+                        }
+                        storage.list_conversations().unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default();
+                    let _ = tx.send(UiMsg::OlderChatsLoaded {
+                        conversations,
+                        reached_eof,
+                    });
+                }
+                Err(_) => {
+                    let _ = tx.send(UiMsg::OlderChatsFailed);
+                }
+            }
         });
     }
 
@@ -1990,14 +1800,10 @@ impl AppState {
         rendered.approx_heap_bytes().max(64)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn insert_bounded_image_cache(
         cache: &mut HashMap<String, RenderedTerminalImage>,
         order: &mut VecDeque<String>,
         bytes_total: &mut usize,
-        other_cache: &mut HashMap<String, RenderedTerminalImage>,
-        other_order: &mut VecDeque<String>,
-        other_bytes_total: &mut usize,
         max_entries: usize,
         cache_key: String,
         rendered: RenderedTerminalImage,
@@ -2020,25 +1826,12 @@ impl AppState {
             }
         }
 
-        // Enforce strict 8 MiB combined heap budget across both image caches,
-        // keeping at least the newly inserted image if a single image exceeds budget.
-        while bytes_total.saturating_add(*other_bytes_total) > img_preview::MAX_IMAGE_CACHE_BYTES {
-            if !other_order.is_empty() {
-                if let Some(evicted) = other_order.pop_front() {
-                    if let Some(removed) = other_cache.remove(&evicted) {
-                        *other_bytes_total = other_bytes_total
-                            .saturating_sub(Self::rendered_image_bytes(&removed));
-                    }
-                }
-            } else if order.len() > 1 {
-                if let Some(evicted) = order.pop_front() {
-                    if let Some(removed) = cache.remove(&evicted) {
-                        *bytes_total =
-                            bytes_total.saturating_sub(Self::rendered_image_bytes(&removed));
-                    }
-                }
-            } else {
+        while *bytes_total > img_preview::MAX_IMAGE_CACHE_BYTES && order.len() > 1 {
+            let Some(evicted) = order.pop_front() else {
                 break;
+            };
+            if let Some(removed) = cache.remove(&evicted) {
+                *bytes_total = bytes_total.saturating_sub(Self::rendered_image_bytes(&removed));
             }
         }
     }
@@ -2051,53 +1844,10 @@ impl AppState {
             &mut self.image_cache,
             &mut self.image_cache_order,
             &mut self.image_cache_bytes,
-            &mut self.onenote_image_cache,
-            &mut self.onenote_image_cache_order,
-            &mut self.onenote_image_cache_bytes,
             MAX_IMAGE_CACHE,
             cache_key,
             rendered,
         );
-    }
-
-    pub fn insert_onenote_image_cache(
-        &mut self,
-        cache_key: String,
-        rendered: RenderedTerminalImage,
-    ) {
-        const MAX_ONENOTE_IMAGE_CACHE: usize = 24;
-        self.onenote_image_pending.remove(&cache_key);
-        self.onenote_image_errors.remove(&cache_key);
-        Self::insert_bounded_image_cache(
-            &mut self.onenote_image_cache,
-            &mut self.onenote_image_cache_order,
-            &mut self.onenote_image_cache_bytes,
-            &mut self.image_cache,
-            &mut self.image_cache_order,
-            &mut self.image_cache_bytes,
-            MAX_ONENOTE_IMAGE_CACHE,
-            cache_key,
-            rendered,
-        );
-    }
-
-    /// Evicts oldest OneNote cached images until `onenote_image_cache_bytes <= max_bytes`,
-    /// returning total evicted bytes.
-    pub fn trim_onenote_image_cache_to(&mut self, max_bytes: usize) -> usize {
-        let mut evicted_bytes = 0usize;
-        while self.onenote_image_cache_bytes > max_bytes {
-            let Some(evicted) = self.onenote_image_cache_order.pop_front() else {
-                self.onenote_image_cache_bytes = 0;
-                break;
-            };
-            if let Some(removed) = self.onenote_image_cache.remove(&evicted) {
-                let bytes = Self::rendered_image_bytes(&removed);
-                self.onenote_image_cache_bytes =
-                    self.onenote_image_cache_bytes.saturating_sub(bytes);
-                evicted_bytes = evicted_bytes.saturating_add(bytes);
-            }
-        }
-        evicted_bytes
     }
 
     pub fn clear_image_cache(&mut self) {
@@ -2106,15 +1856,8 @@ impl AppState {
         self.image_cache_bytes = 0;
     }
 
-    pub fn clear_onenote_image_cache(&mut self) {
-        self.onenote_image_cache.clear();
-        self.onenote_image_cache_order.clear();
-        self.onenote_image_cache_bytes = 0;
-    }
-
     pub fn clear_image_caches(&mut self) {
         self.clear_image_cache();
-        self.clear_onenote_image_cache();
     }
 
     pub fn request_teams_image(
@@ -2182,2051 +1925,12 @@ impl AppState {
         });
     }
 
-    pub fn request_mail_image(
-        &mut self,
-        mail_id: String,
-        att: MailAttachment,
-        cols: u16,
-        rows: u16,
-    ) {
-        let key = Self::image_cache_key(&mail_id, &att.id, cols, rows);
-        if self.image_cache.contains_key(&key)
-            || self.image_pending.contains(&key)
-            || self.image_errors.contains_key(&key)
-        {
-            return;
-        }
-        self.image_pending.insert(key.clone());
-        let graph = self.graph.clone();
-        let tx = self.ui_tx.clone();
-        let bg = (20, 22, 26);
-        let att_id = att.id.clone();
-        let inline_b64 = att.content_bytes_b64.clone();
-
-        tokio::spawn(async move {
-            let bytes_res: anyhow::Result<Vec<u8>> = if let Some(b64) = inline_b64 {
-                use base64::Engine;
-                base64::engine::general_purpose::STANDARD
-                    .decode(b64.trim())
-                    .map_err(|e| anyhow::anyhow!("base64 디코드 실패: {e}"))
-            } else {
-                graph
-                    .fetch_mail_attachment_bytes(&mail_id, &att_id)
-                    .await
-                    .map(|(_, _, b)| b)
-            };
-
-            match bytes_res {
-                Ok(bytes) => {
-                    let decode_res = tokio::task::spawn_blocking(move || {
-                        img_preview::decode_and_render_halfblocks(&bytes, cols, rows, bg)
-                    })
-                    .await;
-                    match decode_res {
-                        Ok(Ok(rendered)) => {
-                            let _ = tx.send(UiMsg::ImageDecoded {
-                                cache_key: key,
-                                rendered,
-                            });
-                        }
-                        Ok(Err(err)) => {
-                            let _ = tx.send(UiMsg::ImageDecodeFailed {
-                                cache_key: key,
-                                owner_id: mail_id,
-                                att_id,
-                                error: err.to_string(),
-                            });
-                        }
-                        Err(err) => {
-                            let _ = tx.send(UiMsg::ImageDecodeFailed {
-                                cache_key: key,
-                                owner_id: mail_id,
-                                att_id,
-                                error: err.to_string(),
-                            });
-                        }
-                    }
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::ImageDecodeFailed {
-                        cache_key: key,
-                        owner_id: mail_id,
-                        att_id,
-                        error: err.to_string(),
-                    });
-                }
-            }
-        });
-    }
-
     pub fn request_preview_image(&mut self, target: &PreviewTarget, cols: u16, rows: u16) {
         match target {
             PreviewTarget::Teams { msg_id, attachment } => {
                 self.request_teams_image(msg_id.clone(), attachment.clone(), cols, rows);
             }
-            PreviewTarget::Mail {
-                mail_id,
-                attachment,
-            } => {
-                self.request_mail_image(mail_id.clone(), attachment.clone(), cols, rows);
-            }
-            PreviewTarget::OneNote {
-                page_key,
-                resource_id,
-                resource,
-                ..
-            } => {
-                self.request_onenote_preview_image(
-                    page_key.clone(),
-                    resource_id.clone(),
-                    resource.clone(),
-                    cols,
-                    rows,
-                );
-            }
         }
-    }
-
-    /// Loads a full-size OneNote page image into the shared preview cache
-    /// (keyed like every other `PreviewTarget` so `ImagePreviewOverlay` can render it).
-    fn request_onenote_preview_image(
-        &mut self,
-        page_key: String,
-        resource_id: String,
-        resource: OnenoteResource,
-        cols: u16,
-        rows: u16,
-    ) {
-        let key = Self::image_cache_key(&page_key, &resource_id, cols, rows);
-        if self.image_cache.contains_key(&key)
-            || self.image_pending.contains(&key)
-            || self.image_errors.contains_key(&key)
-        {
-            return;
-        }
-        let url = resource.resource_url.trim().to_string();
-        if url.is_empty() {
-            self.image_errors.insert(key, "이미지 URL이 없습니다".to_string());
-            return;
-        }
-        self.image_pending.insert(key.clone());
-        let graph = self.graph.clone();
-        let tx = self.ui_tx.clone();
-        let bg = (20, 22, 26);
-
-        tokio::spawn(async move {
-            match graph.download_onenote_resource_bytes(&url).await {
-                Ok(bytes) => {
-                    let decode_res = tokio::task::spawn_blocking(move || {
-                        img_preview::decode_and_render_halfblocks(&bytes, cols, rows, bg)
-                    })
-                    .await;
-                    match decode_res {
-                        Ok(Ok(rendered)) => {
-                            let _ = tx.send(UiMsg::ImageDecoded {
-                                cache_key: key,
-                                rendered,
-                            });
-                        }
-                        Ok(Err(err)) => {
-                            let _ = tx.send(UiMsg::ImageDecodeFailed {
-                                cache_key: key,
-                                owner_id: page_key,
-                                att_id: resource_id,
-                                error: err.to_string(),
-                            });
-                        }
-                        Err(err) => {
-                            let _ = tx.send(UiMsg::ImageDecodeFailed {
-                                cache_key: key,
-                                owner_id: page_key,
-                                att_id: resource_id,
-                                error: err.to_string(),
-                            });
-                        }
-                    }
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::ImageDecodeFailed {
-                        cache_key: key,
-                        owner_id: page_key,
-                        att_id: resource_id,
-                        error: err.to_string(),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn download_mail_attachment(
-        &mut self,
-        ui: &mut UiState,
-        mail_id: String,
-        att_id: String,
-        name: String,
-    ) {
-        let graph = self.graph.clone();
-        let dir = self.download_dir.clone();
-        let tx = self.ui_tx.clone();
-        let task_label = format!("첨부 다운로드: {name}");
-        ui.tasks.begin(task_label.clone());
-
-        tokio::spawn(async move {
-            match graph.download_mail_attachment(&mail_id, &att_id, &dir).await {
-                Ok(file) => {
-                    let toast = Some((
-                        format!("저장됨: {}", file.path.display()),
-                        ToastKind::Success,
-                    ));
-                    let _ = tx.send(UiMsg::AttachmentDownloaded(file));
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast,
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("다운로드 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    // ------------------------------------------------------------------
-    // Outlook Mail, Calendar, Contacts, To Do & Self-Update Actions
-    // ------------------------------------------------------------------
-
-    pub fn active_mail(&self) -> Option<&MailMessage> {
-        if let Some(m) = self.active_mail.as_ref() {
-            if self.active_mail_id.as_deref() == Some(&m.id) {
-                return Some(m);
-            }
-        }
-        let id = self.active_mail_id.as_deref()?;
-        self.mails.iter().find(|m| m.id == id)
-    }
-
-    pub fn active_event(&self) -> Option<&CalendarEvent> {
-        let id = self.active_event_id.as_deref()?;
-        self.calendar_events.iter().find(|e| e.id == id)
-    }
-
-    pub fn active_contact(&self) -> Option<&ContactItem> {
-        let id = self.active_contact_id.as_deref()?;
-        self.contacts.iter().find(|c| c.id == id)
-    }
-
-    pub fn active_todo_task(&self) -> Option<&TodoTask> {
-        let id = self.active_todo_task_id.as_deref()?;
-        self.todo_tasks.iter().find(|t| t.id == id)
-    }
-
-    pub fn active_todo_list(&self, ui: &UiState) -> Option<&TodoList> {
-        let id = ui.active_todo_list_id.as_deref()?;
-        self.todo_lists.iter().find(|l| l.id == id)
-    }
-
-    pub fn unread_mail_count(&self) -> i32 {
-        let folder_unread: i32 = self
-            .mail_folders
-            .iter()
-            .filter(|f| f.well_known_name.as_deref() == Some("inbox"))
-            .map(|f| f.unread_item_count.max(0))
-            .sum();
-        if folder_unread > 0 {
-            folder_unread
-        } else {
-            self.mails.iter().filter(|m| !m.is_read).count() as i32
-        }
-    }
-
-    pub fn event_join_url(ev: &CalendarEvent) -> Option<&str> {
-        ev.online_meeting_url
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .or_else(|| ev.web_link.as_deref().filter(|s| !s.is_empty()))
-    }
-
-    pub fn select_mail_folder(
-        &mut self,
-        ui: &mut UiState,
-        folder_id: String,
-        display_name: String,
-    ) {
-        ui.active_mail_folder_id = folder_id.clone();
-        ui.active_mail_folder_name = display_name;
-        self.mails = self
-            .storage
-            .list_mail_summaries(Some(&folder_id), 100)
-            .unwrap_or_default();
-        self.active_mail_id = None;
-        self.active_mail = None;
-        self.loading_mail = false;
-        if let Some(first_id) = self.mails.first().map(|m| m.id.clone()) {
-            self.select_mail(ui, first_id);
-        } else {
-            ui.mail_scroll = ScrollState::default();
-            ui.mail_attach_index = 0;
-        }
-
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        let graph = self.graph.clone();
-        let storage = self.storage.clone();
-        let tx = self.ui_tx.clone();
-        self.sync_ctrl.send(SyncCommand::SyncMailFolder {
-            folder_id: folder_id.clone(),
-        });
-        tokio::spawn(async move {
-            if let Ok(list) = graph.list_mail_messages(&folder_id, 50).await {
-                let db_folder_id = folder_id.clone();
-                let cached = tokio::task::spawn_blocking(move || {
-                    let _ = storage.upsert_mail_messages(&list);
-                    storage
-                        .list_mail_summaries(Some(&db_folder_id), 100)
-                        .unwrap_or(list)
-                })
-                .await
-                .unwrap_or_default();
-                let _ = tx.send(UiMsg::MailFolderLoaded {
-                    folder_id,
-                    mails: cached,
-                });
-            }
-        });
-    }
-
-    fn spawn_mail_prefetch(&self, mail_id: String) {
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        let graph = self.graph.clone();
-        let storage = self.storage.clone();
-        let tx = self.ui_tx.clone();
-        tokio::spawn(async move {
-            let db_storage = storage.clone();
-            let db_id = mail_id.clone();
-            let cached = tokio::task::spawn_blocking(move || {
-                db_storage.get_mail_message(&db_id).ok().flatten()
-            })
-            .await
-            .ok()
-            .flatten();
-            if let Some(mail) = cached {
-                if !mail.body_html.is_empty() && (!mail.has_attachments || !mail.attachments.is_empty()) {
-                    let _ = tx.send(UiMsg::MailDetailLoaded { mail });
-                    return;
-                }
-            }
-            match graph.get_mail_message(&mail_id).await {
-                Ok(mail) => {
-                    let mail_to_store = mail.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let _ = storage.upsert_mail_messages(std::slice::from_ref(&mail_to_store));
-                    })
-                    .await;
-                    let _ = tx.send(UiMsg::MailDetailLoaded { mail });
-                }
-                Err(_) => {
-                    let _ = tx.send(UiMsg::MailPrefetchFailed { mail_id });
-                }
-            }
-        });
-    }
-
-    pub fn select_mail(&mut self, ui: &mut UiState, mail_id: String) {
-        self.active_mail_id = Some(mail_id.clone());
-        let in_mem = self.mails.iter().find(|m| m.id == mail_id).cloned();
-        self.active_mail = if in_mem
-            .as_ref()
-            .is_some_and(|m| !m.body_html.is_empty() && (!m.has_attachments || !m.attachments.is_empty()))
-        {
-            in_mem
-        } else {
-            self.storage
-                .get_mail_message(&mail_id)
-                .ok()
-                .flatten()
-                .filter(|m| !m.body_html.is_empty() || !m.body_plain.is_empty())
-                .or(in_mem)
-        };
-        ui.mail_scroll = ScrollState::default();
-        ui.mail_scroll.top();
-        ui.mail_attach_index = 0;
-
-        let needs_detail = self
-            .active_mail
-            .as_ref()
-            .is_none_or(|m| m.body_html.is_empty() || (m.has_attachments && m.attachments.is_empty()));
-        self.loading_mail = needs_detail;
-
-        if tokio::runtime::Handle::try_current().is_ok() {
-            if needs_detail {
-                let graph = self.graph.clone();
-                let storage = self.storage.clone();
-                let tx = self.ui_tx.clone();
-                let req_id = mail_id.clone();
-                tokio::spawn(async move {
-                    match graph.get_mail_message(&req_id).await {
-                        Ok(mail) => {
-                            let mail_to_store = mail.clone();
-                            let _ = tokio::task::spawn_blocking(move || {
-                                let _ = storage.upsert_mail_messages(std::slice::from_ref(&mail_to_store));
-                            })
-                            .await;
-                            let _ = tx.send(UiMsg::MailDetailLoaded { mail });
-                        }
-                        Err(err) => {
-                            let _ = tx.send(UiMsg::MailDetailFailed { mail_id: req_id });
-                            let _ = tx.send(UiMsg::TaskDone {
-                                label: "메일 읽기".to_string(),
-                                error: Some(err.to_string()),
-                                toast: None,
-                            });
-                        }
-                    }
-                });
-            }
-
-            // Prefetch up to 2 neighboring mails (idx - 1, idx + 1) when header-only.
-            if let Some(idx) = self.mails.iter().position(|m| m.id == mail_id) {
-                let mut neighbors = Vec::with_capacity(2);
-                if idx > 0 {
-                    neighbors.push(idx - 1);
-                }
-                if idx + 1 < self.mails.len() {
-                    neighbors.push(idx + 1);
-                }
-                for n_idx in neighbors {
-                    if let Some(neighbor) = self.mails.get(n_idx) {
-                        if neighbor.body_html.is_empty()
-                            && !self.mail_prefetch_pending.contains(&neighbor.id)
-                        {
-                            let n_id = neighbor.id.clone();
-                            self.mail_prefetch_pending.insert(n_id.clone());
-                            self.spawn_mail_prefetch(n_id);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn submit_mail_compose(
-        &mut self,
-        ui: &mut UiState,
-        mode: MailComposeMode,
-        to: Vec<String>,
-        cc: Vec<String>,
-        subject: String,
-        body_markdown: String,
-        attachments: Vec<PathBuf>,
-    ) {
-        let compiled = parser::compile_outgoing_markdown(
-            &body_markdown,
-            None,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            None,
-        );
-        let graph = self.graph.clone();
-        let tx = self.ui_tx.clone();
-        let sync_ctrl = self.sync_ctrl.clone();
-        let task_label = match &mode {
-            MailComposeMode::New => "메일 전송".to_string(),
-            MailComposeMode::Reply { .. } => "답장 전송".to_string(),
-            MailComposeMode::ReplyAll { .. } => "전체 답장 전송".to_string(),
-            MailComposeMode::Forward { .. } => "메일 전달".to_string(),
-        };
-        ui.tasks.begin(task_label.clone());
-
-        tokio::spawn(async move {
-            let res = match mode {
-                MailComposeMode::New => {
-                    graph
-                        .send_mail(&OutgoingMail {
-                            subject,
-                            body_html: compiled.body_html,
-                            to,
-                            cc,
-                            bcc: Vec::new(),
-                            importance: None,
-                            attachments,
-                            save_to_sent_items: true,
-                        })
-                        .await
-                }
-                MailComposeMode::Reply { message_id } => {
-                    graph
-                        .reply_mail(&message_id, &compiled.body_html, false)
-                        .await
-                }
-                MailComposeMode::ReplyAll { message_id } => {
-                    graph
-                        .reply_mail(&message_id, &compiled.body_html, true)
-                        .await
-                }
-                MailComposeMode::Forward { message_id } => {
-                    graph
-                        .forward_mail(&message_id, &to, &compiled.body_html)
-                        .await
-                }
-            };
-            match res {
-                Ok(()) => {
-                    sync_ctrl.send(SyncCommand::RefreshOutlook);
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast: Some(("메일을 전송했습니다".to_string(), ToastKind::Success)),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("메일 전송 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    fn set_mail_read_in_memory(&mut self, mail_id: &str, is_read: bool) {
-        if let Some(m) = self.mails.iter_mut().find(|m| m.id == mail_id) {
-            m.is_read = is_read;
-        }
-        if let Some(m) = self.active_mail.as_mut().filter(|m| m.id == mail_id) {
-            m.is_read = is_read;
-        }
-    }
-
-    fn set_mail_flagged_in_memory(&mut self, mail_id: &str, flagged: bool) {
-        if let Some(m) = self.mails.iter_mut().find(|m| m.id == mail_id) {
-            m.flagged = flagged;
-        }
-        if let Some(m) = self.active_mail.as_mut().filter(|m| m.id == mail_id) {
-            m.flagged = flagged;
-        }
-    }
-
-    fn optimistic_remove_active_mail(
-        &mut self,
-        ui: &mut UiState,
-    ) -> Option<(String, Option<usize>, MailMessage)> {
-        let mail = self.active_mail().cloned()?;
-        let folder_id = ui.active_mail_folder_id.clone();
-        let idx = self.mails.iter().position(|m| m.id == mail.id);
-        if let Some(pos) = idx {
-            self.mails.remove(pos);
-            let next_id = self
-                .mails
-                .get(pos)
-                .or_else(|| self.mails.last())
-                .map(|m| m.id.clone());
-            if let Some(id) = next_id {
-                self.select_mail(ui, id);
-            } else {
-                self.active_mail_id = None;
-                self.active_mail = None;
-                self.loading_mail = false;
-            }
-        } else if self.active_mail_id.as_deref() == Some(&mail.id) {
-            if let Some(id) = self.mails.first().map(|m| m.id.clone()) {
-                self.select_mail(ui, id);
-            } else {
-                self.active_mail_id = None;
-                self.active_mail = None;
-                self.loading_mail = false;
-            }
-        }
-        Some((folder_id, idx, mail))
-    }
-
-    pub fn toggle_active_mail_read(&mut self, ui: &mut UiState) {
-        let Some(mail) = self.active_mail().cloned() else {
-            return;
-        };
-        let prev_read = mail.is_read;
-        let next_read = !prev_read;
-        let target_folder = mail
-            .folder_id
-            .as_deref()
-            .unwrap_or(&ui.active_mail_folder_id);
-        let folder_prev_unread = self
-            .mail_folders
-            .iter_mut()
-            .find(|f| {
-                f.id == target_folder
-                    || f.well_known_name
-                        .as_deref()
-                        .is_some_and(|w| w.eq_ignore_ascii_case(target_folder))
-            })
-            .map(|f| {
-                let prev = f.unread_item_count;
-                let delta = if next_read { -1 } else { 1 };
-                f.unread_item_count = (prev + delta).max(0);
-                (f.id.clone(), prev)
-            });
-        self.set_mail_read_in_memory(&mail.id, next_read);
-
-        let task_label = if next_read { "읽음 표시" } else { "안읽음 표시" }.to_string();
-        ui.tasks.begin(task_label.clone());
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        let graph = self.graph.clone();
-        let storage = self.storage.clone();
-        let tx = self.ui_tx.clone();
-
-        tokio::spawn(async move {
-            match graph.set_mail_read(&mail.id, next_read).await {
-                Ok(()) => {
-                    let mut updated = mail;
-                    updated.is_read = next_read;
-                    let _ = storage.upsert_mail_messages(std::slice::from_ref(&updated));
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label.clone(),
-                        error: None,
-                        toast: Some((task_label, ToastKind::Success)),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::MailReadRollback {
-                        mail_id: mail.id,
-                        prev_read,
-                        folder_prev_unread,
-                    });
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("메일 상태 변경 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn toggle_active_mail_flag(&mut self, ui: &mut UiState) {
-        let Some(mail) = self.active_mail().cloned() else {
-            return;
-        };
-        let prev_flagged = mail.flagged;
-        let next_flag = !prev_flagged;
-        self.set_mail_flagged_in_memory(&mail.id, next_flag);
-
-        let task_label = if next_flag { "중요 표시" } else { "표시 해제" }.to_string();
-        ui.tasks.begin(task_label.clone());
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        let graph = self.graph.clone();
-        let storage = self.storage.clone();
-        let tx = self.ui_tx.clone();
-
-        tokio::spawn(async move {
-            match graph.set_mail_flag(&mail.id, next_flag).await {
-                Ok(()) => {
-                    let mut updated = mail;
-                    updated.flagged = next_flag;
-                    let _ = storage.upsert_mail_messages(std::slice::from_ref(&updated));
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label.clone(),
-                        error: None,
-                        toast: Some((task_label, ToastKind::Success)),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::MailFlagRollback {
-                        mail_id: mail.id,
-                        prev_flagged,
-                    });
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("깃발 변경 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn archive_active_mail(&mut self, ui: &mut UiState) {
-        let Some((folder_id, index, mail)) = self.optimistic_remove_active_mail(ui) else {
-            return;
-        };
-        let task_label = "메일 보관".to_string();
-        ui.tasks.begin(task_label.clone());
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        let graph = self.graph.clone();
-        let storage = self.storage.clone();
-        let tx = self.ui_tx.clone();
-
-        tokio::spawn(async move {
-            match graph.move_mail_message(&mail.id, "archive").await {
-                Ok(moved) => {
-                    let _ = storage.delete_mail_messages_by_ids(std::slice::from_ref(&mail.id));
-                    let _ = storage.upsert_mail_messages(&[moved]);
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast: Some(("보관함으로 이동했습니다".to_string(), ToastKind::Success)),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::MailRemoveRollback {
-                        folder_id,
-                        index,
-                        mail,
-                    });
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("보관 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn delete_active_mail(&mut self, ui: &mut UiState) {
-        let Some((folder_id, index, mail)) = self.optimistic_remove_active_mail(ui) else {
-            return;
-        };
-        let task_label = "메일 삭제".to_string();
-        ui.tasks.begin(task_label.clone());
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        let graph = self.graph.clone();
-        let storage = self.storage.clone();
-        let tx = self.ui_tx.clone();
-
-        tokio::spawn(async move {
-            match graph.delete_mail_message(&mail.id).await {
-                Ok(()) => {
-                    let _ = storage.delete_mail_messages_by_ids(std::slice::from_ref(&mail.id));
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast: Some(("메일을 삭제했습니다".to_string(), ToastKind::Success)),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::MailRemoveRollback {
-                        folder_id,
-                        index,
-                        mail,
-                    });
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("메일 삭제 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn select_calendar_event(&mut self, ui: &mut UiState, event_id: String) {
-        self.active_event_id = Some(event_id);
-        ui.mail_scroll = ScrollState::default();
-        ui.mail_scroll.top();
-    }
-
-    pub fn create_calendar_event(&mut self, ui: &mut UiState, event: OutgoingEvent) {
-        let graph = self.graph.clone();
-        let storage = self.storage.clone();
-        let tx = self.ui_tx.clone();
-        let task_label = "일정 생성".to_string();
-        ui.tasks.begin(task_label.clone());
-
-        tokio::spawn(async move {
-            match graph.create_calendar_event(&event).await {
-                Ok(created) => {
-                    let _ = storage.upsert_calendar_events(std::slice::from_ref(&created));
-                    let _ = tx.send(UiMsg::CalendarEventCreated { event: created });
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast: Some(("일정을 생성했습니다".to_string(), ToastKind::Success)),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("일정 생성 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn respond_active_event(&mut self, ui: &mut UiState, response: &str) {
-        let Some(ev) = self.active_event().cloned() else {
-            return;
-        };
-        let resp_owned = response.to_string();
-        let graph = self.graph.clone();
-        let storage = self.storage.clone();
-        let tx = self.ui_tx.clone();
-        let task_label = format!("일정 응답({response})");
-        ui.tasks.begin(task_label.clone());
-
-        tokio::spawn(async move {
-            match graph.respond_calendar_event(&ev.id, &resp_owned, None).await {
-                Ok(()) => {
-                    let mut updated = ev.clone();
-                    updated.response_status = match resp_owned.as_str() {
-                        "accept" => "accepted",
-                        "tentativelyAccept" => "tentativelyAccepted",
-                        "decline" => "declined",
-                        other => other,
-                    }
-                    .to_string();
-                    let _ = storage.upsert_calendar_events(&[updated]);
-                    let _ = tx.send(UiMsg::CalendarEventResponded {
-                        event_id: ev.id,
-                        response: resp_owned,
-                    });
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast: Some(("일정 응답을 보냈습니다".to_string(), ToastKind::Success)),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("일정 응답 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn delete_active_event(&mut self, ui: &mut UiState) {
-        let Some(ev) = self.active_event().cloned() else {
-            return;
-        };
-        let graph = self.graph.clone();
-        let storage = self.storage.clone();
-        let tx = self.ui_tx.clone();
-        let task_label = "일정 삭제".to_string();
-        ui.tasks.begin(task_label.clone());
-
-        tokio::spawn(async move {
-            match graph.delete_calendar_event(&ev.id).await {
-                Ok(()) => {
-                    let _ = storage.delete_calendar_event(&ev.id);
-                    let _ = tx.send(UiMsg::CalendarEventDeleted { event_id: ev.id });
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast: Some(("일정을 삭제했습니다".to_string(), ToastKind::Success)),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("일정 삭제 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn open_active_event_meeting(&mut self, ui: &mut UiState) {
-        let Some(ev) = self.active_event() else {
-            ui.info("선택된 일정이 없습니다");
-            return;
-        };
-        let Some(url) = Self::event_join_url(ev) else {
-            ui.info("이 일정에 연결된 회의/웹 링크가 없습니다");
-            return;
-        };
-        match open::that(url) {
-            Ok(()) => ui.success("브라우저에서 회의를 열었습니다"),
-            Err(err) => ui.error(format!("링크 열기 실패: {err}")),
-        }
-    }
-
-    pub fn select_contact(&mut self, ui: &mut UiState, contact_id: String) {
-        self.active_contact_id = Some(contact_id);
-        ui.mail_scroll = ScrollState::default();
-        ui.mail_scroll.top();
-    }
-
-    pub fn create_contact(&mut self, ui: &mut UiState, contact: OutgoingContact) {
-        let graph = self.graph.clone();
-        let storage = self.storage.clone();
-        let tx = self.ui_tx.clone();
-        let task_label = "연락처 추가".to_string();
-        ui.tasks.begin(task_label.clone());
-
-        tokio::spawn(async move {
-            match graph.create_contact(&contact).await {
-                Ok(created) => {
-                    let _ = storage.upsert_contacts(std::slice::from_ref(&created));
-                    let _ = tx.send(UiMsg::ContactCreated { contact: created });
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast: Some(("연락처를 추가했습니다".to_string(), ToastKind::Success)),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("연락처 추가 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn delete_active_contact(&mut self, ui: &mut UiState) {
-        let Some(contact) = self.active_contact().cloned() else {
-            return;
-        };
-        if contact.source != "contact" {
-            ui.info("조직 디렉터리 사용자는 삭제할 수 없습니다");
-            return;
-        }
-        let graph = self.graph.clone();
-        let storage = self.storage.clone();
-        let tx = self.ui_tx.clone();
-        let task_label = "연락처 삭제".to_string();
-        ui.tasks.begin(task_label.clone());
-
-        tokio::spawn(async move {
-            match graph.delete_contact(&contact.id).await {
-                Ok(()) => {
-                    let _ = storage.delete_contact(&contact.id);
-                    let _ = tx.send(UiMsg::ContactDeleted {
-                        contact_id: contact.id,
-                    });
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast: Some(("연락처를 삭제했습니다".to_string(), ToastKind::Success)),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("연락처 삭제 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn start_chat_with_contact(&mut self, ui: &mut UiState) {
-        let Some(contact) = self.active_contact().cloned() else {
-            return;
-        };
-        let peer_ref = if contact.source == "directory" && !contact.id.is_empty() {
-            contact.id.clone()
-        } else if let Some(email) = contact.primary_email() {
-            email.to_string()
-        } else {
-            ui.error("이 연락처에 이메일 주소가 없습니다");
-            return;
-        };
-        let label = format!("1:1 채팅 시작: {}", contact.display_name);
-        ui.active_nav_tab = 0; // TAB_CHATS
-        self.ensure_tab_domain_activated(ui, 0);
-        self.create_chat(ui, vec![peer_ref], None);
-        ui.info(label);
-    }
-
-    pub fn select_todo_list(&mut self, ui: &mut UiState, list_id: String) {
-        ui.active_todo_list_id = Some(list_id.clone());
-        let include_completed = ui.todo_include_completed;
-        self.todo_tasks = self
-            .storage
-            .list_todo_tasks(&list_id, include_completed, 200)
-            .unwrap_or_default();
-        self.active_todo_task_id = self.todo_tasks.first().map(|t| t.id.clone());
-
-        let graph = self.graph.clone();
-        let storage = self.storage.clone();
-        let tx = self.ui_tx.clone();
-        self.sync_ctrl.send(SyncCommand::SyncTodoList {
-            list_id: list_id.clone(),
-        });
-        tokio::spawn(async move {
-            if let Ok(tasks) = graph
-                .list_todo_tasks(&list_id, include_completed, 100)
-                .await
-            {
-                let tasks_to_store = tasks.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = storage.upsert_todo_tasks(&tasks_to_store);
-                })
-                .await;
-                let _ = tx.send(UiMsg::TodoTasksLoaded { list_id, tasks });
-            }
-        });
-    }
-
-    pub fn select_todo_task(&mut self, _ui: &mut UiState, task_id: String) {
-        self.active_todo_task_id = Some(task_id);
-    }
-
-    pub fn cycle_todo_list(&mut self, ui: &mut UiState, delta: isize) {
-        if self.todo_lists.is_empty() {
-            return;
-        }
-        let cur_idx = ui
-            .active_todo_list_id
-            .as_deref()
-            .and_then(|id| self.todo_lists.iter().position(|l| l.id == id))
-            .unwrap_or(0);
-        let len = self.todo_lists.len() as isize;
-        let next_idx = ((cur_idx as isize + delta).rem_euclid(len)) as usize;
-        if let Some(next_list) = self.todo_lists.get(next_idx).cloned() {
-            self.select_todo_list(ui, next_list.id);
-        }
-    }
-
-    pub fn toggle_todo_show_completed(&mut self, ui: &mut UiState) {
-        ui.todo_include_completed = !ui.todo_include_completed;
-        if let Some(list_id) = ui.active_todo_list_id.clone() {
-            self.select_todo_list(ui, list_id);
-        }
-    }
-
-    pub fn toggle_active_todo_completed(&mut self, ui: &mut UiState) {
-        let Some(task) = self.active_todo_task().cloned() else {
-            return;
-        };
-        let prev_status = task.status.clone();
-        let next_completed = !task.is_completed();
-        let next_status = if next_completed {
-            "completed"
-        } else {
-            "notStarted"
-        };
-        if let Some(t) = self.todo_tasks.iter_mut().find(|t| t.id == task.id) {
-            t.status = next_status.to_string();
-        }
-        let task_label = if next_completed { "할 일 완료" } else { "완료 취소" }.to_string();
-        ui.tasks.begin(task_label.clone());
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        let graph = self.graph.clone();
-        let storage = self.storage.clone();
-        let tx = self.ui_tx.clone();
-
-        tokio::spawn(async move {
-            match graph
-                .set_todo_task_completed(&task.list_id, &task.id, next_completed)
-                .await
-            {
-                Ok(updated) => {
-                    let _ = storage.upsert_todo_tasks(std::slice::from_ref(&updated));
-                    let _ = tx.send(UiMsg::TodoTaskUpserted { task: updated });
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label.clone(),
-                        error: None,
-                        toast: Some((task_label, ToastKind::Success)),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TodoStatusRollback {
-                        task_id: task.id,
-                        prev_status,
-                    });
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("상태 변경 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn create_todo_task(&mut self, ui: &mut UiState, title: String) {
-        let title = title.trim().to_string();
-        if title.is_empty() {
-            return;
-        }
-        let Some(list_id) = ui
-            .active_todo_list_id
-            .clone()
-            .or_else(|| self.todo_lists.first().map(|l| l.id.clone()))
-        else {
-            ui.error("활성화된 할 일 목록이 없습니다");
-            return;
-        };
-        let graph = self.graph.clone();
-        let storage = self.storage.clone();
-        let tx = self.ui_tx.clone();
-        let task_label = "할 일 추가".to_string();
-        ui.tasks.begin(task_label.clone());
-
-        tokio::spawn(async move {
-            match graph
-                .create_todo_task(
-                    &list_id,
-                    &OutgoingTodoTask {
-                        title,
-                        body_plain: None,
-                        due_date_iso: None,
-                        importance: None,
-                    },
-                )
-                .await
-            {
-                Ok(created) => {
-                    let _ = storage.upsert_todo_tasks(std::slice::from_ref(&created));
-                    let _ = tx.send(UiMsg::TodoTaskUpserted { task: created });
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast: Some(("할 일을 추가했습니다".to_string(), ToastKind::Success)),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("할 일 추가 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn delete_active_todo(&mut self, ui: &mut UiState) {
-        let Some(task) = self.active_todo_task().cloned() else {
-            return;
-        };
-        let graph = self.graph.clone();
-        let storage = self.storage.clone();
-        let tx = self.ui_tx.clone();
-        let task_label = "할 일 삭제".to_string();
-        ui.tasks.begin(task_label.clone());
-
-        tokio::spawn(async move {
-            match graph.delete_todo_task(&task.list_id, &task.id).await {
-                Ok(()) => {
-                    let _ = storage.delete_todo_task(&task.id);
-                    let _ = tx.send(UiMsg::TodoTaskDeleted { task_id: task.id });
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast: Some(("할 일을 삭제했습니다".to_string(), ToastKind::Success)),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("할 일 삭제 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    // ------------------------------------------------------------------
-    // Microsoft OneNote Workspace Actions
-    // ------------------------------------------------------------------
-
-    pub fn active_onenote_notebook(&self) -> Option<&OnenoteNotebook> {
-        if let Some(key) = self.active_notebook_key.as_deref() {
-            if let Some(nb) = self
-                .onenote_notebooks
-                .iter()
-                .find(|nb| nb.notebook_key == key)
-            {
-                return Some(nb);
-            }
-        }
-        let sec = self.active_onenote_section()?;
-        let nb_id = sec.notebook_id.as_deref()?;
-        self.onenote_notebooks
-            .iter()
-            .find(|nb| nb.scope.scope_key() == sec.scope.scope_key() && nb.id == nb_id)
-    }
-
-    pub fn active_onenote_section(&self) -> Option<&OnenoteSection> {
-        let key = self.active_section_key.as_deref()?;
-        self.onenote_sections
-            .iter()
-            .find(|sec| sec.section_key == key)
-    }
-
-    /// Sections that belong to the currently active notebook (clone of in-memory state).
-    pub fn sections_for_active_notebook(&self) -> Vec<OnenoteSection> {
-        let Some(key) = self.active_notebook_key.as_deref() else {
-            return Vec::new();
-        };
-        let Some(nb) = self
-            .onenote_notebooks
-            .iter()
-            .find(|nb| nb.notebook_key == key)
-        else {
-            return Vec::new();
-        };
-        self.onenote_sections
-            .iter()
-            .filter(|sec| nav_pane::section_belongs_to_notebook(sec, nb))
-            .cloned()
-            .collect()
-    }
-
-    pub fn onenote_image_key(page_key: &str, resource_index: usize, cols: u16, rows: u16) -> String {
-        format!("{page_key}:{resource_index}:{cols}x{rows}")
-    }
-
-    pub fn request_onenote_image(
-        &mut self,
-        page_key: String,
-        resource_index: usize,
-        resource: OnenoteResource,
-        thumb_cols: u16,
-        thumb_rows: u16,
-    ) {
-        let key = Self::onenote_image_key(&page_key, resource_index, thumb_cols, thumb_rows);
-        if self.onenote_image_cache.contains_key(&key)
-            || self.onenote_image_pending.contains(&key)
-            || self.onenote_image_errors.contains(&key)
-        {
-            return;
-        }
-        let url = resource.resource_url.trim().to_string();
-        if url.is_empty() {
-            self.onenote_image_errors.insert(key);
-            return;
-        }
-        self.onenote_image_pending.insert(key.clone());
-        let graph = self.graph.clone();
-        let tx = self.ui_tx.clone();
-        let bg = (20, 22, 26);
-
-        tokio::spawn(async move {
-            match graph.download_onenote_resource_bytes(&url).await {
-                Ok(bytes) => {
-                    let decode_res = tokio::task::spawn_blocking(move || {
-                        img_preview::decode_and_render_halfblocks(
-                            &bytes, thumb_cols, thumb_rows, bg,
-                        )
-                    })
-                    .await;
-                    match decode_res {
-                        Ok(Ok(rendered)) => {
-                            let _ = tx.send(UiMsg::OnenoteImageDecoded {
-                                cache_key: key,
-                                rendered,
-                            });
-                        }
-                        Ok(Err(err)) => {
-                            let _ = tx.send(UiMsg::OnenoteImageDecodeFailed {
-                                cache_key: key,
-                                error: err.to_string(),
-                            });
-                        }
-                        Err(err) => {
-                            let _ = tx.send(UiMsg::OnenoteImageDecodeFailed {
-                                cache_key: key,
-                                error: err.to_string(),
-                            });
-                        }
-                    }
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::OnenoteImageDecodeFailed {
-                        cache_key: key,
-                        error: err.to_string(),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn download_onenote_attachment(
-        &mut self,
-        ui: &mut UiState,
-        _page_key: &str,
-        resource_index: usize,
-        resource: OnenoteResource,
-    ) {
-        let url = resource.resource_url.trim().to_string();
-        if url.is_empty() {
-            ui.info("이 첨부에는 다운로드 링크가 없습니다");
-            return;
-        }
-        let file_name = resource
-            .file_name
-            .clone()
-            .or_else(|| resource.alt_text.clone())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| format!("onenote_{}.bin", resource_index + 1));
-        let safe_name = file_name.replace(['/', '\\', ':', '|', '*', '?', '"', '<', '>'], "_");
-        let graph = self.graph.clone();
-        let dir = self.download_dir.clone();
-        let tx = self.ui_tx.clone();
-        let task_label = format!("첨부 다운로드: {safe_name}");
-        ui.tasks.begin(task_label.clone());
-
-        tokio::spawn(async move {
-            let write_res: anyhow::Result<PathBuf> = async {
-                let bytes = graph.download_onenote_resource_bytes(&url).await?;
-                tokio::fs::create_dir_all(&dir).await?;
-                let path = dir.join(&safe_name);
-                tokio::fs::write(&path, &bytes).await?;
-                Ok(path)
-            }
-            .await;
-
-            match write_res {
-                Ok(path) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast: Some((
-                            format!("저장됨: {}", path.display()),
-                            ToastKind::Success,
-                        )),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("다운로드 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn create_onenote_notebook(&mut self, ui: &mut UiState, display_name: String) {
-        let name = display_name.trim().to_string();
-        if name.is_empty() {
-            ui.info("필기장 이름을 입력하세요");
-            return;
-        }
-        let scope = self
-            .active_notebook_key
-            .as_deref()
-            .and_then(|key| self.onenote_notebooks.iter().find(|nb| nb.notebook_key == key))
-            .map(|nb| nb.scope.clone())
-            .unwrap_or(OnenoteScope::Me);
-        let graph = self.graph.clone();
-        let storage = self.storage.clone();
-        let sync = self.sync_ctrl.clone();
-        let tx = self.ui_tx.clone();
-        let task_label = "필기장 만들기".to_string();
-        ui.tasks.begin(task_label.clone());
-
-        tokio::spawn(async move {
-            match graph.create_onenote_notebook(&scope, &name).await {
-                Ok(created) => {
-                    let _ = storage.upsert_onenote_notebooks(std::slice::from_ref(&created));
-                    sync.request(SyncCommand::RefreshOneNote);
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast: Some((
-                            format!("필기장을 만들었습니다: {}", created.display_name),
-                            ToastKind::Success,
-                        )),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("필기장 만들기 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn create_onenote_section(
-        &mut self,
-        ui: &mut UiState,
-        notebook_key: String,
-        display_name: String,
-    ) {
-        let name = display_name.trim().to_string();
-        if name.is_empty() {
-            ui.info("섹션 이름을 입력하세요");
-            return;
-        }
-        let (scope, notebook_id) = crate::models::split_onenote_entity_key(&notebook_key);
-        let graph = self.graph.clone();
-        let storage = self.storage.clone();
-        let sync = self.sync_ctrl.clone();
-        let tx = self.ui_tx.clone();
-        let task_label = "섹션 만들기".to_string();
-        ui.tasks.begin(task_label.clone());
-
-        tokio::spawn(async move {
-            match graph
-                .create_onenote_section(&scope, &notebook_id, &name)
-                .await
-            {
-                Ok(created) => {
-                    let _ = storage.upsert_onenote_sections(std::slice::from_ref(&created));
-                    sync.request(SyncCommand::RefreshOneNote);
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast: Some((
-                            format!("섹션을 만들었습니다: {}", created.display_name),
-                            ToastKind::Success,
-                        )),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("섹션 만들기 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn create_onenote_page(
-        &mut self,
-        ui: &mut UiState,
-        section_key: String,
-        title: String,
-        markdown_body: String,
-        inline_images: Vec<InlineImageUpload>,
-        level: Option<i32>,
-    ) {
-        let title = title.trim().to_string();
-        if title.is_empty() {
-            ui.info("페이지 제목을 입력하세요");
-            return;
-        }
-        let (scope, section_id) = crate::models::split_onenote_entity_key(&section_key);
-        let outgoing = OutgoingOnenotePage {
-            title,
-            markdown_body,
-            inline_images,
-            level: level.filter(|l| *l > 0),
-        };
-        let graph = self.graph.clone();
-        let storage = self.storage.clone();
-        let sync = self.sync_ctrl.clone();
-        let tx = self.ui_tx.clone();
-        let task_label = "페이지 만들기".to_string();
-        ui.tasks.begin(task_label.clone());
-
-        tokio::spawn(async move {
-            match graph
-                .create_onenote_page(&scope, &section_id, &outgoing)
-                .await
-            {
-                Ok(created) => {
-                    let _ = storage.upsert_onenote_pages(std::slice::from_ref(&created));
-                    sync.request(SyncCommand::SyncOneNoteSection { section_key });
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast: Some(("페이지를 만들었습니다".to_string(), ToastKind::Success)),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("페이지 만들기 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn append_onenote_markdown(
-        &mut self,
-        ui: &mut UiState,
-        page_key: String,
-        markdown: String,
-        inline_images: Vec<InlineImageUpload>,
-    ) {
-        if markdown.trim().is_empty() && inline_images.is_empty() {
-            ui.info("추가할 Markdown 내용을 입력하세요");
-            return;
-        }
-        let primary_div_id = self
-            .active_page_detail
-            .as_ref()
-            .filter(|d| d.summary.page_key == page_key)
-            .and_then(|d| d.primary_div_id.clone());
-        let (scope, page_id) = crate::models::split_onenote_entity_key(&page_key);
-        let graph = self.graph.clone();
-        let sync = self.sync_ctrl.clone();
-        let tx = self.ui_tx.clone();
-        let task_label = "페이지에 내용 추가".to_string();
-        ui.tasks.begin(task_label.clone());
-
-        tokio::spawn(async move {
-            match graph
-                .append_onenote_page_markdown(
-                    &scope,
-                    &page_id,
-                    primary_div_id.as_deref(),
-                    &markdown,
-                    &inline_images,
-                )
-                .await
-            {
-                Ok(()) => {
-                    sync.request(SyncCommand::SyncOneNotePage {
-                        page_key: page_key.clone(),
-                    });
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast: Some(("페이지에 내용을 추가했습니다".to_string(), ToastKind::Success)),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("내용 추가 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn edit_onenote_block(
-        &mut self,
-        ui: &mut UiState,
-        page_key: String,
-        element_id: String,
-        markdown: String,
-    ) {
-        if element_id.trim().is_empty() {
-            ui.info("수정할 블록 ID가 없습니다");
-            return;
-        }
-        if markdown.trim().is_empty() {
-            ui.info("수정할 블록 Markdown 내용을 입력하세요");
-            return;
-        }
-        let command = parser::onenote::build_replace_block_patch(&element_id, &markdown);
-        let (scope, page_id) = crate::models::split_onenote_entity_key(&page_key);
-        let graph = self.graph.clone();
-        let sync = self.sync_ctrl.clone();
-        let tx = self.ui_tx.clone();
-        let task_label = "블록 수정".to_string();
-        ui.tasks.begin(task_label.clone());
-
-        tokio::spawn(async move {
-            match graph
-                .patch_onenote_page_commands(&scope, &page_id, &[command])
-                .await
-            {
-                Ok(()) => {
-                    sync.request(SyncCommand::SyncOneNotePage {
-                        page_key: page_key.clone(),
-                    });
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast: Some(("블록을 수정했습니다".to_string(), ToastKind::Success)),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("블록 수정 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn search_notes(&mut self, query: String) {
-        let trimmed = query.trim().to_string();
-        if trimmed.is_empty() {
-            self.onenote_search_results.clear();
-            return;
-        }
-        self.onenote_search_results = self
-            .storage
-            .search_onenote_pages(&trimmed, None, 50)
-            .unwrap_or_default();
-    }
-
-    pub fn jump_to_note_search_hit(&mut self, ui: &mut UiState, index: usize) {
-        let Some(hit) = self.onenote_search_results.get(index).cloned() else {
-            return;
-        };
-        let section_key = hit.scope.make_entity_key(&hit.section_id);
-        let notebook_key = self
-            .onenote_sections
-            .iter()
-            .find(|sec| sec.section_key == section_key)
-            .and_then(|sec| sec.notebook_id.clone())
-            .and_then(|nb_id| {
-                self.onenote_notebooks
-                    .iter()
-                    .find(|nb| nb.scope.scope_key() == hit.scope.scope_key() && nb.id == nb_id)
-                    .map(|nb| nb.notebook_key.clone())
-            });
-        ui.persona = Persona::OneNote;
-        ui.active_nav_tab = nav_pane::TAB_NOTES;
-        self.ensure_tab_domain_activated(ui, nav_pane::TAB_NOTES);
-        if let Some(nb_key) = notebook_key {
-            ui.collapsed_notebook_keys.remove(&nb_key);
-            self.active_notebook_key = Some(nb_key);
-        }
-        self.active_section_key = Some(section_key);
-        self.open_onenote_page(ui, hit.page_key);
-    }
-
-    pub fn open_onenote_notebook(&mut self, ui: &mut UiState, notebook_key: String) {
-        ui.collapsed_notebook_keys.remove(&notebook_key);
-        if self.active_notebook_key.as_deref() == Some(notebook_key.as_str()) {
-            return;
-        }
-        self.active_notebook_key = Some(notebook_key);
-        self.active_section_key = None;
-        self.active_page_key = None;
-        self.active_page_detail = None;
-        self.onenote_pages.clear();
-        self.loading_onenote_pages = false;
-        self.loading_onenote_detail = false;
-        ui.onenote_selected_block = 0;
-        ui.onenote_scroll = ScrollState::default();
-    }
-
-    pub fn open_onenote_section(&mut self, ui: &mut UiState, section_key: String) {
-        if let Some(nb_key) = self
-            .onenote_sections
-            .iter()
-            .find(|sec| sec.section_key == section_key)
-            .and_then(|sec| {
-                let nb_id = sec.notebook_id.as_deref()?;
-                let scope_key = sec.scope.scope_key();
-                self.onenote_notebooks
-                    .iter()
-                    .find(|nb| nb.scope.scope_key() == scope_key && nb.id == nb_id)
-                    .map(|nb| nb.notebook_key.clone())
-            })
-        {
-            self.active_notebook_key = Some(nb_key);
-        }
-        self.active_section_key = Some(section_key.clone());
-        self.active_page_key = None;
-        self.active_page_detail = None;
-        self.onenote_pages = self
-            .storage
-            .list_onenote_pages(&section_key)
-            .unwrap_or_default();
-        self.loading_onenote_pages = true;
-        self.loading_onenote_detail = false;
-        ui.onenote_selected_block = 0;
-        ui.onenote_scroll = ScrollState::default();
-        self.sync_ctrl
-            .request(SyncCommand::SyncOneNoteSection { section_key });
-        if let Some(first_page_key) = self.onenote_pages.first().map(|p| p.page_key.clone()) {
-            self.open_onenote_page(ui, first_page_key);
-        }
-    }
-
-    pub fn cycle_onenote_section(&mut self, ui: &mut UiState, delta: isize) {
-        let sections = self.sections_for_active_notebook();
-        if sections.is_empty() {
-            return;
-        }
-        let cur_idx = self
-            .active_section_key
-            .as_deref()
-            .and_then(|key| sections.iter().position(|s| s.section_key == key))
-            .unwrap_or(0);
-        let len = sections.len() as isize;
-        let next_idx = ((cur_idx as isize + delta) % len + len) as usize % sections.len();
-        self.open_onenote_section(ui, sections[next_idx].section_key.clone());
-    }
-
-    pub fn cycle_onenote_page(&mut self, ui: &mut UiState, delta: isize) {
-        if self.onenote_pages.is_empty() {
-            return;
-        }
-        let cur_idx = self
-            .active_page_key
-            .as_deref()
-            .and_then(|key| self.onenote_pages.iter().position(|p| p.page_key == key))
-            .unwrap_or(0);
-        let len = self.onenote_pages.len() as isize;
-        let next_idx =
-            ((cur_idx as isize + delta) % len + len) as usize % self.onenote_pages.len();
-        self.open_onenote_page(ui, self.onenote_pages[next_idx].page_key.clone());
-    }
-
-    pub fn replace_onenote_page_body(
-        &mut self,
-        ui: &mut UiState,
-        page_key: String,
-        markdown: String,
-    ) {
-        let detail = self
-            .active_page_detail
-            .as_ref()
-            .filter(|d| d.summary.page_key == page_key)
-            .cloned()
-            .or_else(|| self.storage.get_onenote_page_detail(&page_key).ok().flatten());
-        let Some(detail) = detail else {
-            ui.info("편집할 페이지 본문 정보를 찾을 수 없습니다");
-            return;
-        };
-        let commands =
-            parser::onenote::build_replace_page_body_commands(&detail, None, &markdown);
-        if commands.is_empty() {
-            return;
-        }
-        let (scope, page_id) = crate::models::split_onenote_entity_key(&page_key);
-        let graph = self.graph.clone();
-        let sync = self.sync_ctrl.clone();
-        let tx = self.ui_tx.clone();
-        let task_label = "페이지 전체 수정".to_string();
-        ui.tasks.begin(task_label.clone());
-
-        tokio::spawn(async move {
-            match graph
-                .patch_onenote_page_commands(&scope, &page_id, &commands)
-                .await
-            {
-                Ok(()) => {
-                    sync.request(SyncCommand::SyncOneNotePage {
-                        page_key: page_key.clone(),
-                    });
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast: Some(("페이지 본문을 업데이트했습니다".to_string(), ToastKind::Success)),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("페이지 수정 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn open_onenote_page(&mut self, ui: &mut UiState, page_key: String) {
-        self.active_page_detail = self
-            .storage
-            .get_onenote_page_detail(&page_key)
-            .unwrap_or(None);
-        self.active_page_key = Some(page_key.clone());
-        self.loading_onenote_detail = true;
-        ui.onenote_selected_block = 0;
-        ui.onenote_scroll = ScrollState {
-            follow_tail: false,
-            scroll_up: u16::MAX,
-            ..ScrollState::default()
-        };
-        ui.onenote_follow_selection = false;
-        self.sync_ctrl
-            .request(SyncCommand::SyncOneNotePage { page_key });
-    }
-
-    pub fn select_onenote_block(&mut self, ui: &mut UiState, index: usize) {
-        ui.onenote_selected_block = index;
-        ui.onenote_follow_selection = true;
-    }
-
-    pub fn toggle_onenote_todo(&mut self, ui: &mut UiState, index: usize) {
-        let Some(detail) = self.active_page_detail.clone() else {
-            ui.info("페이지를 먼저 열어야 체크리스트를 바꿀 수 있습니다");
-            return;
-        };
-        let Some(block) = detail.blocks.get(index).cloned() else {
-            ui.info("선택한 블록이 없습니다");
-            return;
-        };
-        let Some((command, completed)) = parser::onenote::build_toggle_todo_patch(&block) else {
-            ui.info("이 블록은 체크리스트 항목이 아닙니다");
-            return;
-        };
-        let page_key = detail.summary.page_key.clone();
-        let (scope, page_id) = crate::models::split_onenote_entity_key(&page_key);
-        let graph = self.graph.clone();
-        let sync = self.sync_ctrl.clone();
-        let tx = self.ui_tx.clone();
-        let task_label = "체크리스트 변경".to_string();
-        ui.tasks.begin(task_label.clone());
-        let toast_text = if completed {
-            "완료로 표시했습니다".to_string()
-        } else {
-            "미완료로 되돌렸습니다".to_string()
-        };
-
-        tokio::spawn(async move {
-            match graph
-                .patch_onenote_page_commands(&scope, &page_id, &[command])
-                .await
-            {
-                Ok(()) => {
-                    sync.request(SyncCommand::SyncOneNotePage {
-                        page_key: page_key.clone(),
-                    });
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast: Some((toast_text, ToastKind::Success)),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((
-                            format!("체크리스트 변경 실패: {err}"),
-                            ToastKind::Error,
-                        )),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn toggle_onenote_notebook(&mut self, ui: &mut UiState, notebook_key: String) {
-        if !ui.collapsed_notebook_keys.remove(&notebook_key) {
-            ui.collapsed_notebook_keys.insert(notebook_key);
-        }
-    }
-
-    pub fn open_onenote_create_notebook(&mut self, ui: &mut UiState) {
-        ui.push_overlay(Overlay::OnenoteForm(OnenoteFormOverlay::create_notebook()));
-    }
-
-    pub fn open_onenote_create_section(&mut self, ui: &mut UiState) {
-        let Some(notebook_key) = self.active_notebook_key.clone() else {
-            ui.info("섹션을 만들 필기장을 먼저 선택하세요");
-            return;
-        };
-        let notebook_name = self
-            .onenote_notebooks
-            .iter()
-            .find(|nb| nb.notebook_key == notebook_key)
-            .map(|nb| nb.display_name.clone())
-            .unwrap_or_else(|| notebook_key.clone());
-        ui.push_overlay(Overlay::OnenoteForm(OnenoteFormOverlay::create_section(
-            notebook_key,
-            notebook_name,
-        )));
-    }
-
-    pub fn open_onenote_create_page(&mut self, ui: &mut UiState, subpage: bool) {
-        let Some(section_key) = self.active_section_key.clone() else {
-            ui.info("페이지를 만들 섹션을 먼저 선택하세요");
-            return;
-        };
-        let section_name = self
-            .onenote_sections
-            .iter()
-            .find(|sec| sec.section_key == section_key)
-            .map(|sec| sec.display_name.clone())
-            .unwrap_or_else(|| section_key.clone());
-        let level = if subpage {
-            self.active_page_detail
-                .as_ref()
-                .map(|d| (d.summary.level + 1).clamp(1, 2))
-                .unwrap_or(1)
-        } else {
-            0
-        };
-        ui.push_overlay(Overlay::OnenoteForm(OnenoteFormOverlay::create_page(
-            section_key,
-            section_name,
-            level,
-        )));
-    }
-
-    pub fn delete_active_onenote_page(&mut self, ui: &mut UiState) {
-        let Some(page_key) = self.active_page_key.clone() else {
-            ui.info("삭제할 페이지를 먼저 선택하세요");
-            return;
-        };
-        let (scope, page_id) = crate::models::split_onenote_entity_key(&page_key);
-        let graph = self.graph.clone();
-        let storage = self.storage.clone();
-        let sync = self.sync_ctrl.clone();
-        let tx = self.ui_tx.clone();
-        let task_label = "페이지 삭제".to_string();
-        ui.tasks.begin(task_label.clone());
-
-        self.onenote_pages.retain(|p| p.page_key != page_key);
-        self.active_page_key = None;
-        self.active_page_detail = None;
-        ui.onenote_selected_block = 0;
-        ui.onenote_scroll = ScrollState::default();
-
-        tokio::spawn(async move {
-            match graph.delete_onenote_page(&scope, &page_id).await {
-                Ok(()) => {
-                    let _ = storage.delete_onenote_page(&page_key);
-                    sync.request(SyncCommand::RefreshOneNote);
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast: Some(("페이지를 삭제했습니다".to_string(), ToastKind::Success)),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("페이지 삭제 실패: {err}"), ToastKind::Error)),
-                    });
-                }
-            }
-        });
-    }
-
-    pub fn refresh_onenote(&mut self, ui: &mut UiState) {
-        self.loading_onenote_pages = true;
-        self.sync_ctrl.request(SyncCommand::RefreshOneNote);
-        ui.info("OneNote를 새로고침합니다");
-    }
-
-    pub fn open_active_onenote_in_browser(&mut self, ui: &mut UiState) {
-        let url = self
-            .active_page_detail
-            .as_ref()
-            .and_then(|d| d.summary.web_url.clone())
-            .or_else(|| {
-                let key = self.active_page_key.as_deref()?;
-                self.onenote_pages
-                    .iter()
-                    .find(|p| p.page_key == key)
-                    .and_then(|p| p.web_url.clone())
-            });
-        let Some(url) = url else {
-            ui.info("이 페이지는 브라우저 링크가 없습니다");
-            return;
-        };
-        match open::that(&url) {
-            Ok(()) => ui.success("브라우저에서 페이지를 열었습니다"),
-            Err(err) => ui.error(format!("링크 열기 실패: {err}")),
-        }
-    }
-
-    pub fn search_mail(&mut self, query: String) {
-        self.search_query = query.clone();
-        self.mail_search_results.clear();
-        if query.trim().is_empty() {
-            self.searching = false;
-            return;
-        }
-        self.searching = true;
-        let storage = self.storage.clone();
-        let graph = self.graph.clone();
-        let tx = self.ui_tx.clone();
-
-        tokio::spawn(async move {
-            let db_storage = storage.clone();
-            let db_query = query.clone();
-            let mut hits = tokio::task::spawn_blocking(move || {
-                db_storage
-                    .search_mail_messages(&db_query, None, 40)
-                    .unwrap_or_default()
-            })
-            .await
-            .unwrap_or_default();
-            if hits.is_empty() {
-                if let Ok(remote) = graph.search_mail_remote(&query, 25).await {
-                    let remote_to_store = remote.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let _ = storage.upsert_mail_messages(&remote_to_store);
-                    })
-                    .await;
-                    hits = remote
-                        .into_iter()
-                        .map(|m| MailSearchHit {
-                            from_display: m.from_display(),
-                            id: m.id,
-                            folder_id: m.folder_id,
-                            subject: m.subject,
-                            received_at: m.received_at,
-                            snippet: m.preview,
-                            has_attachments: m.has_attachments,
-                            is_read: m.is_read,
-                        })
-                        .collect();
-                }
-            }
-            let _ = tx.send(UiMsg::MailSearchResults { query, hits });
-        });
-    }
-
-    pub fn search_contacts(&mut self, query: String) {
-        self.search_query = query.clone();
-        self.contact_search_results.clear();
-        if query.trim().is_empty() {
-            self.searching = false;
-            return;
-        }
-        self.searching = true;
-        let storage = self.storage.clone();
-        let graph = self.graph.clone();
-        let tx = self.ui_tx.clone();
-
-        tokio::spawn(async move {
-            let db_storage = storage.clone();
-            let db_query = query.clone();
-            let mut list = tokio::task::spawn_blocking(move || {
-                db_storage
-                    .list_contacts(Some(&db_query), 50)
-                    .unwrap_or_default()
-            })
-            .await
-            .unwrap_or_default();
-            if list.is_empty() {
-                if let Ok(remote) = graph.search_contacts_and_directory(&query, 30).await {
-                    let remote_to_store = remote.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let _ = storage.upsert_contacts(&remote_to_store);
-                    })
-                    .await;
-                    list = remote;
-                }
-            }
-            let _ = tx.send(UiMsg::ContactSearchResults {
-                query,
-                contacts: list,
-            });
-        });
     }
 
     pub fn check_for_updates(&mut self, ui: &mut UiState, check_only: bool, force: bool) {
@@ -4305,14 +2009,52 @@ impl AppState {
         });
     }
 
+    fn prepend_older_messages(&mut self, ui: &mut UiState, messages: Vec<MessageItem>) -> usize {
+        if messages.is_empty() {
+            return 0;
+        }
+        let existing_ids: HashSet<String> =
+            self.messages.iter().map(|m| m.msg_id.clone()).collect();
+        let mut new_older: Vec<MessageItem> = messages
+            .into_iter()
+            .filter(|m| !existing_ids.contains(&m.msg_id))
+            .collect();
+        if new_older.is_empty() {
+            return 0;
+        }
+        new_older.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.msg_id.cmp(&b.msg_id))
+        });
+        let prepended_count = new_older.len();
+        if !ui.chat_scroll.follow_tail && ui.chat_scroll.total_lines > 0 {
+            ui.pending_prepend_anchor =
+                Some((ui.chat_scroll.total_lines, ui.chat_scroll.offset));
+        }
+        if let Some(sel) = ui.chat_scroll.selected_idx {
+            ui.chat_scroll.selected_idx = Some(sel + prepended_count);
+        }
+        new_older.extend(std::mem::take(&mut self.messages));
+        self.messages = new_older;
+        prepended_count
+    }
+
+    fn emit_scope_warning_once(&mut self, ui: &mut UiState, warning: Option<String>) {
+        if self.scope_warned {
+            return;
+        }
+        if let Some(msg) = warning.filter(|s| !s.trim().is_empty()) {
+            self.scope_warned = true;
+            ui.error(msg);
+        }
+    }
+
     pub fn handle_core_event(&mut self, ui: &mut UiState, event: CoreEvent) {
         match event {
             CoreEvent::SyncStateChanged { busy, summary } => {
                 self.syncing = busy;
                 self.sync_summary = summary;
-                if !busy && self.persona == Persona::OneNote {
-                    ui.tasks.finish("초기 동기화", None);
-                }
             }
             CoreEvent::SyncError(err) => {
                 ui.error(format!("동기화 오류: {err}"));
@@ -4330,14 +2072,15 @@ impl AppState {
                 notify_candidate,
             } => {
                 if self.active_conv_key.as_deref() == Some(&conv_key) {
-                    if let Ok(msgs) = self.storage.list_root_messages(&conv_key, 80, None) {
+                    let window = self.messages.len().max(80);
+                    if let Ok(msgs) = self.storage.list_root_messages(&conv_key, window, None) {
                         merge_optimistic_messages(&mut self.messages, msgs);
                     }
                     if let Some(root_id) =
                         self.active_thread.as_ref().map(|t| t.root.msg_id.clone())
                     {
                         if let Ok(Some(mut thread)) =
-                            self.storage.get_thread(&conv_key, &root_id, 100)
+                            self.storage.get_thread(&conv_key, &root_id, 200)
                         {
                             if let Some(existing) = self.active_thread.as_mut() {
                                 merge_optimistic_messages(
@@ -4366,118 +2109,6 @@ impl AppState {
                         self.my_presence = Some(p.clone());
                     }
                     self.presences.insert(p.user_id.clone(), p);
-                }
-            }
-            CoreEvent::MailFoldersUpdated(folders) => {
-                self.mail_folders = folders;
-            }
-            CoreEvent::MailMessagesUpdated {
-                folder_id,
-                messages,
-                notify_candidate,
-            } => {
-                if ui.active_mail_folder_id == folder_id {
-                    self.mails = messages;
-                    if let Some(active_id) = self.active_mail_id.clone() {
-                        if let Some(updated) = self.mails.iter().find(|m| m.id == active_id).cloned()
-                        {
-                            let keep_existing_body = self
-                                .active_mail
-                                .as_ref()
-                                .is_some_and(|m| m.id == active_id && !m.body_html.is_empty())
-                                && updated.body_html.is_empty();
-                            if !keep_existing_body {
-                                self.active_mail = Some(updated);
-                            }
-                        }
-                    }
-                }
-                if let Some(candidate) = notify_candidate {
-                    self.maybe_notify(ui, &candidate);
-                }
-            }
-            CoreEvent::CalendarEventsUpdated(events) => {
-                self.calendar_events = events;
-                if self.active_event_id.is_none() {
-                    self.active_event_id = self.calendar_events.first().map(|e| e.id.clone());
-                }
-            }
-            CoreEvent::ContactsUpdated(contacts) => {
-                self.contacts = contacts;
-                if self.active_contact_id.is_none() {
-                    self.active_contact_id = self.contacts.first().map(|c| c.id.clone());
-                }
-            }
-            CoreEvent::TodoUpdated {
-                lists,
-                list_id,
-                tasks,
-            } => {
-                self.todo_lists = lists;
-                if ui.active_todo_list_id.is_none() {
-                    ui.active_todo_list_id =
-                        list_id.clone().or_else(|| self.todo_lists.first().map(|l| l.id.clone()));
-                }
-                if ui.active_todo_list_id.as_deref() == list_id.as_deref() {
-                    self.todo_tasks = tasks;
-                }
-            }
-            CoreEvent::OnenoteHierarchyUpdated {
-                notebooks,
-                section_groups: _,
-                sections,
-            } => {
-                self.onenote_notebooks = notebooks;
-                self.onenote_sections = sections;
-                if self.active_notebook_key.is_none() {
-                    self.active_notebook_key = self
-                        .onenote_notebooks
-                        .first()
-                        .map(|nb| nb.notebook_key.clone());
-                }
-                if self.active_section_key.is_none() {
-                    let first_sec = self
-                        .sections_for_active_notebook()
-                        .first()
-                        .map(|sec| sec.section_key.clone())
-                        .or_else(|| self.onenote_sections.first().map(|sec| sec.section_key.clone()));
-                    if let Some(sec_key) = first_sec {
-                        self.open_onenote_section(ui, sec_key);
-                        return;
-                    }
-                }
-                self.loading_onenote_pages = false;
-                self.loading_onenote_detail = false;
-                if self.persona == Persona::OneNote {
-                    self.syncing = false;
-                    self.sync_summary = "최신 상태".to_string();
-                    ui.tasks.finish("초기 동기화", None);
-                }
-            }
-            CoreEvent::OnenotePagesUpdated { section_key, pages } => {
-                if self.active_section_key.as_deref() == Some(section_key.as_str()) {
-                    self.onenote_pages = pages;
-                    self.loading_onenote_pages = false;
-                    let active_missing = self
-                        .active_page_key
-                        .as_deref()
-                        .is_none_or(|k| !self.onenote_pages.iter().any(|p| p.page_key == k));
-                    if active_missing {
-                        if let Some(first_key) =
-                            self.onenote_pages.first().map(|p| p.page_key.clone())
-                        {
-                            self.open_onenote_page(ui, first_key);
-                        }
-                    }
-                }
-            }
-            CoreEvent::OnenotePageDetailUpdated(detail) => {
-                if self.active_page_key.as_deref() == Some(detail.summary.page_key.as_str())
-                    || self.active_page_key.is_none()
-                {
-                    self.active_page_key = Some(detail.summary.page_key.clone());
-                    self.active_page_detail = Some(*detail);
-                    self.loading_onenote_detail = false;
                 }
             }
         }
@@ -4510,6 +2141,7 @@ impl AppState {
                 teams,
                 mentions,
                 presences,
+                scope_warning,
             } => {
                 if let Some(u) = me {
                     self.my_user_id = u.id.clone();
@@ -4524,8 +2156,9 @@ impl AppState {
                 self.presences.extend(presences);
                 self.syncing = false;
                 self.sync_summary = "최신 상태".to_string();
+                self.emit_scope_warning_once(ui, scope_warning);
 
-                if self.active_conv_key.is_none() && ui.active_nav_tab < nav_pane::TAB_MAIL {
+                if self.active_conv_key.is_none() {
                     if let Some(first) = self.conversations.first().cloned() {
                         self.select_conversation(ui, first.target);
                     }
@@ -4544,16 +2177,39 @@ impl AppState {
             }
             UiMsg::OlderMessagesLoaded {
                 conv_key,
-                mut messages,
-                reached_end,
+                messages,
+                reached_eof,
             } => {
                 if self.active_conv_key.as_deref() == Some(&conv_key) {
-                    self.oldest_reached = reached_end;
-                    if !messages.is_empty() {
-                        messages.extend(std::mem::take(&mut self.messages));
-                        self.messages = messages;
-                    }
+                    self.loading_older = false;
+                    self.oldest_reached = reached_eof;
+                    self.history_error = None;
+                    self.prepend_older_messages(ui, messages);
                 }
+            }
+            UiMsg::OlderMessagesFailed {
+                conv_key,
+                local_messages,
+                error,
+            } => {
+                if self.active_conv_key.as_deref() == Some(&conv_key) {
+                    self.loading_older = false;
+                    self.history_error = Some(error);
+                    self.prepend_older_messages(ui, local_messages);
+                }
+            }
+            UiMsg::OlderChatsLoaded {
+                conversations,
+                reached_eof,
+            } => {
+                self.loading_older_chats = false;
+                self.chats_oldest_reached = reached_eof;
+                if !conversations.is_empty() {
+                    self.conversations = conversations;
+                }
+            }
+            UiMsg::OlderChatsFailed => {
+                self.loading_older_chats = false;
             }
             UiMsg::ThreadLoaded {
                 conv_key,
@@ -4752,261 +2408,6 @@ impl AppState {
                     self.presences.insert(uid, status);
                 }
             }
-            UiMsg::OutlookCachedSecondaryLoaded {
-                calendar_events,
-                contacts,
-                todo_lists,
-                todo_tasks,
-                active_todo_list_id,
-            } => {
-                if self.calendar_events.is_empty() {
-                    self.calendar_events = calendar_events;
-                }
-                if self.active_event_id.is_none() {
-                    self.active_event_id = self.calendar_events.first().map(|e| e.id.clone());
-                }
-                if self.contacts.is_empty() {
-                    self.contacts = contacts;
-                }
-                if self.active_contact_id.is_none() {
-                    self.active_contact_id = self.contacts.first().map(|c| c.id.clone());
-                }
-                if self.todo_lists.is_empty() {
-                    self.todo_lists = todo_lists;
-                }
-                if ui.active_todo_list_id.is_none() {
-                    ui.active_todo_list_id = active_todo_list_id;
-                }
-                if self.todo_tasks.is_empty() {
-                    self.todo_tasks = todo_tasks;
-                }
-                if self.active_todo_task_id.is_none() {
-                    self.active_todo_task_id = self.todo_tasks.first().map(|t| t.id.clone());
-                }
-            }
-            UiMsg::OutlookBootstrapDone {
-                mail_folders,
-                mails,
-                calendar_events,
-                contacts,
-                todo_lists,
-                todo_tasks,
-                active_todo_list_id,
-            } => {
-                self.mail_folders = mail_folders;
-                if ui.active_mail_folder_id == "inbox" {
-                    self.mails = mails;
-                    if self.active_mail_id.is_none() {
-                        if let Some(first_id) = self.mails.first().map(|m| m.id.clone()) {
-                            self.select_mail(ui, first_id);
-                        }
-                    }
-                }
-                self.calendar_events = calendar_events;
-                if self.active_event_id.is_none() {
-                    self.active_event_id = self.calendar_events.first().map(|e| e.id.clone());
-                }
-                self.contacts = contacts;
-                if self.active_contact_id.is_none() {
-                    self.active_contact_id = self.contacts.first().map(|c| c.id.clone());
-                }
-                self.todo_lists = todo_lists;
-                if ui.active_todo_list_id.is_none() {
-                    ui.active_todo_list_id = active_todo_list_id;
-                }
-                if self.todo_tasks.is_empty() {
-                    self.todo_tasks = todo_tasks;
-                }
-                if self.active_todo_task_id.is_none() {
-                    self.active_todo_task_id = self.todo_tasks.first().map(|t| t.id.clone());
-                }
-                if self.persona == Persona::Outlook {
-                    self.syncing = false;
-                    self.sync_summary = "최신 상태".to_string();
-                }
-            }
-            UiMsg::MailFolderLoaded { folder_id, mails } => {
-                if ui.active_mail_folder_id == folder_id {
-                    self.mails = mails;
-                    if self.active_mail_id.is_none() {
-                        if let Some(first_id) = self.mails.first().map(|m| m.id.clone()) {
-                            self.select_mail(ui, first_id);
-                        }
-                    }
-                }
-            }
-            UiMsg::MailDetailLoaded { mail } => {
-                self.mail_prefetch_pending.remove(&mail.id);
-                if let Some(existing) = self.mails.iter_mut().find(|m| m.id == mail.id) {
-                    *existing = mail.clone();
-                }
-                if self.active_mail_id.as_deref() == Some(&mail.id) {
-                    self.loading_mail = false;
-                    self.active_mail = Some(mail);
-                }
-            }
-            UiMsg::MailDetailFailed { mail_id } => {
-                self.mail_prefetch_pending.remove(&mail_id);
-                if self.active_mail_id.as_deref() == Some(&mail_id) {
-                    self.loading_mail = false;
-                }
-            }
-            UiMsg::MailPrefetchFailed { mail_id } => {
-                self.mail_prefetch_pending.remove(&mail_id);
-            }
-            UiMsg::MailReadRollback {
-                mail_id,
-                prev_read,
-                folder_prev_unread,
-            } => {
-                self.set_mail_read_in_memory(&mail_id, prev_read);
-                if let Some((fid, prev_count)) = folder_prev_unread {
-                    if let Some(folder) = self.mail_folders.iter_mut().find(|f| f.id == fid) {
-                        folder.unread_item_count = prev_count;
-                    }
-                }
-            }
-            UiMsg::MailFlagRollback {
-                mail_id,
-                prev_flagged,
-            } => {
-                self.set_mail_flagged_in_memory(&mail_id, prev_flagged);
-            }
-            UiMsg::MailRemoveRollback {
-                folder_id,
-                index,
-                mail,
-            } => {
-                if ui.active_mail_folder_id == folder_id {
-                    if let Some(pos) = index {
-                        if !self.mails.iter().any(|m| m.id == mail.id) {
-                            let insert_at = pos.min(self.mails.len());
-                            self.mails.insert(insert_at, mail.clone());
-                        }
-                    }
-                    if self.active_mail_id.is_none() {
-                        self.active_mail_id = Some(mail.id.clone());
-                        self.active_mail = Some(mail);
-                    }
-                }
-            }
-            UiMsg::TodoStatusRollback {
-                task_id,
-                prev_status,
-            } => {
-                if let Some(t) = self.todo_tasks.iter_mut().find(|t| t.id == task_id) {
-                    t.status = prev_status;
-                }
-            }
-            UiMsg::MailUpdated { mail } => {
-                if let Some(existing) = self.mails.iter_mut().find(|m| m.id == mail.id) {
-                    *existing = mail.clone();
-                }
-                if self.active_mail_id.as_deref() == Some(&mail.id) {
-                    self.active_mail = Some(mail);
-                }
-            }
-            UiMsg::MailRemoved { mail_id } => {
-                self.mails.retain(|m| m.id != mail_id);
-                if self.active_mail_id.as_deref() == Some(&mail_id) {
-                    self.active_mail_id = self.mails.first().map(|m| m.id.clone());
-                    self.active_mail = self.mails.first().cloned();
-                }
-            }
-            UiMsg::CalendarLoaded { events } => {
-                self.calendar_events = events;
-                if self.active_event_id.is_none() {
-                    self.active_event_id = self.calendar_events.first().map(|e| e.id.clone());
-                }
-            }
-            UiMsg::CalendarEventCreated { event } => {
-                if !self.calendar_events.iter().any(|e| e.id == event.id) {
-                    self.calendar_events.push(event.clone());
-                    self.calendar_events
-                        .sort_by(|a, b| a.start_iso.cmp(&b.start_iso));
-                }
-                self.active_event_id = Some(event.id);
-            }
-            UiMsg::CalendarEventDeleted { event_id } => {
-                self.calendar_events.retain(|e| e.id != event_id);
-                if self.active_event_id.as_deref() == Some(&event_id) {
-                    self.active_event_id = self.calendar_events.first().map(|e| e.id.clone());
-                }
-            }
-            UiMsg::CalendarEventResponded { event_id, response } => {
-                if let Some(ev) = self.calendar_events.iter_mut().find(|e| e.id == event_id) {
-                    ev.response_status = match response.as_str() {
-                        "accept" => "accepted",
-                        "tentativelyAccept" => "tentativelyAccepted",
-                        "decline" => "declined",
-                        other => other,
-                    }
-                    .to_string();
-                }
-            }
-            UiMsg::ContactsLoaded { contacts } => {
-                self.contacts = contacts;
-                if self.active_contact_id.is_none() {
-                    self.active_contact_id = self.contacts.first().map(|c| c.id.clone());
-                }
-            }
-            UiMsg::ContactCreated { contact } => {
-                if !self.contacts.iter().any(|c| c.id == contact.id) {
-                    self.contacts.insert(0, contact.clone());
-                }
-                self.active_contact_id = Some(contact.id);
-            }
-            UiMsg::ContactDeleted { contact_id } => {
-                self.contacts.retain(|c| c.id != contact_id);
-                if self.active_contact_id.as_deref() == Some(&contact_id) {
-                    self.active_contact_id = self.contacts.first().map(|c| c.id.clone());
-                }
-            }
-            UiMsg::TodoListsLoaded { lists } => {
-                self.todo_lists = lists;
-                if ui.active_todo_list_id.is_none() {
-                    ui.active_todo_list_id = self.todo_lists.first().map(|l| l.id.clone());
-                }
-            }
-            UiMsg::TodoTasksLoaded { list_id, tasks } => {
-                if ui.active_todo_list_id.as_deref() == Some(&list_id) {
-                    self.todo_tasks = tasks;
-                    if self.active_todo_task_id.is_none() {
-                        self.active_todo_task_id = self.todo_tasks.first().map(|t| t.id.clone());
-                    }
-                }
-            }
-            UiMsg::TodoTaskUpserted { task } => {
-                if ui.active_todo_list_id.as_deref() == Some(&task.list_id) {
-                    if let Some(existing) = self.todo_tasks.iter_mut().find(|t| t.id == task.id) {
-                        *existing = task.clone();
-                    } else {
-                        self.todo_tasks.insert(0, task.clone());
-                    }
-                    if !ui.todo_include_completed {
-                        self.todo_tasks.retain(|t| !t.is_completed());
-                    }
-                    self.active_todo_task_id = Some(task.id);
-                }
-            }
-            UiMsg::TodoTaskDeleted { task_id } => {
-                self.todo_tasks.retain(|t| t.id != task_id);
-                if self.active_todo_task_id.as_deref() == Some(&task_id) {
-                    self.active_todo_task_id = self.todo_tasks.first().map(|t| t.id.clone());
-                }
-            }
-            UiMsg::MailSearchResults { query, hits } => {
-                if self.search_query == query {
-                    self.searching = false;
-                    self.mail_search_results = hits;
-                }
-            }
-            UiMsg::ContactSearchResults { query, contacts } => {
-                if self.search_query == query {
-                    self.searching = false;
-                    self.contact_search_results = contacts;
-                }
-            }
             UiMsg::ImageDecoded {
                 cache_key,
                 rendered,
@@ -5029,31 +2430,12 @@ impl AppState {
                     }
                 }
             }
-            UiMsg::OnenoteImageDecoded {
-                cache_key,
-                rendered,
-            } => {
-                self.insert_onenote_image_cache(cache_key, rendered);
-            }
-            UiMsg::OnenoteImageDecodeFailed { cache_key, .. } => {
-                self.onenote_image_pending.remove(&cache_key);
-                self.onenote_image_errors.insert(cache_key);
-            }
             UiMsg::UpdateChecked(_res) => {}
             UiMsg::DaemonAttached { pid, sync_busy } => {
                 self.daemon_attached = true;
                 self.daemon_pid = pid;
                 self.syncing = sync_busy;
                 self.sync_summary = "데몬 연결됨".to_string();
-                if ui.active_todo_list_id.is_none() {
-                    ui.active_todo_list_id = self.todo_lists.first().map(|l| l.id.clone());
-                }
-                match self.persona {
-                    Persona::Teams => self.activated_teams = true,
-                    Persona::Outlook => self.activated_outlook = true,
-                    Persona::OneNote => self.activated_onenote = true,
-                }
-                self.send_active_domains();
                 self.sync_ctrl.set_focus(
                     self.active_target.clone(),
                     self.active_thread.as_ref().map(|t| t.root.msg_id.clone()),
@@ -5068,7 +2450,6 @@ impl AppState {
                 if !self.syncing {
                     self.sync_summary = "로컬 동기화".to_string();
                 }
-                self.send_active_domains();
                 self.sync_ctrl.set_focus(
                     self.active_target.clone(),
                     self.active_thread.as_ref().map(|t| t.root.msg_id.clone()),
@@ -5079,7 +2460,11 @@ impl AppState {
                 self.daemon_pid = None;
                 self.spawn_bootstrap(ui);
             }
-            UiMsg::ProfileLoaded { me, presence } => {
+            UiMsg::ProfileLoaded {
+                me,
+                presence,
+                scope_warning,
+            } => {
                 if let Some(u) = me {
                     self.my_user_id = u.id.clone();
                     self.my_profile = Some(u);
@@ -5087,6 +2472,7 @@ impl AppState {
                 if let Some(p) = presence {
                     self.my_presence = Some(p);
                 }
+                self.emit_scope_warning_once(ui, scope_warning);
                 if !self.my_user_id.is_empty() && self.activity_mentions.is_empty() {
                     if let Ok(mentions) = self.storage.list_mentions_for_user(&self.my_user_id, 50)
                     {
@@ -5137,33 +2523,35 @@ impl AppState {
     }
 }
 
-fn merge_optimistic_messages(target: &mut Vec<MessageItem>, mut incoming: Vec<MessageItem>) {
+fn merge_optimistic_messages(target: &mut Vec<MessageItem>, incoming: Vec<MessageItem>) {
+    let incoming_ids: HashSet<String> = incoming.iter().map(|m| m.msg_id.clone()).collect();
+    let earliest_incoming_ts = incoming.first().map(|m| m.created_at.as_str());
+
+    let mut older_preserved: Vec<MessageItem> = target
+        .iter()
+        .filter(|m| {
+            !m.msg_id.starts_with("optimistic-")
+                && !incoming_ids.contains(&m.msg_id)
+                && earliest_incoming_ts
+                    .is_some_and(|ts| m.created_at.as_str() <= ts)
+        })
+        .cloned()
+        .collect();
+
     let pending: Vec<MessageItem> = target
         .iter()
         .filter(|m| m.msg_id.starts_with("optimistic-"))
         .cloned()
         .collect();
-    incoming.extend(pending);
-    *target = incoming;
+
+    older_preserved.extend(incoming);
+    older_preserved.extend(pending);
+    *target = older_preserved;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn persona_outlook_defaults_to_mail_tab() {
-        let cfg = AppConfig::default();
-        let teams_ui = UiState::from_config_with_persona(&cfg, Persona::Teams);
-        let outlook_ui = UiState::from_config_with_persona(&cfg, Persona::Outlook);
-        let onenote_ui = UiState::from_config_with_persona(&cfg, Persona::OneNote);
-        assert_eq!(teams_ui.persona, Persona::Teams);
-        assert_eq!(teams_ui.active_nav_tab, 0);
-        assert_eq!(outlook_ui.persona, Persona::Outlook);
-        assert_eq!(outlook_ui.active_nav_tab, 3);
-        assert_eq!(onenote_ui.persona, Persona::OneNote);
-        assert_eq!(onenote_ui.active_nav_tab, 7);
-    }
 
     #[test]
     fn image_cache_key_formats_stably() {
@@ -5173,18 +2561,51 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn stash_draft_noop_does_not_mark_dirty_and_ignores_stale_loads() {
+    fn make_test_msg(conv_key: &str, msg_id: &str, created_at: &str, body: &str) -> MessageItem {
+        MessageItem {
+            msg_key: MessageItem::make_msg_key(conv_key, msg_id),
+            conv_key: conv_key.to_string(),
+            msg_id: msg_id.to_string(),
+            parent_msg_id: None,
+            reply_to_id: None,
+            reply_to_author: None,
+            reply_to_preview: None,
+            subject: None,
+            author_id: None,
+            author_name: "Alice".to_string(),
+            is_me: false,
+            created_at: created_at.to_string(),
+            last_modified_at: None,
+            deleted: false,
+            importance: "normal".to_string(),
+            message_type: "message".to_string(),
+            body_html: format!("<p>{body}</p>"),
+            body_plain: body.to_string(),
+            attachments: Vec::new(),
+            mentions: Vec::new(),
+            reactions: Vec::new(),
+            reply_count: 0,
+            web_url: None,
+        }
+    }
+
+    fn make_test_app() -> (AppState, UiState) {
         let cfg = AppConfig::default();
         let auth = AuthManager::new(cfg.clone()).unwrap();
         let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
         let storage = Storage::open_in_memory().unwrap();
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let sync_ctrl = sync::spawn_sync_engine(cfg.clone(), graph.clone(), storage.clone(), event_tx);
+        let sync_ctrl =
+            sync::spawn_sync_engine(cfg.clone(), graph.clone(), storage.clone(), event_tx);
         let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+        let app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let ui = UiState::from_config(&cfg);
+        (app, ui)
+    }
 
-        let mut app = AppState::new(cfg, auth, graph, storage, sync_ctrl.clone(), ui_tx);
-        let mut ui = UiState::new();
+    #[tokio::test]
+    async fn stash_draft_noop_does_not_mark_dirty_and_ignores_stale_loads() {
+        let (mut app, mut ui) = make_test_app();
         app.active_conv_key = Some("chat:room-a".to_string());
         app.drafts.clear();
 
@@ -5206,31 +2627,7 @@ mod tests {
 
         // Stale MessagesLoaded for another room must NOT overwrite active room's messages
         app.loading_messages = true;
-        let stale_msg = MessageItem {
-            msg_key: "chat:room-b|m1".to_string(),
-            conv_key: "chat:room-b".to_string(),
-            msg_id: "m1".to_string(),
-            parent_msg_id: None,
-            reply_to_id: None,
-            reply_to_author: None,
-            reply_to_preview: None,
-            subject: None,
-            author_id: None,
-            author_name: "Other".to_string(),
-            is_me: false,
-            created_at: "2026-11-18T00:00:00Z".to_string(),
-            last_modified_at: None,
-            deleted: false,
-            importance: "normal".to_string(),
-            message_type: "message".to_string(),
-            body_html: String::new(),
-            body_plain: "stale".to_string(),
-            attachments: Vec::new(),
-            mentions: Vec::new(),
-            reactions: Vec::new(),
-            reply_count: 0,
-            web_url: None,
-        };
+        let stale_msg = make_test_msg("chat:room-b", "m1", "2026-11-18T00:00:00Z", "stale");
         app.handle_ui_msg(
             &mut ui,
             UiMsg::MessagesLoaded {
@@ -5254,170 +2651,12 @@ mod tests {
         assert_eq!(app.messages.len(), 1);
         assert!(!app.loading_messages);
 
-        sync_ctrl.request(SyncCommand::Shutdown);
-    }
-
-    fn make_test_app_with_persona(persona: Persona) -> (AppState, UiState) {
-        let cfg = AppConfig::default();
-        let auth = AuthManager::new(cfg.clone()).unwrap();
-        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
-        let storage = Storage::open_in_memory().unwrap();
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let sync_ctrl =
-            sync::spawn_sync_engine(cfg.clone(), graph.clone(), storage.clone(), event_tx);
-        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
-        let app =
-            AppState::new_with_persona(cfg.clone(), persona, auth, graph, storage, sync_ctrl, ui_tx);
-        let ui = UiState::from_config_with_persona(&cfg, persona);
-        (app, ui)
-    }
-
-    fn sample_mail(id: &str, is_read: bool, flagged: bool) -> MailMessage {
-        MailMessage {
-            id: id.to_string(),
-            conversation_id: None,
-            folder_id: Some("inbox".to_string()),
-            subject: format!("Subject {id}"),
-            from: None,
-            to_recipients: vec![],
-            cc_recipients: vec![],
-            bcc_recipients: vec![],
-            received_at: "2026-11-18T00:00:00Z".to_string(),
-            sent_at: None,
-            is_read,
-            is_draft: false,
-            flagged,
-            importance: "normal".to_string(),
-            has_attachments: false,
-            preview: format!("Preview {id}"),
-            body_html: format!("<p>{id}</p>"),
-            body_plain: id.to_string(),
-            attachments: vec![],
-            web_link: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn persona_outlook_activates_only_outlook_initially_then_teams_on_tab_switch() {
-        let (mut app, mut ui) = make_test_app_with_persona(Persona::Outlook);
-        app.load_cached_for_persona();
-        assert!(!app.activated_teams);
-        assert!(app.activated_outlook);
-        assert!(!app.activated_onenote);
-
-        // Switching to Tab 0 (Teams) lazily activates Teams without activating OneNote.
-        app.ensure_tab_domain_activated(&mut ui, 0);
-        assert!(app.activated_teams);
-        assert!(app.activated_outlook);
-        assert!(!app.activated_onenote);
-
-        // Switching to Tab 7 (OneNote) activates OneNote.
-        app.ensure_tab_domain_activated(&mut ui, nav_pane::TAB_NOTES);
-        assert!(app.activated_onenote);
-
         app.sync_ctrl.request(SyncCommand::Shutdown);
     }
 
     #[tokio::test]
-    async fn optimistic_mail_read_flag_delete_and_rollback() {
-        let (mut app, mut ui) = make_test_app_with_persona(Persona::Outlook);
-        app.mail_folders = vec![MailFolder {
-            id: "inbox".to_string(),
-            display_name: "Inbox".to_string(),
-            well_known_name: Some("inbox".to_string()),
-            parent_folder_id: None,
-            unread_item_count: 2,
-            total_item_count: 2,
-        }];
-        let m1 = sample_mail("m1", false, false);
-        let m2 = sample_mail("m2", true, false);
-        app.mails = vec![m1.clone(), m2.clone()];
-        app.active_mail_id = Some("m1".to_string());
-        app.active_mail = Some(m1);
-
-        // 1. Optimistic Read toggle + rollback
-        app.toggle_active_mail_read(&mut ui);
-        assert!(app.mails[0].is_read);
-        assert!(app.active_mail.as_ref().unwrap().is_read);
-        assert_eq!(app.mail_folders[0].unread_item_count, 1);
-
-        app.handle_ui_msg(
-            &mut ui,
-            UiMsg::MailReadRollback {
-                mail_id: "m1".to_string(),
-                prev_read: false,
-                folder_prev_unread: Some(("inbox".to_string(), 2)),
-            },
-        );
-        assert!(!app.mails[0].is_read);
-        assert!(!app.active_mail.as_ref().unwrap().is_read);
-        assert_eq!(app.mail_folders[0].unread_item_count, 2);
-
-        // 2. Optimistic Flag toggle + rollback
-        app.toggle_active_mail_flag(&mut ui);
-        assert!(app.mails[0].flagged);
-        assert!(app.active_mail.as_ref().unwrap().flagged);
-
-        app.handle_ui_msg(
-            &mut ui,
-            UiMsg::MailFlagRollback {
-                mail_id: "m1".to_string(),
-                prev_flagged: false,
-            },
-        );
-        assert!(!app.mails[0].flagged);
-        assert!(!app.active_mail.as_ref().unwrap().flagged);
-
-        // 3. Optimistic Delete advances active_mail_id to m2 + rollback re-inserts m1 at index 0
-        let m1_snapshot = app.mails[0].clone();
-        app.delete_active_mail(&mut ui);
-        assert_eq!(app.mails.len(), 1);
-        assert_eq!(app.mails[0].id, "m2");
-        assert_eq!(app.active_mail_id.as_deref(), Some("m2"));
-
-        app.handle_ui_msg(
-            &mut ui,
-            UiMsg::MailRemoveRollback {
-                folder_id: "inbox".to_string(),
-                index: Some(0),
-                mail: m1_snapshot,
-            },
-        );
-        assert_eq!(app.mails.len(), 2);
-        assert_eq!(app.mails[0].id, "m1");
-        assert_eq!(app.mails[1].id, "m2");
-
-        app.sync_ctrl.request(SyncCommand::Shutdown);
-    }
-
-    #[tokio::test]
-    async fn optimistic_todo_and_message_send_with_rollback() {
-        let (mut app, mut ui) = make_test_app_with_persona(Persona::Teams);
-        app.todo_tasks = vec![TodoTask {
-            id: "t1".to_string(),
-            list_id: "l1".to_string(),
-            title: "Task 1".to_string(),
-            status: "notStarted".to_string(),
-            importance: "normal".to_string(),
-            body_plain: None,
-            due_date_iso: None,
-            reminder_iso: None,
-            completed_at: None,
-            created_at: None,
-            updated_at: None,
-        }];
-        app.active_todo_task_id = Some("t1".to_string());
-        app.toggle_active_todo_completed(&mut ui);
-        assert_eq!(app.todo_tasks[0].status, "completed");
-
-        app.handle_ui_msg(
-            &mut ui,
-            UiMsg::TodoStatusRollback {
-                task_id: "t1".to_string(),
-                prev_status: "notStarted".to_string(),
-            },
-        );
-        assert_eq!(app.todo_tasks[0].status, "notStarted");
+    async fn optimistic_message_send_with_rollback() {
+        let (mut app, mut ui) = make_test_app();
 
         // Optimistic message send -> replacement -> failure restore
         app.active_conv_key = Some("chat:c1".to_string());
@@ -5466,31 +2705,6 @@ mod tests {
         app.sync_ctrl.request(SyncCommand::Shutdown);
     }
 
-    #[tokio::test]
-    async fn onenote_image_cache_is_bounded_to_24_fifo() {
-        let (mut app, _ui) = make_test_app_with_persona(Persona::OneNote);
-        for i in 0..30 {
-            let key = format!("page:{i}:20x10");
-            let img = RenderedTerminalImage {
-                width_px: 10,
-                height_px: 10,
-                cols: 20,
-                rows: 10,
-                format_label: "PNG".to_string(),
-                lines: vec![],
-            };
-            app.insert_onenote_image_cache(key, img);
-        }
-        assert_eq!(app.onenote_image_cache.len(), 24);
-        assert_eq!(app.onenote_image_cache_order.len(), 24);
-        assert!(!app.onenote_image_cache.contains_key("page:0:20x10"));
-        assert!(!app.onenote_image_cache.contains_key("page:5:20x10"));
-        assert!(app.onenote_image_cache.contains_key("page:6:20x10"));
-        assert!(app.onenote_image_cache.contains_key("page:29:20x10"));
-
-        app.sync_ctrl.request(SyncCommand::Shutdown);
-    }
-
     fn make_sized_test_image(label_bytes: usize) -> RenderedTerminalImage {
         RenderedTerminalImage {
             width_px: 10,
@@ -5503,94 +2717,126 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn image_cache_byte_budget_evicts_across_both_caches_and_clear_resets_bytes() {
-        let (mut app, _ui) = make_test_app_with_persona(Persona::Teams);
+    async fn image_cache_byte_budget_evicts_and_clear_resets_bytes() {
+        let (mut app, _ui) = make_test_app();
         let two_mib = 2 * 1024 * 1024 - 128;
 
-        for i in 0..3 {
+        for i in 0..5 {
             app.insert_image_cache(format!("msg:{i}:20x10"), make_sized_test_image(two_mib));
         }
-        assert_eq!(app.image_cache.len(), 3);
         assert!(app.image_cache_bytes <= img_preview::MAX_IMAGE_CACHE_BYTES);
+        assert_eq!(app.image_cache.len(), 4);
 
-        // Inserting OneNote images pushes combined cache over 8 MiB -> older entries are evicted
-        // so combined byte usage stays <= MAX_IMAGE_CACHE_BYTES.
-        for i in 0..2 {
-            app.insert_onenote_image_cache(
-                format!("note:{i}:20x10"),
-                make_sized_test_image(two_mib),
-            );
-        }
-        assert!(
-            app.image_cache_bytes + app.onenote_image_cache_bytes
-                <= img_preview::MAX_IMAGE_CACHE_BYTES
-        );
-        assert_eq!(app.onenote_image_cache.len(), 2);
-
-        // Replacing an existing key updates byte counter accurately.
-        let one_mib = 1024 * 1024 - 128;
-        app.insert_onenote_image_cache(
-            "note:1:20x10".to_string(),
-            make_sized_test_image(one_mib),
-        );
-        let expected_onenote_bytes: usize = app
-            .onenote_image_cache
-            .values()
-            .map(AppState::rendered_image_bytes)
-            .sum();
-        assert_eq!(app.onenote_image_cache_bytes, expected_onenote_bytes);
-
-        let expected_teams_bytes: usize = app
+        let expected_bytes: usize = app
             .image_cache
             .values()
             .map(AppState::rendered_image_bytes)
             .sum();
-        assert_eq!(app.image_cache_bytes, expected_teams_bytes);
+        assert_eq!(app.image_cache_bytes, expected_bytes);
 
         // Single image larger than MAX_IMAGE_CACHE_BYTES still stays cached as the sole entry.
         let ten_mib = 10 * 1024 * 1024;
         app.insert_image_cache("oversized:0:20x10".to_string(), make_sized_test_image(ten_mib));
         assert_eq!(app.image_cache.len(), 1);
         assert!(app.image_cache.contains_key("oversized:0:20x10"));
-        assert_eq!(app.onenote_image_cache.len(), 0);
-        assert_eq!(app.onenote_image_cache_bytes, 0);
 
-        // Clearing resets maps, orders, and byte counters to zero.
+        // Clearing resets map, order, and byte counter to zero.
         app.clear_image_caches();
         assert!(app.image_cache.is_empty());
         assert!(app.image_cache_order.is_empty());
         assert_eq!(app.image_cache_bytes, 0);
-        assert!(app.onenote_image_cache.is_empty());
-        assert!(app.onenote_image_cache_order.is_empty());
-        assert_eq!(app.onenote_image_cache_bytes, 0);
 
         app.sync_ctrl.request(SyncCommand::Shutdown);
     }
 
     #[tokio::test]
-    async fn leaving_onenote_tab_trims_onenote_image_cache_to_2mib() {
-        let (mut app, mut ui) = make_test_app_with_persona(Persona::OneNote);
-        app.load_cached_for_persona();
-        let one_mib = 1024 * 1024 - 128;
-        for i in 0..4 {
-            app.insert_onenote_image_cache(
-                format!("note:{i}:20x10"),
-                make_sized_test_image(one_mib),
-            );
-        }
-        assert!(app.onenote_image_cache_bytes > 2 * 1024 * 1024);
+    async fn older_messages_loaded_deduplicates_prepends_shifts_selection_and_sets_anchor() {
+        let (mut app, mut ui) = make_test_app();
+        let conv = "chat:c1";
+        app.active_conv_key = Some(conv.to_string());
+        app.loading_older = true;
+        app.messages = vec![
+            make_test_msg(conv, "m3", "2026-11-18T03:00:00Z", "three"),
+            make_test_msg(conv, "m4", "2026-11-18T04:00:00Z", "four"),
+        ];
+        ui.chat_scroll.follow_tail = false;
+        ui.chat_scroll.total_lines = 12;
+        ui.chat_scroll.offset = 0;
+        ui.chat_scroll.selected_idx = Some(0);
 
-        // Leaving TAB_NOTES trims OneNote cache down to <= 2 MiB while preserving newest entries.
-        app.ensure_tab_domain_activated(&mut ui, 0);
-        assert!(app.onenote_image_cache_bytes <= 2 * 1024 * 1024);
-        assert!(!app.onenote_image_cache.contains_key("note:0:20x10"));
-        assert!(app.onenote_image_cache.contains_key("note:3:20x10"));
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::OlderMessagesLoaded {
+                conv_key: conv.to_string(),
+                messages: vec![
+                    make_test_msg(conv, "m2", "2026-11-18T02:00:00Z", "two"),
+                    make_test_msg(conv, "m1", "2026-11-18T01:00:00Z", "one"),
+                    make_test_msg(conv, "m3", "2026-11-18T03:00:00Z", "three"),
+                ],
+                reached_eof: false,
+            },
+        );
+
+        assert!(!app.loading_older);
+        assert!(!app.oldest_reached);
+        assert_eq!(app.history_error, None);
+        let ids: Vec<&str> = app.messages.iter().map(|m| m.msg_id.as_str()).collect();
+        assert_eq!(ids, vec!["m1", "m2", "m3", "m4"]);
+        assert_eq!(ui.chat_scroll.selected_idx, Some(2));
+        assert_eq!(ui.pending_prepend_anchor, Some((12, 0)));
 
         app.sync_ctrl.request(SyncCommand::Shutdown);
     }
 
     #[tokio::test]
-    async fn daemon_attached_skips_duplicate_bootstrap_and_preserves_domain_and_focus_nudges() {
+    async fn older_messages_failed_preserves_oldest_reached_false_and_sets_error_banner() {
+        let (mut app, mut ui) = make_test_app();
+        let conv = "chat:c1";
+        app.active_conv_key = Some(conv.to_string());
+        app.loading_older = true;
+        app.oldest_reached = false;
+        app.messages = vec![make_test_msg(conv, "m3", "2026-11-18T03:00:00Z", "three")];
+
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::OlderMessagesFailed {
+                conv_key: conv.to_string(),
+                local_messages: vec![make_test_msg(conv, "m2", "2026-11-18T02:00:00Z", "two")],
+                error: "권한 부족 (403)".to_string(),
+            },
+        );
+
+        assert!(!app.loading_older);
+        assert!(!app.oldest_reached);
+        assert_eq!(app.history_error.as_deref(), Some("권한 부족 (403)"));
+        let ids: Vec<&str> = app.messages.iter().map(|m| m.msg_id.as_str()).collect();
+        assert_eq!(ids, vec!["m2", "m3"]);
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[test]
+    fn merge_optimistic_messages_preserves_loaded_older_history() {
+        let conv = "chat:c1";
+        let mut target = vec![
+            make_test_msg(conv, "m1", "2026-11-18T01:00:00Z", "one"),
+            make_test_msg(conv, "m2", "2026-11-18T02:00:00Z", "two"),
+            make_test_msg(conv, "m3", "2026-11-18T03:00:00Z", "three"),
+            make_test_msg(conv, "optimistic-1", "2026-11-18T05:00:00Z", "pending"),
+        ];
+        let incoming = vec![
+            make_test_msg(conv, "m3", "2026-11-18T03:00:00Z", "three-updated"),
+            make_test_msg(conv, "m4", "2026-11-18T04:00:00Z", "four"),
+        ];
+
+        merge_optimistic_messages(&mut target, incoming);
+        let ids: Vec<&str> = target.iter().map(|m| m.msg_id.as_str()).collect();
+        assert_eq!(ids, vec!["m1", "m2", "m3", "m4", "optimistic-1"]);
+        assert_eq!(target[2].body_plain, "three-updated");
+    }
+
+    #[tokio::test]
+    async fn daemon_attached_skips_duplicate_bootstrap_and_preserves_focus() {
         let cfg = AppConfig::default();
         let auth = AuthManager::new(cfg.clone()).unwrap();
         let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
@@ -5600,16 +2846,8 @@ mod tests {
         let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx, false);
         let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
 
-        let mut app = AppState::new_with_persona(
-            cfg.clone(),
-            Persona::Teams,
-            auth,
-            graph,
-            storage,
-            sync_ctrl,
-            ui_tx,
-        );
-        let mut ui = UiState::from_config_with_persona(&cfg, Persona::Teams);
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
         app.my_profile = Some(UserProfile {
             id: "user-1".to_string(),
             display_name: "Alice".to_string(),
@@ -5633,20 +2871,8 @@ mod tests {
         assert_eq!(app.daemon_pid, Some(4242));
         assert!(!app.syncing);
         assert_eq!(app.sync_summary, "데몬 연결됨");
-        assert!(app.activated_teams);
-        assert!(!app.activated_outlook);
-        assert!(!app.activated_onenote);
         assert!(ui.tasks.first_running().is_none());
 
-        let cmd = nudge_rx.try_recv().expect("expected SetActiveDomains nudge");
-        assert!(matches!(
-            cmd,
-            SyncCommand::SetActiveDomains {
-                teams: true,
-                outlook: false,
-                onenote: false,
-            }
-        ));
         assert!(nudge_rx.try_recv().is_err(), "unexpected extra bootstrap command");
         assert_eq!(
             focus_rx.borrow().target,
@@ -5659,13 +2885,5 @@ mod tests {
         assert!(!app.daemon_attached);
         assert_eq!(app.daemon_pid, None);
         assert_eq!(app.sync_summary, "로컬 동기화");
-        assert!(matches!(
-            nudge_rx.try_recv().expect("expected re-activated domains on detach"),
-            SyncCommand::SetActiveDomains {
-                teams: true,
-                outlook: false,
-                onenote: false,
-            }
-        ));
     }
 }

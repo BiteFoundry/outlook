@@ -1,4 +1,4 @@
-//! `teams` / `outlook` / `onenote` tri-persona CLI parser, command dispatcher, and shared domain helpers for CLI/HTTP/MCP.
+//! `teams` CLI parser, command dispatcher, and shared domain helpers for CLI/HTTP/MCP.
 
 use std::{
     collections::HashMap,
@@ -7,24 +7,22 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone};
+use base64::Engine as _;
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
 use crate::{
-    auth::{AuthManager, LoginOptions, StoredTokens},
+    auth::{
+        diagnose_access_token_scopes, explain_graph_permission_error, AuthManager, LoginOptions,
+        StoredTokens,
+    },
     config::{self, AppConfig, Persona},
     graph::GraphClient,
     img_preview,
     models::{
-        split_onenote_entity_key, AttachmentInfo, CalendarEvent, ContactItem, ConversationKind,
-        ConversationSummary, ConversationTarget, DownloadedFile, InlineImageUpload, MailAttachment,
-        MailFolder, MailMessage, MentionInfo, MessageItem, OnenoteBlock, OnenoteBlockKind,
-        OnenoteNotebook, OnenotePageDetail, OnenotePageSummary, OnenotePatchCommand,
-        OnenoteResource, OnenoteScope, OnenoteSearchHit, OnenoteSection, OnenoteTagKind,
-        OutgoingContact, OutgoingEvent, OutgoingMail, OutgoingOnenotePage, OutgoingTodoTask,
-        QuotedReply, RichSpan, TeamSummary, TodoList, TodoTask,
+        AttachmentInfo, ConversationKind, ConversationSummary, ConversationTarget, DownloadedFile,
+        InlineImageUpload, MentionInfo, MessageItem, QuotedReply, SyncCursor, TeamSummary,
     },
     parser, resolver,
     serve::{self, ServeOptions},
@@ -36,7 +34,6 @@ const DELETE_JSON_REQUIRES_YES: &str = "--json 모드에서 삭제하려면 --ye
 
 const ENV_AFTER_HELP: &str = "\
 환경 변수 (Environment Variables):
-  TEAMS_PERSONA=teams|outlook|onenote   실행 페르소나 강제 지정
   TEAMS_TOKEN_FILE=<PATH>               외부 토큰 파일(JWT 또는 JSON) 직접 로드 (키링 자동 생략)
   TEAMS_TOKEN_REFRESH_CMD=<CMD>         토큰 만료 임박 시 자동 실행할 갱신 커맨드 훅
   TEAMS_TOKEN_REFRESH_MINS=<MINS>       갱신 훅 실행 기준 남은 시간(분) [기본: 5]
@@ -45,52 +42,23 @@ const ENV_AFTER_HELP: &str = "\
   TEAMS_CLIENT_ID / TEAMS_TENANT_ID     Entra 앱 Client ID / Tenant ID 재정의
   TEAMS_CONFIG_DIR / TEAMS_DATA_DIR     설정 및 로컬 SQLite 캐시 디렉터리 재정의
   TEAMS_CLI_CACHE_SECS=<SECS>           CLI 읽기 명령 로컬 캐시 유효 시간(초) [기본: 0, --cached/--fast 시 캐시 우선]
-  TEAMS_BACKGROUND_ALL=1                TUI 시작 시 비활성 도메인까지 백그라운드 폴링 활성화 [기본: false]
   TEAMS_AUTO_DAEMON=1                   백그라운드 동기화 데몬 자동 시작/연결 (config.toml: auto_daemon = true) [기본: false]
 
 백그라운드 동기화 데몬 (Background Sync Daemon):
-  teams daemon start | status | stop | restart   (outlook / onenote 동일)";
+  teams daemon start | status | stop | restart";
 
 #[derive(Parser, Debug)]
 #[command(
     name = "teams",
     version,
-    about = "Microsoft Teams · Outlook · OneNote 터미널 클라이언트 (CLI · TUI · HTTP API · MCP)",
-    long_about = "Microsoft Graph v1.0 기반 Microsoft Teams · Outlook · OneNote 터미널 클라이언트입니다.\n\
+    about = "Microsoft Teams 터미널 클라이언트 (CLI · TUI · HTTP API · MCP)",
+    long_about = "Microsoft Graph v1.0 기반 Microsoft Teams 터미널 클라이언트입니다.\n\
                   인자 없이 실행하면 로그인 상태를 확인한 뒤 TUI를 엽니다.",
     after_help = ENV_AFTER_HELP
 )]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
-}
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "outlook",
-    version,
-    about = "Microsoft Outlook 터미널 클라이언트 (메일 · 캘린더 · 연락처 · To Do · OneNote · CLI · TUI · HTTP API · MCP)",
-    long_about = "Microsoft Graph v1.0 기반 Microsoft Outlook / M365 터미널 클라이언트입니다.\n\
-                  인자 없이 실행하면 로그인 상태를 확인한 뒤 Outlook TUI를 엽니다.",
-    after_help = ENV_AFTER_HELP
-)]
-pub struct OutlookCli {
-    #[command(subcommand)]
-    pub command: Option<OutlookCommand>,
-}
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "onenote",
-    version,
-    about = "Microsoft OneNote 터미널 클라이언트 (개인/팀 공유 필기장 · 섹션 · 페이지 · CLI · TUI · HTTP API · MCP)",
-    long_about = "Microsoft Graph v1.0 기반 Microsoft OneNote 터미널 클라이언트입니다.\n\
-                  인자 없이 실행하면 로그인 상태를 확인한 뒤 OneNote TUI를 엽니다.",
-    after_help = ENV_AFTER_HELP
-)]
-pub struct OnenoteCli {
-    #[command(subcommand)]
-    pub command: Option<OnenoteCommand>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -185,11 +153,17 @@ pub enum Command {
     Read {
         target: String,
         /// 최대 조회 개수
-        #[arg(long, visible_alias = "top", default_value_t = 50)]
+        #[arg(long, visible_alias = "top", default_value_t = 30)]
         limit: usize,
+        /// 이 타임스탬프(ISO-8601 / YYYY-MM-DD) 또는 메시지 ID 이전의 과거 메시지 조회
+        #[arg(long, value_name = "TIMESTAMP_OR_MSG_ID")]
+        before: Option<String>,
+        /// 특정 채널 스레드(루트 메시지 ID) 읽기
+        #[arg(long)]
+        thread: Option<String>,
         #[arg(long)]
         offline: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
+        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있거나 부족하면 네트워크 조회)
         #[arg(long, visible_alias = "fast")]
         cached: bool,
         #[arg(long)]
@@ -314,13 +288,17 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 채팅방/팀/채널 목록과 최근 메시지를 로컬 SQLite 캐시에 동기화합니다
+    /// 채팅방/팀/채널 목록과 과거 메시지를 로컬 SQLite 캐시에 동기화합니다
     Sync {
+        /// 특정 대화방/채널만 지정하여 깊이 동기화
         #[arg(long)]
         target: Option<String>,
-        /// 최대 조회 개수
-        #[arg(long, visible_alias = "top", default_value_t = 50)]
-        limit: usize,
+        /// 동기화할 최근 채팅방 개수
+        #[arg(long, default_value_t = 100)]
+        chats: usize,
+        /// 대화방/채널당 로컬 FTS5 캐시에 백필할 메시지 수
+        #[arg(long, visible_aliases = ["limit", "top"], default_value_t = 50)]
+        depth: usize,
         #[arg(long)]
         json: bool,
     },
@@ -349,65 +327,6 @@ pub enum Command {
         expiration_mins: Option<u32>,
         #[arg(long)]
         json: bool,
-    },
-    /// Outlook 메일 명령 (`teams mail <subcmd>`)
-    Mail {
-        #[command(subcommand)]
-        command: MailCommand,
-    },
-    /// 받은편지함 또는 지정한 폴더의 메일 목록을 표시합니다 (teams mail list 단축 명령)
-    Inbox {
-        #[arg(long, default_value = "inbox")]
-        folder: String,
-        /// 최대 조회 개수
-        #[arg(long, visible_alias = "top", default_value_t = 30)]
-        limit: usize,
-        #[arg(long)]
-        unread: bool,
-        #[arg(long)]
-        refresh: bool,
-        #[arg(long)]
-        offline: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
-        #[arg(long, visible_alias = "fast")]
-        cached: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Outlook 메일 검색 (`teams mail search` 단축 명령)
-    #[command(name = "mail-search")]
-    MailSearch {
-        query: String,
-        #[arg(long)]
-        folder: Option<String>,
-        #[arg(long)]
-        remote: bool,
-        /// 최대 조회 개수
-        #[arg(long, visible_alias = "top", default_value_t = 30)]
-        limit: usize,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Outlook 캘린더 명령 (`teams cal <subcmd>`)
-    Cal {
-        #[command(subcommand)]
-        command: CalCommand,
-    },
-    /// Outlook 연락처 및 조직 디렉터리 명령 (`teams contacts <subcmd>`)
-    Contacts {
-        #[command(subcommand)]
-        command: ContactsCommand,
-    },
-    /// Microsoft To Do 할 일 명령 (`teams todo <subcmd>`)
-    Todo {
-        #[command(subcommand)]
-        command: TodoCommand,
-    },
-    /// Microsoft OneNote 필기장·섹션·페이지 명령 (`teams notes <subcmd>`)
-    #[command(visible_alias = "onenote")]
-    Notes {
-        #[command(subcommand)]
-        command: NotesCommand,
     },
     /// 메시지 이미지 첨부 또는 로컬 이미지를 터미널에 미리보기 렌더링합니다
     Preview {
@@ -493,1082 +412,6 @@ pub enum DaemonCommand {
     Run,
 }
 
-#[derive(Subcommand, Debug)]
-pub enum OutlookCommand {
-    /// Microsoft Entra ID(OAuth 2.0)로 로그인하고 토큰을 저장합니다
-    #[command(visible_alias = "in")]
-    Login {
-        #[arg(long)]
-        client_id: Option<String>,
-        #[arg(long)]
-        tenant_id: Option<String>,
-        #[arg(long)]
-        device_code: bool,
-        #[arg(long)]
-        client_secret: Option<String>,
-        #[arg(long)]
-        token: Option<String>,
-        #[arg(long)]
-        port: Option<u16>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 저장된 토큰을 삭제합니다
-    #[command(visible_alias = "out")]
-    Logout {
-        #[arg(long)]
-        json: bool,
-    },
-    /// 현재 로그인한 사용자 프로필과 토큰 상태를 표시합니다
-    Whoami {
-        #[arg(long)]
-        json: bool,
-    },
-    /// 설정/DB/키링 경로, 스코프, 캐시 카운트 및 선택적 Graph 연결 진단을 표시합니다
-    Doctor {
-        #[arg(long)]
-        probe: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Outlook 메일 폴더 목록을 표시합니다
-    Folders {
-        #[arg(long)]
-        refresh: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
-        #[arg(long, visible_alias = "fast")]
-        cached: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 받은편지함 또는 지정한 폴더의 메일 목록을 표시합니다
-    #[command(visible_alias = "list")]
-    Inbox {
-        #[arg(long, default_value = "inbox")]
-        folder: String,
-        /// 최대 조회 개수
-        #[arg(long, visible_alias = "top", default_value_t = 30)]
-        limit: usize,
-        #[arg(long)]
-        unread: bool,
-        #[arg(long)]
-        refresh: bool,
-        #[arg(long)]
-        offline: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
-        #[arg(long, visible_alias = "fast")]
-        cached: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 메일 본문과 첨부파일 정보를 읽습니다
-    #[command(visible_alias = "cat")]
-    Read {
-        mail_id: String,
-        #[arg(long)]
-        offline: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
-        #[arg(long, visible_alias = "fast")]
-        cached: bool,
-        #[arg(long = "preview-images")]
-        preview_images: bool,
-        #[arg(long = "no-mark-read")]
-        no_mark_read: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Markdown 본문으로 새 메일을 발송합니다
-    Send {
-        #[arg(long = "to", required = true, value_name = "email")]
-        to: Vec<String>,
-        #[arg(long = "cc", value_name = "email")]
-        cc: Vec<String>,
-        #[arg(long = "bcc", value_name = "email")]
-        bcc: Vec<String>,
-        #[arg(long, required = true)]
-        subject: String,
-        markdown_body: String,
-        #[arg(long = "attach", value_name = "path")]
-        attach: Vec<PathBuf>,
-        #[arg(long)]
-        important: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 메일에 답장합니다
-    Reply {
-        mail_id: String,
-        markdown_comment: String,
-        #[arg(long)]
-        all: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 메일을 전달합니다
-    Forward {
-        mail_id: String,
-        #[arg(long = "to", required = true, value_name = "email")]
-        to: Vec<String>,
-        #[arg(default_value = "")]
-        markdown_comment: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 메일에 플래그를 설정하거나 해제합니다
-    Flag {
-        mail_id: String,
-        #[arg(long)]
-        off: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 메일을 읽음 또는 읽지 않음으로 표시합니다
-    #[command(name = "mark-read")]
-    MarkRead {
-        mail_id: String,
-        #[arg(long)]
-        unread: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 메일을 다른 폴더로 이동합니다
-    Move {
-        mail_id: String,
-        dest_folder: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 메일을 삭제합니다
-    Delete {
-        mail_id: String,
-        #[arg(long)]
-        yes: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 메일 첨부파일을 다운로드하거나 터미널에 미리보기합니다
-    Attachment {
-        mail_id: String,
-        #[arg(long)]
-        index: Option<usize>,
-        #[arg(long)]
-        id: Option<String>,
-        #[arg(long)]
-        out: Option<PathBuf>,
-        #[arg(long)]
-        preview: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 로컬 SQLite 및 선택적 원격 Graph에서 메일을 검색합니다
-    #[command(visible_alias = "mail-search")]
-    Search {
-        query: String,
-        #[arg(long)]
-        folder: Option<String>,
-        #[arg(long)]
-        remote: bool,
-        /// 최대 조회 개수
-        #[arg(long, visible_alias = "top", default_value_t = 30)]
-        limit: usize,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Outlook 메일 이미지 첨부 또는 로컬 이미지를 터미널에 미리보기 렌더링합니다
-    Preview {
-        mail_id: Option<String>,
-        #[arg(long)]
-        attachment: Option<String>,
-        #[arg(long)]
-        file: Option<PathBuf>,
-        #[arg(long)]
-        offline: bool,
-        #[arg(long)]
-        cols: Option<u16>,
-        #[arg(long)]
-        rows: Option<u16>,
-    },
-    /// 로컬 이미지 파일을 터미널에 미리보기 렌더링합니다
-    #[command(name = "preview-file")]
-    PreviewFile {
-        path: PathBuf,
-        #[arg(long)]
-        cols: Option<u16>,
-        #[arg(long)]
-        rows: Option<u16>,
-    },
-    /// Outlook 메일 명령 (outlook mail <subcmd> — teams mail 과 동일)
-    Mail {
-        #[command(subcommand)]
-        command: MailCommand,
-    },
-    /// Outlook 캘린더 명령 (`outlook cal <subcmd>`)
-    Cal {
-        #[command(subcommand)]
-        command: CalCommand,
-    },
-    /// Outlook 연락처 및 조직 디렉터리 명령 (`outlook contacts <subcmd>`)
-    Contacts {
-        #[command(subcommand)]
-        command: ContactsCommand,
-    },
-    /// Microsoft To Do 할 일 명령 (`outlook todo <subcmd>`)
-    Todo {
-        #[command(subcommand)]
-        command: TodoCommand,
-    },
-    /// Microsoft OneNote 필기장·섹션·페이지 명령 (`outlook notes <subcmd>`)
-    #[command(visible_alias = "onenote")]
-    Notes {
-        #[command(subcommand)]
-        command: NotesCommand,
-    },
-    /// GitHub Releases에서 최신 버전을 확인하거나 자가 업데이트합니다
-    Update {
-        #[arg(long)]
-        check: bool,
-        #[arg(long)]
-        force: bool,
-        #[arg(long)]
-        repo: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Teams 1:1/그룹/모임 채팅 목록을 표시합니다
-    Chats {
-        /// 최대 조회 개수
-        #[arg(long, visible_alias = "top", default_value_t = 50)]
-        limit: usize,
-        #[arg(long)]
-        refresh: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (네트워크 호출 생략)
-        #[arg(long, visible_alias = "fast")]
-        cached: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 가입된 Teams 팀과 채널 목록을 표시합니다
-    Teams {
-        #[arg(long)]
-        refresh: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (네트워크 호출 생략)
-        #[arg(long, visible_alias = "fast")]
-        cached: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 터미널 UI(TUI)를 실행합니다
-    Tui,
-    /// 에이전트용 로컬 HTTP JSON API 서버를 실행합니다
-    #[command(visible_alias = "api")]
-    Serve {
-        #[arg(long, default_value = "127.0.0.1")]
-        bind: String,
-        #[arg(long, default_value_t = 8788)]
-        port: u16,
-        #[arg(long)]
-        token: Option<String>,
-    },
-    /// 에이전트용 stdio MCP(JSON-RPC 2.0) 서버를 실행합니다
-    #[command(visible_alias = "mcp-server")]
-    Mcp,
-    /// 백그라운드 동기화 데몬을 제어합니다 (`start` | `stop` | `status` | `restart` | `run`)
-    Daemon {
-        #[command(subcommand)]
-        command: DaemonCommand,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum MailCommand {
-    /// 메일 폴더 목록을 표시합니다
-    Folders {
-        #[arg(long)]
-        refresh: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
-        #[arg(long, visible_alias = "fast")]
-        cached: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 받은편지함 또는 지정한 폴더의 메일 목록을 표시합니다
-    #[command(visible_alias = "inbox")]
-    List {
-        #[arg(long, default_value = "inbox")]
-        folder: String,
-        /// 최대 조회 개수
-        #[arg(long, visible_alias = "top", default_value_t = 30)]
-        limit: usize,
-        #[arg(long)]
-        unread: bool,
-        #[arg(long)]
-        refresh: bool,
-        #[arg(long)]
-        offline: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
-        #[arg(long, visible_alias = "fast")]
-        cached: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 메일 본문을 읽습니다
-    Read {
-        mail_id: String,
-        #[arg(long)]
-        offline: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
-        #[arg(long, visible_alias = "fast")]
-        cached: bool,
-        #[arg(long = "preview-images")]
-        preview_images: bool,
-        #[arg(long = "no-mark-read")]
-        no_mark_read: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Markdown 본문으로 새 메일을 발송합니다
-    Send {
-        #[arg(long = "to", required = true, value_name = "email")]
-        to: Vec<String>,
-        #[arg(long = "cc", value_name = "email")]
-        cc: Vec<String>,
-        #[arg(long = "bcc", value_name = "email")]
-        bcc: Vec<String>,
-        #[arg(long, required = true)]
-        subject: String,
-        markdown_body: String,
-        #[arg(long = "attach", value_name = "path")]
-        attach: Vec<PathBuf>,
-        #[arg(long)]
-        important: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 메일에 답장합니다
-    Reply {
-        mail_id: String,
-        markdown_comment: String,
-        #[arg(long)]
-        all: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 메일을 전달합니다
-    Forward {
-        mail_id: String,
-        #[arg(long = "to", required = true, value_name = "email")]
-        to: Vec<String>,
-        #[arg(default_value = "")]
-        markdown_comment: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 메일에 플래그를 설정하거나 해제합니다
-    Flag {
-        mail_id: String,
-        #[arg(long)]
-        off: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 메일을 읽음 또는 읽지 않음으로 표시합니다
-    #[command(name = "mark-read")]
-    MarkRead {
-        mail_id: String,
-        #[arg(long)]
-        unread: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 메일을 다른 폴더로 이동합니다
-    Move {
-        mail_id: String,
-        dest_folder: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 메일을 삭제합니다
-    Delete {
-        mail_id: String,
-        #[arg(long)]
-        yes: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 메일 첨부파일을 다운로드하거나 터미널에 미리보기합니다
-    Attachment {
-        mail_id: String,
-        #[arg(long)]
-        index: Option<usize>,
-        #[arg(long)]
-        id: Option<String>,
-        #[arg(long)]
-        out: Option<PathBuf>,
-        #[arg(long)]
-        preview: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 로컬 SQLite 및 선택적 원격 Graph에서 메일을 검색합니다
-    #[command(visible_alias = "mail-search")]
-    Search {
-        query: String,
-        #[arg(long)]
-        folder: Option<String>,
-        #[arg(long)]
-        remote: bool,
-        /// 최대 조회 개수
-        #[arg(long, visible_alias = "top", default_value_t = 30)]
-        limit: usize,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum CalCommand {
-    /// 오늘 일정을 표시합니다
-    Today {
-        #[arg(long)]
-        offline: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
-        #[arg(long, visible_alias = "fast")]
-        cached: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 향후 N일(기본 7일) 일정을 표시합니다
-    Week {
-        #[arg(long, default_value_t = 7)]
-        days: i64,
-        #[arg(long)]
-        offline: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
-        #[arg(long, visible_alias = "fast")]
-        cached: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 지정한 기간의 일정을 표시합니다
-    List {
-        #[arg(long)]
-        start: Option<String>,
-        #[arg(long)]
-        end: Option<String>,
-        /// 최대 조회 개수
-        #[arg(long, visible_alias = "top", default_value_t = 50)]
-        limit: usize,
-        #[arg(long)]
-        offline: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
-        #[arg(long, visible_alias = "fast")]
-        cached: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 일정 상세 정보를 표시합니다
-    Show {
-        event_id: String,
-        #[arg(long)]
-        offline: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
-        #[arg(long, visible_alias = "fast")]
-        cached: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 새 일정을 생성합니다
-    Create {
-        #[arg(long)]
-        subject: String,
-        #[arg(long)]
-        start: String,
-        #[arg(long)]
-        end: String,
-        #[arg(long = "to", value_name = "email")]
-        to: Vec<String>,
-        #[arg(long)]
-        location: Option<String>,
-        #[arg(long)]
-        body: Option<String>,
-        #[arg(long = "teams-meeting")]
-        teams_meeting: bool,
-        #[arg(long = "all-day")]
-        all_day: bool,
-        #[arg(long)]
-        time_zone: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 일정 초대에 응답(accept/tentative/decline)합니다
-    Rsvp {
-        event_id: String,
-        response: String,
-        #[arg(long)]
-        comment: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 온라인 모임 URL을 브라우저로 열거나 출력합니다
-    Join {
-        event_id: String,
-        #[arg(long = "print-only")]
-        print_only: bool,
-        #[arg(long)]
-        offline: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 일정을 삭제합니다
-    Delete {
-        event_id: String,
-        #[arg(long)]
-        yes: bool,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum ContactsCommand {
-    /// 개인 연락처 목록을 표시합니다
-    List {
-        /// 최대 조회 개수
-        #[arg(long, visible_alias = "top", default_value_t = 50)]
-        limit: usize,
-        #[arg(long)]
-        refresh: bool,
-        #[arg(long)]
-        offline: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
-        #[arg(long, visible_alias = "fast")]
-        cached: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 연락처 및 조직 디렉터리를 검색합니다
-    Search {
-        query: String,
-        /// 최대 조회 개수
-        #[arg(long, visible_alias = "top", default_value_t = 30)]
-        limit: usize,
-        #[arg(long)]
-        offline: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 새 개인 연락처를 추가합니다
-    Add {
-        #[arg(long)]
-        name: String,
-        #[arg(long = "email", value_name = "addr")]
-        email: Vec<String>,
-        #[arg(long)]
-        mobile: Option<String>,
-        #[arg(long)]
-        company: Option<String>,
-        #[arg(long)]
-        title: Option<String>,
-        #[arg(long)]
-        notes: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 개인 연락처를 삭제합니다
-    Delete {
-        contact_id: String,
-        #[arg(long)]
-        yes: bool,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum TodoCommand {
-    /// To Do 작업 목록을 표시합니다
-    Lists {
-        #[arg(long)]
-        refresh: bool,
-        #[arg(long)]
-        offline: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
-        #[arg(long, visible_alias = "fast")]
-        cached: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// To Do 할 일 항목을 표시합니다
-    Tasks {
-        #[arg(long, default_value = "default")]
-        list: String,
-        #[arg(long)]
-        all: bool,
-        /// 최대 조회 개수
-        #[arg(long, visible_alias = "top", default_value_t = 50)]
-        limit: usize,
-        #[arg(long)]
-        refresh: bool,
-        #[arg(long)]
-        offline: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있으면 네트워크 조회)
-        #[arg(long, visible_alias = "fast")]
-        cached: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 새 To Do 할 일을 추가합니다
-    Add {
-        title: String,
-        #[arg(long, default_value = "default")]
-        list: String,
-        #[arg(long)]
-        due: Option<String>,
-        #[arg(long)]
-        important: bool,
-        #[arg(long)]
-        body: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// To Do 할 일을 완료 또는 미완료 처리합니다
-    Done {
-        task_id: String,
-        #[arg(long, default_value = "default")]
-        list: String,
-        #[arg(long)]
-        undo: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// To Do 할 일을 삭제합니다
-    Delete {
-        task_id: String,
-        #[arg(long, default_value = "default")]
-        list: String,
-        #[arg(long)]
-        yes: bool,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Subcommand, Debug, Clone)]
-pub enum NotesCommand {
-    /// 개인 및 가입된 팀/그룹의 OneNote 필기장 목록을 표시합니다
-    #[command(visible_alias = "ls")]
-    Notebooks {
-        /// 개인(`/me/onenote`) 필기장만 조회합니다
-        #[arg(long = "personal-only")]
-        personal_only: bool,
-        /// 팀/그룹 공유 필기장을 포함합니다 (기본 true)
-        #[arg(
-            long = "include-teams",
-            default_value_t = true,
-            default_missing_value = "true",
-            num_args = 0..=1,
-            require_equals = true
-        )]
-        include_teams: bool,
-        #[arg(long)]
-        refresh: bool,
-        #[arg(long)]
-        offline: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 새 OneNote 필기장을 생성합니다
-    #[command(name = "create-notebook")]
-    CreateNotebook {
-        name: String,
-        #[arg(long)]
-        group: Option<String>,
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 필기장 내(또는 전체) OneNote 섹션 목록을 표시합니다
-    Sections {
-        notebook: Option<String>,
-        #[arg(long)]
-        refresh: bool,
-        #[arg(long)]
-        offline: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 지정한 필기장에 새 OneNote 섹션을 생성합니다
-    #[command(name = "create-section")]
-    CreateSection {
-        notebook: String,
-        name: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 지정한 섹션(`"필기장/섹션"` 또는 섹션 이름/키)의 페이지 목록을 표시합니다
-    #[command(visible_alias = "list")]
-    Pages {
-        section: String,
-        /// 최대 조회 개수
-        #[arg(long, visible_alias = "top", default_value_t = 50)]
-        limit: usize,
-        #[arg(long)]
-        refresh: bool,
-        #[arg(long)]
-        offline: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// OneNote 페이지 본문, 블록(`element_id`/태그) 및 리소스 상세 정보를 읽습니다
-    #[command(visible_alias = "cat")]
-    Read {
-        page: String,
-        #[arg(long, default_value = "md", value_parser = ["md", "plain", "blocks", "xhtml"])]
-        format: String,
-        #[arg(long = "preview-images")]
-        preview_images: bool,
-        #[arg(long)]
-        offline: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Markdown 본문과 선택적 인라인 이미지로 새 OneNote 페이지를 생성합니다
-    Create {
-        section: String,
-        #[arg(long, required = true)]
-        title: String,
-        markdown_body: Option<String>,
-        #[arg(long)]
-        file: Option<PathBuf>,
-        #[arg(long = "image", value_name = "img_path")]
-        image: Vec<PathBuf>,
-        #[arg(long, value_parser = clap::value_parser!(i32).range(0..=2))]
-        level: Option<i32>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 기존 OneNote 페이지 끝에 Markdown 본문 및 인라인 이미지를 추가(append)합니다
-    Append {
-        page: String,
-        markdown_body: Option<String>,
-        #[arg(long)]
-        file: Option<PathBuf>,
-        #[arg(long = "image", value_name = "img_path")]
-        image: Vec<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// OneNote 페이지의 특정 블록(`--block-id`) 또는 전체 제목/본문을 수정합니다
-    Update {
-        page: String,
-        #[arg(long)]
-        title: Option<String>,
-        #[arg(long)]
-        body: Option<String>,
-        #[arg(long)]
-        file: Option<PathBuf>,
-        #[arg(long = "block-id")]
-        block_id: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// OneNote 페이지의 `to-do` 체크박스 블록을 완료/미완료 토글합니다
-    Check {
-        page: String,
-        #[arg(long = "block-id")]
-        block_id: Option<String>,
-        #[arg(long)]
-        index: Option<usize>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// OneNote 페이지를 삭제합니다
-    Delete {
-        page: String,
-        #[arg(long)]
-        yes: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 로컬 SQLite FTS5(`onenote_fts`)에서 OneNote 페이지를 검색합니다
-    Search {
-        query: String,
-        #[arg(long)]
-        section: Option<String>,
-        #[arg(long)]
-        refresh: bool,
-        /// 최대 조회 개수
-        #[arg(long, visible_alias = "top", default_value_t = 30)]
-        limit: usize,
-        #[arg(long)]
-        json: bool,
-    },
-    /// OneNote 페이지의 이미지 또는 첨부 리소스를 다운로드하거나 터미널에 미리보기합니다
-    Resource {
-        page: String,
-        #[arg(long)]
-        index: Option<usize>,
-        #[arg(long)]
-        out: Option<PathBuf>,
-        #[arg(long)]
-        preview: bool,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum OnenoteCommand {
-    /// Microsoft Entra ID(OAuth 2.0)로 로그인하고 토큰을 저장합니다
-    #[command(visible_alias = "in")]
-    Login {
-        #[arg(long)]
-        client_id: Option<String>,
-        #[arg(long)]
-        tenant_id: Option<String>,
-        #[arg(long)]
-        device_code: bool,
-        #[arg(long)]
-        client_secret: Option<String>,
-        #[arg(long)]
-        token: Option<String>,
-        #[arg(long)]
-        port: Option<u16>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 저장된 토큰을 삭제합니다
-    #[command(visible_alias = "out")]
-    Logout {
-        #[arg(long)]
-        json: bool,
-    },
-    /// 현재 로그인한 사용자 프로필과 토큰 상태를 표시합니다
-    Whoami {
-        #[arg(long)]
-        json: bool,
-    },
-    /// 설정/DB/키링 경로, 스코프, 캐시 카운트 및 선택적 Graph 연결 진단을 표시합니다
-    Doctor {
-        #[arg(long)]
-        probe: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 개인 및 가입된 팀/그룹의 OneNote 필기장 목록을 표시합니다
-    #[command(visible_alias = "ls")]
-    Notebooks {
-        #[arg(long = "personal-only")]
-        personal_only: bool,
-        #[arg(
-            long = "include-teams",
-            default_value_t = true,
-            default_missing_value = "true",
-            num_args = 0..=1,
-            require_equals = true
-        )]
-        include_teams: bool,
-        #[arg(long)]
-        refresh: bool,
-        #[arg(long)]
-        offline: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 새 OneNote 필기장을 생성합니다
-    #[command(name = "create-notebook")]
-    CreateNotebook {
-        name: String,
-        #[arg(long)]
-        group: Option<String>,
-        #[arg(long)]
-        site: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 필기장 내(또는 전체) OneNote 섹션 목록을 표시합니다
-    Sections {
-        notebook: Option<String>,
-        #[arg(long)]
-        refresh: bool,
-        #[arg(long)]
-        offline: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 지정한 필기장에 새 OneNote 섹션을 생성합니다
-    #[command(name = "create-section")]
-    CreateSection {
-        notebook: String,
-        name: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 지정한 섹션(`"필기장/섹션"` 또는 섹션 이름/키)의 페이지 목록을 표시합니다
-    #[command(visible_alias = "list")]
-    Pages {
-        section: String,
-        /// 최대 조회 개수
-        #[arg(long, visible_alias = "top", default_value_t = 50)]
-        limit: usize,
-        #[arg(long)]
-        refresh: bool,
-        #[arg(long)]
-        offline: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// OneNote 페이지 본문, 블록(`element_id`/태그) 및 리소스 상세 정보를 읽습니다
-    #[command(visible_alias = "cat")]
-    Read {
-        page: String,
-        #[arg(long, default_value = "md", value_parser = ["md", "plain", "blocks", "xhtml"])]
-        format: String,
-        #[arg(long = "preview-images")]
-        preview_images: bool,
-        #[arg(long)]
-        offline: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Markdown 본문과 선택적 인라인 이미지로 새 OneNote 페이지를 생성합니다
-    Create {
-        section: String,
-        #[arg(long, required = true)]
-        title: String,
-        markdown_body: Option<String>,
-        #[arg(long)]
-        file: Option<PathBuf>,
-        #[arg(long = "image", value_name = "img_path")]
-        image: Vec<PathBuf>,
-        #[arg(long, value_parser = clap::value_parser!(i32).range(0..=2))]
-        level: Option<i32>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 기존 OneNote 페이지 끝에 Markdown 본문 및 인라인 이미지를 추가(append)합니다
-    Append {
-        page: String,
-        markdown_body: Option<String>,
-        #[arg(long)]
-        file: Option<PathBuf>,
-        #[arg(long = "image", value_name = "img_path")]
-        image: Vec<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// OneNote 페이지의 특정 블록(`--block-id`) 또는 전체 제목/본문을 수정합니다
-    Update {
-        page: String,
-        #[arg(long)]
-        title: Option<String>,
-        #[arg(long)]
-        body: Option<String>,
-        #[arg(long)]
-        file: Option<PathBuf>,
-        #[arg(long = "block-id")]
-        block_id: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// OneNote 페이지의 `to-do` 체크박스 블록을 완료/미완료 토글합니다
-    Check {
-        page: String,
-        #[arg(long = "block-id")]
-        block_id: Option<String>,
-        #[arg(long)]
-        index: Option<usize>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// OneNote 페이지를 삭제합니다
-    Delete {
-        page: String,
-        #[arg(long)]
-        yes: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 로컬 SQLite FTS5(`onenote_fts`)에서 OneNote 페이지를 검색합니다
-    Search {
-        query: String,
-        #[arg(long)]
-        section: Option<String>,
-        #[arg(long)]
-        refresh: bool,
-        /// 최대 조회 개수
-        #[arg(long, visible_alias = "top", default_value_t = 30)]
-        limit: usize,
-        #[arg(long)]
-        json: bool,
-    },
-    /// OneNote 페이지의 이미지 또는 첨부 리소스를 다운로드하거나 터미널에 미리보기합니다
-    Resource {
-        page: String,
-        #[arg(long)]
-        index: Option<usize>,
-        #[arg(long)]
-        out: Option<PathBuf>,
-        #[arg(long)]
-        preview: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 로컬 이미지 파일을 터미널에 미리보기 렌더링합니다
-    #[command(name = "preview-file")]
-    PreviewFile {
-        path: PathBuf,
-        #[arg(long)]
-        cols: Option<u16>,
-        #[arg(long)]
-        rows: Option<u16>,
-    },
-    /// GitHub Releases에서 최신 버전을 확인하거나 자가 업데이트합니다
-    /// (`onenote update <page>` 는 페이지 수정이므로 자가 업데이트는 `onenote self-update` / `onenote upgrade`)
-    #[command(name = "self-update", visible_alias = "upgrade")]
-    SelfUpdate {
-        #[arg(long)]
-        check: bool,
-        #[arg(long)]
-        force: bool,
-        #[arg(long)]
-        repo: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// 터미널 UI(TUI)를 실행합니다
-    Tui,
-    /// 에이전트용 로컬 HTTP JSON API 서버를 실행합니다
-    #[command(visible_alias = "api")]
-    Serve {
-        #[arg(long, default_value = "127.0.0.1")]
-        bind: String,
-        #[arg(long, default_value_t = 8788)]
-        port: u16,
-        #[arg(long)]
-        token: Option<String>,
-    },
-    /// 에이전트용 stdio MCP(JSON-RPC 2.0) 서버를 실행합니다
-    #[command(visible_alias = "mcp-server")]
-    Mcp,
-    /// Microsoft OneNote 필기장·섹션·페이지 명령 (`onenote notes <subcmd>`)
-    #[command(visible_alias = "onenote")]
-    Notes {
-        #[command(subcommand)]
-        command: NotesCommand,
-    },
-    /// Outlook 메일 명령 (`onenote mail <subcmd>`)
-    Mail {
-        #[command(subcommand)]
-        command: MailCommand,
-    },
-    /// 백그라운드 동기화 데몬을 제어합니다 (`start` | `stop` | `status` | `restart` | `run`)
-    Daemon {
-        #[command(subcommand)]
-        command: DaemonCommand,
-    },
-}
 
 /// Synchronously handles `--help`, `-h`, `--version`, `-V`, and `help` before Tokio/rustls/Keyring/SQLite init.
 pub fn try_fast_help_or_version() -> Option<Result<()>> {
@@ -1595,8 +438,6 @@ where
 
     let err = match persona {
         Persona::Teams => Cli::try_parse_from(&raw).err()?,
-        Persona::Outlook => OutlookCli::try_parse_from(&raw).err()?,
-        Persona::OneNote => OnenoteCli::try_parse_from(&raw).err()?,
     };
     if matches!(
         err.kind(),
@@ -1610,23 +451,9 @@ where
 
 pub async fn run_from_env() -> Result<()> {
     let persona = Persona::detect();
-    match persona {
-        Persona::Teams => {
-            let cli = Cli::parse();
-            let mut cfg = AppConfig::load();
-            Box::pin(dispatch_command(&mut cfg, persona, cli.command)).await
-        }
-        Persona::Outlook => {
-            let cli = OutlookCli::parse();
-            let mut cfg = AppConfig::load();
-            Box::pin(dispatch_outlook_command(&mut cfg, persona, cli.command)).await
-        }
-        Persona::OneNote => {
-            let cli = OnenoteCli::parse();
-            let mut cfg = AppConfig::load();
-            Box::pin(dispatch_onenote_command(&mut cfg, persona, cli.command)).await
-        }
-    }
+    let cli = Cli::parse();
+    let mut cfg = AppConfig::load();
+    Box::pin(dispatch_command(&mut cfg, persona, cli.command)).await
 }
 
 async fn dispatch_command(
@@ -1688,10 +515,24 @@ async fn dispatch_command(
         Some(Command::Read {
             target,
             limit,
+            before,
+            thread,
             offline,
             cached,
             json,
-        }) => Box::pin(cmd_read(cfg, &target, limit, offline, cached, json)).await,
+        }) => {
+            Box::pin(cmd_read(
+                cfg,
+                &target,
+                limit,
+                before.as_deref(),
+                thread.as_deref(),
+                offline,
+                cached,
+                json,
+            ))
+            .await
+        }
         Some(Command::Thread {
             channel_target,
             root_msg_id,
@@ -1841,9 +682,10 @@ async fn dispatch_command(
         }) => Box::pin(cmd_search(cfg, &query, target.as_deref(), limit, json)).await,
         Some(Command::Sync {
             target,
-            limit,
+            chats,
+            depth,
             json,
-        }) => Box::pin(cmd_sync(cfg, target.as_deref(), limit, json)).await,
+        }) => Box::pin(cmd_sync(cfg, target.as_deref(), chats, depth, json)).await,
         Some(Command::Export {
             target,
             format,
@@ -1878,32 +720,6 @@ async fn dispatch_command(
             ))
             .await
         }
-        Some(Command::Mail { command }) => Box::pin(dispatch_mail_command(cfg, command)).await,
-        Some(Command::Inbox {
-            folder,
-            limit,
-            unread,
-            refresh,
-            offline,
-            cached,
-            json,
-        }) => {
-            Box::pin(cmd_mail_list(
-                cfg, &folder, limit, unread, refresh, offline, cached, json,
-            ))
-            .await
-        }
-        Some(Command::MailSearch {
-            query,
-            folder,
-            remote,
-            limit,
-            json,
-        }) => Box::pin(cmd_mail_search(cfg, &query, folder.as_deref(), remote, limit, json)).await,
-        Some(Command::Cal { command }) => Box::pin(dispatch_cal_command(cfg, command)).await,
-        Some(Command::Contacts { command }) => Box::pin(dispatch_contacts_command(cfg, command)).await,
-        Some(Command::Todo { command }) => Box::pin(dispatch_todo_command(cfg, command)).await,
-        Some(Command::Notes { command }) => Box::pin(dispatch_notes_command(cfg, command)).await,
         Some(Command::Preview {
             target,
             msg_id,
@@ -1953,759 +769,6 @@ async fn dispatch_command(
     }
 }
 
-async fn dispatch_outlook_command(
-    cfg: &mut AppConfig,
-    persona: Persona,
-    command: Option<OutlookCommand>,
-) -> Result<()> {
-    match command {
-        None => Box::pin(cmd_tui(cfg, persona)).await,
-        Some(OutlookCommand::Login {
-            client_id,
-            tenant_id,
-            device_code,
-            client_secret,
-            token,
-            port,
-            json,
-        }) => {
-            Box::pin(cmd_login(
-                cfg,
-                LoginOptions {
-                    client_id,
-                    tenant_id,
-                    device_code,
-                    client_secret,
-                    access_token: token,
-                    port,
-                },
-                json,
-            ))
-            .await
-        }
-        Some(OutlookCommand::Logout { json }) => Box::pin(cmd_logout(cfg, json)).await,
-        Some(OutlookCommand::Whoami { json }) => Box::pin(cmd_whoami(cfg, persona, json)).await,
-        Some(OutlookCommand::Doctor { probe, json }) => Box::pin(cmd_doctor(cfg, persona, probe, json)).await,
-        Some(OutlookCommand::Folders {
-            refresh,
-            cached,
-            json,
-        }) => Box::pin(cmd_mail_folders(cfg, refresh, cached, json)).await,
-        Some(OutlookCommand::Inbox {
-            folder,
-            limit,
-            unread,
-            refresh,
-            offline,
-            cached,
-            json,
-        }) => {
-            Box::pin(cmd_mail_list(
-                cfg, &folder, limit, unread, refresh, offline, cached, json,
-            ))
-            .await
-        }
-        Some(OutlookCommand::Read {
-            mail_id,
-            offline,
-            cached,
-            preview_images,
-            no_mark_read,
-            json,
-        }) => {
-            Box::pin(cmd_mail_read(
-                cfg,
-                &mail_id,
-                offline,
-                cached,
-                preview_images,
-                no_mark_read,
-                json,
-            ))
-            .await
-        }
-        Some(OutlookCommand::Send {
-            to,
-            cc,
-            bcc,
-            subject,
-            markdown_body,
-            attach,
-            important,
-            json,
-        }) => {
-            Box::pin(cmd_mail_send(
-                cfg,
-                to,
-                cc,
-                bcc,
-                &subject,
-                &markdown_body,
-                attach,
-                important,
-                json,
-            ))
-            .await
-        }
-        Some(OutlookCommand::Reply {
-            mail_id,
-            markdown_comment,
-            all,
-            json,
-        }) => Box::pin(cmd_mail_reply(cfg, &mail_id, &markdown_comment, all, json)).await,
-        Some(OutlookCommand::Forward {
-            mail_id,
-            to,
-            markdown_comment,
-            json,
-        }) => Box::pin(cmd_mail_forward(cfg, &mail_id, to, &markdown_comment, json)).await,
-        Some(OutlookCommand::Flag { mail_id, off, json }) => {
-            Box::pin(cmd_mail_flag(cfg, &mail_id, !off, json)).await
-        }
-        Some(OutlookCommand::MarkRead {
-            mail_id,
-            unread,
-            json,
-        }) => Box::pin(cmd_mail_mark_read(cfg, &mail_id, !unread, json)).await,
-        Some(OutlookCommand::Move {
-            mail_id,
-            dest_folder,
-            json,
-        }) => Box::pin(cmd_mail_move(cfg, &mail_id, &dest_folder, json)).await,
-        Some(OutlookCommand::Delete { mail_id, yes, json }) => {
-            Box::pin(cmd_mail_delete(cfg, &mail_id, yes, json)).await
-        }
-        Some(OutlookCommand::Attachment {
-            mail_id,
-            index,
-            id,
-            out,
-            preview,
-            json,
-        }) => {
-            Box::pin(cmd_mail_attachment(
-                cfg,
-                &mail_id,
-                index,
-                id.as_deref(),
-                out.as_deref(),
-                preview,
-                json,
-            ))
-            .await
-        }
-        Some(OutlookCommand::Search {
-            query,
-            folder,
-            remote,
-            limit,
-            json,
-        }) => Box::pin(cmd_mail_search(cfg, &query, folder.as_deref(), remote, limit, json)).await,
-        Some(OutlookCommand::Preview {
-            mail_id,
-            attachment,
-            file,
-            offline,
-            cols,
-            rows,
-        }) => {
-            Box::pin(cmd_preview_outlook(
-                cfg,
-                mail_id.as_deref(),
-                attachment.as_deref(),
-                file.as_deref(),
-                offline,
-                cols,
-                rows,
-            ))
-            .await
-        }
-        Some(OutlookCommand::PreviewFile { path, cols, rows }) => {
-            cmd_preview_local_file(&path, cols, rows)
-        }
-        Some(OutlookCommand::Mail { command }) => {
-            Box::pin(dispatch_mail_command(cfg, command)).await
-        }
-        Some(OutlookCommand::Cal { command }) => Box::pin(dispatch_cal_command(cfg, command)).await,
-        Some(OutlookCommand::Contacts { command }) => {
-            Box::pin(dispatch_contacts_command(cfg, command)).await
-        }
-        Some(OutlookCommand::Todo { command }) => Box::pin(dispatch_todo_command(cfg, command)).await,
-        Some(OutlookCommand::Notes { command }) => {
-            Box::pin(dispatch_notes_command(cfg, command)).await
-        }
-        Some(OutlookCommand::Update {
-            check,
-            force,
-            repo,
-            json,
-        }) => Box::pin(cmd_update(cfg, check, force, repo.as_deref(), json)).await,
-        Some(OutlookCommand::Chats {
-            limit,
-            refresh,
-            cached,
-            json,
-        }) => Box::pin(cmd_chats(cfg, limit, refresh, cached, json)).await,
-        Some(OutlookCommand::Teams {
-            refresh,
-            cached,
-            json,
-        }) => Box::pin(cmd_teams(cfg, refresh, cached, json)).await,
-        Some(OutlookCommand::Tui) => Box::pin(cmd_tui(cfg, persona)).await,
-        Some(OutlookCommand::Serve { bind, port, token }) => {
-            let (_auth, graph, storage) = Box::pin(open_runtime(cfg, false)).await?;
-            Box::pin(serve::run(
-                cfg.clone(),
-                graph,
-                storage,
-                ServeOptions { bind, port, token },
-            ))
-            .await
-        }
-        Some(OutlookCommand::Mcp) => {
-            let (_auth, graph, storage) = Box::pin(open_runtime(cfg, false)).await?;
-            Box::pin(crate::mcp::run(cfg.clone(), graph, storage)).await
-        }
-        Some(OutlookCommand::Daemon { command }) => {
-            Box::pin(dispatch_daemon_command(cfg, command)).await
-        }
-    }
-}
-
-async fn dispatch_mail_command(cfg: &AppConfig, command: MailCommand) -> Result<()> {
-    match command {
-        MailCommand::Folders {
-            refresh,
-            cached,
-            json,
-        } => cmd_mail_folders(cfg, refresh, cached, json).await,
-        MailCommand::List {
-            folder,
-            limit,
-            unread,
-            refresh,
-            offline,
-            cached,
-            json,
-        } => cmd_mail_list(cfg, &folder, limit, unread, refresh, offline, cached, json).await,
-        MailCommand::Read {
-            mail_id,
-            offline,
-            cached,
-            preview_images,
-            no_mark_read,
-            json,
-        } => {
-            cmd_mail_read(
-                cfg,
-                &mail_id,
-                offline,
-                cached,
-                preview_images,
-                no_mark_read,
-                json,
-            )
-            .await
-        }
-        MailCommand::Send {
-            to,
-            cc,
-            bcc,
-            subject,
-            markdown_body,
-            attach,
-            important,
-            json,
-        } => cmd_mail_send(cfg, to, cc, bcc, &subject, &markdown_body, attach, important, json).await,
-        MailCommand::Reply {
-            mail_id,
-            markdown_comment,
-            all,
-            json,
-        } => cmd_mail_reply(cfg, &mail_id, &markdown_comment, all, json).await,
-        MailCommand::Forward {
-            mail_id,
-            to,
-            markdown_comment,
-            json,
-        } => cmd_mail_forward(cfg, &mail_id, to, &markdown_comment, json).await,
-        MailCommand::Flag { mail_id, off, json } => cmd_mail_flag(cfg, &mail_id, !off, json).await,
-        MailCommand::MarkRead {
-            mail_id,
-            unread,
-            json,
-        } => cmd_mail_mark_read(cfg, &mail_id, !unread, json).await,
-        MailCommand::Move {
-            mail_id,
-            dest_folder,
-            json,
-        } => cmd_mail_move(cfg, &mail_id, &dest_folder, json).await,
-        MailCommand::Delete { mail_id, yes, json } => cmd_mail_delete(cfg, &mail_id, yes, json).await,
-        MailCommand::Attachment {
-            mail_id,
-            index,
-            id,
-            out,
-            preview,
-            json,
-        } => cmd_mail_attachment(cfg, &mail_id, index, id.as_deref(), out.as_deref(), preview, json).await,
-        MailCommand::Search {
-            query,
-            folder,
-            remote,
-            limit,
-            json,
-        } => cmd_mail_search(cfg, &query, folder.as_deref(), remote, limit, json).await,
-    }
-}
-
-async fn dispatch_cal_command(cfg: &AppConfig, command: CalCommand) -> Result<()> {
-    match command {
-        CalCommand::Today {
-            offline,
-            cached,
-            json,
-        } => cmd_cal_today(cfg, offline, cached, json).await,
-        CalCommand::Week {
-            days,
-            offline,
-            cached,
-            json,
-        } => cmd_cal_week(cfg, days, offline, cached, json).await,
-        CalCommand::List {
-            start,
-            end,
-            limit,
-            offline,
-            cached,
-            json,
-        } => cmd_cal_list(cfg, start.as_deref(), end.as_deref(), limit, offline, cached, json).await,
-        CalCommand::Show {
-            event_id,
-            offline,
-            cached,
-            json,
-        } => cmd_cal_show(cfg, &event_id, offline, cached, json).await,
-        CalCommand::Create {
-            subject,
-            start,
-            end,
-            to,
-            location,
-            body,
-            teams_meeting,
-            all_day,
-            time_zone,
-            json,
-        } => {
-            cmd_cal_create(
-                cfg,
-                &subject,
-                &start,
-                &end,
-                to,
-                location,
-                body,
-                teams_meeting,
-                all_day,
-                time_zone,
-                json,
-            )
-            .await
-        }
-        CalCommand::Rsvp {
-            event_id,
-            response,
-            comment,
-            json,
-        } => cmd_cal_rsvp(cfg, &event_id, &response, comment.as_deref(), json).await,
-        CalCommand::Join {
-            event_id,
-            print_only,
-            offline,
-            json,
-        } => cmd_cal_join(cfg, &event_id, print_only, offline, json).await,
-        CalCommand::Delete {
-            event_id,
-            yes,
-            json,
-        } => cmd_cal_delete(cfg, &event_id, yes, json).await,
-    }
-}
-
-async fn dispatch_contacts_command(cfg: &AppConfig, command: ContactsCommand) -> Result<()> {
-    match command {
-        ContactsCommand::List {
-            limit,
-            refresh,
-            offline,
-            cached,
-            json,
-        } => cmd_contacts_list(cfg, limit, refresh, offline, cached, json).await,
-        ContactsCommand::Search {
-            query,
-            limit,
-            offline,
-            json,
-        } => cmd_contacts_search(cfg, &query, limit, offline, json).await,
-        ContactsCommand::Add {
-            name,
-            email,
-            mobile,
-            company,
-            title,
-            notes,
-            json,
-        } => cmd_contacts_add(cfg, &name, email, mobile, company, title, notes, json).await,
-        ContactsCommand::Delete {
-            contact_id,
-            yes,
-            json,
-        } => cmd_contacts_delete(cfg, &contact_id, yes, json).await,
-    }
-}
-
-async fn dispatch_todo_command(cfg: &AppConfig, command: TodoCommand) -> Result<()> {
-    match command {
-        TodoCommand::Lists {
-            refresh,
-            offline,
-            cached,
-            json,
-        } => cmd_todo_lists(cfg, refresh, offline, cached, json).await,
-        TodoCommand::Tasks {
-            list,
-            all,
-            limit,
-            refresh,
-            offline,
-            cached,
-            json,
-        } => cmd_todo_tasks(cfg, &list, all, limit, refresh, offline, cached, json).await,
-        TodoCommand::Add {
-            title,
-            list,
-            due,
-            important,
-            body,
-            json,
-        } => cmd_todo_add(cfg, &title, &list, due.as_deref(), important, body, json).await,
-        TodoCommand::Done {
-            task_id,
-            list,
-            undo,
-            json,
-        } => cmd_todo_done(cfg, &task_id, &list, !undo, json).await,
-        TodoCommand::Delete {
-            task_id,
-            list,
-            yes,
-            json,
-        } => cmd_todo_delete(cfg, &task_id, &list, yes, json).await,
-    }
-}
-
-pub async fn dispatch_onenote_command(
-    cfg: &mut AppConfig,
-    persona: Persona,
-    command: Option<OnenoteCommand>,
-) -> Result<()> {
-    match command {
-        None => Box::pin(cmd_tui(cfg, persona)).await,
-        Some(OnenoteCommand::Login {
-            client_id,
-            tenant_id,
-            device_code,
-            client_secret,
-            token,
-            port,
-            json,
-        }) => {
-            Box::pin(cmd_login(
-                cfg,
-                LoginOptions {
-                    client_id,
-                    tenant_id,
-                    device_code,
-                    client_secret,
-                    access_token: token,
-                    port,
-                },
-                json,
-            ))
-            .await
-        }
-        Some(OnenoteCommand::Logout { json }) => Box::pin(cmd_logout(cfg, json)).await,
-        Some(OnenoteCommand::Whoami { json }) => Box::pin(cmd_whoami(cfg, persona, json)).await,
-        Some(OnenoteCommand::Doctor { probe, json }) => {
-            Box::pin(cmd_doctor(cfg, persona, probe, json)).await
-        }
-        Some(OnenoteCommand::Notebooks {
-            personal_only,
-            include_teams,
-            refresh,
-            offline,
-            json,
-        }) => {
-            Box::pin(dispatch_notes_command(
-                cfg,
-                NotesCommand::Notebooks {
-                    personal_only,
-                    include_teams,
-                    refresh,
-                    offline,
-                    json,
-                },
-            ))
-            .await
-        }
-        Some(OnenoteCommand::CreateNotebook {
-            name,
-            group,
-            site,
-            json,
-        }) => {
-            Box::pin(dispatch_notes_command(
-                cfg,
-                NotesCommand::CreateNotebook {
-                    name,
-                    group,
-                    site,
-                    json,
-                },
-            ))
-            .await
-        }
-        Some(OnenoteCommand::Sections {
-            notebook,
-            refresh,
-            offline,
-            json,
-        }) => {
-            Box::pin(dispatch_notes_command(
-                cfg,
-                NotesCommand::Sections {
-                    notebook,
-                    refresh,
-                    offline,
-                    json,
-                },
-            ))
-            .await
-        }
-        Some(OnenoteCommand::CreateSection {
-            notebook,
-            name,
-            json,
-        }) => {
-            Box::pin(dispatch_notes_command(
-                cfg,
-                NotesCommand::CreateSection {
-                    notebook,
-                    name,
-                    json,
-                },
-            ))
-            .await
-        }
-        Some(OnenoteCommand::Pages {
-            section,
-            limit,
-            refresh,
-            offline,
-            json,
-        }) => {
-            Box::pin(dispatch_notes_command(
-                cfg,
-                NotesCommand::Pages {
-                    section,
-                    limit,
-                    refresh,
-                    offline,
-                    json,
-                },
-            ))
-            .await
-        }
-        Some(OnenoteCommand::Read {
-            page,
-            format,
-            preview_images,
-            offline,
-            json,
-        }) => {
-            Box::pin(dispatch_notes_command(
-                cfg,
-                NotesCommand::Read {
-                    page,
-                    format,
-                    preview_images,
-                    offline,
-                    json,
-                },
-            ))
-            .await
-        }
-        Some(OnenoteCommand::Create {
-            section,
-            title,
-            markdown_body,
-            file,
-            image,
-            level,
-            json,
-        }) => {
-            Box::pin(dispatch_notes_command(
-                cfg,
-                NotesCommand::Create {
-                    section,
-                    title,
-                    markdown_body,
-                    file,
-                    image,
-                    level,
-                    json,
-                },
-            ))
-            .await
-        }
-        Some(OnenoteCommand::Append {
-            page,
-            markdown_body,
-            file,
-            image,
-            json,
-        }) => {
-            Box::pin(dispatch_notes_command(
-                cfg,
-                NotesCommand::Append {
-                    page,
-                    markdown_body,
-                    file,
-                    image,
-                    json,
-                },
-            ))
-            .await
-        }
-        Some(OnenoteCommand::Update {
-            page,
-            title,
-            body,
-            file,
-            block_id,
-            json,
-        }) => {
-            Box::pin(dispatch_notes_command(
-                cfg,
-                NotesCommand::Update {
-                    page,
-                    title,
-                    body,
-                    file,
-                    block_id,
-                    json,
-                },
-            ))
-            .await
-        }
-        Some(OnenoteCommand::Check {
-            page,
-            block_id,
-            index,
-            json,
-        }) => {
-            Box::pin(dispatch_notes_command(
-                cfg,
-                NotesCommand::Check {
-                    page,
-                    block_id,
-                    index,
-                    json,
-                },
-            ))
-            .await
-        }
-        Some(OnenoteCommand::Delete { page, yes, json }) => {
-            Box::pin(dispatch_notes_command(
-                cfg,
-                NotesCommand::Delete { page, yes, json },
-            ))
-            .await
-        }
-        Some(OnenoteCommand::Search {
-            query,
-            section,
-            refresh,
-            limit,
-            json,
-        }) => {
-            Box::pin(dispatch_notes_command(
-                cfg,
-                NotesCommand::Search {
-                    query,
-                    section,
-                    refresh,
-                    limit,
-                    json,
-                },
-            ))
-            .await
-        }
-        Some(OnenoteCommand::Resource {
-            page,
-            index,
-            out,
-            preview,
-            json,
-        }) => {
-            Box::pin(dispatch_notes_command(
-                cfg,
-                NotesCommand::Resource {
-                    page,
-                    index,
-                    out,
-                    preview,
-                    json,
-                },
-            ))
-            .await
-        }
-        Some(OnenoteCommand::PreviewFile { path, cols, rows }) => {
-            cmd_preview_local_file(&path, cols, rows)
-        }
-        Some(OnenoteCommand::SelfUpdate {
-            check,
-            force,
-            repo,
-            json,
-        }) => Box::pin(cmd_update(cfg, check, force, repo.as_deref(), json)).await,
-        Some(OnenoteCommand::Tui) => Box::pin(cmd_tui(cfg, persona)).await,
-        Some(OnenoteCommand::Serve { bind, port, token }) => {
-            let (_auth, graph, storage) = Box::pin(open_runtime(cfg, false)).await?;
-            Box::pin(serve::run(
-                cfg.clone(),
-                graph,
-                storage,
-                ServeOptions { bind, port, token },
-            ))
-            .await
-        }
-        Some(OnenoteCommand::Mcp) => {
-            let (_auth, graph, storage) = Box::pin(open_runtime(cfg, false)).await?;
-            Box::pin(crate::mcp::run(cfg.clone(), graph, storage)).await
-        }
-        Some(OnenoteCommand::Notes { command }) => {
-            Box::pin(dispatch_notes_command(cfg, command)).await
-        }
-        Some(OnenoteCommand::Mail { command }) => {
-            Box::pin(dispatch_mail_command(cfg, command)).await
-        }
-        Some(OnenoteCommand::Daemon { command }) => {
-            Box::pin(dispatch_daemon_command(cfg, command)).await
-        }
-    }
-}
 
 fn print_daemon_status_text(header: &str, cfg: &AppConfig, status: &crate::daemon::DaemonStatus) {
     println!(
@@ -2791,135 +854,6 @@ async fn dispatch_daemon_command(cfg: &AppConfig, command: DaemonCommand) -> Res
     }
 }
 
-pub async fn dispatch_notes_command(cfg: &AppConfig, command: NotesCommand) -> Result<()> {
-    match command {
-        NotesCommand::Notebooks {
-            personal_only,
-            include_teams,
-            refresh,
-            offline,
-            json,
-        } => {
-            cmd_notes_notebooks(
-                cfg,
-                !personal_only && include_teams,
-                refresh,
-                offline,
-                json,
-            )
-            .await
-        }
-        NotesCommand::CreateNotebook {
-            name,
-            group,
-            site,
-            json,
-        } => cmd_notes_create_notebook(cfg, &name, group.as_deref(), site.as_deref(), json).await,
-        NotesCommand::Sections {
-            notebook,
-            refresh,
-            offline,
-            json,
-        } => cmd_notes_sections(cfg, notebook.as_deref(), refresh, offline, json).await,
-        NotesCommand::CreateSection {
-            notebook,
-            name,
-            json,
-        } => cmd_notes_create_section(cfg, &notebook, &name, json).await,
-        NotesCommand::Pages {
-            section,
-            limit,
-            refresh,
-            offline,
-            json,
-        } => cmd_notes_pages(cfg, &section, limit, refresh, offline, json).await,
-        NotesCommand::Read {
-            page,
-            format,
-            preview_images,
-            offline,
-            json,
-        } => cmd_notes_read(cfg, &page, &format, preview_images, offline, json).await,
-        NotesCommand::Create {
-            section,
-            title,
-            markdown_body,
-            file,
-            image,
-            level,
-            json,
-        } => {
-            cmd_notes_create(
-                cfg,
-                &section,
-                &title,
-                markdown_body.as_deref(),
-                file.as_deref(),
-                &image,
-                level,
-                json,
-            )
-            .await
-        }
-        NotesCommand::Append {
-            page,
-            markdown_body,
-            file,
-            image,
-            json,
-        } => {
-            cmd_notes_append(
-                cfg,
-                &page,
-                markdown_body.as_deref(),
-                file.as_deref(),
-                &image,
-                json,
-            )
-            .await
-        }
-        NotesCommand::Update {
-            page,
-            title,
-            body,
-            file,
-            block_id,
-            json,
-        } => {
-            cmd_notes_update(
-                cfg,
-                &page,
-                title.as_deref(),
-                body.as_deref(),
-                file.as_deref(),
-                block_id.as_deref(),
-                json,
-            )
-            .await
-        }
-        NotesCommand::Check {
-            page,
-            block_id,
-            index,
-            json,
-        } => cmd_notes_check(cfg, &page, block_id.as_deref(), index, json).await,
-        NotesCommand::Delete { page, yes, json } => cmd_notes_delete(cfg, &page, yes, json).await,
-        NotesCommand::Search {
-            query,
-            section,
-            refresh,
-            limit,
-            json,
-        } => cmd_notes_search(cfg, &query, section.as_deref(), refresh, limit, json).await,
-        NotesCommand::Resource {
-            page,
-            index,
-            out,
-            preview,
-            json,
-        } => cmd_notes_resource(cfg, &page, index, out.as_deref(), preview, json).await,
-    }
-}
 
 async fn open_runtime(
     cfg: &AppConfig,
@@ -3200,13 +1134,7 @@ async fn cmd_tui(cfg: &mut AppConfig, persona: Persona) -> Result<()> {
     if storage.list_conversations()?.is_empty() {
         let _ = sync::bootstrap_conversations(&graph, &storage).await;
     }
-    if persona == Persona::Outlook && storage.list_mail_folders()?.is_empty() {
-        let _ = sync::bootstrap_outlook(&graph, &storage).await;
-    }
-    if persona == Persona::OneNote && storage.list_onenote_notebooks()?.is_empty() {
-        let _ = sync::bootstrap_onenote(&graph, &storage).await;
-    }
-    tui::run_with_persona(cfg.clone(), persona, auth, graph, storage).await
+    tui::run(cfg.clone(), auth, graph, storage).await
 }
 
 async fn cmd_login(cfg: &mut AppConfig, opts: LoginOptions, json_out: bool) -> Result<()> {
@@ -3328,6 +1256,8 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
         }
     }
 
+    let scope_diag = diagnose_access_token_scopes(&tokens.access_token);
+
     if tokens.is_expired_soon(0) {
         let err_detail = match refresh_failure {
             Some(ref err) => format!(
@@ -3357,6 +1287,9 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
                     "expired": true,
                     "expiring_soon": true,
                     "status": "expired",
+                    "scopes": scope_diag.scopes,
+                    "roles": scope_diag.roles,
+                    "scope_warnings": scope_diag.warnings,
                     "error": format!("토큰 만료 (exp: {}) — refresh 후 재시도하세요", format_unix_ts(tokens.expires_at)),
                 }))?
             );
@@ -3422,6 +1355,9 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
                 "expired": false,
                 "expiring_soon": expiring_soon,
                 "status": if expiring_soon { "expiring_soon" } else { "valid" },
+                "scopes": scope_diag.scopes,
+                "roles": scope_diag.roles,
+                "scope_warnings": scope_diag.warnings,
             }))?
         );
     } else {
@@ -3444,6 +1380,17 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
                 "유효"
             }
         );
+        if !scope_diag.scopes.is_empty() {
+            println!("토큰 권한(scp): {}", scope_diag.scopes.join(" "));
+        } else if !scope_diag.has_scope_claims {
+            println!("토큰 권한(scp): (JWT 클레임 없음)");
+        }
+        if !scope_diag.roles.is_empty() {
+            println!("토큰 역할(roles): {}", scope_diag.roles.join(" "));
+        }
+        for warning in &scope_diag.warnings {
+            println!("권한 경고: {warning}");
+        }
     }
     Ok(())
 }
@@ -3457,13 +1404,17 @@ async fn cmd_doctor(
     let auth = AuthManager::new(cfg.clone())?;
     let tokens = auth.current_tokens().await;
     let user_id = tokens.as_ref().and_then(|t| t.user_id.as_deref());
+    let token_diag = tokens
+        .as_ref()
+        .map(|t| diagnose_access_token_scopes(&t.access_token))
+        .unwrap_or_default();
 
     let cfg_path = config::config_file_path();
     let cred_path = config::credential_fallback_path();
     let drafts = config::drafts_path();
     let db = config::db_path(user_id);
     let dl_dir = cfg.resolved_download_dir();
-    let scopes = cfg.effective_scopes();
+    let configured_scopes = cfg.effective_scopes();
     let token_file = cfg.resolved_token_file();
     let token_refresh_cmd_configured = !cfg.token_refresh_cmd.trim().is_empty();
     let auth_mode = tokens.as_ref().map(|t| t.auth_mode.clone());
@@ -3471,47 +1422,17 @@ async fn cmd_doctor(
 
     let keyring_status = describe_keyring_status(tokens.as_ref(), &cred_path);
 
-    let (
-        cached_conversations,
-        cached_mail_folders,
-        cached_mails,
-        cached_events,
-        cached_contacts,
-        cached_todo_lists,
-        cached_onenote_notebooks,
-        cached_onenote_sections,
-    ) = if db.exists() {
+    let (cached_conversations, cached_teams) = if db.exists() {
         if let Ok(storage) = Storage::open(&db) {
             (
                 storage.list_conversations().map(|v| v.len()).unwrap_or(0),
-                storage.list_mail_folders().map(|v| v.len()).unwrap_or(0),
-                storage
-                    .list_mail_messages(None, 100_000)
-                    .map(|v| v.len())
-                    .unwrap_or(0),
-                storage
-                    .list_calendar_events(None, None, 100_000)
-                    .map(|v| v.len())
-                    .unwrap_or(0),
-                storage
-                    .list_contacts(None, 100_000)
-                    .map(|v| v.len())
-                    .unwrap_or(0),
-                storage.list_todo_lists().map(|v| v.len()).unwrap_or(0),
-                storage
-                    .list_onenote_notebooks()
-                    .map(|v| v.len())
-                    .unwrap_or(0),
-                storage
-                    .list_onenote_sections(None)
-                    .map(|v| v.len())
-                    .unwrap_or(0),
+                storage.list_teams().map(|v| v.len()).unwrap_or(0),
             )
         } else {
-            (0, 0, 0, 0, 0, 0, 0, 0)
+            (0, 0)
         }
     } else {
-        (0, 0, 0, 0, 0, 0, 0, 0)
+        (0, 0)
     };
 
     let daemon_status = crate::daemon::query_daemon_status(cfg)
@@ -3520,7 +1441,6 @@ async fn cmd_doctor(
 
     let mut probe_me: Option<serde_json::Value> = None;
     let mut probe_presence: Option<serde_json::Value> = None;
-    let mut probe_onenote: Option<serde_json::Value> = None;
     let mut probe_error: Option<String> = None;
 
     if probe {
@@ -3533,34 +1453,17 @@ async fn cmd_doctor(
                 probe_me = Some(serde_json::to_value(&me)?);
                 match graph.get_my_presence().await {
                     Ok(p) => probe_presence = Some(serde_json::to_value(&p)?),
-                    Err(err) => probe_error = Some(format!("presence probe 실패: {err:#}")),
+                    Err(err) => {
+                        let wrapped = wrap_graph_permission_error(&graph, err).await;
+                        probe_error = Some(format!("presence probe 실패: {wrapped:#}"));
+                    }
                 }
             }
-            Err(err) => probe_error = Some(format!("get_me probe 실패: {err:#}")),
+            Err(err) => {
+                let wrapped = wrap_graph_permission_error(&graph, err).await;
+                probe_error = Some(format!("get_me probe 실패: {wrapped:#}"));
+            }
         }
-        // Non-fatal OneNote probe (/me/onenote/notebooks?$top=1)
-        probe_onenote = Some(
-            match graph
-                .get_json::<serde_json::Value>("/me/onenote/notebooks?$top=1")
-                .await
-            {
-                Ok(val) => {
-                    let count = val
-                        .get("value")
-                        .and_then(|v| v.as_array())
-                        .map(|a| a.len())
-                        .unwrap_or(0);
-                    json!({
-                        "ok": true,
-                        "sampled_notebooks": count,
-                    })
-                }
-                Err(err) => json!({
-                    "ok": false,
-                    "error": format!("{err:#}"),
-                }),
-            },
-        );
     }
 
     if json_out {
@@ -3569,7 +1472,10 @@ async fn cmd_doctor(
             serde_json::to_string_pretty(&json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "persona": persona,
-                "scopes": scopes,
+                "scopes": token_diag.scopes,
+                "roles": token_diag.roles,
+                "scope_warnings": token_diag.warnings,
+                "configured_scopes": configured_scopes,
                 "config_path": cfg_path,
                 "config_exists": cfg_path.exists(),
                 "credentials_fallback_path": cred_path,
@@ -3593,13 +1499,7 @@ async fn cmd_doctor(
                 "logged_in": tokens.is_some(),
                 "cache_counts": {
                     "conversations": cached_conversations,
-                    "mail_folders": cached_mail_folders,
-                    "mails": cached_mails,
-                    "events": cached_events,
-                    "contacts": cached_contacts,
-                    "todo_lists": cached_todo_lists,
-                    "onenote_notebooks": cached_onenote_notebooks,
-                    "onenote_sections": cached_onenote_sections,
+                    "teams": cached_teams,
                 },
                 "daemon": {
                     "running": daemon_status.running,
@@ -3614,7 +1514,6 @@ async fn cmd_doctor(
                         "ok": probe_error.is_none(),
                         "me": probe_me,
                         "presence": probe_presence,
-                        "onenote": probe_onenote,
                         "error": probe_error,
                     }))
                 } else {
@@ -3633,11 +1532,34 @@ async fn cmd_doctor(
         println!("drafts.json: {}", drafts.display());
         println!("cache.db: {} (exists={})", db.display(), db.exists());
         println!(
-            "cache_counts: conversations={cached_conversations}, mail_folders={cached_mail_folders}, mails={cached_mails}, events={cached_events}, contacts={cached_contacts}, todo_lists={cached_todo_lists}, onenote_notebooks={cached_onenote_notebooks}, onenote_sections={cached_onenote_sections}"
+            "cache_counts: conversations={cached_conversations}, teams={cached_teams}"
         );
         println!("download_dir: {}", dl_dir.display());
         println!("github_repo: {}", cfg.github_repo);
-        println!("scopes ({}): {}", scopes.len(), scopes.join(", "));
+        println!(
+            "configured_scopes ({}): {}",
+            configured_scopes.len(),
+            configured_scopes.join(", ")
+        );
+        if !token_diag.scopes.is_empty() {
+            println!(
+                "token_scopes ({}): {}",
+                token_diag.scopes.len(),
+                token_diag.scopes.join(" ")
+            );
+        } else if tokens.is_some() {
+            println!("token_scopes: (JWT scp 클레임 없음)");
+        }
+        if !token_diag.roles.is_empty() {
+            println!(
+                "token_roles ({}): {}",
+                token_diag.roles.len(),
+                token_diag.roles.join(" ")
+            );
+        }
+        for warning in &token_diag.warnings {
+            println!("권한 경고: {warning}");
+        }
         println!("client_id: {}", cfg.client_id);
         println!("tenant_id: {}", cfg.tenant_id);
         println!("graph_base_url: {}", cfg.graph_base_url);
@@ -3671,17 +1593,11 @@ async fn cmd_doctor(
             token_expires_at.as_deref().unwrap_or("-")
         );
         if probe {
-            let onenote_state = probe_onenote
-                .as_ref()
-                .and_then(|v| v.get("ok"))
-                .and_then(|v| v.as_bool())
-                .map(|ok| if ok { "ok" } else { "unavailable" })
-                .unwrap_or("-");
             if let Some(err) = probe_error {
-                println!("probe: 실패 ({err}, onenote={onenote_state})");
+                println!("probe: 실패 ({err})");
             } else {
                 println!(
-                    "probe: 성공 (me={}, presence={}, onenote={onenote_state})",
+                    "probe: 성공 (me={}, presence={})",
                     probe_me
                         .as_ref()
                         .and_then(|v| v.get("display_name"))
@@ -3763,7 +1679,7 @@ async fn cmd_chats(
                     .into_iter()
                     .filter(|c| !c.kind.is_channel())
                     .collect();
-                if !chats.is_empty() {
+                if !chats.is_empty() && (cached || chats.len() >= limit) {
                     chats.truncate(limit);
                     return print_chats_output(&chats, json_out);
                 }
@@ -3779,8 +1695,11 @@ async fn cmd_chats(
         .filter(|c| !c.kind.is_channel())
         .collect();
 
-    let mut chats = if refresh || cached_chats.is_empty() {
-        let fetched = graph.list_chats(limit).await?;
+    let mut chats = if refresh || (!cached && cached_chats.len() < limit) || cached_chats.is_empty() {
+        let fetched = match graph.list_chats(limit).await {
+            Ok(items) => items,
+            Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+        };
         storage.upsert_conversations(&fetched)?;
         record_cli_sync_cursor(&storage, "cli:chats");
         let stored: Vec<ConversationSummary> = storage
@@ -4011,7 +1930,7 @@ fn resolve_team_from_slice(teams: &[TeamSummary], query: &str) -> Result<TeamSum
 
 fn print_read_output(
     conv: &ConversationSummary,
-    messages: &[MessageItem],
+    res: &ReadMessagesResult,
     json_out: bool,
 ) -> Result<()> {
     if json_out {
@@ -4019,55 +1938,85 @@ fn print_read_output(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "conversation": conv,
-                "messages": messages,
+                "messages": res.messages,
+                "has_more": res.has_more,
+                "next_before": res.next_before,
             }))?
         );
     } else {
         println!("# {} ({})", conv.title, conv.conv_key);
-        if messages.is_empty() {
+        if res.messages.is_empty() {
             println!("(메시지가 없습니다)");
         } else {
-            for msg in messages {
+            for msg in &res.messages {
                 print_message_line(msg, "");
+            }
+            if res.has_more {
+                if let Some(ref next_before) = res.next_before {
+                    println!(
+                        "--- 이전 메시지 더 보기: teams read \"{}\" --before {} ---",
+                        conv.conv_key, next_before
+                    );
+                }
             }
         }
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_read(
     cfg: &AppConfig,
     target: &str,
     limit: usize,
+    before: Option<&str>,
+    thread: Option<&str>,
     offline: bool,
     cached: bool,
     json_out: bool,
 ) -> Result<()> {
+    if let Some(root_msg_id) = thread.map(str::trim).filter(|s| !s.is_empty()) {
+        return cmd_thread_with_cache(cfg, target, root_msg_id, limit, offline, cached, json_out)
+            .await;
+    }
+
     let limit = clamp_limit(limit);
     if offline {
         let storage = open_storage_only(cfg)?;
         let cached_convs = storage.list_conversations()?;
         let conv = resolver::resolve_from_slice(&cached_convs, target)?;
-        let messages = storage.list_root_messages(&conv.conv_key, limit, None)?;
-        return print_read_output(&conv, &messages, json_out);
+        let res = read_conversation_messages_offline(&storage, &conv, limit, before)?;
+        return print_read_output(&conv, &res, json_out);
     }
 
     let ttl = cli_cache_ttl_secs(cfg);
-    if cached || ttl > 0 {
+    if cached || (before.is_none() && ttl > 0) {
         if let Ok(storage) = open_storage_only(cfg) {
             if let Ok(cached_convs) = storage.list_conversations() {
                 if let Ok(conv) = resolver::resolve_from_slice(&cached_convs, target) {
-                    let cursor_key = format!("cli:read:{}", conv.conv_key);
-                    if cached
-                        || is_cursor_fresh(
-                            &storage,
-                            &[cursor_key.as_str(), conv.conv_key.as_str()],
-                            ttl,
-                        )
-                    {
-                        let messages = storage.list_root_messages(&conv.conv_key, limit, None)?;
-                        if !messages.is_empty() {
-                            return print_read_output(&conv, &messages, json_out);
+                    if before.is_some() {
+                        let res = read_conversation_messages_offline(&storage, &conv, limit, before)?;
+                        let is_eof = storage
+                            .get_sync_cursor(&SyncCursor::history_scope(&conv.conv_key))
+                            .ok()
+                            .flatten()
+                            .is_some_and(|c| c.is_history_eof());
+                        if res.messages.len() >= limit || is_eof {
+                            return print_read_output(&conv, &res, json_out);
+                        }
+                    } else {
+                        let cursor_key = format!("cli:read:{}", conv.conv_key);
+                        if cached
+                            || is_cursor_fresh(
+                                &storage,
+                                &[cursor_key.as_str(), conv.conv_key.as_str()],
+                                ttl,
+                            )
+                        {
+                            let res = read_conversation_messages_offline(&storage, &conv, limit, None)?;
+                            if !res.messages.is_empty() && (cached || res.messages.len() >= limit) {
+                                return print_read_output(&conv, &res, json_out);
+                            }
                         }
                     }
                 }
@@ -4077,17 +2026,12 @@ async fn cmd_read(
 
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
     let conv = resolve_target(&storage, &graph, target, false).await?;
-
-    let msgs = graph.list_messages(&conv.target, limit).await?;
-    storage.upsert_messages(&msgs)?;
-    record_cli_sync_cursor(&storage, &format!("cli:read:{}", conv.conv_key));
-
-    let mut messages = storage.list_root_messages(&conv.conv_key, limit, None)?;
-    if messages.is_empty() {
-        messages = msgs;
+    let res = read_conversation_messages(&storage, &graph, &conv, limit, before, false, true).await?;
+    if before.is_none() {
+        record_cli_sync_cursor(&storage, &format!("cli:read:{}", conv.conv_key));
     }
 
-    print_read_output(&conv, &messages, json_out)
+    print_read_output(&conv, &res, json_out)
 }
 
 async fn cmd_thread(
@@ -4098,8 +2042,35 @@ async fn cmd_thread(
     offline: bool,
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
+    cmd_thread_with_cache(cfg, channel_target, root_msg_id, limit, offline, false, json_out).await
+}
+
+async fn cmd_thread_with_cache(
+    cfg: &AppConfig,
+    channel_target: &str,
+    root_msg_id: &str,
+    limit: usize,
+    offline: bool,
+    cached: bool,
+    json_out: bool,
+) -> Result<()> {
     let limit = clamp_limit(limit);
+    if offline || cached {
+        if let Ok(storage) = open_storage_only(cfg) {
+            if let Ok(cached_convs) = storage.list_conversations() {
+                if let Ok(conv) = resolver::resolve_from_slice(&cached_convs, channel_target) {
+                    if let Some(thread) = storage.get_thread(&conv.conv_key, root_msg_id, limit)? {
+                        return print_thread_output(&conv, &thread, json_out);
+                    }
+                }
+            }
+        }
+        if offline {
+            bail!("로컬 캐시에 스레드가 없습니다: {root_msg_id}");
+        }
+    }
+
+    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
     let conv = resolve_target(&storage, &graph, channel_target, offline).await?;
 
     let ConversationTarget::Channel {
@@ -4115,9 +2086,13 @@ async fn cmd_thread(
             .get_thread(&conv.conv_key, root_msg_id, limit)?
             .with_context(|| format!("로컬 캐시에 스레드가 없습니다: {root_msg_id}"))?
     } else {
-        let view = graph
+        let view = match graph
             .get_thread(team_id, channel_id, root_msg_id, limit)
-            .await?;
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+        };
         let mut all = Vec::with_capacity(1 + view.replies.len());
         all.push(view.root.clone());
         all.extend(view.replies.iter().cloned());
@@ -4125,6 +2100,14 @@ async fn cmd_thread(
         view
     };
 
+    print_thread_output(&conv, &thread, json_out)
+}
+
+fn print_thread_output(
+    conv: &ConversationSummary,
+    thread: &crate::models::ThreadView,
+    json_out: bool,
+) -> Result<()> {
     if json_out {
         println!(
             "{}",
@@ -4600,20 +2583,128 @@ async fn cmd_search(
     Ok(())
 }
 
+async fn sync_conversation_depth(
+    storage: &Storage,
+    graph: &GraphClient,
+    conv: &ConversationSummary,
+    depth: usize,
+) -> Result<usize> {
+    let first_page_top = depth.min(50);
+    let (latest_msgs, first_next_link) = match graph
+        .list_messages_page(&conv.target, first_page_top, None)
+        .await
+    {
+        Ok(res) => res,
+        Err(err) => return Err(wrap_graph_permission_error(graph, err).await),
+    };
+    let mut synced_count = if latest_msgs.is_empty() {
+        0
+    } else {
+        storage.upsert_messages(&latest_msgs).unwrap_or(latest_msgs.len())
+    };
+
+    let scope_key = SyncCursor::history_scope(&conv.conv_key);
+    if storage.get_sync_cursor(&scope_key)?.is_none() {
+        let oldest_ts = if first_next_link.is_none() {
+            Some(SyncCursor::HISTORY_EOF.to_string())
+        } else {
+            latest_msgs.first().map(|m| m.created_at.clone())
+        };
+        let _ = storage.save_sync_cursor(&SyncCursor {
+            scope_key: scope_key.clone(),
+            delta_link: first_next_link,
+            oldest_msg_ts: oldest_ts,
+            synced_at: Utc::now().to_rfc3339(),
+        });
+    }
+
+    let mut local_count = storage
+        .list_root_messages(&conv.conv_key, depth, None)
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    while local_count < depth {
+        let cursor = storage.get_sync_cursor(&scope_key)?;
+        if cursor.as_ref().is_some_and(SyncCursor::is_history_eof) {
+            break;
+        }
+        let saved_link = cursor.as_ref().and_then(|c| c.delta_link.clone());
+        let (older_msgs, new_next_link) = match graph
+            .fetch_older_messages(&conv.target, saved_link.as_deref(), None, depth - local_count)
+            .await
+        {
+            Ok(res) => res,
+            Err(err) => return Err(wrap_graph_permission_error(graph, err).await),
+        };
+        if !older_msgs.is_empty() {
+            synced_count += storage.upsert_messages(&older_msgs).unwrap_or(older_msgs.len());
+        }
+        let oldest_ts = if new_next_link.is_none() {
+            Some(SyncCursor::HISTORY_EOF.to_string())
+        } else {
+            older_msgs
+                .first()
+                .map(|m| m.created_at.clone())
+                .or_else(|| cursor.as_ref().and_then(|c| c.oldest_msg_ts.clone()))
+        };
+        let _ = storage.save_sync_cursor(&SyncCursor {
+            scope_key: scope_key.clone(),
+            delta_link: new_next_link.clone(),
+            oldest_msg_ts: oldest_ts,
+            synced_at: Utc::now().to_rfc3339(),
+        });
+
+        local_count = storage
+            .list_root_messages(&conv.conv_key, depth, None)
+            .map(|v| v.len())
+            .unwrap_or(local_count);
+
+        if new_next_link.is_none() || (older_msgs.is_empty() && new_next_link == saved_link) {
+            break;
+        }
+    }
+
+    Ok(synced_count.max(local_count))
+}
+
 async fn cmd_sync(
     cfg: &AppConfig,
     target: Option<&str>,
-    limit: usize,
+    chats: usize,
+    depth: usize,
     json_out: bool,
 ) -> Result<()> {
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let limit = clamp_limit(limit);
+    let chats_limit = clamp_limit(chats);
+    let depth = clamp_limit(depth);
 
     let targets: Vec<ConversationSummary> = match target {
         Some(t) => vec![resolve_target(&storage, &graph, t, false).await?],
         None => {
-            sync::bootstrap_conversations(&graph, &storage).await?;
-            storage.list_conversations()?
+            let (chats_res, teams_res) = tokio::join!(
+                graph.list_chats(chats_limit),
+                graph.list_joined_teams_with_channels(),
+            );
+            let fetched_chats = match chats_res {
+                Ok(c) => c,
+                Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+            };
+            storage.upsert_conversations(&fetched_chats)?;
+            if let Ok(teams) = teams_res {
+                storage.upsert_teams(&teams)?;
+            }
+            let all_convs = storage.list_conversations()?;
+            let mut chat_count = 0usize;
+            let mut selected = Vec::new();
+            for conv in all_convs {
+                if conv.kind.is_channel() {
+                    selected.push(conv);
+                } else if chat_count < chats_limit {
+                    chat_count += 1;
+                    selected.push(conv);
+                }
+            }
+            selected
         }
     };
 
@@ -4622,10 +2713,12 @@ async fn cmd_sync(
     let mut errors = Vec::new();
 
     for conv in &targets {
-        match graph.list_messages(&conv.target, limit).await {
-            Ok(msgs) => {
-                let count = storage.upsert_messages(&msgs).unwrap_or(msgs.len());
-                total_messages += count.max(msgs.len());
+        if !json_out && target.is_some() {
+            println!("동기화 중: {} ({}, 목표 깊이 {}건)...", conv.title, conv.conv_key, depth);
+        }
+        match sync_conversation_depth(&storage, &graph, conv, depth).await {
+            Ok(count) => {
+                total_messages += count;
                 synced_convs += 1;
             }
             Err(err) => {
@@ -4639,6 +2732,8 @@ async fn cmd_sync(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "ok": errors.is_empty(),
+                "chats_limit": chats_limit,
+                "depth": depth,
                 "conversations_total": targets.len(),
                 "conversations_synced": synced_convs,
                 "messages_synced": total_messages,
@@ -4647,8 +2742,10 @@ async fn cmd_sync(
         );
     } else {
         println!(
-            "동기화 완료: 대화 {synced_convs}/{}개 · 메시지 {total_messages}건",
-            targets.len()
+            "동기화 완료: 대화 {synced_convs}/{}개 · 메시지 {total_messages}건 (chats={}, depth={})",
+            targets.len(),
+            chats_limit,
+            depth
         );
         for err in &errors {
             eprintln!("경고: {err}");
@@ -4875,6 +2972,279 @@ fn prompt(label: &str) -> Result<String> {
 
 pub(crate) fn clamp_limit(limit: usize) -> usize {
     limit.clamp(1, 1_000)
+}
+
+pub(crate) struct ReadMessagesResult {
+    pub messages: Vec<MessageItem>,
+    pub has_more: bool,
+    pub next_before: Option<String>,
+}
+
+pub(crate) fn is_forbidden_error(err: &anyhow::Error) -> bool {
+    let lower = format!("{err:#}").to_ascii_lowercase();
+    lower.contains("403")
+        || lower.contains("forbidden")
+        || lower.contains("authorization_requestdenied")
+        || lower.contains("insufficient privileges")
+        || lower.contains("missing scope")
+        || lower.contains("aclcheckfailed")
+        || lower.contains("권한 부족")
+}
+
+pub(crate) async fn wrap_graph_permission_error(
+    graph: &GraphClient,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    let raw = format!("{err:#}");
+    let token = graph.auth().current_tokens().await.map(|t| t.access_token);
+    if let Some(explained) = explain_graph_permission_error(&raw, token.as_deref()) {
+        anyhow::anyhow!("{explained}\n원본 오류: {raw}")
+    } else {
+        err
+    }
+}
+
+/// Resolves `--before` (`TIMESTAMP_OR_MSG_ID`) into `(before_created_at, Option<before_msg_id>)`.
+pub(crate) fn resolve_before_cursor(
+    storage: &Storage,
+    conv_key: &str,
+    before_input: &str,
+) -> Result<(String, Option<String>)> {
+    let trimmed = before_input.trim();
+    if trimmed.is_empty() {
+        bail!("--before 값이 비어 있습니다.");
+    }
+
+    if let Some(msg) = storage.get_message(conv_key, trimmed)? {
+        return Ok((msg.created_at, Some(msg.msg_id)));
+    }
+
+    let ts = normalize_before_timestamp(trimmed)?;
+    Ok((ts, None))
+}
+
+fn normalize_before_timestamp(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        return Ok(dt
+            .with_timezone(&Utc)
+            .to_rfc3339_opts(SecondsFormat::AutoSi, true));
+    }
+    if NaiveDate::parse_from_str(trimmed, "%Y-%m-%d").is_ok() {
+        return Ok(format!("{trimmed}T00:00:00Z"));
+    }
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d_%H:%M:%S",
+        "%Y-%m-%d_%H:%M",
+    ] {
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(trimmed, fmt) {
+            let local_dt = Local
+                .from_local_datetime(&ndt)
+                .single()
+                .or_else(|| Local.from_local_datetime(&ndt).earliest())
+                .context("로컬 시간 변환에 실패했습니다")?;
+            return Ok(local_dt
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(SecondsFormat::Secs, true));
+        }
+    }
+    bail!(
+        "유효하지 않은 --before 값입니다: '{trimmed}' (ISO-8601 타임스탬프, YYYY-MM-DD, 또는 캐시된 메시지 ID)"
+    )
+}
+
+fn trim_older_window(mut rows: Vec<MessageItem>, limit: usize) -> (Vec<MessageItem>, bool) {
+    if rows.len() > limit {
+        let excess = rows.len() - limit;
+        rows.drain(..excess);
+        (rows, true)
+    } else {
+        (rows, false)
+    }
+}
+
+pub(crate) fn read_conversation_messages_offline(
+    storage: &Storage,
+    conv: &ConversationSummary,
+    limit: usize,
+    before: Option<&str>,
+) -> Result<ReadMessagesResult> {
+    let limit = clamp_limit(limit);
+    let (messages, has_more) = match before {
+        None => {
+            let rows = storage.list_root_messages(&conv.conv_key, limit + 1, None)?;
+            trim_older_window(rows, limit)
+        }
+        Some(raw_before) => {
+            let (before_ts, before_id) = resolve_before_cursor(storage, &conv.conv_key, raw_before)?;
+            let rows = storage.list_older_root_messages(
+                &conv.conv_key,
+                limit + 1,
+                &before_ts,
+                before_id.as_deref(),
+            )?;
+            trim_older_window(rows, limit)
+        }
+    };
+    let next_before = messages.first().map(|m| m.msg_id.clone());
+    Ok(ReadMessagesResult {
+        messages,
+        has_more,
+        next_before,
+    })
+}
+
+pub(crate) async fn read_conversation_messages(
+    storage: &Storage,
+    graph: &GraphClient,
+    conv: &ConversationSummary,
+    limit: usize,
+    before: Option<&str>,
+    offline: bool,
+    fetch_older: bool,
+) -> Result<ReadMessagesResult> {
+    let limit = clamp_limit(limit);
+    if offline {
+        return read_conversation_messages_offline(storage, conv, limit, before);
+    }
+
+    let scope_key = SyncCursor::history_scope(&conv.conv_key);
+    match before {
+        None => {
+            let fetched = if limit <= 50 {
+                let (msgs, next_link) = match graph.list_messages_page(&conv.target, limit, None).await {
+                    Ok(res) => res,
+                    Err(err) => return Err(wrap_graph_permission_error(graph, err).await),
+                };
+                storage.upsert_messages(&msgs)?;
+                if storage.get_sync_cursor(&scope_key)?.is_none() {
+                    let oldest_ts = if next_link.is_none() {
+                        Some(SyncCursor::HISTORY_EOF.to_string())
+                    } else {
+                        msgs.first().map(|m| m.created_at.clone())
+                    };
+                    let _ = storage.save_sync_cursor(&SyncCursor {
+                        scope_key: scope_key.clone(),
+                        delta_link: next_link,
+                        oldest_msg_ts: oldest_ts,
+                        synced_at: Utc::now().to_rfc3339(),
+                    });
+                }
+                msgs
+            } else {
+                let msgs = match graph.list_messages(&conv.target, limit).await {
+                    Ok(res) => res,
+                    Err(err) => return Err(wrap_graph_permission_error(graph, err).await),
+                };
+                storage.upsert_messages(&msgs)?;
+                msgs
+            };
+
+            let rows = storage.list_root_messages(&conv.conv_key, limit + 1, None)?;
+            let (mut messages, mut has_more) = trim_older_window(rows, limit);
+            if messages.is_empty() {
+                messages = fetched;
+            }
+            if !has_more {
+                has_more = storage
+                    .get_sync_cursor(&scope_key)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|c| !c.is_history_eof() && c.delta_link.is_some());
+            }
+            let next_before = messages.first().map(|m| m.msg_id.clone());
+            Ok(ReadMessagesResult {
+                messages,
+                has_more,
+                next_before,
+            })
+        }
+        Some(raw_before) => {
+            let (before_ts, before_id) = resolve_before_cursor(storage, &conv.conv_key, raw_before)?;
+            if fetch_older {
+                let mut local = storage.list_older_root_messages(
+                    &conv.conv_key,
+                    limit,
+                    &before_ts,
+                    before_id.as_deref(),
+                )?;
+                while local.len() < limit {
+                    let cursor = storage.get_sync_cursor(&scope_key)?;
+                    if cursor.as_ref().is_some_and(SyncCursor::is_history_eof) {
+                        break;
+                    }
+                    let saved_link = cursor.as_ref().and_then(|c| c.delta_link.clone());
+                    let (fetched, new_next_link) = match graph
+                        .fetch_older_messages(
+                            &conv.target,
+                            saved_link.as_deref(),
+                            Some(&before_ts),
+                            limit - local.len(),
+                        )
+                        .await
+                    {
+                        Ok(res) => res,
+                        Err(err) => return Err(wrap_graph_permission_error(graph, err).await),
+                    };
+
+                    if !fetched.is_empty() {
+                        storage.upsert_messages(&fetched)?;
+                    }
+                    let oldest_ts = if new_next_link.is_none() {
+                        Some(SyncCursor::HISTORY_EOF.to_string())
+                    } else {
+                        fetched
+                            .first()
+                            .map(|m| m.created_at.clone())
+                            .or_else(|| cursor.as_ref().and_then(|c| c.oldest_msg_ts.clone()))
+                    };
+                    let _ = storage.save_sync_cursor(&SyncCursor {
+                        scope_key: scope_key.clone(),
+                        delta_link: new_next_link.clone(),
+                        oldest_msg_ts: oldest_ts,
+                        synced_at: Utc::now().to_rfc3339(),
+                    });
+
+                    local = storage.list_older_root_messages(
+                        &conv.conv_key,
+                        limit,
+                        &before_ts,
+                        before_id.as_deref(),
+                    )?;
+                    if new_next_link.is_none()
+                        || (fetched.is_empty() && new_next_link == saved_link)
+                    {
+                        break;
+                    }
+                }
+            }
+
+            let rows = storage.list_older_root_messages(
+                &conv.conv_key,
+                limit + 1,
+                &before_ts,
+                before_id.as_deref(),
+            )?;
+            let (messages, mut has_more) = trim_older_window(rows, limit);
+            if !has_more {
+                has_more = storage
+                    .get_sync_cursor(&scope_key)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|c| !c.is_history_eof() && c.delta_link.is_some());
+            }
+            let next_before = messages.first().map(|m| m.msg_id.clone());
+            Ok(ReadMessagesResult {
+                messages,
+                has_more,
+                next_before,
+            })
+        }
+    }
 }
 
 pub(crate) async fn resolve_target(
@@ -5208,32 +3578,6 @@ async fn cmd_preview_teams(
     Ok(())
 }
 
-async fn cmd_preview_outlook(
-    cfg: &AppConfig,
-    mail_id: Option<&str>,
-    attachment: Option<&str>,
-    file: Option<&Path>,
-    offline: bool,
-    cols: Option<u16>,
-    rows: Option<u16>,
-) -> Result<()> {
-    if let Some(path) = file {
-        return cmd_preview_local_file(path, cols, rows);
-    }
-    let mail_id = mail_id.context("메일 ID(<mail_id>) 또는 --file <path> 를 지정하세요.")?;
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let mail = load_mail_message(&storage, &graph, mail_id, offline).await?;
-    let att = select_mail_attachment(&mail, None, attachment)?;
-    let (_name, _ct, bytes) = load_mail_attachment_bytes(&graph, &mail.id, att, offline).await?;
-    let (c, r) = default_preview_dimensions(cols, rows);
-    let rendered = img_preview::render_ansi_stdout(&bytes, c, r)?;
-    print!("{rendered}");
-    if !rendered.ends_with('\n') {
-        println!();
-    }
-    io::stdout().flush()?;
-    Ok(())
-}
 
 pub(crate) fn select_teams_attachment<'a>(
     msg: &'a MessageItem,
@@ -5268,3525 +3612,6 @@ pub(crate) fn select_teams_attachment<'a>(
         .unwrap_or(&msg.attachments[0]))
 }
 
-pub(crate) fn select_mail_attachment<'a>(
-    mail: &'a MailMessage,
-    index: Option<usize>,
-    selector: Option<&str>,
-) -> Result<&'a MailAttachment> {
-    if mail.attachments.is_empty() {
-        bail!("이 메일에는 첨부 파일이 없습니다: {}", mail.id);
-    }
-    if let Some(sel) = selector.map(str::trim).filter(|s| !s.is_empty()) {
-        if let Ok(idx) = sel.parse::<usize>() {
-            return mail.attachments.get(idx).with_context(|| {
-                format!(
-                    "첨부 파일 인덱스 {idx} 가 범위를 벗어났습니다 (총 {}개)",
-                    mail.attachments.len()
-                )
-            });
-        }
-        if let Some(found) = mail
-            .attachments
-            .iter()
-            .find(|a| a.id == sel || a.name.eq_ignore_ascii_case(sel))
-        {
-            return Ok(found);
-        }
-        bail!("일치하는 메일 첨부 파일을 찾을 수 없습니다: {sel}");
-    }
-    if let Some(idx) = index {
-        return mail.attachments.get(idx).with_context(|| {
-            format!(
-                "첨부 파일 인덱스 {idx} 가 범위를 벗어났습니다 (총 {}개)",
-                mail.attachments.len()
-            )
-        });
-    }
-    Ok(mail
-        .attachments
-        .iter()
-        .find(|a| img_preview::is_image_mime_or_name(&a.content_type, Some(&a.name)))
-        .unwrap_or(&mail.attachments[0]))
-}
-
-pub(crate) async fn load_mail_attachment_bytes(
-    graph: &GraphClient,
-    mail_id: &str,
-    att: &MailAttachment,
-    offline: bool,
-) -> Result<(String, String, Vec<u8>)> {
-    if let Some(ref b64) = att.content_bytes_b64 {
-        let cleaned: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
-        let bytes = BASE64_STANDARD
-            .decode(cleaned)
-            .with_context(|| format!("첨부 파일 base64 디코딩 실패: {}", att.name))?;
-        return Ok((att.name.clone(), att.content_type.clone(), bytes));
-    }
-    if offline {
-        bail!("오프라인 모드에서는 캐시되지 않은 첨부 파일을 가져올 수 없습니다: {}", att.name);
-    }
-    graph.fetch_mail_attachment_bytes(mail_id, &att.id).await
-}
-
-// ---------------------------------------------------------------------------
-// Outlook Mail commands & shared helpers
-// ---------------------------------------------------------------------------
-
-pub(crate) fn resolve_mail_folder_from_slice(folders: &[MailFolder], query: &str) -> Option<String> {
-    let q = query.trim();
-    if q.is_empty() {
-        return None;
-    }
-    if let Some(f) = folders.iter().find(|f| f.id == q) {
-        return Some(f.id.clone());
-    }
-    let normalized = match q.to_ascii_lowercase().as_str() {
-        "sent" => "sentitems",
-        "trash" | "deleted" => "deleteditems",
-        "junk" | "spam" => "junkemail",
-        other => {
-            if let Some(f) = folders.iter().find(|f| {
-                f.well_known_name
-                    .as_deref()
-                    .is_some_and(|wk| wk.eq_ignore_ascii_case(other))
-                    || f.display_name.eq_ignore_ascii_case(q)
-            }) {
-                return Some(f.id.clone());
-            }
-            return None;
-        }
-    };
-    folders
-        .iter()
-        .find(|f| {
-            f.well_known_name
-                .as_deref()
-                .is_some_and(|wk| wk.eq_ignore_ascii_case(normalized))
-                || f.display_name.eq_ignore_ascii_case(q)
-        })
-        .map(|f| f.id.clone())
-}
-
-fn resolve_mail_folder_id_cached(storage: &Storage, folder: &str) -> Result<String> {
-    let q = folder.trim();
-    if q.is_empty() {
-        return Ok("inbox".to_string());
-    }
-    let cached = storage.list_mail_folders()?;
-    if let Some(id) = resolve_mail_folder_from_slice(&cached, q) {
-        return Ok(id);
-    }
-    Ok(match q.to_ascii_lowercase().as_str() {
-        "sent" => "sentitems".to_string(),
-        "trash" | "deleted" => "deleteditems".to_string(),
-        "junk" | "spam" => "junkemail".to_string(),
-        _ => q.to_string(),
-    })
-}
-
-pub(crate) async fn resolve_mail_folder_id(
-    storage: &Storage,
-    graph: &GraphClient,
-    folder: &str,
-    offline: bool,
-) -> Result<String> {
-    let q = folder.trim();
-    if q.is_empty() {
-        return Ok("inbox".to_string());
-    }
-    let cached = storage.list_mail_folders()?;
-    if let Some(id) = resolve_mail_folder_from_slice(&cached, q) {
-        return Ok(id);
-    }
-    if !offline && cached.is_empty() {
-        if let Ok(fetched) = graph.list_mail_folders().await {
-            let _ = storage.upsert_mail_folders(&fetched);
-            if let Some(id) = resolve_mail_folder_from_slice(&fetched, q) {
-                return Ok(id);
-            }
-        }
-    }
-    Ok(match q.to_ascii_lowercase().as_str() {
-        "sent" => "sentitems".to_string(),
-        "trash" | "deleted" => "deleteditems".to_string(),
-        "junk" | "spam" => "junkemail".to_string(),
-        _ => q.to_string(),
-    })
-}
-
-async fn load_mail_message(
-    storage: &Storage,
-    graph: &GraphClient,
-    mail_id: &str,
-    offline: bool,
-) -> Result<MailMessage> {
-    if offline {
-        return storage
-            .get_mail_message(mail_id)?
-            .with_context(|| format!("로컬 캐시에서 메일을 찾을 수 없습니다: {mail_id}"));
-    }
-    let msg = graph.get_mail_message(mail_id).await?;
-    let _ = storage.upsert_mail_messages(std::slice::from_ref(&msg));
-    Ok(msg)
-}
-
-fn print_mail_folders_output(folders: &[MailFolder], json_out: bool) -> Result<()> {
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({ "folders": folders }))?
-        );
-    } else if folders.is_empty() {
-        println!("메일 폴더가 없습니다.");
-    } else {
-        for f in folders {
-            let wk = f
-                .well_known_name
-                .as_deref()
-                .map(|w| format!(" [{w}]"))
-                .unwrap_or_default();
-            println!(
-                "{}{}  unread={}/{}  ({})",
-                f.display_name, wk, f.unread_item_count, f.total_item_count, f.id
-            );
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_mail_folders(
-    cfg: &AppConfig,
-    refresh: bool,
-    cached: bool,
-    json_out: bool,
-) -> Result<()> {
-    let ttl = cli_cache_ttl_secs(cfg);
-    let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
-    if !refresh && (cached || daemon_warm || ttl > 0) {
-        if let Ok(storage) = open_storage_only(cfg) {
-            if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:mail_folders"], ttl) {
-                let folders = storage.list_mail_folders()?;
-                if !folders.is_empty() {
-                    return print_mail_folders_output(&folders, json_out);
-                }
-            }
-        }
-    }
-
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let cached_folders = storage.list_mail_folders()?;
-    let folders = if refresh || cached_folders.is_empty() {
-        let fetched = graph.list_mail_folders().await?;
-        storage.upsert_mail_folders(&fetched)?;
-        record_cli_sync_cursor(&storage, "cli:mail_folders");
-        let stored = storage.list_mail_folders()?;
-        if stored.is_empty() {
-            fetched
-        } else {
-            stored
-        }
-    } else {
-        cached_folders
-    };
-
-    print_mail_folders_output(&folders, json_out)
-}
-
-fn load_cached_mail_list(
-    storage: &Storage,
-    folder_id: &str,
-    limit: usize,
-    json_out: bool,
-) -> Result<Vec<MailMessage>> {
-    if json_out {
-        storage.list_mail_messages(Some(folder_id), limit)
-    } else {
-        storage.list_mail_summaries(Some(folder_id), limit)
-    }
-}
-
-fn print_mail_list_output(
-    folder: &str,
-    folder_id: &str,
-    mut messages: Vec<MailMessage>,
-    unread_only: bool,
-    limit: usize,
-    json_out: bool,
-) -> Result<()> {
-    if unread_only {
-        messages.retain(|m| !m.is_read);
-    }
-    messages.truncate(limit);
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "folder": folder_id,
-                "messages": messages,
-            }))?
-        );
-    } else if messages.is_empty() {
-        println!("표시할 메일이 없습니다 ({folder}).");
-    } else {
-        for m in &messages {
-            let unread_mark = if m.is_read { " " } else { "*" };
-            let flag_mark = if m.flagged { "⚑" } else { " " };
-            let att_mark = if m.has_attachments { "📎" } else { "  " };
-            println!(
-                "{unread_mark}{flag_mark} {att_mark} [{}] {} | {} ({})",
-                m.received_at,
-                m.from_display(),
-                truncate_single_line(&m.subject, 60),
-                m.id
-            );
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn cmd_mail_list(
-    cfg: &AppConfig,
-    folder: &str,
-    limit: usize,
-    unread_only: bool,
-    refresh: bool,
-    offline: bool,
-    cached: bool,
-    json_out: bool,
-) -> Result<()> {
-    let limit = clamp_limit(limit);
-    if offline {
-        let storage = open_storage_only(cfg)?;
-        let folder_id = resolve_mail_folder_id_cached(&storage, folder)?;
-        let messages = load_cached_mail_list(&storage, &folder_id, limit, json_out)?;
-        return print_mail_list_output(folder, &folder_id, messages, unread_only, limit, json_out);
-    }
-
-    let ttl = cli_cache_ttl_secs(cfg);
-    let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
-    if !refresh && (cached || daemon_warm || ttl > 0) {
-        if let Ok(storage) = open_storage_only(cfg) {
-            if let Ok(folder_id) = resolve_mail_folder_id_cached(&storage, folder) {
-                let cli_key = format!("cli:mail:{folder_id}");
-                let delta_key = format!("mail_delta:{folder_id}");
-                if cached
-                    || daemon_warm
-                    || is_cursor_fresh(&storage, &[cli_key.as_str(), delta_key.as_str()], ttl)
-                {
-                    let messages = load_cached_mail_list(&storage, &folder_id, limit, json_out)?;
-                    if !messages.is_empty() {
-                        return print_mail_list_output(
-                            folder,
-                            &folder_id,
-                            messages,
-                            unread_only,
-                            limit,
-                            json_out,
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let folder_id = resolve_mail_folder_id(&storage, &graph, folder, false).await?;
-
-    let cached_msgs = load_cached_mail_list(&storage, &folder_id, limit, json_out)?;
-    let messages = if refresh || cached_msgs.is_empty() {
-        let fetched = graph.list_mail_messages(&folder_id, limit).await?;
-        storage.upsert_mail_messages(&fetched)?;
-        record_cli_sync_cursor(&storage, &format!("cli:mail:{folder_id}"));
-        let stored = load_cached_mail_list(&storage, &folder_id, limit, json_out)?;
-        if stored.is_empty() {
-            fetched
-        } else {
-            stored
-        }
-    } else {
-        cached_msgs
-    };
-
-    print_mail_list_output(folder, &folder_id, messages, unread_only, limit, json_out)
-}
-
-fn print_mail_read_text(msg: &MailMessage) {
-    println!("제목: {}", msg.subject);
-    println!("보낸사람: {}", msg.from_display());
-    if !msg.to_recipients.is_empty() {
-        let to_list: Vec<String> = msg.to_recipients.iter().map(|r| r.display()).collect();
-        println!("받는사람: {}", to_list.join(", "));
-    }
-    if !msg.cc_recipients.is_empty() {
-        let cc_list: Vec<String> = msg.cc_recipients.iter().map(|r| r.display()).collect();
-        println!("참조: {}", cc_list.join(", "));
-    }
-    println!(
-        "수신일: {} | 읽음={} | 플래그={} | 중요도={}",
-        msg.received_at, msg.is_read, msg.flagged, msg.importance
-    );
-    if !msg.attachments.is_empty() {
-        println!("첨부 ({}개):", msg.attachments.len());
-        for (idx, att) in msg.attachments.iter().enumerate() {
-            println!(
-                "  [{idx}] {} ({}, {} bytes, id={})",
-                att.name, att.content_type, att.size, att.id
-            );
-        }
-    }
-    println!("---");
-    let body = if !msg.body_plain.trim().is_empty() {
-        msg.body_plain.trim().to_string()
-    } else {
-        parser::html_and_cards_to_plain(&msg.body_html, &[])
-    };
-    println!("{body}");
-}
-
-async fn cmd_mail_read(
-    cfg: &AppConfig,
-    mail_id: &str,
-    offline: bool,
-    cached: bool,
-    preview_images: bool,
-    no_mark_read: bool,
-    json_out: bool,
-) -> Result<()> {
-    if offline && !preview_images {
-        let storage = open_storage_only(cfg)?;
-        let msg = storage
-            .get_mail_message(mail_id)?
-            .with_context(|| format!("로컬 캐시에서 메일을 찾을 수 없습니다: {mail_id}"))?;
-        if json_out {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({ "message": msg }))?
-            );
-        } else {
-            print_mail_read_text(&msg);
-        }
-        return Ok(());
-    }
-
-    if !offline && cached && !preview_images {
-        if let Ok(storage) = open_storage_only(cfg) {
-            if let Some(msg) = storage.get_mail_message(mail_id)? {
-                if !msg.body_html.trim().is_empty() || !msg.body_plain.trim().is_empty() {
-                    if json_out {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&json!({ "message": msg }))?
-                        );
-                    } else {
-                        print_mail_read_text(&msg);
-                    }
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let mut msg = load_mail_message(&storage, &graph, mail_id, offline).await?;
-
-    if !offline && !no_mark_read && !msg.is_read && graph.set_mail_read(&msg.id, true).await.is_ok()
-    {
-        msg.is_read = true;
-        let _ = storage.upsert_mail_messages(std::slice::from_ref(&msg));
-    }
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({ "message": msg }))?
-        );
-        return Ok(());
-    }
-
-    print_mail_read_text(&msg);
-
-    if preview_images {
-        let (cols, rows) = default_preview_dimensions(None, None);
-        for att in &msg.attachments {
-            if img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name)) {
-                match load_mail_attachment_bytes(&graph, &msg.id, att, offline).await {
-                    Ok((_name, _ct, bytes)) => match img_preview::render_ansi_stdout(&bytes, cols, rows)
-                    {
-                        Ok(rendered) => {
-                            println!("\n[이미지 미리보기: {}]", att.name);
-                            print!("{rendered}");
-                            if !rendered.ends_with('\n') {
-                                println!();
-                            }
-                        }
-                        Err(err) => eprintln!("이미지 렌더링 실패 ({}): {err:#}", att.name),
-                    },
-                    Err(err) => eprintln!("이미지 로드 실패 ({}): {err:#}", att.name),
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn cmd_mail_send(
-    cfg: &AppConfig,
-    to: Vec<String>,
-    cc: Vec<String>,
-    bcc: Vec<String>,
-    subject: &str,
-    markdown_body: &str,
-    attach: Vec<PathBuf>,
-    important: bool,
-    json_out: bool,
-) -> Result<()> {
-    if markdown_body.trim().is_empty() {
-        bail!("메일 본문이 비어 있습니다.");
-    }
-    for path in &attach {
-        if !path.exists() || !path.is_file() {
-            bail!("첨부 파일을 찾을 수 없습니다: {}", path.display());
-        }
-    }
-    let (_auth, graph, _storage) = open_runtime(cfg, true).await?;
-    let body_html =
-        parser::compile_outgoing_markdown(markdown_body, None, vec![], vec![], vec![], None)
-            .body_html;
-    let mail = OutgoingMail {
-        subject: subject.to_string(),
-        body_html,
-        to: to.clone(),
-        cc,
-        bcc,
-        importance: if important {
-            Some("high".to_string())
-        } else {
-            None
-        },
-        attachments: attach,
-        save_to_sent_items: true,
-    };
-    graph.send_mail(&mail).await?;
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "to": to,
-                "subject": subject,
-            }))?
-        );
-    } else {
-        println!("메일 전송 완료: '{}' -> {}", subject, to.join(", "));
-    }
-    Ok(())
-}
-
-async fn cmd_mail_reply(
-    cfg: &AppConfig,
-    mail_id: &str,
-    markdown_comment: &str,
-    reply_all: bool,
-    json_out: bool,
-) -> Result<()> {
-    if markdown_comment.trim().is_empty() {
-        bail!("답장 본문이 비어 있습니다.");
-    }
-    let (_auth, graph, _storage) = open_runtime(cfg, true).await?;
-    let comment_html =
-        parser::compile_outgoing_markdown(markdown_comment, None, vec![], vec![], vec![], None)
-            .body_html;
-    graph.reply_mail(mail_id, &comment_html, reply_all).await?;
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "mail_id": mail_id,
-                "reply_all": reply_all,
-            }))?
-        );
-    } else {
-        println!(
-            "메일 {} 완료: {mail_id}",
-            if reply_all { "전체 답장" } else { "답장" }
-        );
-    }
-    Ok(())
-}
-
-async fn cmd_mail_forward(
-    cfg: &AppConfig,
-    mail_id: &str,
-    to: Vec<String>,
-    markdown_comment: &str,
-    json_out: bool,
-) -> Result<()> {
-    let (_auth, graph, _storage) = open_runtime(cfg, true).await?;
-    let comment_html = if markdown_comment.trim().is_empty() {
-        String::new()
-    } else {
-        parser::compile_outgoing_markdown(markdown_comment, None, vec![], vec![], vec![], None)
-            .body_html
-    };
-    graph.forward_mail(mail_id, &to, &comment_html).await?;
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "mail_id": mail_id,
-                "to": to,
-            }))?
-        );
-    } else {
-        println!("메일 전달 완료: {mail_id} -> {}", to.join(", "));
-    }
-    Ok(())
-}
-
-async fn cmd_mail_flag(
-    cfg: &AppConfig,
-    mail_id: &str,
-    flagged: bool,
-    json_out: bool,
-) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    graph.set_mail_flag(mail_id, flagged).await?;
-    if let Ok(Some(mut msg)) = storage.get_mail_message(mail_id) {
-        msg.flagged = flagged;
-        let _ = storage.upsert_mail_messages(&[msg]);
-    }
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "mail_id": mail_id,
-                "flagged": flagged,
-            }))?
-        );
-    } else {
-        println!(
-            "메일 플래그 {}: {mail_id}",
-            if flagged { "설정" } else { "해제" }
-        );
-    }
-    Ok(())
-}
-
-async fn cmd_mail_mark_read(
-    cfg: &AppConfig,
-    mail_id: &str,
-    is_read: bool,
-    json_out: bool,
-) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    graph.set_mail_read(mail_id, is_read).await?;
-    if let Ok(Some(mut msg)) = storage.get_mail_message(mail_id) {
-        msg.is_read = is_read;
-        let _ = storage.upsert_mail_messages(&[msg]);
-    }
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "mail_id": mail_id,
-                "is_read": is_read,
-            }))?
-        );
-    } else {
-        println!(
-            "메일 상태 변경 ({}): {mail_id}",
-            if is_read { "읽음" } else { "읽지 않음" }
-        );
-    }
-    Ok(())
-}
-
-async fn cmd_mail_move(
-    cfg: &AppConfig,
-    mail_id: &str,
-    dest_folder: &str,
-    json_out: bool,
-) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let folder_id = resolve_mail_folder_id(&storage, &graph, dest_folder, false).await?;
-    let moved = graph.move_mail_message(mail_id, &folder_id).await?;
-    let _ = storage.upsert_mail_messages(std::slice::from_ref(&moved));
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "message": moved,
-            }))?
-        );
-    } else {
-        println!("메일 이동 완료: {} -> {folder_id}", moved.id);
-    }
-    Ok(())
-}
-
-async fn cmd_mail_delete(cfg: &AppConfig, mail_id: &str, yes: bool, json_out: bool) -> Result<()> {
-    if json_out && !yes {
-        bail!("{DELETE_JSON_REQUIRES_YES}");
-    }
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let answer = if yes {
-        None
-    } else {
-        Some(prompt(&format!(
-            "메일 {mail_id} 를 삭제합니다. 계속하려면 'yes' 입력: "
-        ))?)
-    };
-    delete_gate(yes, json_out, answer.as_deref())?;
-
-    graph.delete_mail_message(mail_id).await?;
-    let _ = storage.delete_mail_messages_by_ids(&[mail_id.to_string()]);
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "mail_id": mail_id,
-            }))?
-        );
-    } else {
-        println!("메일 삭제 완료: {mail_id}");
-    }
-    Ok(())
-}
-
-async fn cmd_mail_attachment(
-    cfg: &AppConfig,
-    mail_id: &str,
-    index: Option<usize>,
-    att_id: Option<&str>,
-    out: Option<&Path>,
-    preview: bool,
-    json_out: bool,
-) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let mail = load_mail_message(&storage, &graph, mail_id, false).await?;
-    let idx = if att_id.is_none() {
-        Some(index.unwrap_or(0))
-    } else {
-        index
-    };
-    let att = select_mail_attachment(&mail, idx, att_id)?;
-
-    if preview && out.is_none() && !json_out {
-        let (_name, _ct, bytes) = load_mail_attachment_bytes(&graph, &mail.id, att, false).await?;
-        let (cols, rows) = default_preview_dimensions(None, None);
-        let rendered = img_preview::render_ansi_stdout(&bytes, cols, rows)?;
-        print!("{rendered}");
-        if !rendered.ends_with('\n') {
-            println!();
-        }
-        io::stdout().flush()?;
-        return Ok(());
-    }
-
-    let out_dir = out
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| cfg.resolved_download_dir());
-    let downloaded = graph
-        .download_mail_attachment(&mail.id, &att.id, &out_dir)
-        .await?;
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "mail_id": mail.id,
-                "attachment_id": att.id,
-                "path": downloaded.path,
-                "file_name": downloaded.file_name,
-                "bytes_written": downloaded.bytes_written,
-            }))?
-        );
-    } else {
-        println!(
-            "메일 첨부 다운로드 완료: {} ({} bytes)",
-            downloaded.path.display(),
-            downloaded.bytes_written
-        );
-        if preview {
-            let bytes = std::fs::read(&downloaded.path)?;
-            let (cols, rows) = default_preview_dimensions(None, None);
-            let rendered = img_preview::render_ansi_stdout(&bytes, cols, rows)?;
-            print!("{rendered}");
-            if !rendered.ends_with('\n') {
-                println!();
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_mail_search(
-    cfg: &AppConfig,
-    query: &str,
-    folder: Option<&str>,
-    remote: bool,
-    limit: usize,
-    json_out: bool,
-) -> Result<()> {
-    if query.trim().is_empty() {
-        bail!("검색어가 비어 있습니다.");
-    }
-    let limit = clamp_limit(limit);
-    let (hits, remote_messages) = if !remote {
-        let storage = open_storage_only(cfg)?;
-        let folder_filter = match folder.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(f) => Some(resolve_mail_folder_id_cached(&storage, f)?),
-            None => None,
-        };
-        let hits = storage.search_mail_messages(query, folder_filter.as_deref(), limit)?;
-        (hits, Vec::new())
-    } else {
-        let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-        let folder_filter = match folder.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(f) => Some(resolve_mail_folder_id(&storage, &graph, f, false).await?),
-            None => None,
-        };
-        let hits = storage.search_mail_messages(query, folder_filter.as_deref(), limit)?;
-        let msgs = graph.search_mail_remote(query, limit).await?;
-        let _ = storage.upsert_mail_messages(&msgs);
-        (hits, msgs)
-    };
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "query": query,
-                "hits": hits,
-                "remote": remote_messages,
-            }))?
-        );
-    } else if hits.is_empty() && remote_messages.is_empty() {
-        println!("'{query}' 와 일치하는 메일이 없습니다.");
-    } else {
-        for hit in &hits {
-            println!(
-                "[로컬][{}] {} | {}: {}",
-                hit.received_at, hit.from_display, hit.subject, hit.snippet
-            );
-        }
-        for msg in &remote_messages {
-            println!(
-                "[원격][{}] {} | {} ({})",
-                msg.received_at,
-                msg.from_display(),
-                msg.subject,
-                msg.id
-            );
-        }
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Outlook Calendar commands & shared helpers
-// ---------------------------------------------------------------------------
-
-pub(crate) fn normalize_datetime_iso(raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        bail!("날짜/시간 문자열이 비어 있습니다.");
-    }
-    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
-        return Ok(dt.to_rfc3339());
-    }
-    for fmt in [
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d_%H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d_%H:%M",
-        "%Y-%m-%dT%H:%M",
-    ] {
-        if let Ok(naive) = NaiveDateTime::parse_from_str(trimmed, fmt) {
-            let dt = Local
-                .from_local_datetime(&naive)
-                .earliest()
-                .or_else(|| Local.from_local_datetime(&naive).latest())
-                .context("로컬 시간대 변환에 실패했습니다.")?;
-            return Ok(dt.to_rfc3339());
-        }
-    }
-    if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
-        let naive = date.and_hms_opt(0, 0, 0).context("날짜 변환 실패")?;
-        let dt = Local
-            .from_local_datetime(&naive)
-            .earliest()
-            .or_else(|| Local.from_local_datetime(&naive).latest())
-            .context("로컬 시간대 변환에 실패했습니다.")?;
-        return Ok(dt.to_rfc3339());
-    }
-    bail!("날짜/시간 형식을 해석할 수 없습니다: '{trimmed}' (ISO-8601 또는 YYYY-MM-DD_HH:MM)")
-}
-
-pub(crate) fn default_calendar_window(
-    start: Option<&str>,
-    end: Option<&str>,
-    days: i64,
-) -> Result<(String, String)> {
-    let clamped_days = days.clamp(1, 365);
-    let start_iso = match start.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(s) => normalize_datetime_iso(s)?,
-        None => {
-            let today = Local::now().date_naive();
-            let naive = today.and_hms_opt(0, 0, 0).context("오늘 시작 시각 계산 실패")?;
-            Local
-                .from_local_datetime(&naive)
-                .earliest()
-                .unwrap_or_else(Local::now)
-                .to_rfc3339()
-        }
-    };
-    let end_iso = match end.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(e) => normalize_datetime_iso(e)?,
-        None => {
-            let start_dt = DateTime::parse_from_rfc3339(&start_iso)?;
-            (start_dt + chrono::Duration::days(clamped_days)).to_rfc3339()
-        }
-    };
-    Ok((start_iso, end_iso))
-}
-
-pub(crate) fn normalize_rsvp_response(raw: &str) -> Result<&'static str> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "accept" | "accepted" => Ok("accept"),
-        "tentative" | "tentativelyaccept" | "tentatively_accept" | "tentativelyaccepted" => {
-            Ok("tentativelyAccept")
-        }
-        "decline" | "declined" => Ok("decline"),
-        other => bail!("지원하지 않는 RSVP 응답입니다: '{other}' (accept | tentative | decline)"),
-    }
-}
-
-async fn cmd_cal_today(
-    cfg: &AppConfig,
-    offline: bool,
-    cached: bool,
-    json_out: bool,
-) -> Result<()> {
-    let (start_iso, end_iso) = default_calendar_window(None, None, 1)?;
-    cmd_cal_list(cfg, Some(&start_iso), Some(&end_iso), 50, offline, cached, json_out).await
-}
-
-async fn cmd_cal_week(
-    cfg: &AppConfig,
-    days: i64,
-    offline: bool,
-    cached: bool,
-    json_out: bool,
-) -> Result<()> {
-    let (start_iso, end_iso) = default_calendar_window(None, None, days)?;
-    cmd_cal_list(cfg, Some(&start_iso), Some(&end_iso), 100, offline, cached, json_out).await
-}
-
-fn print_cal_events_output(
-    start_iso: &str,
-    end_iso: &str,
-    events: &[CalendarEvent],
-    json_out: bool,
-) -> Result<()> {
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "start": start_iso,
-                "end": end_iso,
-                "events": events,
-            }))?
-        );
-    } else if events.is_empty() {
-        println!("표시할 일정이 없습니다.");
-    } else {
-        for ev in events {
-            let loc = ev
-                .location
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| format!(" @ {s}"))
-                .unwrap_or_default();
-            let meet = if ev.is_online_meeting { " [Teams]" } else { "" };
-            println!(
-                "[{} ~ {}] {}{}{} ({})",
-                ev.start_iso, ev.end_iso, ev.subject, loc, meet, ev.id
-            );
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_cal_list(
-    cfg: &AppConfig,
-    start: Option<&str>,
-    end: Option<&str>,
-    limit: usize,
-    offline: bool,
-    cached: bool,
-    json_out: bool,
-) -> Result<()> {
-    let limit = clamp_limit(limit);
-    let (start_iso, end_iso) = default_calendar_window(start, end, 7)?;
-    let start_filter = start.map(|_| start_iso.as_str());
-    let end_filter = end.map(|_| end_iso.as_str());
-
-    if offline {
-        let storage = open_storage_only(cfg)?;
-        let events = storage.list_calendar_events(start_filter, end_filter, limit)?;
-        return print_cal_events_output(&start_iso, &end_iso, &events, json_out);
-    }
-
-    let ttl = cli_cache_ttl_secs(cfg);
-    let daemon_warm = resolve_daemon_warm(cfg, false, cached).await;
-    if cached || daemon_warm || ttl > 0 {
-        if let Ok(storage) = open_storage_only(cfg) {
-            if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:cal"], ttl) {
-                let events = storage.list_calendar_events(start_filter, end_filter, limit)?;
-                if !events.is_empty() {
-                    return print_cal_events_output(&start_iso, &end_iso, &events, json_out);
-                }
-            }
-        }
-    }
-
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let events = graph.list_calendar_view(&start_iso, &end_iso, limit).await?;
-    let _ = storage.upsert_calendar_events(&events);
-    record_cli_sync_cursor(&storage, "cli:cal");
-
-    print_cal_events_output(&start_iso, &end_iso, &events, json_out)
-}
-
-async fn load_calendar_event(
-    storage: &Storage,
-    graph: &GraphClient,
-    event_id: &str,
-    offline: bool,
-) -> Result<CalendarEvent> {
-    if offline {
-        return storage
-            .list_calendar_events(None, None, 10_000)?
-            .into_iter()
-            .find(|e| e.id == event_id)
-            .with_context(|| format!("로컬 캐시에서 일정을 찾을 수 없습니다: {event_id}"));
-    }
-    let ev = graph.get_calendar_event(event_id).await?;
-    let _ = storage.upsert_calendar_events(std::slice::from_ref(&ev));
-    Ok(ev)
-}
-
-fn print_cal_show_output(ev: &CalendarEvent, json_out: bool) -> Result<()> {
-    if json_out {
-        println!("{}", serde_json::to_string_pretty(&json!({ "event": ev }))?);
-    } else {
-        println!("제목: {}", ev.subject);
-        println!("시간: {} ~ {} ({})", ev.start_iso, ev.end_iso, ev.time_zone);
-        if let Some(ref loc) = ev.location {
-            println!("장소: {loc}");
-        }
-        if let Some(ref org) = ev.organizer_name.as_deref().or(ev.organizer_email.as_deref()) {
-            println!("주최자: {org}");
-        }
-        println!("내 응답: {}", ev.response_status);
-        if let Some(ref url) = ev.online_meeting_url {
-            println!("온라인 모임: {url}");
-        }
-        if !ev.attendees.is_empty() {
-            println!("참석자 ({}명):", ev.attendees.len());
-            for a in &ev.attendees {
-                println!(
-                    "  - {} <{}> [{} / {}]",
-                    a.name.as_deref().unwrap_or(&a.address),
-                    a.address,
-                    a.attendee_type,
-                    a.response_status
-                );
-            }
-        }
-        if !ev.body_plain.trim().is_empty() {
-            println!("---\n{}", ev.body_plain.trim());
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_cal_show(
-    cfg: &AppConfig,
-    event_id: &str,
-    offline: bool,
-    cached: bool,
-    json_out: bool,
-) -> Result<()> {
-    if offline {
-        let storage = open_storage_only(cfg)?;
-        let ev = storage
-            .list_calendar_events(None, None, 10_000)?
-            .into_iter()
-            .find(|e| e.id == event_id)
-            .with_context(|| format!("로컬 캐시에서 일정을 찾을 수 없습니다: {event_id}"))?;
-        return print_cal_show_output(&ev, json_out);
-    }
-
-    if cached {
-        if let Ok(storage) = open_storage_only(cfg) {
-            if let Some(ev) = storage
-                .list_calendar_events(None, None, 10_000)?
-                .into_iter()
-                .find(|e| e.id == event_id)
-            {
-                return print_cal_show_output(&ev, json_out);
-            }
-        }
-    }
-
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let ev = load_calendar_event(&storage, &graph, event_id, false).await?;
-    print_cal_show_output(&ev, json_out)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn cmd_cal_create(
-    cfg: &AppConfig,
-    subject: &str,
-    start: &str,
-    end: &str,
-    attendees: Vec<String>,
-    location: Option<String>,
-    body: Option<String>,
-    is_online_meeting: bool,
-    is_all_day: bool,
-    time_zone: Option<String>,
-    json_out: bool,
-) -> Result<()> {
-    if subject.trim().is_empty() {
-        bail!("일정 제목이 비어 있습니다.");
-    }
-    let start_iso = normalize_datetime_iso(start)?;
-    let end_iso = normalize_datetime_iso(end)?;
-    let body_html = body
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|md| {
-            parser::compile_outgoing_markdown(md, None, vec![], vec![], vec![], None).body_html
-        });
-
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let outgoing = OutgoingEvent {
-        subject: subject.to_string(),
-        start_iso,
-        end_iso,
-        time_zone,
-        is_all_day,
-        location,
-        body_html,
-        attendees,
-        is_online_meeting,
-    };
-    let created = graph.create_calendar_event(&outgoing).await?;
-    let _ = storage.upsert_calendar_events(std::slice::from_ref(&created));
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "event": created,
-            }))?
-        );
-    } else {
-        println!(
-            "일정 생성 완료: {} ({} ~ {}) id={}",
-            created.subject, created.start_iso, created.end_iso, created.id
-        );
-        if let Some(ref url) = created.online_meeting_url {
-            println!("Teams 모임 링크: {url}");
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_cal_rsvp(
-    cfg: &AppConfig,
-    event_id: &str,
-    response: &str,
-    comment: Option<&str>,
-    json_out: bool,
-) -> Result<()> {
-    let normalized = normalize_rsvp_response(response)?;
-    let (_auth, graph, _storage) = open_runtime(cfg, true).await?;
-    graph
-        .respond_calendar_event(event_id, normalized, comment)
-        .await?;
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "event_id": event_id,
-                "response": normalized,
-            }))?
-        );
-    } else {
-        println!("일정 응답 완료: {event_id} -> {normalized}");
-    }
-    Ok(())
-}
-
-async fn cmd_cal_join(
-    cfg: &AppConfig,
-    event_id: &str,
-    print_only: bool,
-    offline: bool,
-    json_out: bool,
-) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let ev = load_calendar_event(&storage, &graph, event_id, offline).await?;
-    let url = ev
-        .online_meeting_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .with_context(|| format!("이 일정에는 온라인 모임 URL이 없습니다: {}", ev.subject))?;
-
-    if !print_only && !json_out {
-        open::that(url).with_context(|| format!("모임 URL 열기 실패: {url}"))?;
-    }
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "event_id": ev.id,
-                "subject": ev.subject,
-                "url": url,
-                "opened": false,
-            }))?
-        );
-    } else if print_only {
-        println!("{url}");
-    } else {
-        println!("모임 URL 열기: {url}");
-    }
-    Ok(())
-}
-
-async fn cmd_cal_delete(cfg: &AppConfig, event_id: &str, yes: bool, json_out: bool) -> Result<()> {
-    if json_out && !yes {
-        bail!("{DELETE_JSON_REQUIRES_YES}");
-    }
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let answer = if yes {
-        None
-    } else {
-        Some(prompt(&format!(
-            "일정 {event_id} 를 삭제합니다. 계속하려면 'yes' 입력: "
-        ))?)
-    };
-    delete_gate(yes, json_out, answer.as_deref())?;
-
-    graph.delete_calendar_event(event_id).await?;
-    let _ = storage.delete_calendar_event(event_id);
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "event_id": event_id,
-            }))?
-        );
-    } else {
-        println!("일정 삭제 완료: {event_id}");
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Outlook Contacts commands
-// ---------------------------------------------------------------------------
-
-fn print_contacts_output(contacts: &[ContactItem], json_out: bool) -> Result<()> {
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({ "contacts": contacts }))?
-        );
-    } else if contacts.is_empty() {
-        println!("표시할 연락처가 없습니다.");
-    } else {
-        for c in contacts {
-            print_contact_line(c);
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_contacts_list(
-    cfg: &AppConfig,
-    limit: usize,
-    refresh: bool,
-    offline: bool,
-    cached: bool,
-    json_out: bool,
-) -> Result<()> {
-    let limit = clamp_limit(limit);
-    if offline {
-        let storage = open_storage_only(cfg)?;
-        let contacts = storage.list_contacts(None, limit)?;
-        return print_contacts_output(&contacts, json_out);
-    }
-
-    let ttl = cli_cache_ttl_secs(cfg);
-    let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
-    if !refresh && (cached || daemon_warm || ttl > 0) {
-        if let Ok(storage) = open_storage_only(cfg) {
-            if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:contacts"], ttl) {
-                let contacts = storage.list_contacts(None, limit)?;
-                if !contacts.is_empty() {
-                    return print_contacts_output(&contacts, json_out);
-                }
-            }
-        }
-    }
-
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let cached_contacts = storage.list_contacts(None, limit)?;
-    let contacts = if refresh || cached_contacts.is_empty() {
-        let fetched = graph.list_contacts(limit).await?;
-        storage.upsert_contacts(&fetched)?;
-        record_cli_sync_cursor(&storage, "cli:contacts");
-        let stored = storage.list_contacts(None, limit)?;
-        if stored.is_empty() {
-            fetched
-        } else {
-            stored
-        }
-    } else {
-        cached_contacts
-    };
-
-    print_contacts_output(&contacts, json_out)
-}
-
-async fn cmd_contacts_search(
-    cfg: &AppConfig,
-    query: &str,
-    limit: usize,
-    offline: bool,
-    json_out: bool,
-) -> Result<()> {
-    if query.trim().is_empty() {
-        bail!("검색어가 비어 있습니다.");
-    }
-    let limit = clamp_limit(limit);
-    let contacts = if offline {
-        let storage = open_storage_only(cfg)?;
-        storage.list_contacts(Some(query), limit)?
-    } else {
-        let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-        let fetched = graph.search_contacts_and_directory(query, limit).await?;
-        let _ = storage.upsert_contacts(&fetched);
-        fetched
-    };
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "query": query,
-                "contacts": contacts,
-            }))?
-        );
-    } else if contacts.is_empty() {
-        println!("'{query}' 와 일치하는 연락처가 없습니다.");
-    } else {
-        for c in &contacts {
-            print_contact_line(c);
-        }
-    }
-    Ok(())
-}
-
-fn print_contact_line(c: &ContactItem) {
-    let email = c.primary_email().unwrap_or("-");
-    let org = c
-        .company_name
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| format!(" · {s}"))
-        .unwrap_or_default();
-    let phone = c
-        .mobile_phone
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| format!(" · {s}"))
-        .unwrap_or_default();
-    println!(
-        "[{}] {} <{}>{}{} ({})",
-        c.source, c.display_name, email, org, phone, c.id
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn cmd_contacts_add(
-    cfg: &AppConfig,
-    display_name: &str,
-    email_addresses: Vec<String>,
-    mobile_phone: Option<String>,
-    company_name: Option<String>,
-    job_title: Option<String>,
-    notes: Option<String>,
-    json_out: bool,
-) -> Result<()> {
-    if display_name.trim().is_empty() {
-        bail!("연락처 이름이 비어 있습니다.");
-    }
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let outgoing = OutgoingContact {
-        display_name: display_name.to_string(),
-        given_name: None,
-        surname: None,
-        email_addresses,
-        mobile_phone,
-        company_name,
-        job_title,
-        department: None,
-        notes,
-    };
-    let created = graph.create_contact(&outgoing).await?;
-    let _ = storage.upsert_contacts(std::slice::from_ref(&created));
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "contact": created,
-            }))?
-        );
-    } else {
-        println!("연락처 추가 완료: {} ({})", created.display_name, created.id);
-    }
-    Ok(())
-}
-
-async fn cmd_contacts_delete(
-    cfg: &AppConfig,
-    contact_id: &str,
-    yes: bool,
-    json_out: bool,
-) -> Result<()> {
-    if json_out && !yes {
-        bail!("{DELETE_JSON_REQUIRES_YES}");
-    }
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let answer = if yes {
-        None
-    } else {
-        Some(prompt(&format!(
-            "연락처 {contact_id} 를 삭제합니다. 계속하려면 'yes' 입력: "
-        ))?)
-    };
-    delete_gate(yes, json_out, answer.as_deref())?;
-
-    graph.delete_contact(contact_id).await?;
-    let _ = storage.delete_contact(contact_id);
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "contact_id": contact_id,
-            }))?
-        );
-    } else {
-        println!("연락처 삭제 완료: {contact_id}");
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Microsoft To Do commands & shared helpers
-// ---------------------------------------------------------------------------
-
-pub(crate) fn resolve_todo_list_from_slice(lists: &[TodoList], query: &str) -> Result<TodoList> {
-    let q = query.trim();
-    if lists.is_empty() {
-        bail!("To Do 목록이 비어 있습니다.");
-    }
-    if q.is_empty() || q.eq_ignore_ascii_case("default") {
-        if let Some(def) = lists
-            .iter()
-            .find(|l| l.wellknown_list_name.as_deref() == Some("defaultList"))
-        {
-            return Ok(def.clone());
-        }
-        return Ok(lists[0].clone());
-    }
-    if let Some(exact) = lists.iter().find(|l| l.id == q) {
-        return Ok(exact.clone());
-    }
-    let q_lower = q.to_lowercase();
-    if let Some(wk) = lists.iter().find(|l| {
-        l.wellknown_list_name
-            .as_deref()
-            .is_some_and(|w| w.to_lowercase() == q_lower)
-    }) {
-        return Ok(wk.clone());
-    }
-    let exact_name: Vec<&TodoList> = lists
-        .iter()
-        .filter(|l| l.display_name.to_lowercase() == q_lower)
-        .collect();
-    if exact_name.len() == 1 {
-        return Ok(exact_name[0].clone());
-    }
-    let sub: Vec<&TodoList> = lists
-        .iter()
-        .filter(|l| l.display_name.to_lowercase().contains(&q_lower))
-        .collect();
-    match sub.len() {
-        0 => bail!("To Do 목록을 찾을 수 없습니다: {q}"),
-        1 => Ok(sub[0].clone()),
-        _ => bail!("여러 To Do 목록이 '{q}' 와 일치합니다."),
-    }
-}
-
-pub(crate) async fn resolve_todo_list_id(
-    storage: &Storage,
-    graph: &GraphClient,
-    list_query: &str,
-    offline: bool,
-) -> Result<String> {
-    let cached = storage.list_todo_lists()?;
-    if !cached.is_empty() {
-        if let Ok(found) = resolve_todo_list_from_slice(&cached, list_query) {
-            return Ok(found.id);
-        }
-    }
-    if !offline {
-        let fetched = graph.list_todo_lists().await?;
-        let _ = storage.upsert_todo_lists(&fetched);
-        if let Ok(found) = resolve_todo_list_from_slice(&fetched, list_query) {
-            return Ok(found.id);
-        }
-    }
-    if !list_query.trim().is_empty() && !list_query.trim().eq_ignore_ascii_case("default") {
-        return Ok(list_query.trim().to_string());
-    }
-    bail!("기본 To Do 목록을 찾을 수 없습니다.")
-}
-
-pub(crate) fn normalize_todo_due_iso(raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        bail!("마감일이 비어 있습니다.");
-    }
-    if NaiveDate::parse_from_str(trimmed, "%Y-%m-%d").is_ok() {
-        return Ok(format!("{trimmed}T00:00:00Z"));
-    }
-    normalize_datetime_iso(trimmed)
-}
-
-pub(crate) fn normalize_todo_importance(raw: &str) -> Result<&'static str> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "low" => Ok("low"),
-        "normal" => Ok("normal"),
-        "high" => Ok("high"),
-        other => bail!("지원하지 않는 To Do 중요도입니다: '{other}' (low | normal | high)"),
-    }
-}
-
-fn resolve_todo_list_id_cached(storage: &Storage, list_query: &str) -> Result<String> {
-    let cached = storage.list_todo_lists()?;
-    if !cached.is_empty() {
-        if let Ok(found) = resolve_todo_list_from_slice(&cached, list_query) {
-            return Ok(found.id);
-        }
-    }
-    if !list_query.trim().is_empty() && !list_query.trim().eq_ignore_ascii_case("default") {
-        return Ok(list_query.trim().to_string());
-    }
-    bail!("기본 To Do 목록을 찾을 수 없습니다.")
-}
-
-fn print_todo_lists_output(lists: &[TodoList], json_out: bool) -> Result<()> {
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({ "lists": lists }))?
-        );
-    } else if lists.is_empty() {
-        println!("To Do 목록이 없습니다.");
-    } else {
-        for l in lists {
-            let wk = l
-                .wellknown_list_name
-                .as_deref()
-                .map(|w| format!(" [{w}]"))
-                .unwrap_or_default();
-            println!("{}{} ({})", l.display_name, wk, l.id);
-        }
-    }
-    Ok(())
-}
-
-fn print_todo_tasks_output(list_id: &str, tasks: &[TodoTask], json_out: bool) -> Result<()> {
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "list_id": list_id,
-                "tasks": tasks,
-            }))?
-        );
-    } else if tasks.is_empty() {
-        println!("표시할 할 일이 없습니다.");
-    } else {
-        for t in tasks {
-            let check = if t.is_completed() { "x" } else { " " };
-            let imp = if t.importance.eq_ignore_ascii_case("high") {
-                "!"
-            } else {
-                " "
-            };
-            let due = t
-                .due_date_iso
-                .as_deref()
-                .map(|d| format!(" (기한 {d})"))
-                .unwrap_or_default();
-            println!("[{check}]{imp} {}{}  ({})", t.title, due, t.id);
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_todo_lists(
-    cfg: &AppConfig,
-    refresh: bool,
-    offline: bool,
-    cached: bool,
-    json_out: bool,
-) -> Result<()> {
-    if offline {
-        let storage = open_storage_only(cfg)?;
-        let lists = storage.list_todo_lists()?;
-        return print_todo_lists_output(&lists, json_out);
-    }
-
-    let ttl = cli_cache_ttl_secs(cfg);
-    let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
-    if !refresh && (cached || daemon_warm || ttl > 0) {
-        if let Ok(storage) = open_storage_only(cfg) {
-            if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:todo_lists"], ttl) {
-                let lists = storage.list_todo_lists()?;
-                if !lists.is_empty() {
-                    return print_todo_lists_output(&lists, json_out);
-                }
-            }
-        }
-    }
-
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let cached_lists = storage.list_todo_lists()?;
-    let lists = if refresh || cached_lists.is_empty() {
-        let fetched = graph.list_todo_lists().await?;
-        storage.upsert_todo_lists(&fetched)?;
-        record_cli_sync_cursor(&storage, "cli:todo_lists");
-        let stored = storage.list_todo_lists()?;
-        if stored.is_empty() {
-            fetched
-        } else {
-            stored
-        }
-    } else {
-        cached_lists
-    };
-
-    print_todo_lists_output(&lists, json_out)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn cmd_todo_tasks(
-    cfg: &AppConfig,
-    list: &str,
-    include_completed: bool,
-    limit: usize,
-    refresh: bool,
-    offline: bool,
-    cached: bool,
-    json_out: bool,
-) -> Result<()> {
-    let limit = clamp_limit(limit);
-    if offline {
-        let storage = open_storage_only(cfg)?;
-        let list_id = resolve_todo_list_id_cached(&storage, list)?;
-        let mut tasks = storage.list_todo_tasks(&list_id, include_completed, limit)?;
-        tasks.truncate(limit);
-        return print_todo_tasks_output(&list_id, &tasks, json_out);
-    }
-
-    let ttl = cli_cache_ttl_secs(cfg);
-    let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
-    if !refresh && (cached || daemon_warm || ttl > 0) {
-        if let Ok(storage) = open_storage_only(cfg) {
-            if let Ok(list_id) = resolve_todo_list_id_cached(&storage, list) {
-                let cursor_key = format!("cli:todo_tasks:{list_id}");
-                if cached || daemon_warm || is_cursor_fresh(&storage, &[cursor_key.as_str()], ttl) {
-                    let mut tasks = storage.list_todo_tasks(&list_id, include_completed, limit)?;
-                    if !tasks.is_empty() {
-                        tasks.truncate(limit);
-                        return print_todo_tasks_output(&list_id, &tasks, json_out);
-                    }
-                }
-            }
-        }
-    }
-
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let list_id = resolve_todo_list_id(&storage, &graph, list, false).await?;
-    let cached_tasks = storage.list_todo_tasks(&list_id, include_completed, limit)?;
-    let mut tasks = if refresh || cached_tasks.is_empty() {
-        let fetched = graph
-            .list_todo_tasks(&list_id, include_completed, limit)
-            .await?;
-        storage.upsert_todo_tasks(&fetched)?;
-        record_cli_sync_cursor(&storage, &format!("cli:todo_tasks:{list_id}"));
-        let stored = storage.list_todo_tasks(&list_id, include_completed, limit)?;
-        if stored.is_empty() {
-            fetched
-        } else {
-            stored
-        }
-    } else {
-        cached_tasks
-    };
-    tasks.truncate(limit);
-
-    print_todo_tasks_output(&list_id, &tasks, json_out)
-}
-
-async fn cmd_todo_add(
-    cfg: &AppConfig,
-    title: &str,
-    list: &str,
-    due: Option<&str>,
-    important: bool,
-    body: Option<String>,
-    json_out: bool,
-) -> Result<()> {
-    if title.trim().is_empty() {
-        bail!("할 일 제목이 비어 있습니다.");
-    }
-    let due_date_iso = due.map(normalize_todo_due_iso).transpose()?;
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let list_id = resolve_todo_list_id(&storage, &graph, list, false).await?;
-
-    let outgoing = OutgoingTodoTask {
-        title: title.to_string(),
-        body_plain: body,
-        due_date_iso,
-        importance: if important {
-            Some("high".to_string())
-        } else {
-            None
-        },
-    };
-    let created = graph.create_todo_task(&list_id, &outgoing).await?;
-    let _ = storage.upsert_todo_tasks(std::slice::from_ref(&created));
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "task": created,
-            }))?
-        );
-    } else {
-        println!("할 일 추가 완료: {} ({})", created.title, created.id);
-    }
-    Ok(())
-}
-
-async fn cmd_todo_done(
-    cfg: &AppConfig,
-    task_id: &str,
-    list: &str,
-    completed: bool,
-    json_out: bool,
-) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let list_id = resolve_todo_list_id(&storage, &graph, list, false).await?;
-    let updated = graph
-        .set_todo_task_completed(&list_id, task_id, completed)
-        .await?;
-    let _ = storage.upsert_todo_tasks(std::slice::from_ref(&updated));
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "task": updated,
-            }))?
-        );
-    } else {
-        println!(
-            "할 일 {} 처리 완료: {} ({})",
-            if completed { "완료" } else { "미완료" },
-            updated.title,
-            updated.id
-        );
-    }
-    Ok(())
-}
-
-async fn cmd_todo_delete(
-    cfg: &AppConfig,
-    task_id: &str,
-    list: &str,
-    yes: bool,
-    json_out: bool,
-) -> Result<()> {
-    if json_out && !yes {
-        bail!("{DELETE_JSON_REQUIRES_YES}");
-    }
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let list_id = resolve_todo_list_id(&storage, &graph, list, false).await?;
-    let answer = if yes {
-        None
-    } else {
-        Some(prompt(&format!(
-            "할 일 {task_id} 를 삭제합니다. 계속하려면 'yes' 입력: "
-        ))?)
-    };
-    delete_gate(yes, json_out, answer.as_deref())?;
-
-    graph.delete_todo_task(&list_id, task_id).await?;
-    let _ = storage.delete_todo_task(task_id);
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "list_id": list_id,
-                "task_id": task_id,
-            }))?
-        );
-    } else {
-        println!("할 일 삭제 완료: {task_id}");
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Microsoft OneNote commands & shared helpers (reused by `serve.rs` & `mcp.rs`)
-// ---------------------------------------------------------------------------
-
-pub(crate) fn build_onenote_scope_from_args(
-    group_id: Option<&str>,
-    site_id: Option<&str>,
-) -> Result<OnenoteScope> {
-    let g = group_id.map(str::trim).filter(|s| !s.is_empty());
-    let s = site_id.map(str::trim).filter(|s| !s.is_empty());
-    match (g, s) {
-        (Some(_), Some(_)) => bail!("--group 과 --site 는 동시에 지정할 수 없습니다."),
-        (Some(gid), None) => Ok(OnenoteScope::Group {
-            group_id: gid.to_string(),
-            group_name: None,
-        }),
-        (None, Some(sid)) => Ok(OnenoteScope::Site {
-            site_id: sid.to_string(),
-            site_name: None,
-        }),
-        (None, None) => Ok(OnenoteScope::Me),
-    }
-}
-
-pub(crate) fn filter_notebooks_by_scope(
-    items: Vec<OnenoteNotebook>,
-    include_teams: bool,
-) -> Vec<OnenoteNotebook> {
-    if include_teams {
-        items
-    } else {
-        items
-            .into_iter()
-            .filter(|n| n.scope.is_personal())
-            .collect()
-    }
-}
-
-pub(crate) fn resolve_onenote_notebook_from_slice(
-    notebooks: &[OnenoteNotebook],
-    query: &str,
-) -> Result<OnenoteNotebook> {
-    let q = query.trim();
-    if q.is_empty() {
-        bail!("필기장 이름 또는 키가 비어 있습니다.");
-    }
-    if let Some(exact_key) = notebooks
-        .iter()
-        .find(|n| n.notebook_key == q || n.id == q)
-    {
-        return Ok(exact_key.clone());
-    }
-    let q_lower = q.to_lowercase();
-    if let Some((owner_part, name_part)) = q_lower.rsplit_once('/') {
-        let owner_q = owner_part.trim();
-        let name_q = name_part.trim();
-        if !owner_q.is_empty() && !name_q.is_empty() {
-            let exact_pair: Vec<&OnenoteNotebook> = notebooks
-                .iter()
-                .filter(|n| {
-                    n.display_name.to_lowercase() == name_q
-                        && n.scope.owner_label().to_lowercase().contains(owner_q)
-                })
-                .collect();
-            if exact_pair.len() == 1 {
-                return Ok(exact_pair[0].clone());
-            }
-            let sub_pair: Vec<&OnenoteNotebook> = notebooks
-                .iter()
-                .filter(|n| {
-                    n.display_name.to_lowercase().contains(name_q)
-                        && n.scope.owner_label().to_lowercase().contains(owner_q)
-                })
-                .collect();
-            if sub_pair.len() == 1 {
-                return Ok(sub_pair[0].clone());
-            }
-        }
-    }
-
-    let exact_name: Vec<&OnenoteNotebook> = notebooks
-        .iter()
-        .filter(|n| n.display_name.to_lowercase() == q_lower)
-        .collect();
-    if exact_name.len() == 1 {
-        return Ok(exact_name[0].clone());
-    }
-    if exact_name.len() > 1 {
-        let personal: Vec<&&OnenoteNotebook> = exact_name
-            .iter()
-            .filter(|n| n.scope.is_personal())
-            .collect();
-        if personal.len() == 1 {
-            return Ok((*personal[0]).clone());
-        }
-        let candidates: Vec<String> = exact_name
-            .iter()
-            .map(|n| format!("{}/{} ({})", n.scope.owner_label(), n.display_name, n.notebook_key))
-            .collect();
-        bail!(
-            "여러 필기장이 '{q}' 와 일치합니다: {}",
-            candidates.join(", ")
-        );
-    }
-
-    let sub: Vec<&OnenoteNotebook> = notebooks
-        .iter()
-        .filter(|n| {
-            n.display_name.to_lowercase().contains(&q_lower)
-                || format!("{}/{}", n.scope.owner_label(), n.display_name)
-                    .to_lowercase()
-                    .contains(&q_lower)
-        })
-        .collect();
-    match sub.len() {
-        0 => bail!("필기장을 찾을 수 없습니다: {q}"),
-        1 => Ok(sub[0].clone()),
-        _ => {
-            let candidates: Vec<String> = sub
-                .iter()
-                .map(|n| {
-                    format!(
-                        "{}/{} ({})",
-                        n.scope.owner_label(),
-                        n.display_name,
-                        n.notebook_key
-                    )
-                })
-                .collect();
-            bail!(
-                "여러 필기장이 '{q}' 와 일치합니다: {}",
-                candidates.join(", ")
-            );
-        }
-    }
-}
-
-pub(crate) async fn load_onenote_notebooks(
-    storage: &Storage,
-    graph: &GraphClient,
-    include_teams: bool,
-    refresh: bool,
-    offline: bool,
-) -> Result<Vec<OnenoteNotebook>> {
-    let cached = filter_notebooks_by_scope(storage.list_onenote_notebooks()?, include_teams);
-    if !offline && (refresh || cached.is_empty()) {
-        let fetched = if include_teams {
-            graph.list_all_accessible_notebooks(true).await?
-        } else {
-            graph.list_onenote_notebooks(&OnenoteScope::Me).await?
-        };
-        storage.upsert_onenote_notebooks(&fetched)?;
-        let stored = filter_notebooks_by_scope(storage.list_onenote_notebooks()?, include_teams);
-        if stored.is_empty() {
-            Ok(filter_notebooks_by_scope(fetched, include_teams))
-        } else {
-            Ok(stored)
-        }
-    } else {
-        Ok(cached)
-    }
-}
-
-pub(crate) async fn resolve_onenote_notebook(
-    storage: &Storage,
-    graph: &GraphClient,
-    query: &str,
-    include_teams: bool,
-    refresh: bool,
-    offline: bool,
-) -> Result<OnenoteNotebook> {
-    if !refresh {
-        let cached = filter_notebooks_by_scope(storage.list_onenote_notebooks()?, include_teams);
-        if !cached.is_empty() {
-            if let Ok(found) = resolve_onenote_notebook_from_slice(&cached, query) {
-                return Ok(found);
-            }
-        }
-    }
-    if !offline {
-        let fetched = if include_teams {
-            graph.list_all_accessible_notebooks(true).await?
-        } else {
-            graph.list_onenote_notebooks(&OnenoteScope::Me).await?
-        };
-        storage.upsert_onenote_notebooks(&fetched)?;
-        let stored = filter_notebooks_by_scope(storage.list_onenote_notebooks()?, include_teams);
-        let pool = if stored.is_empty() { fetched } else { stored };
-        if let Ok(found) = resolve_onenote_notebook_from_slice(&pool, query) {
-            return Ok(found);
-        }
-    }
-    if query.contains('|') {
-        let (scope, nb_id) = split_onenote_entity_key(query);
-        return Ok(OnenoteNotebook {
-            notebook_key: scope.make_entity_key(&nb_id),
-            id: nb_id.clone(),
-            scope,
-            display_name: nb_id,
-            color: None,
-            is_default: false,
-            is_shared: false,
-            user_role: None,
-            created_at: None,
-            last_modified_at: None,
-            created_by: None,
-            web_url: None,
-        });
-    }
-    bail!("필기장을 찾을 수 없습니다: {}", query.trim())
-}
-
-pub(crate) fn resolve_onenote_section_from_slice(
-    sections: &[OnenoteSection],
-    query: &str,
-) -> Result<OnenoteSection> {
-    let q = query.trim();
-    if q.is_empty() {
-        bail!("섹션 이름 또는 키가 비어 있습니다.");
-    }
-    if let Some(exact_key) = sections
-        .iter()
-        .find(|s| s.section_key == q || s.id == q)
-    {
-        return Ok(exact_key.clone());
-    }
-
-    let q_lower = q.to_lowercase();
-    if let Some((lhs_raw, rhs_raw)) = q_lower.rsplit_once('/') {
-        let lhs = lhs_raw.trim();
-        let rhs = rhs_raw.trim();
-        if !lhs.is_empty() && !rhs.is_empty() {
-            let parent_matches = |s: &OnenoteSection, needle: &str, exact: bool| -> bool {
-                let nb = s.notebook_name.as_deref().unwrap_or_default().to_lowercase();
-                let sg = s
-                    .parent_section_group_name
-                    .as_deref()
-                    .unwrap_or_default()
-                    .to_lowercase();
-                let owner = s.scope.owner_label().to_lowercase();
-                let combined = if sg.is_empty() {
-                    nb.clone()
-                } else {
-                    format!("{nb}/{sg}")
-                };
-                if exact {
-                    nb == needle || sg == needle || owner == needle || combined == needle
-                } else {
-                    nb.contains(needle)
-                        || sg.contains(needle)
-                        || owner.contains(needle)
-                        || combined.contains(needle)
-                        || format!("{owner}/{nb}").contains(needle)
-                }
-            };
-
-            let exact_slash: Vec<&OnenoteSection> = sections
-                .iter()
-                .filter(|s| {
-                    s.display_name.to_lowercase() == rhs && parent_matches(s, lhs, true)
-                })
-                .collect();
-            if exact_slash.len() == 1 {
-                return Ok(exact_slash[0].clone());
-            }
-
-            let exact_rhs_sub_lhs: Vec<&OnenoteSection> = sections
-                .iter()
-                .filter(|s| {
-                    s.display_name.to_lowercase() == rhs && parent_matches(s, lhs, false)
-                })
-                .collect();
-            if exact_rhs_sub_lhs.len() == 1 {
-                return Ok(exact_rhs_sub_lhs[0].clone());
-            }
-
-            let sub_slash: Vec<&OnenoteSection> = sections
-                .iter()
-                .filter(|s| {
-                    s.display_name.to_lowercase().contains(rhs) && parent_matches(s, lhs, false)
-                })
-                .collect();
-            match sub_slash.len() {
-                0 => {}
-                1 => return Ok(sub_slash[0].clone()),
-                _ => {
-                    let candidates: Vec<String> = sub_slash
-                        .iter()
-                        .map(|s| {
-                            format!(
-                                "{}/{} ({})",
-                                s.notebook_name.as_deref().unwrap_or("-"),
-                                s.display_name,
-                                s.section_key
-                            )
-                        })
-                        .collect();
-                    bail!(
-                        "여러 섹션이 '{q}' 와 일치합니다: {}",
-                        candidates.join(", ")
-                    );
-                }
-            }
-        }
-    }
-
-    let exact_name: Vec<&OnenoteSection> = sections
-        .iter()
-        .filter(|s| s.display_name.to_lowercase() == q_lower)
-        .collect();
-    if exact_name.len() == 1 {
-        return Ok(exact_name[0].clone());
-    }
-    if exact_name.len() > 1 {
-        let candidates: Vec<String> = exact_name
-            .iter()
-            .map(|s| {
-                format!(
-                    "{}/{} ({})",
-                    s.notebook_name.as_deref().unwrap_or("-"),
-                    s.display_name,
-                    s.section_key
-                )
-            })
-            .collect();
-        bail!(
-            "동일한 이름의 섹션이 여러 개 있습니다 ('필기장/섹션' 또는 키를 지정하세요): {}",
-            candidates.join(", ")
-        );
-    }
-
-    let sub: Vec<&OnenoteSection> = sections
-        .iter()
-        .filter(|s| {
-            s.display_name.to_lowercase().contains(&q_lower)
-                || format!(
-                    "{}/{}",
-                    s.notebook_name.as_deref().unwrap_or_default(),
-                    s.display_name
-                )
-                .to_lowercase()
-                .contains(&q_lower)
-        })
-        .collect();
-    match sub.len() {
-        0 => bail!("섹션을 찾을 수 없습니다: {q}"),
-        1 => Ok(sub[0].clone()),
-        _ => {
-            let candidates: Vec<String> = sub
-                .iter()
-                .map(|s| {
-                    format!(
-                        "{}/{} ({})",
-                        s.notebook_name.as_deref().unwrap_or("-"),
-                        s.display_name,
-                        s.section_key
-                    )
-                })
-                .collect();
-            bail!(
-                "여러 섹션이 '{q}' 와 일치합니다: {}",
-                candidates.join(", ")
-            );
-        }
-    }
-}
-
-pub(crate) async fn load_onenote_sections(
-    storage: &Storage,
-    graph: &GraphClient,
-    notebook_query: Option<&str>,
-    refresh: bool,
-    offline: bool,
-) -> Result<(Option<OnenoteNotebook>, Vec<OnenoteSection>)> {
-    if let Some(nb_q) = notebook_query.map(str::trim).filter(|s| !s.is_empty()) {
-        let nb = resolve_onenote_notebook(storage, graph, nb_q, true, refresh, offline).await?;
-        let cached = storage.list_onenote_sections(Some(&nb.notebook_key))?;
-        if !offline && (refresh || cached.is_empty()) {
-            if let Ok(groups) = graph
-                .list_onenote_section_groups(&nb.scope, Some(&nb.id))
-                .await
-            {
-                if !groups.is_empty() {
-                    let _ = storage.upsert_onenote_section_groups(&groups);
-                }
-            }
-            let mut secs = graph.list_onenote_sections(&nb.scope, Some(&nb.id)).await?;
-            for sec in &mut secs {
-                if sec.notebook_id.is_none() {
-                    sec.notebook_id = Some(nb.id.clone());
-                }
-                if sec.notebook_name.is_none() {
-                    sec.notebook_name = Some(nb.display_name.clone());
-                }
-            }
-            storage.upsert_onenote_sections(&secs)?;
-            let stored = storage.list_onenote_sections(Some(&nb.notebook_key))?;
-            Ok((Some(nb), if stored.is_empty() { secs } else { stored }))
-        } else {
-            Ok((Some(nb), cached))
-        }
-    } else {
-        let cached = storage.list_onenote_sections(None)?;
-        if !offline && (refresh || cached.is_empty()) {
-            let notebooks = load_onenote_notebooks(storage, graph, true, refresh, false).await?;
-            let (groups, secs) = graph.list_all_accessible_sections(&notebooks).await?;
-            if !groups.is_empty() {
-                storage.upsert_onenote_section_groups(&groups)?;
-            }
-            storage.upsert_onenote_sections(&secs)?;
-            let stored = storage.list_onenote_sections(None)?;
-            Ok((None, if stored.is_empty() { secs } else { stored }))
-        } else {
-            Ok((None, cached))
-        }
-    }
-}
-
-pub(crate) async fn resolve_onenote_section(
-    storage: &Storage,
-    graph: &GraphClient,
-    query: &str,
-    refresh: bool,
-    offline: bool,
-) -> Result<OnenoteSection> {
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
-        bail!("섹션 이름 또는 키가 비어 있습니다.");
-    }
-    if !refresh {
-        let cached = storage.list_onenote_sections(None)?;
-        if !cached.is_empty() {
-            if let Ok(found) = resolve_onenote_section_from_slice(&cached, trimmed) {
-                return Ok(found);
-            }
-        }
-    }
-    if !offline {
-        if let Ok((_, fresh)) = load_onenote_sections(storage, graph, None, true, false).await {
-            if let Ok(found) = resolve_onenote_section_from_slice(&fresh, trimmed) {
-                return Ok(found);
-            }
-        }
-    }
-    if trimmed.contains('|') {
-        let (scope, sec_id) = split_onenote_entity_key(trimmed);
-        return Ok(OnenoteSection {
-            section_key: scope.make_entity_key(&sec_id),
-            id: sec_id.clone(),
-            scope,
-            notebook_id: None,
-            notebook_name: None,
-            parent_section_group_id: None,
-            parent_section_group_name: None,
-            display_name: sec_id,
-            color: None,
-            is_default: false,
-            pages_url: None,
-            created_at: None,
-            last_modified_at: None,
-            web_url: None,
-        });
-    }
-    let cached = storage.list_onenote_sections(None)?;
-    resolve_onenote_section_from_slice(&cached, trimmed)
-}
-
-pub(crate) async fn list_onenote_pages_helper(
-    storage: &Storage,
-    graph: &GraphClient,
-    section_query: &str,
-    limit: usize,
-    refresh: bool,
-    offline: bool,
-) -> Result<(OnenoteSection, Vec<OnenotePageSummary>)> {
-    let limit = clamp_limit(limit);
-    let sec = resolve_onenote_section(storage, graph, section_query, refresh, offline).await?;
-    let cached = storage.list_onenote_pages(&sec.section_key)?;
-    let mut pages = if !offline && (refresh || cached.is_empty()) {
-        let mut fetched = graph
-            .list_onenote_pages(&sec.scope, &sec.id, limit)
-            .await?;
-        for p in &mut fetched {
-            if p.section_id.is_empty() {
-                p.section_id = sec.id.clone();
-            }
-            if p.section_name.is_none() {
-                p.section_name = Some(sec.display_name.clone());
-            }
-            if p.notebook_id.is_none() {
-                p.notebook_id = sec.notebook_id.clone();
-            }
-            if p.notebook_name.is_none() {
-                p.notebook_name = sec.notebook_name.clone();
-            }
-        }
-        storage.upsert_onenote_pages(&fetched)?;
-        let stored = storage.list_onenote_pages(&sec.section_key)?;
-        if stored.is_empty() {
-            fetched
-        } else {
-            stored
-        }
-    } else {
-        cached
-    };
-    pages.truncate(limit);
-    Ok((sec, pages))
-}
-
-fn pick_search_hit_for_title<'a>(
-    hits: &'a [OnenoteSearchHit],
-    query: &str,
-) -> Option<&'a OnenoteSearchHit> {
-    let q_lower = query.trim().to_lowercase();
-    if let Some(exact) = hits.iter().find(|h| h.title.to_lowercase() == q_lower) {
-        return Some(exact);
-    }
-    if hits.len() == 1 {
-        return Some(&hits[0]);
-    }
-    let title_matches: Vec<&OnenoteSearchHit> = hits
-        .iter()
-        .filter(|h| h.title.to_lowercase().contains(&q_lower))
-        .collect();
-    if title_matches.len() == 1 {
-        return Some(title_matches[0]);
-    }
-    None
-}
-
-pub(crate) async fn load_onenote_page_detail(
-    storage: &Storage,
-    graph: &GraphClient,
-    page_query: &str,
-    offline: bool,
-) -> Result<OnenotePageDetail> {
-    let q = page_query.trim();
-    if q.is_empty() {
-        bail!("페이지 ID 또는 검색어가 비어 있습니다.");
-    }
-
-    if offline {
-        if let Some(detail) = storage.get_onenote_page_detail(q)? {
-            return Ok(detail);
-        }
-        let hits = storage.search_onenote_pages(q, None, 10)?;
-        if let Some(hit) = pick_search_hit_for_title(&hits, q) {
-            if let Some(detail) = storage.get_onenote_page_detail(&hit.page_key)? {
-                return Ok(detail);
-            }
-        }
-        bail!("오프라인 캐시에서 OneNote 페이지를 찾을 수 없습니다: {q}");
-    }
-
-    let mut cached_summary = storage.get_onenote_page_summary(q)?;
-    if cached_summary.is_none() && !q.contains('|') {
-        let hits = storage.search_onenote_pages(q, None, 10)?;
-        if let Some(hit) = pick_search_hit_for_title(&hits, q) {
-            cached_summary = storage.get_onenote_page_summary(&hit.page_key)?.or_else(|| {
-                Some(OnenotePageSummary {
-                    page_key: hit.page_key.clone(),
-                    id: hit.page_id.clone(),
-                    scope: hit.scope.clone(),
-                    section_id: hit.section_id.clone(),
-                    section_name: hit.section_name.clone(),
-                    notebook_id: None,
-                    notebook_name: hit.notebook_name.clone(),
-                    title: hit.title.clone(),
-                    level: 0,
-                    order: 0,
-                    created_at: None,
-                    last_modified_at: hit.last_modified_at.clone(),
-                    content_url: None,
-                    web_url: hit.web_url.clone(),
-                    preview_text: Some(hit.snippet.clone()),
-                    has_todo: false,
-                })
-            });
-        }
-    }
-
-    if let Some(summary) = cached_summary {
-        let scope = summary.scope.clone();
-        let id = summary.id.clone();
-        let detail = graph
-            .get_onenote_page_detail(&scope, &id, Some(summary))
-            .await?;
-        storage.upsert_onenote_page_detail(&detail)?;
-        let _ = storage.upsert_onenote_pages(std::slice::from_ref(&detail.summary));
-        return Ok(detail);
-    }
-
-    if q.contains('|') {
-        let (scope, page_id) = split_onenote_entity_key(q);
-        let detail = graph.get_onenote_page_detail(&scope, &page_id, None).await?;
-        storage.upsert_onenote_page_detail(&detail)?;
-        let _ = storage.upsert_onenote_pages(std::slice::from_ref(&detail.summary));
-        return Ok(detail);
-    }
-
-    // Try direct personal page ID first unless query clearly contains whitespace/non-ID chars.
-    let looks_like_id = !q.chars().any(char::is_whitespace) && q.is_ascii();
-    if looks_like_id {
-        if let Ok(detail) = graph
-            .get_onenote_page_detail(&OnenoteScope::Me, q, None)
-            .await
-        {
-            storage.upsert_onenote_page_detail(&detail)?;
-            let _ = storage.upsert_onenote_pages(std::slice::from_ref(&detail.summary));
-            return Ok(detail);
-        }
-    }
-
-    // Bootstrap hierarchy/pages and retry summary + FTS lookup.
-    let _ = sync::bootstrap_onenote(graph, storage).await;
-    if let Some(summary) = storage.get_onenote_page_summary(q)? {
-        let scope = summary.scope.clone();
-        let id = summary.id.clone();
-        let detail = graph
-            .get_onenote_page_detail(&scope, &id, Some(summary))
-            .await?;
-        storage.upsert_onenote_page_detail(&detail)?;
-        let _ = storage.upsert_onenote_pages(std::slice::from_ref(&detail.summary));
-        return Ok(detail);
-    }
-    let hits = storage.search_onenote_pages(q, None, 10)?;
-    if let Some(hit) = pick_search_hit_for_title(&hits, q) {
-        let summary = storage.get_onenote_page_summary(&hit.page_key)?;
-        let detail = graph
-            .get_onenote_page_detail(&hit.scope, &hit.page_id, summary)
-            .await?;
-        storage.upsert_onenote_page_detail(&detail)?;
-        let _ = storage.upsert_onenote_pages(std::slice::from_ref(&detail.summary));
-        return Ok(detail);
-    }
-
-    // Also scan cached page titles across all sections in case FTS didn't index uncached bodies yet.
-    let sections = storage.list_onenote_sections(None)?;
-    let q_lower = q.to_lowercase();
-    let mut title_candidates = Vec::new();
-    for sec in &sections {
-        if let Ok(pages) = storage.list_onenote_pages(&sec.section_key) {
-            for p in pages {
-                if p.id == q
-                    || p.page_key == q
-                    || p.title.to_lowercase() == q_lower
-                    || p.title.to_lowercase().contains(&q_lower)
-                {
-                    title_candidates.push(p);
-                }
-            }
-        }
-    }
-    if let Some(exact) = title_candidates
-        .iter()
-        .find(|p| p.id == q || p.title.to_lowercase() == q_lower)
-        .cloned()
-        .or_else(|| {
-            if title_candidates.len() == 1 {
-                Some(title_candidates[0].clone())
-            } else {
-                None
-            }
-        })
-    {
-        let scope = exact.scope.clone();
-        let id = exact.id.clone();
-        let detail = graph
-            .get_onenote_page_detail(&scope, &id, Some(exact))
-            .await?;
-        storage.upsert_onenote_page_detail(&detail)?;
-        let _ = storage.upsert_onenote_pages(std::slice::from_ref(&detail.summary));
-        return Ok(detail);
-    }
-
-    bail!("OneNote 페이지를 찾을 수 없습니다: {q}")
-}
-
-pub(crate) fn read_markdown_input_and_images(
-    body_arg: Option<&str>,
-    file_arg: Option<&Path>,
-    image_paths: &[PathBuf],
-) -> Result<(String, Vec<InlineImageUpload>)> {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(b) = body_arg.filter(|s| !s.is_empty()) {
-        parts.push(b.to_string());
-    }
-    if let Some(path) = file_arg {
-        let from_file = std::fs::read_to_string(path)
-            .with_context(|| format!("Markdown 파일 읽기 실패: {}", path.display()))?;
-        if !from_file.is_empty() {
-            parts.push(from_file);
-        }
-    }
-    let mut markdown = parts.join("\n\n");
-
-    let mut uploads = Vec::with_capacity(image_paths.len());
-    for (idx, img_path) in image_paths.iter().enumerate() {
-        if !img_path.exists() || !img_path.is_file() {
-            bail!("이미지 파일을 찾을 수 없습니다: {}", img_path.display());
-        }
-        let mime_type = image_mime_for_path(img_path).with_context(|| {
-            format!(
-                "지원하지 않는 이미지 형식입니다(png/jpg/jpeg/gif/webp/bmp): {}",
-                img_path.display()
-            )
-        })?;
-        let bytes = std::fs::read(img_path)
-            .with_context(|| format!("이미지 파일 읽기 실패: {}", img_path.display()))?;
-        let file_name = img_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(ToString::to_string);
-        let temp_id = format!("img{}", idx + 1);
-        let marker = format!("name:{temp_id}");
-        if !markdown.contains(&marker) {
-            let alt = file_name.as_deref().unwrap_or("image");
-            if markdown.trim().is_empty() {
-                markdown = format!("![{alt}]({marker})");
-            } else {
-                markdown.push_str(&format!("\n\n![{alt}]({marker})"));
-            }
-        }
-        uploads.push(InlineImageUpload {
-            temp_id,
-            mime_type: mime_type.to_string(),
-            bytes,
-            file_name,
-        });
-    }
-
-    Ok((markdown, uploads))
-}
-
-pub(crate) async fn create_onenote_page_helper(
-    storage: &Storage,
-    graph: &GraphClient,
-    section_query: &str,
-    title: &str,
-    markdown_body: &str,
-    inline_images: Vec<InlineImageUpload>,
-    level: Option<i32>,
-) -> Result<(OnenoteSection, OnenotePageSummary)> {
-    let trimmed_title = title.trim();
-    if trimmed_title.is_empty() {
-        bail!("페이지 제목(--title)이 비어 있습니다.");
-    }
-    if let Some(lv) = level {
-        if !(0..=2).contains(&lv) {
-            bail!("페이지 들여쓰기 level 은 0, 1, 2 중 하나여야 합니다 (입력값: {lv}).");
-        }
-    }
-    let sec = resolve_onenote_section(storage, graph, section_query, false, false).await?;
-    let outgoing = OutgoingOnenotePage {
-        title: trimmed_title.to_string(),
-        markdown_body: markdown_body.to_string(),
-        inline_images,
-        level,
-    };
-    let mut created = graph
-        .create_onenote_page(&sec.scope, &sec.id, &outgoing)
-        .await?;
-    if created.section_id.is_empty() {
-        created.section_id = sec.id.clone();
-    }
-    if created.section_name.is_none() {
-        created.section_name = Some(sec.display_name.clone());
-    }
-    if created.notebook_id.is_none() {
-        created.notebook_id = sec.notebook_id.clone();
-    }
-    if created.notebook_name.is_none() {
-        created.notebook_name = sec.notebook_name.clone();
-    }
-    let _ = storage.upsert_onenote_pages(std::slice::from_ref(&created));
-    Ok((sec, created))
-}
-
-pub(crate) async fn append_onenote_page_helper(
-    storage: &Storage,
-    graph: &GraphClient,
-    page_query: &str,
-    markdown: &str,
-    inline_images: &[InlineImageUpload],
-) -> Result<serde_json::Value> {
-    if markdown.trim().is_empty() && inline_images.is_empty() {
-        bail!("추가할 Markdown 본문 또는 이미지(--file / --image)를 지정하세요.");
-    }
-    let detail = load_onenote_page_detail(storage, graph, page_query, false).await?;
-    graph
-        .append_onenote_page_markdown(
-            &detail.summary.scope,
-            &detail.summary.id,
-            detail.primary_div_id.as_deref(),
-            markdown,
-            inline_images,
-        )
-        .await?;
-
-    let refreshed = graph
-        .get_onenote_page_detail(
-            &detail.summary.scope,
-            &detail.summary.id,
-            Some(detail.summary.clone()),
-        )
-        .await
-        .ok();
-    if let Some(ref d) = refreshed {
-        let _ = storage.upsert_onenote_page_detail(d);
-        let _ = storage.upsert_onenote_pages(std::slice::from_ref(&d.summary));
-    }
-
-    Ok(json!({
-        "ok": true,
-        "page_key": detail.summary.page_key,
-        "page_id": detail.summary.id,
-        "primary_div_id": detail.primary_div_id,
-        "page": refreshed,
-    }))
-}
-
-pub(crate) async fn update_onenote_page_helper(
-    storage: &Storage,
-    graph: &GraphClient,
-    page_query: &str,
-    new_title: Option<&str>,
-    new_markdown: Option<&str>,
-    block_id: Option<&str>,
-) -> Result<serde_json::Value> {
-    let title_opt = new_title.map(str::trim).filter(|s| !s.is_empty());
-    let md_opt = new_markdown.filter(|s| !s.trim().is_empty());
-    let bid_opt = block_id.map(str::trim).filter(|s| !s.is_empty());
-
-    if bid_opt.is_some() && md_opt.is_none() {
-        bail!("block_id 지정 시 교체할 Markdown 본문(--body 또는 --file)이 필요합니다.");
-    }
-    if title_opt.is_none() && md_opt.is_none() {
-        bail!("수정할 제목(--title) 또는 본문(--body / --file) 중 하나 이상을 지정하세요.");
-    }
-
-    let detail = load_onenote_page_detail(storage, graph, page_query, false).await?;
-    let commands: Vec<OnenotePatchCommand> = if let Some(bid) = bid_opt {
-        let mut cmds = vec![parser::onenote::build_replace_block_patch(
-            bid,
-            md_opt.unwrap_or_default(),
-        )];
-        if let Some(t) = title_opt {
-            cmds.push(OnenotePatchCommand {
-                target: "title".to_string(),
-                action: "replace".to_string(),
-                position: None,
-                content: t.to_string(),
-            });
-        }
-        cmds
-    } else if let Some(md) = md_opt {
-        parser::onenote::build_replace_page_body_commands(&detail, title_opt, md)
-    } else {
-        vec![OnenotePatchCommand {
-            target: "title".to_string(),
-            action: "replace".to_string(),
-            position: None,
-            content: title_opt.unwrap_or_default().to_string(),
-        }]
-    };
-
-    if commands.is_empty() {
-        bail!("적용할 OneNote PATCH 명령을 생성할 수 없습니다.");
-    }
-
-    graph
-        .patch_onenote_page_commands(&detail.summary.scope, &detail.summary.id, &commands)
-        .await?;
-
-    let refreshed = graph
-        .get_onenote_page_detail(
-            &detail.summary.scope,
-            &detail.summary.id,
-            Some(detail.summary.clone()),
-        )
-        .await
-        .ok();
-    if let Some(ref d) = refreshed {
-        let _ = storage.upsert_onenote_page_detail(d);
-        let _ = storage.upsert_onenote_pages(std::slice::from_ref(&d.summary));
-    }
-
-    Ok(json!({
-        "ok": true,
-        "page_key": detail.summary.page_key,
-        "page_id": detail.summary.id,
-        "commands_applied": commands.len(),
-        "page": refreshed,
-    }))
-}
-
-pub(crate) async fn toggle_onenote_todo_helper(
-    storage: &Storage,
-    graph: &GraphClient,
-    page_query: &str,
-    block_id: Option<&str>,
-    todo_index: Option<usize>,
-) -> Result<serde_json::Value> {
-    let bid_opt = block_id.map(str::trim).filter(|s| !s.is_empty());
-    if bid_opt.is_none() && todo_index.is_none() {
-        bail!("체크박스 토글을 위해 --block-id <element_id> 또는 --index <todo_index> 를 지정하세요.");
-    }
-
-    let detail = load_onenote_page_detail(storage, graph, page_query, false).await?;
-    let target_block: &OnenoteBlock = if let Some(bid) = bid_opt {
-        let clean = bid.trim_start_matches('#');
-        detail
-            .blocks
-            .iter()
-            .find(|b| {
-                b.element_id
-                    .as_deref()
-                    .is_some_and(|eid| eid.trim_start_matches('#') == clean)
-            })
-            .with_context(|| format!("페이지에서 block_id '{bid}' 를 찾을 수 없습니다."))?
-    } else {
-        let idx = todo_index.unwrap_or(0);
-        let todo_blocks: Vec<&OnenoteBlock> = detail
-            .blocks
-            .iter()
-            .filter(|b| b.tag.as_ref().is_some_and(OnenoteTagKind::is_todo))
-            .collect();
-        if todo_blocks.is_empty() {
-            bail!("이 페이지에는 토글할 OneNote to-do 체크박스가 없습니다.");
-        }
-        todo_blocks.get(idx).copied().with_context(|| {
-            format!(
-                "체크박스 인덱스 {idx} 가 범위를 벗어났습니다 (총 {}개)",
-                todo_blocks.len()
-            )
-        })?
-    };
-
-    let (cmd, completed) = parser::onenote::build_toggle_todo_patch(target_block).context(
-        "선택한 블록은 OneNote to-do 태그가 아니거나 element_id(?includeIDs=true)가 없습니다.",
-    )?;
-
-    graph
-        .patch_onenote_page_commands(
-            &detail.summary.scope,
-            &detail.summary.id,
-            std::slice::from_ref(&cmd),
-        )
-        .await?;
-
-    let refreshed = graph
-        .get_onenote_page_detail(
-            &detail.summary.scope,
-            &detail.summary.id,
-            Some(detail.summary.clone()),
-        )
-        .await
-        .ok();
-    if let Some(ref d) = refreshed {
-        let _ = storage.upsert_onenote_page_detail(d);
-        let _ = storage.upsert_onenote_pages(std::slice::from_ref(&d.summary));
-    }
-
-    Ok(json!({
-        "ok": true,
-        "page_key": detail.summary.page_key,
-        "page_id": detail.summary.id,
-        "element_id": target_block.element_id,
-        "completed": completed,
-        "command": cmd,
-        "page": refreshed,
-    }))
-}
-
-pub(crate) async fn delete_onenote_page_helper(
-    storage: &Storage,
-    graph: &GraphClient,
-    page_query: &str,
-) -> Result<serde_json::Value> {
-    let q = page_query.trim();
-    if q.is_empty() {
-        bail!("삭제할 페이지 ID 또는 검색어가 비어 있습니다.");
-    }
-    let (page_key, scope, page_id) = if let Some(sum) = storage.get_onenote_page_summary(q)? {
-        (sum.page_key, sum.scope, sum.id)
-    } else if !q.contains('|') {
-        let hits = storage.search_onenote_pages(q, None, 5)?;
-        if let Some(hit) = pick_search_hit_for_title(&hits, q) {
-            (hit.page_key.clone(), hit.scope.clone(), hit.page_id.clone())
-        } else {
-            let (s, id) = split_onenote_entity_key(q);
-            (s.make_entity_key(&id), s, id)
-        }
-    } else {
-        let (s, id) = split_onenote_entity_key(q);
-        (s.make_entity_key(&id), s, id)
-    };
-
-    graph.delete_onenote_page(&scope, &page_id).await?;
-    let _ = storage.delete_onenote_page(&page_key);
-    if page_key != page_id {
-        let _ = storage.delete_onenote_page(&page_id);
-    }
-
-    Ok(json!({
-        "ok": true,
-        "page_key": page_key,
-        "page_id": page_id,
-    }))
-}
-
-pub(crate) async fn search_onenote_pages_helper(
-    storage: &Storage,
-    graph: &GraphClient,
-    query: &str,
-    section_query: Option<&str>,
-    refresh: bool,
-    limit: usize,
-) -> Result<Vec<OnenoteSearchHit>> {
-    let q = query.trim();
-    if q.is_empty() {
-        bail!("검색어가 비어 있습니다.");
-    }
-    let limit = clamp_limit(limit);
-
-    if refresh {
-        sync::bootstrap_onenote(graph, storage).await?;
-    }
-
-    let section_filter = match section_query.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(sec_q) => {
-            let sec = match resolve_onenote_section(storage, graph, sec_q, false, true).await {
-                Ok(s) => s,
-                Err(_) => resolve_onenote_section(storage, graph, sec_q, false, false).await?,
-            };
-            Some(sec.section_key)
-        }
-        None => None,
-    };
-
-    let hits = storage.search_onenote_pages(q, section_filter.as_deref(), limit)?;
-    if !hits.is_empty() || refresh {
-        return Ok(hits);
-    }
-
-    if storage.list_onenote_notebooks()?.is_empty() {
-        let _ = sync::bootstrap_onenote(graph, storage).await;
-        return storage.search_onenote_pages(q, section_filter.as_deref(), limit);
-    }
-
-    Ok(hits)
-}
-
-pub(crate) fn select_onenote_resource<'a>(
-    detail: &'a OnenotePageDetail,
-    index: Option<usize>,
-    prefer_image: bool,
-) -> Result<(usize, &'a OnenoteResource)> {
-    if detail.resources.is_empty() {
-        bail!(
-            "이 OneNote 페이지에는 다운로드 가능한 리소스가 없습니다: {}",
-            detail.summary.title
-        );
-    }
-    if let Some(idx) = index {
-        let res = detail.resources.get(idx).with_context(|| {
-            format!(
-                "리소스 인덱스 {idx} 가 범위를 벗어났습니다 (총 {}개)",
-                detail.resources.len()
-            )
-        })?;
-        return Ok((idx, res));
-    }
-    if prefer_image {
-        if let Some((idx, res)) = detail
-            .resources
-            .iter()
-            .enumerate()
-            .find(|(_, r)| r.is_image)
-        {
-            return Ok((idx, res));
-        }
-    }
-    Ok((0, &detail.resources[0]))
-}
-
-pub(crate) fn default_resource_filename(res: &OnenoteResource, index: usize) -> String {
-    if let Some(name) = res.file_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        let safe: String = name
-            .chars()
-            .map(|c| {
-                if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
-                    '_'
-                } else {
-                    c
-                }
-            })
-            .collect();
-        if !safe.is_empty() {
-            return safe;
-        }
-    }
-    let ext = match res.mime_type.to_ascii_lowercase().as_str() {
-        "image/png" => "png",
-        "image/jpeg" | "image/jpg" => "jpg",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        "application/pdf" => "pdf",
-        _ => "bin",
-    };
-    format!("onenote-resource-{index}.{ext}")
-}
-
-fn spans_to_plain(spans: &[RichSpan]) -> String {
-    spans.iter().map(|s| s.text.as_str()).collect()
-}
-
-fn format_onenote_blocks_human(detail: &OnenotePageDetail) -> String {
-    let mut out = String::new();
-    out.push_str(&format!(
-        "# {} ({})\n",
-        detail.summary.title, detail.summary.page_key
-    ));
-    if let Some(ref div_id) = detail.primary_div_id {
-        out.push_str(&format!("primary_div_id: {div_id}\n"));
-    }
-    for (idx, b) in detail.blocks.iter().enumerate() {
-        let id_badge = b
-            .element_id
-            .as_deref()
-            .map(|id| format!("[id={id}] "))
-            .unwrap_or_default();
-        let tag_badge = match &b.tag {
-            Some(OnenoteTagKind::Todo { completed: true }) => "[x] ".to_string(),
-            Some(OnenoteTagKind::Todo { completed: false }) => "[ ] ".to_string(),
-            Some(other) => format!("[tag={}] ", other.data_tag_value()),
-            None => String::new(),
-        };
-        let summary = match &b.kind {
-            OnenoteBlockKind::Heading { level, spans } => {
-                format!("H{level}: {}", spans_to_plain(spans))
-            }
-            OnenoteBlockKind::Paragraph { spans } => spans_to_plain(spans),
-            OnenoteBlockKind::ListItem {
-                ordered,
-                index,
-                depth,
-                spans,
-            } => {
-                let bullet = if *ordered {
-                    format!("{}.", index.unwrap_or(1))
-                } else {
-                    "-".to_string()
-                };
-                format!(
-                    "{}{} {}",
-                    "  ".repeat(*depth as usize),
-                    bullet,
-                    spans_to_plain(spans)
-                )
-            }
-            OnenoteBlockKind::Quote { spans } => format!("> {}", spans_to_plain(spans)),
-            OnenoteBlockKind::CodeBlock { lang, code } => {
-                format!(
-                    "```{}\n{}\n```",
-                    lang.as_deref().unwrap_or_default(),
-                    code
-                )
-            }
-            OnenoteBlockKind::Table { headers, rows } => {
-                format!("Table ({} cols × {} rows)", headers.len(), rows.len())
-            }
-            OnenoteBlockKind::Image {
-                resource_index,
-                alt,
-                ..
-            } => format!(
-                "Image[#{resource_index}] {}",
-                alt.as_deref().unwrap_or_default()
-            ),
-            OnenoteBlockKind::Attachment {
-                resource_index,
-                name,
-                mime_type,
-                ..
-            } => format!("Attachment[#{resource_index}] {name} ({mime_type})"),
-            OnenoteBlockKind::Divider => "---".to_string(),
-        };
-        out.push_str(&format!("{idx:02}: {id_badge}{tag_badge}{summary}\n"));
-    }
-    out
-}
-
-async fn cmd_notes_notebooks(
-    cfg: &AppConfig,
-    include_teams: bool,
-    refresh: bool,
-    offline: bool,
-    json_out: bool,
-) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let notebooks =
-        load_onenote_notebooks(&storage, &graph, include_teams, refresh, offline).await?;
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({ "notebooks": notebooks }))?
-        );
-    } else if notebooks.is_empty() {
-        println!("표시할 OneNote 필기장이 없습니다.");
-    } else {
-        for nb in &notebooks {
-            let badge = if nb.scope.is_personal() {
-                "개인".to_string()
-            } else {
-                format!("공유:{}", nb.scope.owner_label())
-            };
-            let def = if nb.is_default { " [기본]" } else { "" };
-            println!(
-                "[{}] {}{}  ({})",
-                badge, nb.display_name, def, nb.notebook_key
-            );
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_notes_create_notebook(
-    cfg: &AppConfig,
-    name: &str,
-    group: Option<&str>,
-    site: Option<&str>,
-    json_out: bool,
-) -> Result<()> {
-    if name.trim().is_empty() {
-        bail!("필기장 이름이 비어 있습니다.");
-    }
-    let scope = build_onenote_scope_from_args(group, site)?;
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let created = graph.create_onenote_notebook(&scope, name.trim()).await?;
-    storage.upsert_onenote_notebooks(std::slice::from_ref(&created))?;
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "notebook": created,
-            }))?
-        );
-    } else {
-        println!(
-            "OneNote 필기장 생성 완료: {} ({})",
-            created.display_name, created.notebook_key
-        );
-    }
-    Ok(())
-}
-
-async fn cmd_notes_sections(
-    cfg: &AppConfig,
-    notebook: Option<&str>,
-    refresh: bool,
-    offline: bool,
-    json_out: bool,
-) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let (nb, sections) =
-        load_onenote_sections(&storage, &graph, notebook, refresh, offline).await?;
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "notebook": nb,
-                "sections": sections,
-            }))?
-        );
-    } else if sections.is_empty() {
-        println!("표시할 OneNote 섹션이 없습니다.");
-    } else {
-        for sec in &sections {
-            let nb_label = sec.notebook_name.as_deref().unwrap_or("-");
-            let sg_label = sec
-                .parent_section_group_name
-                .as_deref()
-                .map(|g| format!("{g}/"))
-                .unwrap_or_default();
-            println!(
-                "{}/{}{}  ({})",
-                nb_label, sg_label, sec.display_name, sec.section_key
-            );
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_notes_create_section(
-    cfg: &AppConfig,
-    notebook: &str,
-    name: &str,
-    json_out: bool,
-) -> Result<()> {
-    if name.trim().is_empty() {
-        bail!("섹션 이름이 비어 있습니다.");
-    }
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let nb = resolve_onenote_notebook(&storage, &graph, notebook, true, false, false).await?;
-    let mut created = graph
-        .create_onenote_section(&nb.scope, &nb.id, name.trim())
-        .await?;
-    if created.notebook_id.is_none() {
-        created.notebook_id = Some(nb.id.clone());
-    }
-    if created.notebook_name.is_none() {
-        created.notebook_name = Some(nb.display_name.clone());
-    }
-    storage.upsert_onenote_sections(std::slice::from_ref(&created))?;
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "notebook": nb,
-                "section": created,
-            }))?
-        );
-    } else {
-        println!(
-            "OneNote 섹션 생성 완료: {}/{} ({})",
-            nb.display_name, created.display_name, created.section_key
-        );
-    }
-    Ok(())
-}
-
-async fn cmd_notes_pages(
-    cfg: &AppConfig,
-    section: &str,
-    limit: usize,
-    refresh: bool,
-    offline: bool,
-    json_out: bool,
-) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let (sec, pages) =
-        list_onenote_pages_helper(&storage, &graph, section, limit, refresh, offline).await?;
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "section": sec,
-                "pages": pages,
-            }))?
-        );
-    } else if pages.is_empty() {
-        println!("표시할 OneNote 페이지가 없습니다.");
-    } else {
-        for p in &pages {
-            let indent = "  ".repeat(p.level.clamp(0, 4) as usize);
-            let todo_mark = if p.has_todo { "[todo] " } else { "" };
-            let modified = p.last_modified_at.as_deref().unwrap_or("-");
-            println!(
-                "{indent}{todo_mark}{}  [{}] ({})",
-                p.title, modified, p.page_key
-            );
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_notes_read(
-    cfg: &AppConfig,
-    page: &str,
-    format: &str,
-    preview_images: bool,
-    offline: bool,
-    json_out: bool,
-) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let detail = load_onenote_page_detail(&storage, &graph, page, offline).await?;
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "format": format,
-                "page": detail,
-            }))?
-        );
-        return Ok(());
-    }
-
-    match format {
-        "xhtml" => println!("{}", detail.raw_xhtml),
-        "plain" => {
-            println!("# {}\n", detail.summary.title);
-            println!("{}", detail.body_plain);
-        }
-        "blocks" => print!("{}", format_onenote_blocks_human(&detail)),
-        _ => {
-            println!("# {}\n", detail.summary.title);
-            println!("{}", detail.body_markdown);
-        }
-    }
-
-    if preview_images && !offline {
-        let (cols, rows) = default_preview_dimensions(None, None);
-        for res in detail.resources.iter().filter(|r| r.is_image) {
-            let url = res.fullres_url.as_deref().unwrap_or(&res.resource_url);
-            if let Ok(bytes) = graph.download_onenote_resource_bytes(url).await {
-                if let Ok(rendered) = img_preview::render_ansi_stdout(&bytes, cols, rows) {
-                    println!();
-                    print!("{rendered}");
-                    if !rendered.ends_with('\n') {
-                        println!();
-                    }
-                }
-            }
-        }
-        io::stdout().flush()?;
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn cmd_notes_create(
-    cfg: &AppConfig,
-    section: &str,
-    title: &str,
-    markdown_body: Option<&str>,
-    file: Option<&Path>,
-    image: &[PathBuf],
-    level: Option<i32>,
-    json_out: bool,
-) -> Result<()> {
-    let (md, inline_images) = read_markdown_input_and_images(markdown_body, file, image)?;
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let (sec, created) =
-        create_onenote_page_helper(&storage, &graph, section, title, &md, inline_images, level)
-            .await?;
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "section": sec,
-                "page": created,
-            }))?
-        );
-    } else {
-        println!(
-            "OneNote 페이지 생성 완료: {} ({})",
-            created.title, created.page_key
-        );
-    }
-    Ok(())
-}
-
-async fn cmd_notes_append(
-    cfg: &AppConfig,
-    page: &str,
-    markdown_body: Option<&str>,
-    file: Option<&Path>,
-    image: &[PathBuf],
-    json_out: bool,
-) -> Result<()> {
-    let (md, inline_images) = read_markdown_input_and_images(markdown_body, file, image)?;
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let out = append_onenote_page_helper(&storage, &graph, page, &md, &inline_images).await?;
-
-    if json_out {
-        println!("{}", serde_json::to_string_pretty(&out)?);
-    } else {
-        println!(
-            "OneNote 페이지 내용 추가 완료: {}",
-            out["page_key"].as_str().unwrap_or(page)
-        );
-    }
-    Ok(())
-}
-
-async fn cmd_notes_update(
-    cfg: &AppConfig,
-    page: &str,
-    title: Option<&str>,
-    body: Option<&str>,
-    file: Option<&Path>,
-    block_id: Option<&str>,
-    json_out: bool,
-) -> Result<()> {
-    let (md, _) = read_markdown_input_and_images(body, file, &[])?;
-    let md_opt = if body.is_some() || file.is_some() {
-        Some(md.as_str())
-    } else {
-        None
-    };
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let out =
-        update_onenote_page_helper(&storage, &graph, page, title, md_opt, block_id).await?;
-
-    if json_out {
-        println!("{}", serde_json::to_string_pretty(&out)?);
-    } else {
-        println!(
-            "OneNote 페이지 수정 완료: {} ({}개 명령 적용)",
-            out["page_key"].as_str().unwrap_or(page),
-            out["commands_applied"].as_u64().unwrap_or(1)
-        );
-    }
-    Ok(())
-}
-
-async fn cmd_notes_check(
-    cfg: &AppConfig,
-    page: &str,
-    block_id: Option<&str>,
-    index: Option<usize>,
-    json_out: bool,
-) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let out = toggle_onenote_todo_helper(&storage, &graph, page, block_id, index).await?;
-
-    if json_out {
-        println!("{}", serde_json::to_string_pretty(&out)?);
-    } else {
-        let state = if out["completed"].as_bool().unwrap_or(false) {
-            "완료 [x]"
-        } else {
-            "미완료 [ ]"
-        };
-        println!(
-            "OneNote 체크박스 토글 ({state}): {} ({})",
-            out["element_id"].as_str().unwrap_or("-"),
-            out["page_key"].as_str().unwrap_or(page)
-        );
-    }
-    Ok(())
-}
-
-async fn cmd_notes_delete(
-    cfg: &AppConfig,
-    page: &str,
-    yes: bool,
-    json_out: bool,
-) -> Result<()> {
-    if json_out && !yes {
-        bail!("{DELETE_JSON_REQUIRES_YES}");
-    }
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let answer = if yes {
-        None
-    } else {
-        Some(prompt(&format!(
-            "OneNote 페이지 '{page}' 를 삭제합니다. 계속하려면 'yes' 입력: "
-        ))?)
-    };
-    delete_gate(yes, json_out, answer.as_deref())?;
-
-    let out = delete_onenote_page_helper(&storage, &graph, page).await?;
-    if json_out {
-        println!("{}", serde_json::to_string_pretty(&out)?);
-    } else {
-        println!(
-            "OneNote 페이지 삭제 완료: {}",
-            out["page_key"].as_str().unwrap_or(page)
-        );
-    }
-    Ok(())
-}
-
-async fn cmd_notes_search(
-    cfg: &AppConfig,
-    query: &str,
-    section: Option<&str>,
-    refresh: bool,
-    limit: usize,
-    json_out: bool,
-) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, refresh).await?;
-    let hits =
-        search_onenote_pages_helper(&storage, &graph, query, section, refresh, limit).await?;
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({ "hits": hits }))?
-        );
-    } else if hits.is_empty() {
-        println!("일치하는 OneNote 페이지가 없습니다.");
-    } else {
-        for h in &hits {
-            let loc = match (&h.notebook_name, &h.section_name) {
-                (Some(nb), Some(sec)) => format!("{nb}/{sec}"),
-                (None, Some(sec)) => sec.clone(),
-                _ => h.section_id.clone(),
-            };
-            println!(
-                "[{}] {}  ({})  {}",
-                loc,
-                h.title,
-                h.page_key,
-                truncate_single_line(&h.snippet, 80)
-            );
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_notes_resource(
-    cfg: &AppConfig,
-    page: &str,
-    index: Option<usize>,
-    out: Option<&Path>,
-    preview: bool,
-    json_out: bool,
-) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let detail = load_onenote_page_detail(&storage, &graph, page, false).await?;
-    let (resolved_idx, res) = select_onenote_resource(&detail, index, preview)?;
-    let url = res.fullres_url.as_deref().unwrap_or(&res.resource_url);
-    let bytes = graph.download_onenote_resource_bytes(url).await?;
-
-    if preview && out.is_none() && !json_out {
-        let (cols, rows) = default_preview_dimensions(None, None);
-        let rendered = img_preview::render_ansi_stdout(&bytes, cols, rows)?;
-        print!("{rendered}");
-        if !rendered.ends_with('\n') {
-            println!();
-        }
-        io::stdout().flush()?;
-        return Ok(());
-    }
-
-    let file_name = default_resource_filename(res, resolved_idx);
-    let target_path = match out {
-        Some(p) if p.is_dir() => p.join(&file_name),
-        Some(p) => p.to_path_buf(),
-        None => cfg.resolved_download_dir().join(&file_name),
-    };
-    config::ensure_parent(&target_path)?;
-    std::fs::write(&target_path, &bytes)
-        .with_context(|| format!("OneNote 리소스 저장 실패: {}", target_path.display()))?;
-
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "page_key": detail.summary.page_key,
-                "index": resolved_idx,
-                "mime_type": res.mime_type,
-                "file_name": file_name,
-                "path": target_path,
-                "bytes_written": bytes.len(),
-            }))?
-        );
-    } else {
-        println!(
-            "OneNote 리소스 다운로드 완료: {} ({} bytes)",
-            target_path.display(),
-            bytes.len()
-        );
-        if preview && res.is_image {
-            let (cols, rows) = default_preview_dimensions(None, None);
-            if let Ok(rendered) = img_preview::render_ansi_stdout(&bytes, cols, rows) {
-                print!("{rendered}");
-                if !rendered.ends_with('\n') {
-                    println!();
-                }
-            }
-        }
-    }
-    Ok(())
-}
 
 fn format_unix_ts(ts: i64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
@@ -8813,24 +3638,103 @@ mod tests {
     fn parses_default_tui_without_subcommand() {
         let cli = Cli::try_parse_from(["teams"]).unwrap();
         assert!(cli.command.is_none());
-
-        let outlook = OutlookCli::try_parse_from(["outlook"]).unwrap();
-        assert!(outlook.command.is_none());
     }
 
     #[test]
     fn parses_aliases_and_flags() {
-        let cli = Cli::try_parse_from(["teams", "ls", "--limit", "20", "--refresh", "--json"])
+        let cli = Cli::try_parse_from(["teams", "ls", "--limit", "200", "--refresh", "--json"])
             .unwrap();
         assert!(matches!(
             cli.command.unwrap(),
             Command::Chats {
-                limit: 20,
+                limit: 200,
                 refresh: true,
                 cached: false,
                 json: true
             }
         ));
+
+        // Default `teams read` limit is 30, supports `--before` and `--thread`
+        let cli = Cli::try_parse_from(["teams", "read", "개발팀/일반"]).unwrap();
+        match cli.command.unwrap() {
+            Command::Read {
+                target,
+                limit,
+                before,
+                thread,
+                offline,
+                cached,
+                json,
+            } => {
+                assert_eq!(target, "개발팀/일반");
+                assert_eq!(limit, 30);
+                assert!(before.is_none());
+                assert!(thread.is_none());
+                assert!(!offline);
+                assert!(!cached);
+                assert!(!json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "teams",
+            "read",
+            "chat:1",
+            "--before",
+            "2026-11-01",
+            "--limit",
+            "100",
+            "--thread",
+            "root-1",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Read {
+                target,
+                limit,
+                before,
+                thread,
+                ..
+            } => {
+                assert_eq!(target, "chat:1");
+                assert_eq!(limit, 100);
+                assert_eq!(before.as_deref(), Some("2026-11-01"));
+                assert_eq!(thread.as_deref(), Some("root-1"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // `teams sync --chats --depth --target`
+        let cli = Cli::try_parse_from(["teams", "sync"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Sync {
+                target: None,
+                chats: 100,
+                depth: 50,
+                json: false
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "teams", "sync", "--target", "개발팀/일반", "--chats", "250", "--depth", "500", "--json",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Sync {
+                target,
+                chats,
+                depth,
+                json,
+            } => {
+                assert_eq!(target.as_deref(), Some("개발팀/일반"));
+                assert_eq!(chats, 250);
+                assert_eq!(depth, 500);
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
 
         let cli = Cli::try_parse_from([
             "teams",
@@ -8924,8 +3828,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_teams_and_outlook_persona_commands() {
-        // teams update & preview
+    fn parses_update_and_preview_commands() {
         let cli = Cli::try_parse_from([
             "teams",
             "update",
@@ -8956,212 +3859,6 @@ mod tests {
             cli.command.unwrap(),
             Command::PreviewFile { cols: Some(80), .. }
         ));
-
-        // teams mail / cal / contacts / todo
-        let cli = Cli::try_parse_from([
-            "teams",
-            "mail",
-            "send",
-            "--to",
-            "a@b.com",
-            "--subject",
-            "주간 보고",
-            "본문 **Markdown**",
-            "--important",
-            "--json",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command.unwrap(),
-            Command::Mail {
-                command: MailCommand::Send { .. }
-            }
-        ));
-
-        let cli = Cli::try_parse_from([
-            "teams",
-            "cal",
-            "create",
-            "--subject",
-            "스탠드업",
-            "--start",
-            "2026-11-16_09:30",
-            "--end",
-            "2026-11-16_10:00",
-            "--teams-meeting",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command.unwrap(),
-            Command::Cal {
-                command: CalCommand::Create {
-                    teams_meeting: true,
-                    ..
-                }
-            }
-        ));
-
-        // outlook top-level persona commands
-        let out = OutlookCli::try_parse_from([
-            "outlook",
-            "inbox",
-            "--unread",
-            "--limit",
-            "15",
-            "--offline",
-            "--json",
-        ])
-        .unwrap();
-        assert!(matches!(
-            out.command.unwrap(),
-            OutlookCommand::Inbox {
-                unread: true,
-                limit: 15,
-                offline: true,
-                json: true,
-                ..
-            }
-        ));
-
-        let out = OutlookCli::try_parse_from([
-            "outlook",
-            "read",
-            "mail-1",
-            "--preview-images",
-            "--offline",
-        ])
-        .unwrap();
-        assert!(matches!(
-            out.command.unwrap(),
-            OutlookCommand::Read {
-                preview_images: true,
-                offline: true,
-                ..
-            }
-        ));
-
-        let out = OutlookCli::try_parse_from([
-            "outlook",
-            "search",
-            "인보이스",
-            "--remote",
-            "--limit",
-            "20",
-        ])
-        .unwrap();
-        assert!(matches!(
-            out.command.unwrap(),
-            OutlookCommand::Search {
-                remote: true,
-                limit: 20,
-                ..
-            }
-        ));
-
-        let out = OutlookCli::try_parse_from([
-            "outlook",
-            "todo",
-            "add",
-            "릴리스 검토",
-            "--due",
-            "2026-11-20",
-            "--important",
-        ])
-        .unwrap();
-        assert!(matches!(
-            out.command.unwrap(),
-            OutlookCommand::Todo {
-                command: TodoCommand::Add {
-                    important: true,
-                    ..
-                }
-            }
-        ));
-
-        let out = OutlookCli::try_parse_from(["outlook", "chats", "--refresh"]).unwrap();
-        assert!(matches!(
-            out.command.unwrap(),
-            OutlookCommand::Chats { refresh: true, .. }
-        ));
-    }
-
-    #[test]
-    fn normalizes_dates_rsvp_and_resolves_folders_and_lists() {
-        let iso = normalize_datetime_iso("2026-11-16_09:30").unwrap();
-        assert!(iso.starts_with("2026-11-16T09:30:00"));
-        assert_eq!(
-            normalize_datetime_iso("2026-11-16T09:30:00Z").unwrap(),
-            "2026-11-16T09:30:00+00:00"
-        );
-        assert_eq!(
-            normalize_todo_due_iso("2026-11-20").unwrap(),
-            "2026-11-20T00:00:00Z"
-        );
-        assert!(normalize_datetime_iso("not-a-date").is_err());
-
-        assert_eq!(normalize_rsvp_response("accept").unwrap(), "accept");
-        assert_eq!(
-            normalize_rsvp_response("tentative").unwrap(),
-            "tentativelyAccept"
-        );
-        assert_eq!(normalize_rsvp_response("DECLINE").unwrap(), "decline");
-        assert!(normalize_rsvp_response("maybe").is_err());
-
-        let folders = vec![
-            MailFolder {
-                id: "f-inbox".to_string(),
-                display_name: "받은 편지함".to_string(),
-                well_known_name: Some("inbox".to_string()),
-                parent_folder_id: None,
-                unread_item_count: 2,
-                total_item_count: 10,
-            },
-            MailFolder {
-                id: "f-sent".to_string(),
-                display_name: "보낸 편지함".to_string(),
-                well_known_name: Some("sentitems".to_string()),
-                parent_folder_id: None,
-                unread_item_count: 0,
-                total_item_count: 5,
-            },
-        ];
-        assert_eq!(
-            resolve_mail_folder_from_slice(&folders, "inbox").as_deref(),
-            Some("f-inbox")
-        );
-        assert_eq!(
-            resolve_mail_folder_from_slice(&folders, "sent").as_deref(),
-            Some("f-sent")
-        );
-        assert_eq!(
-            resolve_mail_folder_from_slice(&folders, "보낸 편지함").as_deref(),
-            Some("f-sent")
-        );
-
-        let lists = vec![
-            TodoList {
-                id: "l-1".to_string(),
-                display_name: "Tasks".to_string(),
-                wellknown_list_name: Some("defaultList".to_string()),
-                is_owner: true,
-                is_shared: false,
-            },
-            TodoList {
-                id: "l-2".to_string(),
-                display_name: "업무".to_string(),
-                wellknown_list_name: None,
-                is_owner: true,
-                is_shared: false,
-            },
-        ];
-        assert_eq!(
-            resolve_todo_list_from_slice(&lists, "default").unwrap().id,
-            "l-1"
-        );
-        assert_eq!(
-            resolve_todo_list_from_slice(&lists, "업무").unwrap().id,
-            "l-2"
-        );
     }
 
     #[test]
@@ -9210,237 +3907,94 @@ mod tests {
     }
 
     #[test]
-    fn parses_onenote_persona_and_shared_notes_commands() {
-        let cli = OnenoteCli::try_parse_from(["onenote"]).unwrap();
-        assert!(cli.command.is_none());
+    fn resolves_before_cursor_and_offline_pagination() {
+        let storage = Storage::open_in_memory().unwrap();
+        let conv = ConversationSummary {
+            conv_key: "chat:19:hist".to_string(),
+            target: ConversationTarget::Chat {
+                chat_id: "19:hist".to_string(),
+            },
+            kind: ConversationKind::OneOnOne,
+            team_id: None,
+            team_name: None,
+            title: "이력 테스트".to_string(),
+            topic: None,
+            unread_count: 0,
+            last_read_at: None,
+            last_msg_id: None,
+            last_msg_author: None,
+            last_msg_preview: None,
+            last_updated_at: None,
+            pinned: false,
+            peer_user_id: None,
+            web_url: None,
+        };
+        storage.upsert_conversations(std::slice::from_ref(&conv)).unwrap();
 
-        let cli = OnenoteCli::try_parse_from(["onenote", "ls", "--personal-only", "--json"]).unwrap();
-        match cli.command.unwrap() {
-            OnenoteCommand::Notebooks {
-                personal_only,
-                include_teams,
-                json,
-                ..
-            } => {
-                assert!(personal_only);
-                assert!(include_teams);
-                assert!(json);
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+        let mk_msg = |id: &str, ts: &str| MessageItem {
+            msg_key: format!("chat:19:hist|{id}"),
+            conv_key: "chat:19:hist".to_string(),
+            msg_id: id.to_string(),
+            parent_msg_id: None,
+            reply_to_id: None,
+            reply_to_author: None,
+            reply_to_preview: None,
+            subject: None,
+            author_id: Some("u1".to_string()),
+            author_name: "김철수".to_string(),
+            is_me: false,
+            created_at: ts.to_string(),
+            last_modified_at: None,
+            deleted: false,
+            importance: "normal".to_string(),
+            message_type: "message".to_string(),
+            body_html: format!("<p>{id}</p>"),
+            body_plain: id.to_string(),
+            attachments: vec![],
+            mentions: vec![],
+            reactions: vec![],
+            reply_count: 0,
+            web_url: None,
+        };
 
-        let cli = OnenoteCli::try_parse_from([
-            "onenote", "create", "업무/회의", "--title", "주간 회의록", "배포 준비", "--image", "a.png",
-            "--level", "1", "--json",
-        ])
-        .unwrap();
-        match cli.command.unwrap() {
-            OnenoteCommand::Create {
-                section,
-                title,
-                markdown_body,
-                image,
-                level,
-                json,
-                ..
-            } => {
-                assert_eq!(section, "업무/회의");
-                assert_eq!(title, "주간 회의록");
-                assert_eq!(markdown_body.as_deref(), Some("배포 준비"));
-                assert_eq!(image, vec![PathBuf::from("a.png")]);
-                assert_eq!(level, Some(1));
-                assert!(json);
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-        assert!(OnenoteCli::try_parse_from(["onenote", "create", "s", "--title", "t", "--level", "3"]).is_err());
+        storage
+            .upsert_messages(&[
+                mk_msg("m1", "2026-10-30T10:00:00Z"),
+                mk_msg("m2", "2026-10-31T12:00:00Z"),
+                mk_msg("m3", "2026-11-01T09:00:00Z"),
+                mk_msg("m4", "2026-11-02T09:00:00Z"),
+            ])
+            .unwrap();
 
-        let cli = OnenoteCli::try_parse_from(["onenote", "cat", "me|p1", "--format", "blocks"]).unwrap();
-        assert!(matches!(
-            cli.command.unwrap(),
-            OnenoteCommand::Read { ref format, .. } if format == "blocks"
-        ));
-        assert!(OnenoteCli::try_parse_from(["onenote", "read", "p", "--format", "pdf"]).is_err());
+        // Date-only `YYYY-MM-DD` normalizes to `YYYY-MM-DDT00:00:00Z`
+        let (ts, id) = resolve_before_cursor(&storage, &conv.conv_key, "2026-11-01").unwrap();
+        assert_eq!(ts, "2026-11-01T00:00:00Z");
+        assert!(id.is_none());
 
-        let cli = OnenoteCli::try_parse_from(["onenote", "check", "me|p1", "--index", "2"]).unwrap();
-        assert!(matches!(
-            cli.command.unwrap(),
-            OnenoteCommand::Check { index: Some(2), block_id: None, .. }
-        ));
+        // Cached msg_id resolves to its timestamp and msg_id
+        let (ts, id) = resolve_before_cursor(&storage, &conv.conv_key, "m3").unwrap();
+        assert_eq!(ts, "2026-11-01T09:00:00Z");
+        assert_eq!(id.as_deref(), Some("m3"));
 
-        // `update <page>` edits a page; self-update is `self-update` / `upgrade`.
-        let cli = OnenoteCli::try_parse_from([
-            "onenote", "update", "me|p1", "--block-id", "p:{a}{1}", "--body", "교체",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command.unwrap(),
-            OnenoteCommand::Update { block_id: Some(_), body: Some(_), .. }
-        ));
-        let cli = OnenoteCli::try_parse_from(["onenote", "upgrade", "--check"]).unwrap();
-        assert!(matches!(
-            cli.command.unwrap(),
-            OnenoteCommand::SelfUpdate { check: true, .. }
-        ));
-        let cli = OnenoteCli::try_parse_from(["onenote", "doctor", "--probe"]).unwrap();
-        assert!(matches!(cli.command.unwrap(), OnenoteCommand::Doctor { probe: true, .. }));
-        let cli = OnenoteCli::try_parse_from(["onenote", "api", "--port", "9100"]).unwrap();
-        assert!(matches!(cli.command.unwrap(), OnenoteCommand::Serve { port: 9100, .. }));
-        let cli = OnenoteCli::try_parse_from(["onenote", "mcp"]).unwrap();
-        assert!(matches!(cli.command.unwrap(), OnenoteCommand::Mcp));
+        // Invalid input returns an error
+        assert!(resolve_before_cursor(&storage, &conv.conv_key, "not-a-timestamp").is_err());
 
-        // `teams notes <sub>` and `outlook notes <sub>` share NotesCommand.
-        let cli = Cli::try_parse_from(["teams", "notes", "search", "배포", "--limit", "5", "--refresh"]).unwrap();
-        match cli.command.unwrap() {
-            Command::Notes {
-                command: NotesCommand::Search { query, limit, refresh, .. },
-            } => {
-                assert_eq!(query, "배포");
-                assert_eq!(limit, 5);
-                assert!(refresh);
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-        let cli = OutlookCli::try_parse_from(["outlook", "notes", "pages", "업무/회의", "--offline"]).unwrap();
-        assert!(matches!(
-            cli.command.unwrap(),
-            OutlookCommand::Notes {
-                command: NotesCommand::Pages { offline: true, limit: 50, .. }
-            }
-        ));
-        let cli = Cli::try_parse_from(["teams", "notes", "delete", "me|p1", "--yes", "--json"]).unwrap();
-        assert!(matches!(
-            cli.command.unwrap(),
-            Command::Notes {
-                command: NotesCommand::Delete { yes: true, json: true, .. }
-            }
-        ));
+        // Offline pagination before `2026-11-01` yields m1, m2 in chronological order
+        let res = read_conversation_messages_offline(&storage, &conv, 1, Some("2026-11-01"))
+            .unwrap();
+        assert_eq!(res.messages.len(), 1);
+        assert_eq!(res.messages[0].msg_id, "m2");
+        assert!(res.has_more);
+        assert_eq!(res.next_before.as_deref(), Some("m2"));
+
+        let res2 = read_conversation_messages_offline(&storage, &conv, 10, Some("m2")).unwrap();
+        assert_eq!(res2.messages.len(), 1);
+        assert_eq!(res2.messages[0].msg_id, "m1");
+        assert!(!res2.has_more);
     }
 
     #[test]
-    fn resolves_onenote_notebooks_and_sections_fuzzily() {
-        let nb = |key: &str, id: &str, name: &str, scope: OnenoteScope| OnenoteNotebook {
-            notebook_key: key.to_string(),
-            id: id.to_string(),
-            scope,
-            display_name: name.to_string(),
-            color: None,
-            is_default: false,
-            is_shared: false,
-            user_role: None,
-            created_at: None,
-            last_modified_at: None,
-            created_by: None,
-            web_url: None,
-        };
-        let team = OnenoteScope::Group {
-            group_id: "g1".to_string(),
-            group_name: Some("플랫폼팀".to_string()),
-        };
-        let notebooks = vec![
-            nb("me|nb1", "nb1", "업무", OnenoteScope::Me),
-            nb("group:g1|nb2", "nb2", "업무", team.clone()),
-            nb("me|nb3", "nb3", "개인 일기", OnenoteScope::Me),
-        ];
-        assert_eq!(resolve_onenote_notebook_from_slice(&notebooks, "group:g1|nb2").unwrap().id, "nb2");
-        assert_eq!(resolve_onenote_notebook_from_slice(&notebooks, "nb3").unwrap().id, "nb3");
-        // Duplicate name prefers the personal notebook; owner-qualified picks the team one.
-        assert_eq!(resolve_onenote_notebook_from_slice(&notebooks, "업무").unwrap().id, "nb1");
-        assert_eq!(resolve_onenote_notebook_from_slice(&notebooks, "플랫폼팀/업무").unwrap().id, "nb2");
-        assert_eq!(resolve_onenote_notebook_from_slice(&notebooks, "일기").unwrap().id, "nb3");
-        assert!(resolve_onenote_notebook_from_slice(&notebooks, "없는필기장").is_err());
-        assert_eq!(filter_notebooks_by_scope(notebooks.clone(), false).len(), 2);
-
-        let sec = |key: &str, id: &str, nb_name: &str, name: &str| OnenoteSection {
-            section_key: key.to_string(),
-            id: id.to_string(),
-            scope: OnenoteScope::Me,
-            notebook_id: None,
-            notebook_name: Some(nb_name.to_string()),
-            parent_section_group_id: None,
-            parent_section_group_name: None,
-            display_name: name.to_string(),
-            color: None,
-            is_default: false,
-            pages_url: None,
-            created_at: None,
-            last_modified_at: None,
-            web_url: None,
-        };
-        let sections = vec![
-            sec("me|s1", "s1", "업무", "회의"),
-            sec("me|s2", "s2", "개인 일기", "회의"),
-            sec("me|s3", "s3", "업무", "아이디어"),
-        ];
-        assert_eq!(resolve_onenote_section_from_slice(&sections, "업무/회의").unwrap().id, "s1");
-        assert_eq!(resolve_onenote_section_from_slice(&sections, "me|s2").unwrap().id, "s2");
-        assert_eq!(resolve_onenote_section_from_slice(&sections, "아이디어").unwrap().id, "s3");
-        assert!(resolve_onenote_section_from_slice(&sections, "회의").is_err());
-
-        assert!(build_onenote_scope_from_args(Some("g"), Some("s")).is_err());
-        assert_eq!(build_onenote_scope_from_args(None, None).unwrap(), OnenoteScope::Me);
-        assert_eq!(
-            build_onenote_scope_from_args(Some(" g1 "), None).unwrap().scope_key(),
-            "group:g1"
-        );
-    }
-
-    #[test]
-    fn unifies_cross_persona_subcommands_top_alias_and_env_help() {
-        // 1. `outlook mail <subcmd>`
-        let out = OutlookCli::try_parse_from(["outlook", "mail", "list", "--top", "5"]).unwrap();
-        assert!(matches!(
-            out.command.unwrap(),
-            OutlookCommand::Mail {
-                command: MailCommand::List { limit: 5, .. }
-            }
-        ));
-        let out = OutlookCli::try_parse_from(["outlook", "mail", "folders"]).unwrap();
-        assert!(matches!(
-            out.command.unwrap(),
-            OutlookCommand::Mail {
-                command: MailCommand::Folders { .. }
-            }
-        ));
-
-        // 2. `outlook inbox --top 5`
-        let out = OutlookCli::try_parse_from(["outlook", "inbox", "--top", "5"]).unwrap();
-        assert!(matches!(
-            out.command.unwrap(),
-            OutlookCommand::Inbox { limit: 5, .. }
-        ));
-
-        // 3. `teams mail list --top 5` & `teams inbox --top 5`
-        let cli = Cli::try_parse_from(["teams", "mail", "list", "--top", "5"]).unwrap();
-        assert!(matches!(
-            cli.command.unwrap(),
-            Command::Mail {
-                command: MailCommand::List { limit: 5, .. }
-            }
-        ));
-        let cli = Cli::try_parse_from(["teams", "inbox", "--top", "5"]).unwrap();
-        assert!(matches!(
-            cli.command.unwrap(),
-            Command::Inbox { limit: 5, .. }
-        ));
-
-        // 4. `onenote notes notebooks` & `onenote mail list --top 5`
-        let one = OnenoteCli::try_parse_from(["onenote", "notes", "notebooks"]).unwrap();
-        assert!(matches!(
-            one.command.unwrap(),
-            OnenoteCommand::Notes {
-                command: NotesCommand::Notebooks { .. }
-            }
-        ));
-        let one = OnenoteCli::try_parse_from(["onenote", "mail", "list", "--top", "5"]).unwrap();
-        assert!(matches!(
-            one.command.unwrap(),
-            OnenoteCommand::Mail {
-                command: MailCommand::List { limit: 5, .. }
-            }
-        ));
-
-        // 5. `--top` alias across all remaining commands with `limit`
+    fn pure_teams_top_aliases_and_env_help() {
         assert!(matches!(
             Cli::try_parse_from(["teams", "chats", "--top", "7"]).unwrap().command.unwrap(),
             Command::Chats { limit: 7, .. }
@@ -9459,82 +4013,34 @@ mod tests {
         ));
         assert!(matches!(
             Cli::try_parse_from(["teams", "sync", "--top", "7"]).unwrap().command.unwrap(),
-            Command::Sync { limit: 7, .. }
+            Command::Sync { depth: 7, .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "sync", "--limit", "77"]).unwrap().command.unwrap(),
+            Command::Sync { depth: 77, .. }
         ));
         assert!(matches!(
             Cli::try_parse_from(["teams", "export", "c1", "--top", "7"]).unwrap().command.unwrap(),
             Command::Export { limit: 7, .. }
         ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "mail-search", "q", "--top", "7"]).unwrap().command.unwrap(),
-            Command::MailSearch { limit: 7, .. }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "mail", "search", "q", "--top", "7"]).unwrap().command.unwrap(),
-            Command::Mail { command: MailCommand::Search { limit: 7, .. } }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "cal", "list", "--top", "7"]).unwrap().command.unwrap(),
-            Command::Cal { command: CalCommand::List { limit: 7, .. } }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "contacts", "list", "--top", "7"]).unwrap().command.unwrap(),
-            Command::Contacts { command: ContactsCommand::List { limit: 7, .. } }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "contacts", "search", "q", "--top", "7"]).unwrap().command.unwrap(),
-            Command::Contacts { command: ContactsCommand::Search { limit: 7, .. } }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "todo", "tasks", "--top", "7"]).unwrap().command.unwrap(),
-            Command::Todo { command: TodoCommand::Tasks { limit: 7, .. } }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "notes", "pages", "s1", "--top", "7"]).unwrap().command.unwrap(),
-            Command::Notes { command: NotesCommand::Pages { limit: 7, .. } }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "notes", "search", "q", "--top", "7"]).unwrap().command.unwrap(),
-            Command::Notes { command: NotesCommand::Search { limit: 7, .. } }
-        ));
-        assert!(matches!(
-            OutlookCli::try_parse_from(["outlook", "search", "q", "--top", "7"]).unwrap().command.unwrap(),
-            OutlookCommand::Search { limit: 7, .. }
-        ));
-        assert!(matches!(
-            OutlookCli::try_parse_from(["outlook", "chats", "--top", "7"]).unwrap().command.unwrap(),
-            OutlookCommand::Chats { limit: 7, .. }
-        ));
-        assert!(matches!(
-            OnenoteCli::try_parse_from(["onenote", "pages", "s1", "--top", "7"]).unwrap().command.unwrap(),
-            OnenoteCommand::Pages { limit: 7, .. }
-        ));
-        assert!(matches!(
-            OnenoteCli::try_parse_from(["onenote", "search", "q", "--top", "7"]).unwrap().command.unwrap(),
-            OnenoteCommand::Search { limit: 7, .. }
-        ));
 
-        // 6. `--help` renders key environment variables across all three personas
         let required_envs = [
-            "TEAMS_PERSONA",
             "TEAMS_TOKEN_FILE",
             "TEAMS_TOKEN_REFRESH_CMD",
             "TEAMS_ACCESS_TOKEN",
             "TEAMS_DISABLE_KEYRING",
         ];
         let teams_help = <Cli as clap::CommandFactory>::command().render_help().to_string();
-        let outlook_help = <OutlookCli as clap::CommandFactory>::command().render_help().to_string();
-        let onenote_help = <OnenoteCli as clap::CommandFactory>::command().render_help().to_string();
         for env_name in required_envs {
             assert!(teams_help.contains(env_name), "teams help missing {env_name}");
-            assert!(outlook_help.contains(env_name), "outlook help missing {env_name}");
-            assert!(onenote_help.contains(env_name), "onenote help missing {env_name}");
         }
+        assert!(!teams_help.contains("TEAMS_PERSONA"));
+        assert!(Cli::try_parse_from(["teams", "mail"]).is_err());
+        assert!(Cli::try_parse_from(["teams", "notes"]).is_err());
     }
 
     #[test]
-    fn parses_cached_and_fast_flags_across_cli_and_outlook() {
-        // Teams persona: --cached and --fast alias
+    fn parses_cached_and_fast_flags() {
         assert!(matches!(
             Cli::try_parse_from(["teams", "chats", "--cached"]).unwrap().command.unwrap(),
             Command::Chats { cached: true, .. }
@@ -9555,122 +4061,16 @@ mod tests {
             Cli::try_parse_from(["teams", "read", "c1", "--fast"]).unwrap().command.unwrap(),
             Command::Read { cached: true, .. }
         ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "inbox", "--cached"]).unwrap().command.unwrap(),
-            Command::Inbox { cached: true, .. }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "mail", "list", "--fast"]).unwrap().command.unwrap(),
-            Command::Mail {
-                command: MailCommand::List { cached: true, .. }
-            }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "mail", "folders", "--cached"]).unwrap().command.unwrap(),
-            Command::Mail {
-                command: MailCommand::Folders { cached: true, .. }
-            }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "mail", "read", "m1", "--fast"]).unwrap().command.unwrap(),
-            Command::Mail {
-                command: MailCommand::Read { cached: true, .. }
-            }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "cal", "list", "--cached"]).unwrap().command.unwrap(),
-            Command::Cal {
-                command: CalCommand::List { cached: true, .. }
-            }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "cal", "today", "--fast"]).unwrap().command.unwrap(),
-            Command::Cal {
-                command: CalCommand::Today { cached: true, .. }
-            }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "cal", "week", "--cached"]).unwrap().command.unwrap(),
-            Command::Cal {
-                command: CalCommand::Week { cached: true, .. }
-            }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "cal", "show", "ev1", "--fast"]).unwrap().command.unwrap(),
-            Command::Cal {
-                command: CalCommand::Show { cached: true, .. }
-            }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "todo", "lists", "--cached"]).unwrap().command.unwrap(),
-            Command::Todo {
-                command: TodoCommand::Lists { cached: true, .. }
-            }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "todo", "tasks", "--fast"]).unwrap().command.unwrap(),
-            Command::Todo {
-                command: TodoCommand::Tasks { cached: true, .. }
-            }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["teams", "contacts", "list", "--cached"]).unwrap().command.unwrap(),
-            Command::Contacts {
-                command: ContactsCommand::List { cached: true, .. }
-            }
-        ));
-
-        // Outlook persona: --cached and --fast alias
-        assert!(matches!(
-            OutlookCli::try_parse_from(["outlook", "inbox", "--fast"]).unwrap().command.unwrap(),
-            OutlookCommand::Inbox { cached: true, .. }
-        ));
-        assert!(matches!(
-            OutlookCli::try_parse_from(["outlook", "folders", "--cached"]).unwrap().command.unwrap(),
-            OutlookCommand::Folders { cached: true, .. }
-        ));
-        assert!(matches!(
-            OutlookCli::try_parse_from(["outlook", "read", "m1", "--fast"]).unwrap().command.unwrap(),
-            OutlookCommand::Read { cached: true, .. }
-        ));
-        assert!(matches!(
-            OutlookCli::try_parse_from(["outlook", "chats", "--cached"]).unwrap().command.unwrap(),
-            OutlookCommand::Chats { cached: true, .. }
-        ));
-        assert!(matches!(
-            OutlookCli::try_parse_from(["outlook", "teams", "--fast"]).unwrap().command.unwrap(),
-            OutlookCommand::Teams { cached: true, .. }
-        ));
-        assert!(matches!(
-            OutlookCli::try_parse_from(["outlook", "cal", "list", "--fast"]).unwrap().command.unwrap(),
-            OutlookCommand::Cal {
-                command: CalCommand::List { cached: true, .. }
-            }
-        ));
-        assert!(matches!(
-            OutlookCli::try_parse_from(["outlook", "todo", "tasks", "--cached"]).unwrap().command.unwrap(),
-            OutlookCommand::Todo {
-                command: TodoCommand::Tasks { cached: true, .. }
-            }
-        ));
-        assert!(matches!(
-            OutlookCli::try_parse_from(["outlook", "contacts", "list", "--fast"]).unwrap().command.unwrap(),
-            OutlookCommand::Contacts {
-                command: ContactsCommand::List { cached: true, .. }
-            }
-        ));
     }
 
     #[test]
     fn fast_help_version_and_cache_cursor_helpers_work() {
         assert!(try_fast_help_or_version_from(["teams", "--help"], Persona::Teams).is_some());
         assert!(try_fast_help_or_version_from(["teams", "-V"], Persona::Teams).is_some());
-        assert!(try_fast_help_or_version_from(["outlook", "inbox", "--help"], Persona::Outlook).is_some());
-        assert!(try_fast_help_or_version_from(["onenote", "help"], Persona::OneNote).is_some());
+        assert!(try_fast_help_or_version_from(["teams", "read", "--help"], Persona::Teams).is_some());
         assert!(try_fast_help_or_version_from(["teams", "chats"], Persona::Teams).is_none());
         assert!(try_fast_help_or_version_from(["teams", "send", "a", "--", "--help"], Persona::Teams).is_none());
 
-        // JWT oid extraction & fast DB path resolution
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(r#"{"oid":"user-123","sub":"sub-1"}"#);
         let jwt = format!("Bearer header.{payload}.sig");
@@ -9683,13 +4083,11 @@ mod tests {
         std::fs::write(data_dir.join("solo-user").join("cache.db"), b"").unwrap();
 
         let cfg = AppConfig::default();
-        // Single DB on disk resolves without credentials.json or keyring
         assert_eq!(
             resolve_storage_db_path_fast(&cfg, None, &data_dir, &cred_path).unwrap(),
             data_dir.join("solo-user").join("cache.db")
         );
 
-        // Multiple DBs require credentials.json / token / keyring
         std::fs::create_dir_all(data_dir.join("second-user")).unwrap();
         std::fs::write(data_dir.join("second-user").join("cache.db"), b"").unwrap();
         assert!(resolve_storage_db_path_fast(&cfg, None, &data_dir, &cred_path).is_none());
@@ -9700,13 +4098,11 @@ mod tests {
             data_dir.join("second-user").join("cache.db")
         );
 
-        // TEAMS_ACCESS_TOKEN overrides credentials.json
         assert_eq!(
             resolve_storage_db_path_fast(&cfg, Some(&jwt), &data_dir, &cred_path).unwrap(),
             data_dir.join("user-123").join("cache.db")
         );
 
-        // TEAMS_CLI_CACHE_SECS parsing & sync_cursors freshness
         assert_eq!(parse_cli_cache_secs(None), 0);
         assert_eq!(parse_cli_cache_secs(Some(" 60 ")), 60);
         assert_eq!(parse_cli_cache_secs(Some("bad")), 0);
@@ -9719,7 +4115,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_daemon_subcommands_across_all_personas() {
+    fn parses_daemon_subcommands() {
         assert!(matches!(
             Cli::try_parse_from(["teams", "daemon", "start"])
                 .unwrap()
@@ -9772,44 +4168,6 @@ mod tests {
                 .unwrap(),
             Command::Daemon {
                 command: DaemonCommand::Run
-            }
-        ));
-
-        assert!(matches!(
-            OutlookCli::try_parse_from(["outlook", "daemon", "status", "--json"])
-                .unwrap()
-                .command
-                .unwrap(),
-            OutlookCommand::Daemon {
-                command: DaemonCommand::Status { json: true }
-            }
-        ));
-        assert!(matches!(
-            OutlookCli::try_parse_from(["outlook", "daemon", "start"])
-                .unwrap()
-                .command
-                .unwrap(),
-            OutlookCommand::Daemon {
-                command: DaemonCommand::Start { json: false }
-            }
-        ));
-
-        assert!(matches!(
-            OnenoteCli::try_parse_from(["onenote", "daemon", "start"])
-                .unwrap()
-                .command
-                .unwrap(),
-            OnenoteCommand::Daemon {
-                command: DaemonCommand::Start { json: false }
-            }
-        ));
-        assert!(matches!(
-            OnenoteCli::try_parse_from(["onenote", "daemon", "status", "--json"])
-                .unwrap()
-                .command
-                .unwrap(),
-            OnenoteCommand::Daemon {
-                command: DaemonCommand::Status { json: true }
             }
         ));
     }

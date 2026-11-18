@@ -1,6 +1,6 @@
 //! Full-screen inline terminal image preview modal (`v`).
-//! Supports Teams message attachments, Outlook Mail image attachments, and OneNote page images,
-//! prev/next cycling (`[`/`]`, `←`/`→`), zoom (`+`/`-`), download (`d`), and close (`Esc`/`q`/`v`).
+//! Supports Teams message image attachments: prev/next cycling (`[`/`]`, `←`/`→`),
+//! zoom (`+`/`-`), download (`d`), and close (`Esc`/`q`/`v`).
 
 use ratatui::{
     layout::Rect,
@@ -12,7 +12,7 @@ use ratatui::{
 
 use crate::{
     img_preview,
-    models::{AttachmentInfo, MailAttachment, MailMessage, MessageItem, OnenotePageDetail, OnenoteResource},
+    models::{AttachmentInfo, MessageItem},
     ui::{
         action::Action,
         app::{AppState, UiState},
@@ -27,32 +27,18 @@ pub enum PreviewTarget {
         msg_id: String,
         attachment: AttachmentInfo,
     },
-    Mail {
-        mail_id: String,
-        attachment: MailAttachment,
-    },
-    OneNote {
-        page_key: String,
-        resource_id: String,
-        resource_index: usize,
-        resource: OnenoteResource,
-    },
 }
 
 impl PreviewTarget {
     pub fn owner_id(&self) -> &str {
         match self {
             PreviewTarget::Teams { msg_id, .. } => msg_id,
-            PreviewTarget::Mail { mail_id, .. } => mail_id,
-            PreviewTarget::OneNote { page_key, .. } => page_key,
         }
     }
 
     pub fn att_id(&self) -> &str {
         match self {
             PreviewTarget::Teams { attachment, .. } => &attachment.id,
-            PreviewTarget::Mail { attachment, .. } => &attachment.id,
-            PreviewTarget::OneNote { resource_id, .. } => resource_id,
         }
     }
 
@@ -62,16 +48,6 @@ impl PreviewTarget {
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("image_{}", attachment.id)),
-            PreviewTarget::Mail { attachment, .. } => attachment.name.clone(),
-            PreviewTarget::OneNote {
-                resource_index,
-                resource,
-                ..
-            } => resource
-                .file_name
-                .clone()
-                .or_else(|| resource.alt_text.clone())
-                .unwrap_or_else(|| format!("onenote_image_{}.png", resource_index + 1)),
         }
     }
 }
@@ -96,63 +72,6 @@ impl ImagePreviewOverlay {
                 }
                 items.push(PreviewTarget::Teams {
                     msg_id: msg.msg_id.clone(),
-                    attachment: att.clone(),
-                });
-            }
-        }
-        if items.is_empty() {
-            return None;
-        }
-        Some(Self {
-            items,
-            index: start,
-            zoom_pct: 100,
-            error: None,
-        })
-    }
-
-    pub fn from_onenote_page(
-        detail: &OnenotePageDetail,
-        preferred_res_idx: Option<usize>,
-    ) -> Option<Self> {
-        let mut items = Vec::new();
-        let mut start = 0usize;
-        for (raw_idx, res) in detail.resources.iter().enumerate() {
-            if res.is_image
-                || img_preview::is_image_mime_or_name(&res.mime_type, res.file_name.as_deref())
-            {
-                if preferred_res_idx == Some(raw_idx) {
-                    start = items.len();
-                }
-                items.push(PreviewTarget::OneNote {
-                    page_key: detail.summary.page_key.clone(),
-                    resource_id: format!("res-{raw_idx}"),
-                    resource_index: raw_idx,
-                    resource: res.clone(),
-                });
-            }
-        }
-        if items.is_empty() {
-            return None;
-        }
-        Some(Self {
-            items,
-            index: start,
-            zoom_pct: 100,
-            error: None,
-        })
-    }
-
-    pub fn from_mail_message(mail: &MailMessage, preferred_att_idx: Option<usize>) -> Option<Self> {
-        let mut items = Vec::new();
-        let mut start = 0usize;
-        for (raw_idx, att) in mail.attachments.iter().enumerate() {
-            if img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name)) {
-                if preferred_att_idx == Some(raw_idx) {
-                    start = items.len();
-                }
-                items.push(PreviewTarget::Mail {
-                    mail_id: mail.id.clone(),
                     attachment: att.clone(),
                 });
             }
@@ -234,10 +153,7 @@ impl ImagePreviewOverlay {
                 self.zoom_out();
                 OverlayOutcome::Dispatch(Action::LoadPreviewImage)
             }
-            Action::Input('d')
-            | Action::DownloadLatest
-            | Action::MailDownloadAttachment
-            | Action::OnenoteDownloadAttachment => {
+            Action::Input('d') | Action::DownloadLatest => {
                 OverlayOutcome::Dispatch(Action::DownloadPreviewImage)
             }
             _ => OverlayOutcome::Handled,
@@ -341,63 +257,63 @@ impl ImagePreviewOverlay {
 mod tests {
     use super::*;
 
-    fn mail_with_attachments() -> MailMessage {
-        MailMessage {
-            id: "mail-9".to_string(),
-            conversation_id: None,
-            folder_id: Some("inbox".to_string()),
-            subject: "스크린샷".to_string(),
-            from: None,
-            to_recipients: vec![],
-            cc_recipients: vec![],
-            bcc_recipients: vec![],
-            received_at: "2026-11-15T10:00:00Z".to_string(),
-            sent_at: None,
-            is_read: true,
-            is_draft: false,
-            flagged: false,
+    fn teams_msg_with_attachments() -> MessageItem {
+        MessageItem {
+            msg_key: "chat:c1|msg-9".to_string(),
+            conv_key: "chat:c1".to_string(),
+            msg_id: "msg-9".to_string(),
+            parent_msg_id: None,
+            reply_to_id: None,
+            reply_to_author: None,
+            reply_to_preview: None,
+            subject: None,
+            author_id: None,
+            author_name: "Tester".to_string(),
+            is_me: false,
+            created_at: "2026-11-15T10:00:00Z".to_string(),
+            last_modified_at: None,
+            deleted: false,
             importance: "normal".to_string(),
-            has_attachments: true,
-            preview: String::new(),
+            message_type: "message".to_string(),
             body_html: String::new(),
             body_plain: String::new(),
             attachments: vec![
-                MailAttachment {
+                AttachmentInfo {
                     id: "att-pdf".to_string(),
-                    name: "doc.pdf".to_string(),
                     content_type: "application/pdf".to_string(),
-                    size: 100,
-                    is_inline: false,
-                    content_id: None,
-                    content_bytes_b64: None,
+                    content_url: None,
+                    name: Some("doc.pdf".to_string()),
+                    content_json: None,
+                    thumbnail_url: None,
                 },
-                MailAttachment {
+                AttachmentInfo {
                     id: "att-png".to_string(),
-                    name: "shot1.png".to_string(),
                     content_type: "image/png".to_string(),
-                    size: 200,
-                    is_inline: false,
-                    content_id: None,
-                    content_bytes_b64: None,
+                    content_url: None,
+                    name: Some("shot1.png".to_string()),
+                    content_json: None,
+                    thumbnail_url: None,
                 },
-                MailAttachment {
+                AttachmentInfo {
                     id: "att-jpg".to_string(),
-                    name: "photo2.jpg".to_string(),
                     content_type: "image/jpeg".to_string(),
-                    size: 300,
-                    is_inline: false,
-                    content_id: None,
-                    content_bytes_b64: None,
+                    content_url: None,
+                    name: Some("photo2.jpg".to_string()),
+                    content_json: None,
+                    thumbnail_url: None,
                 },
             ],
-            web_link: None,
+            mentions: Vec::new(),
+            reactions: Vec::new(),
+            reply_count: 0,
+            web_url: None,
         }
     }
 
     #[test]
     fn filters_only_images_and_cycles_and_zooms() {
-        let mail = mail_with_attachments();
-        let mut overlay = ImagePreviewOverlay::from_mail_message(&mail, Some(2)).unwrap();
+        let msg = teams_msg_with_attachments();
+        let mut overlay = ImagePreviewOverlay::from_teams_message(&msg, Some(2)).unwrap();
         assert_eq!(overlay.items.len(), 2);
         assert_eq!(overlay.index, 1);
         assert_eq!(overlay.current().unwrap().att_id(), "att-jpg");

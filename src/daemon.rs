@@ -225,9 +225,7 @@ impl DaemonSharedState {
                 guard.sync_busy = *busy;
                 guard.sync_summary = summary.clone();
             }
-            CoreEvent::ConversationsUpdated(_)
-            | CoreEvent::MessagesUpdated { .. }
-            | CoreEvent::MailMessagesUpdated { .. } => {
+            CoreEvent::ConversationsUpdated(_) | CoreEvent::MessagesUpdated { .. } => {
                 guard.last_sync_at = Some(chrono::Utc::now().to_rfc3339());
                 guard.last_error = None;
             }
@@ -849,7 +847,7 @@ pub async fn try_connect_tui(
 }
 
 async fn try_connect_tui_at(
-    cfg: &AppConfig,
+    _cfg: &AppConfig,
     paths: &DaemonPaths,
     expected_user_id: Option<&str>,
 ) -> Option<TuiDaemonConnection> {
@@ -896,7 +894,7 @@ async fn try_connect_tui_at(
     let (focus_tx, mut focus_rx) = watch::channel(FocusTarget::default());
     let (nudge_tx, mut nudge_rx) = mpsc::unbounded_channel::<SyncCommand>();
     let (events_tx, events_rx) = mpsc::unbounded_channel::<CoreEvent>();
-    let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx, cfg.background_all_personas);
+    let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx, false);
 
     tokio::spawn(async move {
         loop {
@@ -985,12 +983,9 @@ async fn run_daemon_inner(
     run_bootstrap: bool,
     enable_signals: bool,
 ) -> Result<()> {
-    let mut sync_cfg = cfg;
-    sync_cfg.background_all_personas = true;
-
     let (engine_event_tx, engine_event_rx) = mpsc::unbounded_channel::<CoreEvent>();
     let sync_ctrl = sync::spawn_sync_engine(
-        sync_cfg,
+        cfg,
         graph.clone(),
         storage.clone(),
         engine_event_tx.clone(),
@@ -1025,12 +1020,7 @@ async fn run_initial_bootstrap(
         summary: "초기 동기화 중...".to_string(),
     });
 
-    let (conv_res, outlook_res) = tokio::join!(
-        sync::bootstrap_conversations(&graph, &storage),
-        sync::bootstrap_outlook(&graph, &storage),
-    );
-
-    match conv_res {
+    match sync::bootstrap_conversations(&graph, &storage).await {
         Ok(()) => {
             if let Ok(convs) = storage.list_conversations() {
                 let _ = event_tx.send(CoreEvent::ConversationsUpdated(convs));
@@ -1042,48 +1032,6 @@ async fn run_initial_bootstrap(
         Err(err) => {
             let _ = event_tx.send(CoreEvent::SyncError(format!(
                 "초기 대화 동기화 실패: {err}"
-            )));
-        }
-    }
-
-    match outlook_res {
-        Ok(()) => {
-            if let Ok(folders) = storage.list_mail_folders() {
-                let _ = event_tx.send(CoreEvent::MailFoldersUpdated(folders));
-            }
-            if let Ok(messages) = storage.list_mail_summaries(Some("inbox"), 40) {
-                let _ = event_tx.send(CoreEvent::MailMessagesUpdated {
-                    folder_id: "inbox".to_string(),
-                    messages,
-                    notify_candidate: None,
-                });
-            }
-            if let Ok(events) = storage.list_calendar_events(None, None, 50) {
-                if !events.is_empty() {
-                    let _ = event_tx.send(CoreEvent::CalendarEventsUpdated(events));
-                }
-            }
-            if let Ok(contacts) = storage.list_contacts(None, 100) {
-                if !contacts.is_empty() {
-                    let _ = event_tx.send(CoreEvent::ContactsUpdated(contacts));
-                }
-            }
-            if let Ok(lists) = storage.list_todo_lists() {
-                if let Some(first) = lists.first() {
-                    let tasks = storage
-                        .list_todo_tasks(&first.id, true, 50)
-                        .unwrap_or_default();
-                    let _ = event_tx.send(CoreEvent::TodoUpdated {
-                        lists: lists.clone(),
-                        list_id: Some(first.id.clone()),
-                        tasks,
-                    });
-                }
-            }
-        }
-        Err(err) => {
-            let _ = event_tx.send(CoreEvent::SyncError(format!(
-                "초기 Outlook 동기화 실패: {err}"
             )));
         }
     }
@@ -1600,7 +1548,7 @@ mod tests {
         // Also test nudge_daemon RPC directly.
         assert!(nudge_daemon_at(
             &harness.paths,
-            Some(SyncCommand::RefreshOutlook),
+            Some(SyncCommand::SyncActiveNow),
             None,
         )
         .await
@@ -1609,7 +1557,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(nudged, SyncCommand::RefreshOutlook));
+        assert!(matches!(nudged, SyncCommand::SyncActiveNow));
 
         assert!(stop_daemon_at(&harness.paths).await.unwrap());
         harness.wait_exit().await.unwrap();

@@ -1,27 +1,18 @@
 //! Central `Action` enum and single `dispatch(action, app, ui) -> bool` reducer.
 
-use std::path::PathBuf;
-
 use chrono::Utc;
 use ratatui::layout::Position;
 
-use crate::config::Persona;
-use crate::models::{
-    ConversationTarget, InlineImageUpload, OutgoingContact, OutgoingEvent,
-};
+use crate::models::ConversationTarget;
 use crate::sync::SyncCommand;
 
 use super::app::{AppState, Focus, NarrowPane, UiState};
 use super::composer::{self, ReplyPreview};
 use super::hitmap::{ButtonId, HitTarget, MessageScope};
-use super::nav_pane::{
-    self, TAB_CALENDAR, TAB_CONTACTS, TAB_COUNT, TAB_MAIL, TAB_NOTES, TAB_TODO,
-};
+use super::nav_pane::{self, TAB_CHATS, TAB_COUNT};
 use super::overlays::context_menu::{ContextMenu, ContextTarget};
 use super::overlays::image_preview::ImagePreviewOverlay;
-use super::overlays::mail_compose::{MailComposeMode, MailComposeOverlay};
-use super::overlays::onenote_form::OnenoteFormOverlay;
-use super::overlays::search::{SearchOverlay, SearchScope};
+use super::overlays::search::SearchOverlay;
 use super::overlays::{Overlay, OverlayKind, OverlayOutcome};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +49,11 @@ pub enum Action {
     ScrollPageDown,
     ScrollTop,
     ScrollBottom,
+    MouseScroll {
+        delta: i32,
+        column: u16,
+        row: u16,
+    },
     Activate,
 
     // Composer editing & clipboard
@@ -204,105 +200,13 @@ pub enum Action {
     },
     ShowToast(String),
 
-    // Persona, Inline Images & Updater
-    SwitchPersona(Persona),
+    // Inline Images & Updater
     ToggleInlineImages,
     OpenImagePreview,
     LoadPreviewImage,
     DownloadPreviewImage,
     CheckForUpdates,
     ApplySelfUpdate,
-
-    // Outlook Mail
-    OpenMailComposeNew,
-    OpenMailReply {
-        reply_all: bool,
-    },
-    OpenMailForward,
-    SubmitMailCompose {
-        mode: MailComposeMode,
-        to: Vec<String>,
-        cc: Vec<String>,
-        subject: String,
-        body_markdown: String,
-        attachments: Vec<PathBuf>,
-    },
-    MailToggleRead,
-    MailToggleFlag,
-    MailArchive,
-    MailDeleteRequest,
-    MailDeleteConfirm,
-    MailDownloadAttachment,
-
-    // Outlook Calendar
-    CreateCalendarEvent(OutgoingEvent),
-    JoinCalendarMeeting,
-    RespondCalendarEvent(String),
-    DeleteCalendarEventRequest,
-    DeleteCalendarEventConfirm,
-
-    // Outlook Contacts
-    CreateContact(OutgoingContact),
-    DeleteContactRequest,
-    DeleteContactConfirm,
-    ContactSendMail,
-    ContactStartChat,
-
-    // Microsoft To Do
-    TodoToggleSelected,
-    TodoCycleList(isize),
-    TodoToggleShowCompleted,
-    TodoFocusInput,
-    TodoDeleteRequest,
-    TodoDeleteConfirm,
-
-    // Scoped Search
-    SearchMail(String),
-    SearchContacts(String),
-    JumpToMailSearchHit(usize),
-    JumpToContactSearchHit(usize),
-
-    // Microsoft OneNote
-    SearchNotes(String),
-    JumpToNoteSearchHit(usize),
-    OnenoteOpenCreateNotebook,
-    OnenoteOpenCreateSection,
-    OnenoteOpenCreatePage { subpage: bool },
-    OnenoteOpenAppendBlock,
-    OnenoteOpenEditBlock,
-    OnenoteOpenEditFullPage,
-    OnenoteToggleTodo,
-    OnenoteCycleSection(isize),
-    OnenoteCyclePage(isize),
-    OnenoteOpenWeb,
-    OnenoteRefresh,
-    OnenoteDeletePageRequest,
-    OnenoteCreateNotebook {
-        display_name: String,
-    },
-    OnenoteCreateSection {
-        notebook_key: String,
-        display_name: String,
-    },
-    OnenoteCreatePage {
-        section_key: String,
-        title: String,
-        markdown_body: String,
-        inline_images: Vec<InlineImageUpload>,
-        level: Option<i32>,
-    },
-    OnenoteAppendMarkdown {
-        page_key: String,
-        markdown: String,
-        inline_images: Vec<InlineImageUpload>,
-    },
-    OnenoteEditBlockSubmit {
-        page_key: String,
-        element_id: String,
-        markdown: String,
-    },
-    OnenoteDeletePageConfirm,
-    OnenoteDownloadAttachment,
 }
 
 /// Dispatches an `Action`, mutating `app` and `ui`.
@@ -343,38 +247,6 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             OverlayOutcome::NotHandled => {
                 ui.overlays.push(top);
             }
-        }
-    }
-
-    // Quick To Do input bar interception when focused on TAB_TODO center pane.
-    if matches!(ui.focus(), Focus::Chat)
-        && ui.active_nav_tab == TAB_TODO
-        && ui.todo_input_active
-    {
-        match action {
-            Action::Input(ch) => {
-                ui.todo_input.push(ch);
-                return false;
-            }
-            Action::Paste(text) => {
-                ui.todo_input.push_str(&text.replace(['\r', '\n'], " "));
-                return false;
-            }
-            Action::Backspace => {
-                ui.todo_input.pop();
-                return false;
-            }
-            Action::SendMessage | Action::Activate => {
-                let title = std::mem::take(&mut ui.todo_input);
-                ui.todo_input_active = false;
-                app.create_todo_task(ui, title);
-                return false;
-            }
-            Action::CloseOverlay | Action::ComposerEscape => {
-                ui.todo_input_active = false;
-                return false;
-            }
-            _ => {}
         }
     }
 
@@ -462,16 +334,8 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::SelectNavTab(tab) => {
             ui.active_nav_tab = tab.min(TAB_COUNT - 1);
             ui.nav_selected = 0;
-            ui.todo_input_active = false;
             ui.narrow_pane = NarrowPane::List;
             ui.set_focus(Focus::Nav);
-            if ui.active_nav_tab == TAB_NOTES {
-                ui.persona = Persona::OneNote;
-            } else if ui.active_nav_tab >= TAB_MAIL {
-                ui.persona = Persona::Outlook;
-            } else {
-                ui.persona = Persona::Teams;
-            }
             app.ensure_tab_domain_activated(ui, ui.active_nav_tab);
         }
         Action::SelectNavRow(idx) => {
@@ -487,6 +351,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             let len = nav_pane::nav_row_count(app, ui);
             if len > 0 {
                 ui.nav_selected = len - 1;
+                maybe_load_older_chats(app, ui);
             }
         }
 
@@ -509,28 +374,32 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         },
         Action::MoveUp => move_selection(app, ui, -1),
         Action::MoveDown => move_selection(app, ui, 1),
-        Action::ScrollUp => scroll_focused(ui, -3),
-        Action::ScrollDown => scroll_focused(ui, 3),
-        Action::ScrollPageUp => scroll_focused(ui, -12),
-        Action::ScrollPageDown => scroll_focused(ui, 12),
+        Action::ScrollUp => scroll_focused_and_autoload(app, ui, -3),
+        Action::ScrollDown => scroll_focused_and_autoload(app, ui, 3),
+        Action::ScrollPageUp => scroll_focused_and_autoload(app, ui, -12),
+        Action::ScrollPageDown => scroll_focused_and_autoload(app, ui, 12),
         Action::ScrollTop => match ui.focus() {
             Focus::Nav => {
                 let _ = dispatch(Action::NavFirst, app, ui);
             }
             Focus::Thread => ui.thread_scroll.top(),
-            _ if ui.active_nav_tab == TAB_NOTES => ui.onenote_scroll.top(),
-            _ if ui.active_nav_tab >= TAB_MAIL => ui.mail_scroll.top(),
-            _ => ui.chat_scroll.top(),
+            _ => {
+                ui.chat_scroll.top();
+                if !app.oldest_reached && !app.loading_older && app.active_conv_key.is_some() {
+                    app.load_older_auto(ui);
+                }
+            }
         },
         Action::ScrollBottom => match ui.focus() {
             Focus::Nav => {
                 let _ = dispatch(Action::NavLast, app, ui);
             }
             Focus::Thread => ui.thread_scroll.bottom(),
-            _ if ui.active_nav_tab == TAB_NOTES => ui.onenote_scroll.bottom(),
-            _ if ui.active_nav_tab >= TAB_MAIL => ui.mail_scroll.bottom(),
             _ => ui.chat_scroll.bottom(),
         },
+        Action::MouseScroll { delta, column, row } => {
+            handle_mouse_scroll(app, ui, delta, column, row);
+        }
         Action::Activate => handle_activate(app, ui),
 
         // Composer
@@ -728,21 +597,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             }
         }
         Action::CopySelectedMessage | Action::CopyFocused => {
-            if ui.active_nav_tab == TAB_NOTES {
-                if let Some(detail) = app.active_page_detail.as_ref() {
-                    let md = detail
-                        .blocks
-                        .get(ui.onenote_selected_block)
-                        .map(|b| {
-                            crate::parser::onenote::onenote_blocks_to_markdown(
-                                std::slice::from_ref(b),
-                            )
-                        })
-                        .filter(|s| !s.trim().is_empty())
-                        .unwrap_or_else(|| detail.body_markdown.clone());
-                    copy_to_clipboard(&md, ui);
-                }
-            } else if let Some((scope, msg_index)) = selected_message_scope_and_index(app, ui) {
+            if let Some((scope, msg_index)) = selected_message_scope_and_index(app, ui) {
                 let _ = dispatch(Action::CopyMessage { scope, msg_index }, app, ui);
             }
         }
@@ -888,24 +743,14 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::RefreshAll => {
             app.sync_ctrl.request(SyncCommand::RefreshConversations);
-            app.sync_ctrl.request(SyncCommand::RefreshOutlook);
-            app.sync_ctrl.request(SyncCommand::RefreshOneNote);
             app.sync_ctrl.request(SyncCommand::SyncActiveNow);
-            ui.info("Teams · Outlook · OneNote 동기화를 새로고침합니다...");
+            ui.info("Teams 대화를 새로고침합니다...");
         }
         Action::SyncHistory => {
-            if let Some(ConversationTarget::Channel {
-                team_id,
-                channel_id,
-            }) = app.active_target.clone()
-            {
-                app.sync_ctrl.request(SyncCommand::SyncChannelHistory {
-                    team_id,
-                    channel_id,
-                });
-                ui.info("전체 히스토리 동기화를 시작합니다...");
+            if matches!(ui.focus(), Focus::Thread) && app.active_thread.is_some() {
+                app.refresh_active_thread(ui);
             } else {
-                app.load_older(ui);
+                app.load_older_with_depth(ui, 150);
             }
         }
         Action::LoadOlder => {
@@ -1000,36 +845,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             ui.info(msg);
         }
 
-        // Persona, Inline Images & Updater
-        Action::SwitchPersona(persona) => {
-            ui.persona = persona;
-            ui.todo_input_active = false;
-            match persona {
-                Persona::Teams => {
-                    if ui.active_nav_tab >= TAB_MAIL {
-                        ui.active_nav_tab = 0;
-                        ui.nav_selected = 0;
-                    }
-                    ui.info("Teams 워크스페이스 모드로 전환했습니다");
-                }
-                Persona::Outlook => {
-                    if ui.active_nav_tab < TAB_MAIL || ui.active_nav_tab == TAB_NOTES {
-                        ui.active_nav_tab = TAB_MAIL;
-                        ui.nav_selected = 0;
-                    }
-                    ui.info("Outlook 워크스페이스 모드로 전환했습니다");
-                }
-                Persona::OneNote => {
-                    if ui.active_nav_tab != TAB_NOTES {
-                        ui.active_nav_tab = TAB_NOTES;
-                        ui.nav_selected = 0;
-                    }
-                    ui.info("OneNote 워크스페이스 모드로 전환했습니다");
-                }
-            }
-            app.ensure_tab_domain_activated(ui, ui.active_nav_tab);
-            ui.set_focus(Focus::Nav);
-        }
+        // Inline Images & Updater
         Action::ToggleInlineImages => {
             ui.inline_images = !ui.inline_images;
             app.config.inline_images = ui.inline_images;
@@ -1067,53 +883,41 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     None
                 }
             });
-            if let Some(target) = current {
-                match target {
-                    super::overlays::image_preview::PreviewTarget::Teams { attachment, .. } => {
-                        let graph = app.graph.clone();
-                        let dir = app.download_dir.clone();
-                        let tx = app.ui_tx.clone();
-                        let label = format!("이미지 저장: {}", attachment.name.as_deref().unwrap_or(&attachment.id));
-                        ui.tasks.begin(label.clone());
-                        tokio::spawn(async move {
-                            match graph.download_attachment(&attachment, &dir).await {
-                                Ok(file) => {
-                                    let _ = tx.send(super::app::UiMsg::TaskDone {
-                                        label,
-                                        error: None,
-                                        toast: Some((
-                                            format!("저장됨: {}", file.path.display()),
-                                            super::toast::ToastKind::Success,
-                                        )),
-                                    });
-                                }
-                                Err(err) => {
-                                    let _ = tx.send(super::app::UiMsg::TaskDone {
-                                        label,
-                                        error: Some(err.to_string()),
-                                        toast: Some((format!("저장 실패: {err}"), super::toast::ToastKind::Error)),
-                                    });
-                                }
-                            }
-                        });
+            if let Some(super::overlays::image_preview::PreviewTarget::Teams { attachment, .. }) =
+                current
+            {
+                let graph = app.graph.clone();
+                let dir = app.download_dir.clone();
+                let tx = app.ui_tx.clone();
+                let label = format!(
+                    "이미지 저장: {}",
+                    attachment.name.as_deref().unwrap_or(&attachment.id)
+                );
+                ui.tasks.begin(label.clone());
+                tokio::spawn(async move {
+                    match graph.download_attachment(&attachment, &dir).await {
+                        Ok(file) => {
+                            let _ = tx.send(super::app::UiMsg::TaskDone {
+                                label,
+                                error: None,
+                                toast: Some((
+                                    format!("저장됨: {}", file.path.display()),
+                                    super::toast::ToastKind::Success,
+                                )),
+                            });
+                        }
+                        Err(err) => {
+                            let _ = tx.send(super::app::UiMsg::TaskDone {
+                                label,
+                                error: Some(err.to_string()),
+                                toast: Some((
+                                    format!("저장 실패: {err}"),
+                                    super::toast::ToastKind::Error,
+                                )),
+                            });
+                        }
                     }
-                    super::overlays::image_preview::PreviewTarget::Mail { mail_id, attachment } => {
-                        app.download_mail_attachment(ui, mail_id, attachment.id, attachment.name);
-                    }
-                    super::overlays::image_preview::PreviewTarget::OneNote {
-                        page_key,
-                        resource_index,
-                        resource,
-                        ..
-                    } => {
-                        app.download_onenote_attachment(
-                            ui,
-                            &page_key,
-                            resource_index,
-                            resource.clone(),
-                        );
-                    }
-                }
+                });
             }
         }
         Action::CheckForUpdates => {
@@ -1121,266 +925,6 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::ApplySelfUpdate => {
             app.check_for_updates(ui, false, false);
-        }
-
-        // Outlook Mail
-        Action::OpenMailComposeNew => {
-            ui.push_overlay(Overlay::MailCompose(MailComposeOverlay::new()));
-        }
-        Action::OpenMailReply { reply_all } => {
-            if let Some(mail) = app.active_mail() {
-                ui.push_overlay(Overlay::MailCompose(MailComposeOverlay::reply(
-                    mail, reply_all,
-                )));
-            } else {
-                ui.info("답장할 메일을 먼저 선택하세요");
-            }
-        }
-        Action::OpenMailForward => {
-            if let Some(mail) = app.active_mail() {
-                ui.push_overlay(Overlay::MailCompose(MailComposeOverlay::forward(mail)));
-            } else {
-                ui.info("전달할 메일을 먼저 선택하세요");
-            }
-        }
-        Action::SubmitMailCompose {
-            mode,
-            to,
-            cc,
-            subject,
-            body_markdown,
-            attachments,
-        } => {
-            app.submit_mail_compose(ui, mode, to, cc, subject, body_markdown, attachments);
-        }
-        Action::MailToggleRead => {
-            app.toggle_active_mail_read(ui);
-        }
-        Action::MailToggleFlag => {
-            app.toggle_active_mail_flag(ui);
-        }
-        Action::MailArchive => {
-            app.archive_active_mail(ui);
-        }
-        Action::MailDeleteRequest => {
-            if let Some(mail) = app.active_mail() {
-                let subj = if mail.subject.is_empty() {
-                    "(제목 없음)"
-                } else {
-                    mail.subject.as_str()
-                };
-                let msg = format!("메일 '{subj}' 을(를) 삭제하시겠습니까?");
-                ui.push_overlay(Overlay::confirm(msg, Some(Action::MailDeleteConfirm)));
-            }
-        }
-        Action::MailDeleteConfirm => {
-            app.delete_active_mail(ui);
-        }
-        Action::MailDownloadAttachment => {
-            if let Some(mail) = app.active_mail().cloned() {
-                if let Some(att) = mail
-                    .attachments
-                    .get(ui.mail_attach_index)
-                    .or_else(|| mail.attachments.first())
-                {
-                    app.download_mail_attachment(ui, mail.id, att.id.clone(), att.name.clone());
-                } else {
-                    ui.info("다운로드할 메일 첨부파일이 없습니다");
-                }
-            }
-        }
-
-        // Outlook Calendar
-        Action::CreateCalendarEvent(event) => {
-            app.create_calendar_event(ui, event);
-        }
-        Action::JoinCalendarMeeting => {
-            app.open_active_event_meeting(ui);
-        }
-        Action::RespondCalendarEvent(response) => {
-            app.respond_active_event(ui, &response);
-        }
-        Action::DeleteCalendarEventRequest => {
-            if let Some(ev) = app.active_event() {
-                let msg = format!("일정 '{}' 을(를) 삭제하시겠습니까?", ev.subject);
-                ui.push_overlay(Overlay::confirm(
-                    msg,
-                    Some(Action::DeleteCalendarEventConfirm),
-                ));
-            }
-        }
-        Action::DeleteCalendarEventConfirm => {
-            app.delete_active_event(ui);
-        }
-
-        // Outlook Contacts
-        Action::CreateContact(contact) => {
-            app.create_contact(ui, contact);
-        }
-        Action::DeleteContactRequest => {
-            if let Some(contact) = app.active_contact() {
-                let msg = format!("연락처 '{}' 을(를) 삭제하시겠습니까?", contact.display_name);
-                ui.push_overlay(Overlay::confirm(msg, Some(Action::DeleteContactConfirm)));
-            }
-        }
-        Action::DeleteContactConfirm => {
-            app.delete_active_contact(ui);
-        }
-        Action::ContactSendMail => {
-            if let Some(contact) = app.active_contact() {
-                let compose = if let Some(email) = contact.primary_email() {
-                    MailComposeOverlay::new_to(email)
-                } else {
-                    MailComposeOverlay::new()
-                };
-                ui.push_overlay(Overlay::MailCompose(compose));
-            } else {
-                ui.info("연락처를 먼저 선택하세요");
-            }
-        }
-        Action::ContactStartChat => {
-            app.start_chat_with_contact(ui);
-        }
-
-        // Microsoft To Do
-        Action::TodoToggleSelected => {
-            app.toggle_active_todo_completed(ui);
-        }
-        Action::TodoCycleList(delta) => {
-            app.cycle_todo_list(ui, delta);
-        }
-        Action::TodoToggleShowCompleted => {
-            app.toggle_todo_show_completed(ui);
-        }
-        Action::TodoFocusInput => {
-            ui.active_nav_tab = TAB_TODO;
-            app.ensure_tab_domain_activated(ui, TAB_TODO);
-            ui.narrow_pane = NarrowPane::Chat;
-            ui.set_focus(Focus::Chat);
-            ui.todo_input_active = true;
-        }
-        Action::TodoDeleteRequest => {
-            if let Some(task) = app.active_todo_task() {
-                let msg = format!("할 일 '{}' 을(를) 삭제하시겠습니까?", task.title);
-                ui.push_overlay(Overlay::confirm(msg, Some(Action::TodoDeleteConfirm)));
-            }
-        }
-        Action::TodoDeleteConfirm => {
-            app.delete_active_todo(ui);
-        }
-
-        // Scoped Search
-        Action::SearchMail(query) => {
-            app.search_mail(query);
-        }
-        Action::SearchContacts(query) => {
-            app.search_contacts(query);
-        }
-        Action::JumpToMailSearchHit(idx) => {
-            if let Some(hit) = app.mail_search_results.get(idx).cloned() {
-                ui.active_nav_tab = TAB_MAIL;
-                ui.persona = Persona::Outlook;
-                app.ensure_tab_domain_activated(ui, TAB_MAIL);
-                app.select_mail(ui, hit.id);
-                ui.narrow_pane = NarrowPane::Chat;
-                ui.set_focus(Focus::Chat);
-            }
-        }
-        Action::JumpToContactSearchHit(idx) => {
-            if let Some(contact) = app.contact_search_results.get(idx).cloned() {
-                ui.active_nav_tab = TAB_CONTACTS;
-                ui.persona = Persona::Outlook;
-                app.ensure_tab_domain_activated(ui, TAB_CONTACTS);
-                if !app.contacts.iter().any(|c| c.id == contact.id) {
-                    app.contacts.insert(0, contact.clone());
-                }
-                app.select_contact(ui, contact.id);
-                ui.narrow_pane = NarrowPane::Chat;
-                ui.set_focus(Focus::Chat);
-            }
-        }
-
-        // Microsoft OneNote
-        Action::SearchNotes(query) => {
-            app.search_notes(query);
-        }
-        Action::JumpToNoteSearchHit(idx) => {
-            app.jump_to_note_search_hit(ui, idx);
-        }
-        Action::OnenoteOpenCreateNotebook => {
-            app.open_onenote_create_notebook(ui);
-        }
-        Action::OnenoteOpenCreateSection => {
-            app.open_onenote_create_section(ui);
-        }
-        Action::OnenoteOpenCreatePage { subpage } => {
-            app.open_onenote_create_page(ui, subpage);
-        }
-        Action::OnenoteOpenAppendBlock => {
-            open_onenote_append_form(app, ui);
-        }
-        Action::OnenoteOpenEditBlock => {
-            open_onenote_edit_block_form(app, ui);
-        }
-        Action::OnenoteOpenEditFullPage => {
-            open_onenote_edit_page_form(app, ui);
-        }
-        Action::OnenoteToggleTodo => {
-            let idx = ui.onenote_selected_block;
-            app.toggle_onenote_todo(ui, idx);
-        }
-        Action::OnenoteCycleSection(delta) => {
-            app.cycle_onenote_section(ui, delta);
-        }
-        Action::OnenoteCyclePage(delta) => {
-            app.cycle_onenote_page(ui, delta);
-        }
-        Action::OnenoteOpenWeb => {
-            app.open_active_onenote_in_browser(ui);
-        }
-        Action::OnenoteRefresh => {
-            app.refresh_onenote(ui);
-        }
-        Action::OnenoteDeletePageRequest => {
-            request_onenote_page_delete(app, ui);
-        }
-        Action::OnenoteCreateNotebook { display_name } => {
-            app.create_onenote_notebook(ui, display_name);
-        }
-        Action::OnenoteCreateSection {
-            notebook_key,
-            display_name,
-        } => {
-            app.create_onenote_section(ui, notebook_key, display_name);
-        }
-        Action::OnenoteCreatePage {
-            section_key,
-            title,
-            markdown_body,
-            inline_images,
-            level,
-        } => {
-            app.create_onenote_page(ui, section_key, title, markdown_body, inline_images, level);
-        }
-        Action::OnenoteAppendMarkdown {
-            page_key,
-            markdown,
-            inline_images,
-        } => {
-            app.append_onenote_markdown(ui, page_key, markdown, inline_images);
-        }
-        Action::OnenoteEditBlockSubmit {
-            page_key,
-            element_id,
-            markdown,
-        } => {
-            app.edit_onenote_block(ui, page_key, element_id, markdown);
-        }
-        Action::OnenoteDeletePageConfirm => {
-            app.delete_active_onenote_page(ui);
-        }
-        Action::OnenoteDownloadAttachment => {
-            download_selected_onenote_attachment(app, ui);
         }
     }
 
@@ -1397,15 +941,7 @@ fn open_overlay(kind: OverlayKind, app: &mut AppState, ui: &mut UiState) {
         }
         OverlayKind::CommandPalette => Overlay::command_palette(),
         OverlayKind::Settings => Overlay::settings(),
-        OverlayKind::Search => {
-            let scope = match ui.active_nav_tab {
-                TAB_MAIL => SearchScope::Mail,
-                TAB_CONTACTS => SearchScope::Contacts,
-                TAB_NOTES => SearchScope::Notes,
-                _ => SearchScope::TeamsMessages,
-            };
-            Overlay::Search(SearchOverlay::with_scope(scope))
-        }
+        OverlayKind::Search => Overlay::Search(SearchOverlay::default()),
         OverlayKind::Presence => Overlay::presence(),
         OverlayKind::Reactions => {
             let (scope, idx) =
@@ -1416,10 +952,6 @@ fn open_overlay(kind: OverlayKind, app: &mut AppState, ui: &mut UiState) {
         OverlayKind::PathInput => Overlay::path_input(),
         OverlayKind::NewChat => Overlay::new_chat(),
         OverlayKind::RoomInfo => Overlay::room_info(),
-        OverlayKind::MailCompose => Overlay::MailCompose(MailComposeOverlay::new()),
-        OverlayKind::EventCreate => Overlay::event_create(),
-        OverlayKind::ContactCreate => Overlay::contact_create(),
-        OverlayKind::OnenoteForm => Overlay::OnenoteForm(OnenoteFormOverlay::create_notebook()),
         OverlayKind::ImagePreview => {
             open_image_preview(app, ui);
             return;
@@ -1431,35 +963,15 @@ fn open_overlay(kind: OverlayKind, app: &mut AppState, ui: &mut UiState) {
 }
 
 fn open_image_preview(app: &mut AppState, ui: &mut UiState) {
-    if ui.active_nav_tab == TAB_NOTES {
-        let pref = app
-            .active_page_detail
-            .as_ref()
-            .and_then(|d| d.blocks.get(ui.onenote_selected_block))
-            .and_then(|b| match b.kind {
-                crate::models::OnenoteBlockKind::Image { resource_index, .. } => {
-                    Some(resource_index)
-                }
-                _ => None,
-            });
-        open_onenote_image_preview(app, ui, pref);
-        return;
-    }
-
-    let preview_opt = if ui.active_nav_tab == TAB_MAIL {
-        app.active_mail()
-            .and_then(|mail| ImagePreviewOverlay::from_mail_message(mail, Some(ui.mail_attach_index)))
-    } else {
-        selected_message_scope_and_index(app, ui)
-            .and_then(|(scope, idx)| app.message_at(scope, idx))
-            .and_then(|msg| ImagePreviewOverlay::from_teams_message(msg, Some(ui.attach_index)))
-            .or_else(|| {
-                app.messages
-                    .iter()
-                    .rev()
-                    .find_map(|msg| ImagePreviewOverlay::from_teams_message(msg, None))
-            })
-    };
+    let preview_opt = selected_message_scope_and_index(app, ui)
+        .and_then(|(scope, idx)| app.message_at(scope, idx))
+        .and_then(|msg| ImagePreviewOverlay::from_teams_message(msg, Some(ui.attach_index)))
+        .or_else(|| {
+            app.messages
+                .iter()
+                .rev()
+                .find_map(|msg| ImagePreviewOverlay::from_teams_message(msg, None))
+        });
 
     let Some(preview) = preview_opt else {
         ui.info("미리볼 수 있는 이미지 첨부가 없습니다");
@@ -1476,12 +988,10 @@ fn open_image_preview(app: &mut AppState, ui: &mut UiState) {
 
 fn cycle_focus(app: &AppState, ui: &mut UiState, forward: bool) {
     let mut order = vec![Focus::Nav, Focus::Chat];
-    if ui.active_nav_tab < TAB_MAIL {
-        if ui.thread_drawer_open && app.active_thread.is_some() {
-            order.push(Focus::Thread);
-        }
-        order.push(Focus::Composer);
+    if ui.thread_drawer_open && app.active_thread.is_some() {
+        order.push(Focus::Thread);
     }
+    order.push(Focus::Composer);
 
     let pos = order.iter().position(|f| *f == ui.focus).unwrap_or(0);
     let next_pos = if forward {
@@ -1536,55 +1046,93 @@ fn selected_message_scope_and_index(
     }
 }
 
+fn maybe_load_older_chats(app: &mut AppState, ui: &UiState) {
+    if ui.active_nav_tab != TAB_CHATS {
+        return;
+    }
+    let len = nav_pane::nav_row_count(app, ui);
+    if len == 0 {
+        return;
+    }
+    if ui.nav_selected + 1 >= len
+        && app.conversations.len() >= 40
+        && !app.chats_oldest_reached
+        && !app.loading_older_chats
+    {
+        app.load_older_chats();
+    }
+}
+
+fn move_nav_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
+    let len = nav_pane::nav_row_count(app, ui);
+    if len == 0 {
+        return;
+    }
+    let cur = ui.nav_selected.min(len - 1) as i32;
+    let next = (cur + delta).clamp(0, (len - 1) as i32) as usize;
+    ui.nav_selected = next;
+    if delta > 0 {
+        maybe_load_older_chats(app, ui);
+    }
+}
+
+fn chat_scroll_is_at_top(ui: &UiState) -> bool {
+    let height = ui.chat_scroll.area.height as usize;
+    if ui.chat_scroll.total_lines > 0 && height > 0 {
+        ui.chat_scroll.offset(height) == 0
+    } else {
+        ui.chat_scroll.offset == 0
+    }
+}
+
+fn scroll_chat_with_autoload(app: &mut AppState, ui: &mut UiState, delta: i32) {
+    let was_at_top = chat_scroll_is_at_top(ui);
+    if delta < 0 {
+        ui.chat_scroll.scroll_up((-delta) as u16);
+    } else if delta > 0 {
+        ui.chat_scroll.scroll_down(delta as u16);
+    }
+    let now_at_top = chat_scroll_is_at_top(ui);
+    if delta < 0
+        && (was_at_top || now_at_top)
+        && !app.oldest_reached
+        && !app.loading_older
+        && app.active_conv_key.is_some()
+    {
+        app.load_older_auto(ui);
+    }
+}
+
 fn move_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
     match ui.focus() {
         Focus::Nav => {
-            let len = nav_pane::nav_row_count(app, ui);
-            if len == 0 {
-                return;
-            }
-            let cur = ui.nav_selected.min(len - 1) as i32;
-            let next = (cur + delta).clamp(0, (len - 1) as i32) as usize;
-            ui.nav_selected = next;
+            move_nav_selection(app, ui, delta);
         }
         Focus::Chat => {
-            if ui.active_nav_tab == TAB_NOTES {
-                let len = app
-                    .active_page_detail
-                    .as_ref()
-                    .map(|d| d.blocks.len())
-                    .unwrap_or(0);
-                if len == 0 {
-                    if delta < 0 {
-                        ui.onenote_scroll.scroll_up((-delta) as u16);
-                    } else if delta > 0 {
-                        ui.onenote_scroll.scroll_down(delta as u16);
-                    }
-                    return;
-                }
-                let cur = ui.onenote_selected_block.min(len - 1) as i32;
-                let next = (cur + delta).clamp(0, (len - 1) as i32) as usize;
-                ui.onenote_selected_block = next;
-                ui.onenote_follow_selection = true;
-                return;
-            }
-            if ui.active_nav_tab >= TAB_MAIL {
-                if delta < 0 {
-                    ui.mail_scroll.scroll_up((-delta) as u16);
-                } else if delta > 0 {
-                    ui.mail_scroll.scroll_down(delta as u16);
-                }
-                return;
-            }
             let len = app.messages.len();
             if len == 0 {
+                if delta < 0
+                    && !app.oldest_reached
+                    && !app.loading_older
+                    && app.active_conv_key.is_some()
+                {
+                    app.load_older_auto(ui);
+                }
                 return;
             }
             let cur = ui.chat_scroll.selected_idx.unwrap_or(len - 1) as i32;
+            let was_at_first = cur == 0;
             let next = (cur + delta).clamp(0, (len - 1) as i32) as usize;
             ui.chat_scroll.selected_idx = Some(next);
             if delta < 0 && next == 0 {
                 ui.chat_scroll.scroll_up(2);
+                if (was_at_first || chat_scroll_is_at_top(ui))
+                    && !app.oldest_reached
+                    && !app.loading_older
+                    && app.active_conv_key.is_some()
+                {
+                    app.load_older_auto(ui);
+                }
             } else if delta > 0 && next == len - 1 {
                 ui.chat_scroll.bottom();
             }
@@ -1611,17 +1159,36 @@ fn move_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
     }
 }
 
-fn scroll_focused(ui: &mut UiState, delta: i32) {
-    let target = match ui.focus() {
-        Focus::Thread => &mut ui.thread_scroll,
-        _ if ui.active_nav_tab == TAB_NOTES => &mut ui.onenote_scroll,
-        _ if ui.active_nav_tab >= TAB_MAIL => &mut ui.mail_scroll,
-        _ => &mut ui.chat_scroll,
-    };
-    if delta < 0 {
-        target.scroll_up((-delta) as u16);
-    } else if delta > 0 {
-        target.scroll_down(delta as u16);
+fn scroll_focused_and_autoload(app: &mut AppState, ui: &mut UiState, delta: i32) {
+    match ui.focus() {
+        Focus::Nav => {
+            move_nav_selection(app, ui, delta);
+        }
+        Focus::Thread => {
+            if delta < 0 {
+                ui.thread_scroll.scroll_up((-delta) as u16);
+            } else if delta > 0 {
+                ui.thread_scroll.scroll_down(delta as u16);
+            }
+        }
+        _ => scroll_chat_with_autoload(app, ui, delta),
+    }
+}
+
+fn handle_mouse_scroll(app: &mut AppState, ui: &mut UiState, delta: i32, column: u16, row: u16) {
+    let pos = Position { x: column, y: row };
+    if ui.nav_area.contains(pos) {
+        move_nav_selection(app, ui, delta);
+    } else if ui.thread_drawer_open && ui.thread_scroll.area.contains(pos) {
+        if delta < 0 {
+            ui.thread_scroll.scroll_up((-delta) as u16);
+        } else if delta > 0 {
+            ui.thread_scroll.scroll_down(delta as u16);
+        }
+    } else if ui.chat_scroll.area.contains(pos) {
+        scroll_chat_with_autoload(app, ui, delta);
+    } else {
+        scroll_focused_and_autoload(app, ui, delta);
     }
 }
 
@@ -1632,69 +1199,22 @@ fn handle_activate(app: &mut AppState, ui: &mut UiState) {
             app.select_nav_row(ui, idx);
         }
         Focus::Chat => {
-            match ui.active_nav_tab {
-                TAB_MAIL => {
-                    let _ = dispatch(Action::OpenMailReply { reply_all: false }, app, ui);
-                }
-                TAB_CALENDAR => {
-                    app.open_active_event_meeting(ui);
-                }
-                TAB_CONTACTS => {
-                    let _ = dispatch(Action::ContactSendMail, app, ui);
-                }
-                TAB_TODO => {
-                    app.toggle_active_todo_completed(ui);
-                }
-                TAB_NOTES => {
-                    let idx = ui.onenote_selected_block;
-                    if let Some(block) = app
-                        .active_page_detail
-                        .as_ref()
-                        .and_then(|d| d.blocks.get(idx))
-                        .cloned()
-                    {
-                        match block.kind {
-                            crate::models::OnenoteBlockKind::Image { resource_index, .. } => {
-                                open_onenote_image_preview(app, ui, Some(resource_index));
-                            }
-                            crate::models::OnenoteBlockKind::Attachment {
-                                resource_index, ..
-                            } => {
-                                download_selected_onenote_attachment(app, ui);
-                                let _ = resource_index;
-                            }
-                            _ if matches!(
-                                block.tag,
-                                Some(crate::models::OnenoteTagKind::Todo { .. })
-                            ) =>
-                            {
-                                app.toggle_onenote_todo(ui, idx);
-                            }
-                            _ => {
-                                open_onenote_edit_block_form(app, ui);
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    if let Some(idx) = selected_chat_index(app, ui) {
-                        if app
-                            .active_target
-                            .as_ref()
-                            .is_some_and(ConversationTarget::is_channel)
-                        {
-                            app.open_thread(ui, idx);
-                        } else {
-                            let _ = dispatch(
-                                Action::ReplyTo {
-                                    scope: MessageScope::Chat,
-                                    msg_index: idx,
-                                },
-                                app,
-                                ui,
-                            );
-                        }
-                    }
+            if let Some(idx) = selected_chat_index(app, ui) {
+                if app
+                    .active_target
+                    .as_ref()
+                    .is_some_and(ConversationTarget::is_channel)
+                {
+                    app.open_thread(ui, idx);
+                } else {
+                    let _ = dispatch(
+                        Action::ReplyTo {
+                            scope: MessageScope::Chat,
+                            msg_index: idx,
+                        },
+                        app,
+                        ui,
+                    );
                 }
             }
         }
@@ -1731,9 +1251,6 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
     }
 
     if let Some(hit) = target {
-        if handle_onenote_hit(hit, app, ui) {
-            return false;
-        }
         let act = action_for_target(hit);
         return dispatch(act, app, ui);
     }
@@ -1741,11 +1258,10 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
     let pos = Position { x: column, y: row };
     if ui.thread_drawer_open && ui.thread_scroll.area.contains(pos) {
         ui.set_focus(Focus::Thread);
-    } else if ui.chat_scroll.area.contains(pos)
-        || ui.mail_scroll.area.contains(pos)
-        || ui.onenote_scroll.area.contains(pos)
-    {
+    } else if ui.chat_scroll.area.contains(pos) {
         ui.set_focus(Focus::Chat);
+    } else if ui.nav_area.contains(pos) {
+        ui.set_focus(Focus::Nav);
     }
     false
 }
@@ -1774,6 +1290,7 @@ fn action_for_target(target: HitTarget) -> Action {
             reaction_index,
         },
         HitTarget::OpenThread { msg_index } => Action::OpenThread { msg_index },
+        HitTarget::LoadOlderMessages => Action::LoadOlder,
         HitTarget::Button(btn) => match btn {
             ButtonId::Search => Action::OpenOverlay(OverlayKind::Search),
             ButtonId::SendFile => Action::OpenOverlay(OverlayKind::PathInput),
@@ -1787,260 +1304,12 @@ fn action_for_target(target: HitTarget) -> Action {
             ButtonId::ComposerTargetToggle => Action::ToggleComposerTarget,
             ButtonId::SubjectToggle => Action::ToggleSubject,
             ButtonId::NarrowToggle => Action::ToggleNarrowPane,
-            ButtonId::NewMail => Action::OpenMailComposeNew,
-            ButtonId::MailReply => Action::OpenMailReply { reply_all: false },
-            ButtonId::MailReplyAll => Action::OpenMailReply { reply_all: true },
-            ButtonId::MailForward => Action::OpenMailForward,
-            ButtonId::MailToggleRead => Action::MailToggleRead,
-            ButtonId::MailToggleFlag => Action::MailToggleFlag,
-            ButtonId::MailArchive => Action::MailArchive,
-            ButtonId::MailDelete => Action::MailDeleteRequest,
             ButtonId::ImagePreview => Action::OpenImagePreview,
-            ButtonId::NewEvent => Action::OpenOverlay(OverlayKind::EventCreate),
-            ButtonId::JoinMeeting => Action::JoinCalendarMeeting,
-            ButtonId::RsvpAccept => Action::RespondCalendarEvent("accept".to_string()),
-            ButtonId::RsvpTentative => {
-                Action::RespondCalendarEvent("tentativelyAccept".to_string())
-            }
-            ButtonId::RsvpDecline => Action::RespondCalendarEvent("decline".to_string()),
-            ButtonId::DeleteEvent => Action::DeleteCalendarEventRequest,
-            ButtonId::NewContact => Action::OpenOverlay(OverlayKind::ContactCreate),
-            ButtonId::ContactMail => Action::ContactSendMail,
-            ButtonId::ContactChat => Action::ContactStartChat,
-            ButtonId::DeleteContact => Action::DeleteContactRequest,
-            ButtonId::NewTodo | ButtonId::TodoInputFocus => Action::TodoFocusInput,
-            ButtonId::TodoToggle => Action::TodoToggleSelected,
-            ButtonId::DeleteTodo => Action::TodoDeleteRequest,
-            // Microsoft OneNote toolbar
-            ButtonId::OnenoteNewNotebook => Action::OnenoteOpenCreateNotebook,
-            ButtonId::OnenoteNewSection => Action::OnenoteOpenCreateSection,
-            ButtonId::OnenoteNewPage => Action::OnenoteOpenCreatePage { subpage: false },
-            ButtonId::OnenoteNewSubpage => Action::OnenoteOpenCreatePage { subpage: true },
-            // These need direct `AppState` access, so `handle_onenote_hit` consumes them first.
-            ButtonId::OnenoteAppendBlock
-            | ButtonId::OnenoteEditBlock
-            | ButtonId::OnenoteEditFullPage
-            | ButtonId::OnenoteToggleTodo
-            | ButtonId::OnenoteOpenWeb
-            | ButtonId::OnenoteRefresh
-            | ButtonId::OnenoteDeletePage => Action::Noop,
         },
         HitTarget::SubjectInput => Action::FocusSubject,
         HitTarget::Composer => Action::OpenComposer,
         HitTarget::OverlayItem { index } => Action::OverlaySelect(index),
-        // OneNote hit targets resolve against `AppState`, so they are handled in
-        // `handle_onenote_hit` before this mapper runs.
-        HitTarget::OnenoteSectionTab(_)
-        | HitTarget::OnenotePage(_)
-        | HitTarget::OnenoteBlock(_)
-        | HitTarget::OnenoteTodoToggle(_)
-        | HitTarget::OnenoteResource { .. } => Action::Noop,
     }
-}
-
-/// Handles OneNote hit targets and toolbar buttons that require direct `AppState` access.
-///
-/// Returns `true` when the target was consumed.
-fn handle_onenote_hit(hit: HitTarget, app: &mut AppState, ui: &mut UiState) -> bool {
-    match hit {
-        HitTarget::OnenoteSectionTab(idx) => {
-            match onenote_section_key_at(app, idx) {
-                Some(section_key) => app.open_onenote_section(ui, section_key),
-                None => ui.info("선택할 OneNote 섹션이 없습니다"),
-            }
-            true
-        }
-        HitTarget::OnenotePage(idx) => {
-            match app.onenote_pages.get(idx).map(|page| page.page_key.clone()) {
-                Some(page_key) => app.open_onenote_page(ui, page_key),
-                None => ui.info("선택할 OneNote 페이지가 없습니다"),
-            }
-            true
-        }
-        HitTarget::OnenoteBlock(idx) => {
-            app.select_onenote_block(ui, idx);
-            true
-        }
-        HitTarget::OnenoteTodoToggle(idx) => {
-            app.toggle_onenote_todo(ui, idx);
-            true
-        }
-        HitTarget::OnenoteResource {
-            resource_index,
-            is_image,
-        } => {
-            if is_image {
-                open_onenote_image_preview(app, ui, Some(resource_index));
-            } else if let Some(detail) = app.active_page_detail.as_ref().cloned() {
-                if let Some(res) = detail.resources.get(resource_index).cloned() {
-                    app.download_onenote_attachment(
-                        ui,
-                        &detail.summary.page_key,
-                        resource_index,
-                        res,
-                    );
-                }
-            }
-            true
-        }
-        HitTarget::Button(btn) => handle_onenote_button(btn, app, ui),
-        _ => false,
-    }
-}
-
-/// Handles the OneNote toolbar buttons that cannot be expressed as an `Action`.
-fn handle_onenote_button(btn: ButtonId, app: &mut AppState, ui: &mut UiState) -> bool {
-    match btn {
-        ButtonId::OnenoteAppendBlock => open_onenote_append_form(app, ui),
-        ButtonId::OnenoteEditBlock => open_onenote_edit_block_form(app, ui),
-        ButtonId::OnenoteEditFullPage => open_onenote_edit_page_form(app, ui),
-        ButtonId::OnenoteToggleTodo => {
-            let idx = ui.onenote_selected_block;
-            app.toggle_onenote_todo(ui, idx);
-        }
-        ButtonId::OnenoteOpenWeb => app.open_active_onenote_in_browser(ui),
-        ButtonId::OnenoteRefresh => app.refresh_onenote(ui),
-        ButtonId::OnenoteDeletePage => request_onenote_page_delete(app, ui),
-        _ => return false,
-    }
-    true
-}
-
-/// Resolves a section ribbon index against the sections of the active notebook.
-fn onenote_section_key_at(app: &AppState, idx: usize) -> Option<String> {
-    let active_notebook_key = app.active_notebook_key.as_deref();
-    app.onenote_sections
-        .iter()
-        .filter(|sec| match active_notebook_key {
-            Some(key) => app
-                .onenote_notebooks
-                .iter()
-                .find(|nb| nb.notebook_key == key)
-                .is_none_or(|nb| nav_pane::section_belongs_to_notebook(sec, nb)),
-            None => true,
-        })
-        .nth(idx)
-        .map(|sec| sec.section_key.clone())
-}
-
-fn request_onenote_page_delete(app: &AppState, ui: &mut UiState) {
-    let Some(detail) = app.active_page_detail.as_ref() else {
-        ui.info("삭제할 OneNote 페이지를 먼저 선택하세요");
-        return;
-    };
-    let msg = format!(
-        "OneNote 페이지 '{}' 을(를) 삭제하시겠습니까?",
-        detail.summary.title
-    );
-    ui.push_overlay(Overlay::confirm(
-        msg,
-        Some(Action::OnenoteDeletePageConfirm),
-    ));
-}
-
-/// Opens the append-markdown form for the active page (`a`).
-fn open_onenote_append_form(app: &AppState, ui: &mut UiState) {
-    let Some(detail) = app.active_page_detail.as_ref() else {
-        ui.info("먼저 OneNote 페이지를 선택하세요");
-        return;
-    };
-    let form = OnenoteFormOverlay::append_markdown(
-        detail.summary.page_key.clone(),
-        detail.summary.title.clone(),
-    );
-    ui.push_overlay(Overlay::OnenoteForm(form));
-}
-
-/// Opens the surgical block edit form for the selected block (`e`).
-fn open_onenote_edit_block_form(app: &AppState, ui: &mut UiState) {
-    let Some(detail) = app.active_page_detail.as_ref() else {
-        ui.info("먼저 OneNote 페이지를 선택하세요");
-        return;
-    };
-    let block_index = ui.onenote_selected_block;
-    let Some(block) = detail.blocks.get(block_index) else {
-        ui.info("편집할 OneNote 블록을 선택하세요");
-        return;
-    };
-    let Some(element_id) = block.element_id.clone() else {
-        ui.info("이 블록은 편집할 수 없습니다 (element ID 없음)");
-        return;
-    };
-    let initial_markdown =
-        crate::parser::onenote::onenote_blocks_to_markdown(std::slice::from_ref(block));
-    let form = OnenoteFormOverlay::edit_block(
-        detail.summary.page_key.clone(),
-        detail.summary.title.clone(),
-        element_id,
-        block_index,
-        initial_markdown,
-    );
-    ui.push_overlay(Overlay::OnenoteForm(form));
-}
-
-/// Launches `$EDITOR` external markdown edit for the whole active OneNote page (`E`).
-fn open_onenote_edit_page_form(app: &AppState, ui: &mut UiState) {
-    let Some(detail) = app.active_page_detail.as_ref() else {
-        ui.info("먼저 OneNote 페이지를 선택하세요");
-        return;
-    };
-    ui.onenote_external_edit = Some((
-        detail.summary.page_key.clone(),
-        detail.body_markdown.clone(),
-    ));
-}
-
-/// Downloads the resource referenced by the selected block (or first page attachment) (`D`).
-fn download_selected_onenote_attachment(app: &mut AppState, ui: &mut UiState) {
-    let Some(detail) = app.active_page_detail.as_ref().cloned() else {
-        ui.info("먼저 OneNote 페이지를 선택하세요");
-        return;
-    };
-    let selected_idx = detail
-        .blocks
-        .get(ui.onenote_selected_block)
-        .and_then(|b| match b.kind {
-            crate::models::OnenoteBlockKind::Attachment { resource_index, .. }
-            | crate::models::OnenoteBlockKind::Image { resource_index, .. } => {
-                Some(resource_index)
-            }
-            _ => None,
-        })
-        .or_else(|| (!detail.resources.is_empty()).then_some(0));
-
-    let Some(res_idx) = selected_idx else {
-        ui.info("다운로드할 OneNote 첨부/이미지 리소스가 없습니다");
-        return;
-    };
-    let Some(resource) = detail.resources.get(res_idx).cloned() else {
-        ui.info("리소스 메타데이터를 찾을 수 없습니다");
-        return;
-    };
-    app.download_onenote_attachment(ui, &detail.summary.page_key, res_idx, resource);
-}
-
-/// Opens the image preview overlay for the active page's resource at `resource_index`.
-fn open_onenote_image_preview(
-    app: &mut AppState,
-    ui: &mut UiState,
-    preferred_res_idx: Option<usize>,
-) {
-    let preview_opt = app
-        .active_page_detail
-        .as_ref()
-        .and_then(|detail| ImagePreviewOverlay::from_onenote_page(detail, preferred_res_idx));
-
-    let Some(preview) = preview_opt else {
-        ui.info("미리볼 수 있는 OneNote 이미지가 없습니다");
-        return;
-    };
-
-    ui.close_overlays_of(OverlayKind::ImagePreview);
-    if let Some(target) = preview.current().cloned() {
-        let (cols, rows) = preview.target_dimensions(ui.term_width, ui.term_height);
-        app.request_preview_image(&target, cols, rows);
-    }
-    ui.push_overlay(Overlay::ImagePreview(preview));
 }
 
 fn open_context_menu_at(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) {

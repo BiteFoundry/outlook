@@ -1,20 +1,20 @@
 #!/usr/bin/env node
 // Zero-Node-Process npm native binary linker.
 //
-// On Unix (linux/darwin): replaces installed `bin/{teams,outlook,onenote}.js` with
+// On Unix (linux/darwin): replaces installed `bin/teams.js` with
 // hardlinks/symlinks directly to `@shinick/teams-<platform>-<arch>/bin/teams` so npm's
-// bin symlinks execve the native Rust binary directly (0ms Node startup, 0MB Node RSS).
+// bin symlink execve's the native Rust binary directly (0ms Node startup, 0MB Node RSS).
 //
-// On Windows (win32): creates NTFS hardlinks (fallback copy) `bin/{teams,outlook,onenote}.exe`
-// and rewrites npm's `.bin/{teams,outlook,onenote}[.cmd|.ps1]` shims when present to invoke
-// the matching `.exe` directly without spawning `node.exe`.
+// On Windows (win32): creates an NTFS hardlink (fallback copy) `bin/teams.exe`
+// and rewrites npm's `.bin/teams[.cmd|.ps1]` shims when present to invoke
+// `teams.exe` directly without spawning `node.exe`.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
-const BIN_NAMES = ['teams', 'outlook', 'onenote'];
+const BIN_NAMES = ['teams'];
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function linkOrCopyFile(source, destination) {

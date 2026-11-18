@@ -464,7 +464,41 @@ pub fn list_root_messages(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let mut out = if let Some(before) = before_created_at {
+    if let Some(before) = before_created_at {
+        return list_older_root_messages(conn, conv_key, limit, before, None);
+    }
+
+    let mut stmt = conn.prepare_cached(
+        "
+        SELECT
+            msg_key, conv_key, msg_id, parent_msg_id, reply_to_id, reply_to_author, reply_to_preview,
+            subject, author_id, author_name, is_me, created_at, last_modified_at, deleted,
+            importance, message_type, body_html, body_plain, attachments_json, mentions_json,
+            reactions_json, reply_count, web_url
+        FROM messages
+        WHERE conv_key = ?1 AND parent_msg_id IS NULL
+        ORDER BY created_at DESC, msg_id DESC
+        LIMIT ?2
+        ",
+    )?;
+    let rows = stmt.query_map(params![conv_key, limit as i64], map_message_row)?;
+    let mut out = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    out.reverse();
+    Ok(out)
+}
+
+/// Lists older root messages strictly preceding `(before_created_at, before_msg_id)` in chronological order (oldest first).
+pub fn list_older_root_messages(
+    conn: &Connection,
+    conv_key: &str,
+    limit: usize,
+    before_created_at: &str,
+    before_msg_id: Option<&str>,
+) -> Result<Vec<MessageItem>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out = if let Some(b_id) = before_msg_id {
         let mut stmt = conn.prepare_cached(
             "
             SELECT
@@ -473,12 +507,17 @@ pub fn list_root_messages(
                 importance, message_type, body_html, body_plain, attachments_json, mentions_json,
                 reactions_json, reply_count, web_url
             FROM messages
-            WHERE conv_key = ?1 AND parent_msg_id IS NULL AND created_at < ?2
+            WHERE parent_msg_id IS NULL
+              AND conv_key = ?1
+              AND (created_at < ?2 OR (created_at = ?2 AND msg_id < ?3))
             ORDER BY created_at DESC, msg_id DESC
-            LIMIT ?3
+            LIMIT ?4
             ",
         )?;
-        let rows = stmt.query_map(params![conv_key, before, limit as i64], map_message_row)?;
+        let rows = stmt.query_map(
+            params![conv_key, before_created_at, b_id, limit as i64],
+            map_message_row,
+        )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     } else {
         let mut stmt = conn.prepare_cached(
@@ -489,12 +528,17 @@ pub fn list_root_messages(
                 importance, message_type, body_html, body_plain, attachments_json, mentions_json,
                 reactions_json, reply_count, web_url
             FROM messages
-            WHERE conv_key = ?1 AND parent_msg_id IS NULL
+            WHERE parent_msg_id IS NULL
+              AND conv_key = ?1
+              AND created_at < ?2
             ORDER BY created_at DESC, msg_id DESC
-            LIMIT ?2
+            LIMIT ?3
             ",
         )?;
-        let rows = stmt.query_map(params![conv_key, limit as i64], map_message_row)?;
+        let rows = stmt.query_map(
+            params![conv_key, before_created_at, limit as i64],
+            map_message_row,
+        )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
 

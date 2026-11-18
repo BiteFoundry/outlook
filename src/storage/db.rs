@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-const SCHEMA_USER_VERSION_UNICODE61: i32 = 40;
-const SCHEMA_USER_VERSION_TRIGRAM: i32 = 41;
+const SCHEMA_USER_VERSION_UNICODE61: i32 = 50;
+const SCHEMA_USER_VERSION_TRIGRAM: i32 = 51;
 
 /// Initializes SQLite PRAGMAs, tables, indexes, and FTS5 virtual table.
 /// Returns `true` if `messages_fts` uses the `trigram` tokenizer, `false` if using `unicode61`.
@@ -38,7 +38,8 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
         {
             let intact: bool = conn
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='onenote_fts')",
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts')
+                     AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_conv_root_created_id')",
                     [],
                     |row| row.get(0),
                 )
@@ -46,6 +47,26 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             if intact {
                 return Ok(user_version == SCHEMA_USER_VERSION_TRIGRAM);
             }
+        }
+        if user_version < SCHEMA_USER_VERSION_UNICODE61 {
+            conn.execute_batch(
+                "
+                DROP TABLE IF EXISTS mail_fts;
+                DROP TABLE IF EXISTS mail_messages;
+                DROP TABLE IF EXISTS mail_folders;
+                DROP TABLE IF EXISTS calendar_events;
+                DROP TABLE IF EXISTS contacts;
+                DROP TABLE IF EXISTS todo_tasks;
+                DROP TABLE IF EXISTS todo_lists;
+                DROP TABLE IF EXISTS onenote_fts;
+                DROP TABLE IF EXISTS onenote_page_details;
+                DROP TABLE IF EXISTS onenote_pages;
+                DROP TABLE IF EXISTS onenote_sections;
+                DROP TABLE IF EXISTS onenote_section_groups;
+                DROP TABLE IF EXISTS onenote_notebooks;
+                ",
+            )
+            .context("레거시 Outlook/OneNote 테이블 정리 실패")?;
         }
     }
 
@@ -109,6 +130,9 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
         CREATE INDEX IF NOT EXISTS idx_messages_conv_parent_created
             ON messages(conv_key, parent_msg_id, created_at);
 
+        CREATE INDEX IF NOT EXISTS idx_messages_conv_root_created_id
+            ON messages(conv_key, parent_msg_id, created_at DESC, msg_id DESC);
+
         CREATE INDEX IF NOT EXISTS idx_messages_conv_msg
             ON messages(conv_key, msg_id);
 
@@ -138,186 +162,6 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             oldest_msg_ts TEXT,
             synced_at TEXT NOT NULL
         );
-
-        CREATE TABLE IF NOT EXISTS mail_folders (
-            id TEXT PRIMARY KEY,
-            display_name TEXT NOT NULL,
-            well_known_name TEXT,
-            parent_folder_id TEXT,
-            unread_item_count INTEGER NOT NULL DEFAULT 0,
-            total_item_count INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS mail_messages (
-            id TEXT PRIMARY KEY,
-            conversation_id TEXT,
-            folder_id TEXT,
-            subject TEXT NOT NULL,
-            from_json TEXT,
-            to_json TEXT NOT NULL,
-            cc_json TEXT NOT NULL,
-            bcc_json TEXT NOT NULL,
-            from_display TEXT NOT NULL,
-            received_at TEXT NOT NULL,
-            sent_at TEXT,
-            is_read INTEGER NOT NULL DEFAULT 0,
-            is_draft INTEGER NOT NULL DEFAULT 0,
-            flagged INTEGER NOT NULL DEFAULT 0,
-            importance TEXT NOT NULL,
-            has_attachments INTEGER NOT NULL DEFAULT 0,
-            preview TEXT NOT NULL,
-            body_html TEXT NOT NULL,
-            body_plain TEXT NOT NULL,
-            attachments_json TEXT NOT NULL,
-            web_link TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_mail_messages_folder_received
-            ON mail_messages(folder_id, received_at DESC);
-
-        CREATE TABLE IF NOT EXISTS calendar_events (
-            id TEXT PRIMARY KEY,
-            subject TEXT NOT NULL,
-            start_iso TEXT NOT NULL,
-            end_iso TEXT NOT NULL,
-            time_zone TEXT NOT NULL,
-            is_all_day INTEGER NOT NULL DEFAULT 0,
-            location TEXT,
-            organizer_name TEXT,
-            organizer_email TEXT,
-            attendees_json TEXT NOT NULL,
-            response_status TEXT NOT NULL,
-            is_online_meeting INTEGER NOT NULL DEFAULT 0,
-            online_meeting_url TEXT,
-            body_html TEXT NOT NULL,
-            body_plain TEXT NOT NULL,
-            is_cancelled INTEGER NOT NULL DEFAULT 0,
-            web_link TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_calendar_events_start
-            ON calendar_events(start_iso ASC);
-
-        CREATE TABLE IF NOT EXISTS contacts (
-            id TEXT PRIMARY KEY,
-            display_name TEXT NOT NULL,
-            given_name TEXT,
-            surname TEXT,
-            emails_json TEXT NOT NULL,
-            mobile_phone TEXT,
-            business_phones_json TEXT NOT NULL,
-            company_name TEXT,
-            job_title TEXT,
-            department TEXT,
-            notes TEXT,
-            source TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_contacts_display_name
-            ON contacts(display_name COLLATE NOCASE ASC);
-
-        CREATE TABLE IF NOT EXISTS todo_lists (
-            id TEXT PRIMARY KEY,
-            display_name TEXT NOT NULL,
-            wellknown_list_name TEXT,
-            is_owner INTEGER NOT NULL DEFAULT 1,
-            is_shared INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS todo_tasks (
-            id TEXT PRIMARY KEY,
-            list_id TEXT NOT NULL,
-            title TEXT NOT NULL,
-            status TEXT NOT NULL,
-            importance TEXT NOT NULL,
-            body_plain TEXT,
-            due_date_iso TEXT,
-            reminder_iso TEXT,
-            completed_at TEXT,
-            created_at TEXT,
-            updated_at TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_todo_tasks_list_status
-            ON todo_tasks(list_id, status);
-
-        CREATE TABLE IF NOT EXISTS onenote_notebooks (
-            notebook_key TEXT PRIMARY KEY,
-            id TEXT NOT NULL,
-            scope_json TEXT NOT NULL,
-            scope_key TEXT NOT NULL,
-            display_name TEXT NOT NULL,
-            color TEXT,
-            is_default INTEGER NOT NULL DEFAULT 0,
-            is_shared INTEGER NOT NULL DEFAULT 0,
-            user_role TEXT,
-            created_at TEXT,
-            last_modified_at TEXT,
-            created_by TEXT,
-            web_url TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS onenote_section_groups (
-            section_group_key TEXT PRIMARY KEY,
-            id TEXT NOT NULL,
-            scope_json TEXT NOT NULL,
-            scope_key TEXT NOT NULL,
-            notebook_id TEXT,
-            parent_section_group_id TEXT,
-            display_name TEXT NOT NULL,
-            created_at TEXT,
-            last_modified_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS onenote_sections (
-            section_key TEXT PRIMARY KEY,
-            id TEXT NOT NULL,
-            scope_json TEXT NOT NULL,
-            scope_key TEXT NOT NULL,
-            notebook_id TEXT,
-            notebook_name TEXT,
-            parent_section_group_id TEXT,
-            parent_section_group_name TEXT,
-            display_name TEXT NOT NULL,
-            color TEXT,
-            is_default INTEGER NOT NULL DEFAULT 0,
-            pages_url TEXT,
-            created_at TEXT,
-            last_modified_at TEXT,
-            web_url TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_onenote_sections_scope_notebook
-            ON onenote_sections(scope_key, notebook_id);
-
-        CREATE TABLE IF NOT EXISTS onenote_pages (
-            page_key TEXT PRIMARY KEY,
-            id TEXT NOT NULL,
-            scope_json TEXT NOT NULL,
-            scope_key TEXT NOT NULL,
-            section_key TEXT NOT NULL,
-            section_id TEXT NOT NULL,
-            section_name TEXT,
-            notebook_id TEXT,
-            notebook_name TEXT,
-            title TEXT NOT NULL,
-            level INTEGER NOT NULL DEFAULT 0,
-            page_order INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT,
-            last_modified_at TEXT,
-            content_url TEXT,
-            web_url TEXT,
-            preview_text TEXT,
-            has_todo INTEGER NOT NULL DEFAULT 0,
-            detail_json TEXT,
-            body_plain TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_onenote_pages_section_order
-            ON onenote_pages(section_key, page_order ASC, last_modified_at DESC);
-
-        CREATE INDEX IF NOT EXISTS idx_onenote_pages_id
-            ON onenote_pages(id);
         ",
     )
     .context("SQLite 기본 스키마 생성 실패")?;
@@ -347,61 +191,8 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
         ",
     )?;
 
-    let mail_trigram = ensure_fts5_table(
-        conn,
-        "mail_fts",
-        "
-        CREATE VIRTUAL TABLE IF NOT EXISTS mail_fts USING fts5(
-            msg_id UNINDEXED,
-            folder_id UNINDEXED,
-            subject,
-            from_display,
-            body_plain,
-            tokenize='trigram'
-        );
-        ",
-        "
-        CREATE VIRTUAL TABLE IF NOT EXISTS mail_fts USING fts5(
-            msg_id UNINDEXED,
-            folder_id UNINDEXED,
-            subject,
-            from_display,
-            body_plain,
-            tokenize='unicode61'
-        );
-        ",
-    )?;
-
-    let onenote_trigram = ensure_fts5_table(
-        conn,
-        "onenote_fts",
-        "
-        CREATE VIRTUAL TABLE IF NOT EXISTS onenote_fts USING fts5(
-            page_key UNINDEXED,
-            section_key UNINDEXED,
-            title,
-            notebook_name,
-            section_name,
-            body_plain,
-            tokenize='trigram'
-        );
-        ",
-        "
-        CREATE VIRTUAL TABLE IF NOT EXISTS onenote_fts USING fts5(
-            page_key UNINDEXED,
-            section_key UNINDEXED,
-            title,
-            notebook_name,
-            section_name,
-            body_plain,
-            tokenize='unicode61'
-        );
-        ",
-    )?;
-
-    let all_trigram = messages_trigram && mail_trigram && onenote_trigram;
     if !is_memory {
-        let version = if all_trigram {
+        let version = if messages_trigram {
             SCHEMA_USER_VERSION_TRIGRAM
         } else {
             SCHEMA_USER_VERSION_UNICODE61
@@ -410,7 +201,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             .context("SQLite user_version 설정 실패")?;
     }
 
-    Ok(all_trigram)
+    Ok(messages_trigram)
 }
 
 /// Configures a read-only WAL reader connection for concurrent UI reads.
@@ -464,12 +255,46 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    const LEGACY_TABLES: &[&str] = &[
+        "mail_fts",
+        "mail_messages",
+        "mail_folders",
+        "calendar_events",
+        "contacts",
+        "todo_tasks",
+        "todo_lists",
+        "onenote_fts",
+        "onenote_page_details",
+        "onenote_pages",
+        "onenote_sections",
+        "onenote_section_groups",
+        "onenote_notebooks",
+    ];
+
+    fn table_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn index_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn test_user_version_fast_path_reopen_and_cache_caps() {
+    fn test_pure_teams_schema_and_user_version_fast_path() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("fastpath.db");
 
-        // First open initializes schema and stamps user_version
+        // First open initializes pure-Teams schema and stamps user_version
         let first_trigram = {
             let conn = Connection::open(&db_path).unwrap();
             let trigram = init_connection(&conn, false).unwrap();
@@ -488,6 +313,25 @@ mod tests {
                 .query_row("PRAGMA cache_size;", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(cache_size, -8000);
+
+            for required in [
+                "conversations",
+                "teams",
+                "messages",
+                "members",
+                "presences",
+                "sync_cursors",
+                "messages_fts",
+            ] {
+                assert!(table_exists(&conn, required), "{required} should exist");
+            }
+            assert!(index_exists(&conn, "idx_messages_conv_root_created_id"));
+            for legacy in LEGACY_TABLES {
+                assert!(
+                    !table_exists(&conn, legacy),
+                    "legacy table {legacy} must not exist"
+                );
+            }
             trigram
         };
 
@@ -517,5 +361,90 @@ mod tests {
             .query_row("PRAGMA cache_size;", [], |row| row.get(0))
             .unwrap();
         assert_eq!(reader_cache, -4000);
+    }
+
+    #[test]
+    fn test_legacy_outlook_onenote_tables_dropped_on_upgrade() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("legacy_v41.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE conversations (
+                    conv_key TEXT PRIMARY KEY,
+                    target_json TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    team_id TEXT,
+                    team_name TEXT,
+                    title TEXT NOT NULL,
+                    topic TEXT,
+                    unread_count INTEGER NOT NULL DEFAULT 0,
+                    last_read_at TEXT,
+                    last_msg_id TEXT,
+                    last_msg_author TEXT,
+                    last_msg_preview TEXT,
+                    last_updated_at TEXT,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    peer_user_id TEXT,
+                    web_url TEXT
+                );
+                INSERT INTO conversations (conv_key, target_json, kind, title)
+                VALUES ('chat:c1', '{\"target_type\":\"chat\",\"chat_id\":\"c1\"}', 'oneOnOne', '홍길동');
+
+                CREATE TABLE mail_folders (id TEXT PRIMARY KEY);
+                CREATE TABLE mail_messages (id TEXT PRIMARY KEY);
+                CREATE VIRTUAL TABLE mail_fts USING fts5(msg_id UNINDEXED, body_plain);
+                CREATE TABLE calendar_events (id TEXT PRIMARY KEY);
+                CREATE TABLE contacts (id TEXT PRIMARY KEY);
+                CREATE TABLE todo_lists (id TEXT PRIMARY KEY);
+                CREATE TABLE todo_tasks (id TEXT PRIMARY KEY);
+                CREATE TABLE onenote_notebooks (notebook_key TEXT PRIMARY KEY);
+                CREATE TABLE onenote_section_groups (section_group_key TEXT PRIMARY KEY);
+                CREATE TABLE onenote_sections (section_key TEXT PRIMARY KEY);
+                CREATE TABLE onenote_pages (page_key TEXT PRIMARY KEY);
+                CREATE TABLE onenote_page_details (page_key TEXT PRIMARY KEY);
+                CREATE VIRTUAL TABLE onenote_fts USING fts5(page_key UNINDEXED, body_plain);
+                PRAGMA user_version = 41;
+                ",
+            )
+            .unwrap();
+            for legacy in LEGACY_TABLES {
+                assert!(table_exists(&conn, legacy), "setup expected {legacy}");
+            }
+        }
+
+        // Upgrade via init_connection drops all legacy tables while keeping Teams data intact
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let trigram = init_connection(&conn, false).unwrap();
+            let ver: i32 = conn
+                .query_row("PRAGMA user_version;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                ver,
+                if trigram {
+                    SCHEMA_USER_VERSION_TRIGRAM
+                } else {
+                    SCHEMA_USER_VERSION_UNICODE61
+                }
+            );
+            for legacy in LEGACY_TABLES {
+                assert!(
+                    !table_exists(&conn, legacy),
+                    "legacy table {legacy} should have been dropped on upgrade"
+                );
+            }
+            assert!(index_exists(&conn, "idx_messages_conv_root_created_id"));
+            let title: String = conn
+                .query_row(
+                    "SELECT title FROM conversations WHERE conv_key = 'chat:c1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(title, "홍길동");
+        }
     }
 }

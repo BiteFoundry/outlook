@@ -1,4 +1,4 @@
-//! One-click GitHub Release self-updater (`teams update` / `outlook update`) with SHA-256 verification
+//! One-click GitHub Release self-updater (`teams update`) with SHA-256 verification
 //! and safe Windows NTFS running-executable replacement.
 
 use std::{

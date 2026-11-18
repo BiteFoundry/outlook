@@ -39,84 +39,9 @@ fn palette_items() -> Vec<PaletteItem> {
             action: Action::SelectNavTab(2),
         },
         PaletteItem {
-            label: "메일(Outlook) 탭으로 이동",
-            shortcut: "Ctrl+4",
-            action: Action::SelectNavTab(3),
-        },
-        PaletteItem {
-            label: "캘린더 탭으로 이동",
-            shortcut: "Ctrl+5",
-            action: Action::SelectNavTab(4),
-        },
-        PaletteItem {
-            label: "연락처 탭으로 이동",
-            shortcut: "Ctrl+6",
-            action: Action::SelectNavTab(5),
-        },
-        PaletteItem {
-            label: "할 일(To Do) 탭으로 이동",
-            shortcut: "Ctrl+7",
-            action: Action::SelectNavTab(6),
-        },
-        PaletteItem {
-            label: "노트(OneNote) 탭으로 이동",
-            shortcut: "Ctrl+8",
-            action: Action::SelectNavTab(7),
-        },
-        PaletteItem {
-            label: "Teams 모드로 전환",
-            shortcut: "Alt+T",
-            action: Action::SwitchPersona(crate::config::Persona::Teams),
-        },
-        PaletteItem {
-            label: "Outlook 모드로 전환",
-            shortcut: "Alt+O",
-            action: Action::SwitchPersona(crate::config::Persona::Outlook),
-        },
-        PaletteItem {
-            label: "OneNote 모드로 전환",
-            shortcut: "Alt+N",
-            action: Action::SwitchPersona(crate::config::Persona::OneNote),
-        },
-        PaletteItem {
             label: "새 채팅 만들기",
             shortcut: "Ctrl+N",
             action: Action::OpenOverlay(OverlayKind::NewChat),
-        },
-        PaletteItem {
-            label: "새 메일 작성",
-            shortcut: "c (메일탭)",
-            action: Action::OpenMailComposeNew,
-        },
-        PaletteItem {
-            label: "새 일정 만들기",
-            shortcut: "n (일정탭)",
-            action: Action::OpenOverlay(OverlayKind::EventCreate),
-        },
-        PaletteItem {
-            label: "새 연락처 추가",
-            shortcut: "n (연락처)",
-            action: Action::OpenOverlay(OverlayKind::ContactCreate),
-        },
-        PaletteItem {
-            label: "새 노트 페이지 만들기",
-            shortcut: "n (노트탭)",
-            action: Action::OnenoteOpenCreatePage { subpage: false },
-        },
-        PaletteItem {
-            label: "새 하위 페이지 만들기",
-            shortcut: "N (노트탭)",
-            action: Action::OnenoteOpenCreatePage { subpage: true },
-        },
-        PaletteItem {
-            label: "새 노트 섹션 만들기",
-            shortcut: "S (노트탭)",
-            action: Action::OnenoteOpenCreateSection,
-        },
-        PaletteItem {
-            label: "새 필기장 만들기",
-            shortcut: "B (노트탭)",
-            action: Action::OnenoteOpenCreateNotebook,
         },
         PaletteItem {
             label: "이미지 첨부 크게보기",
@@ -174,13 +99,13 @@ fn palette_items() -> Vec<PaletteItem> {
             action: Action::RefreshAll,
         },
         PaletteItem {
-            label: "전체 동기화 요청",
-            shortcut: "s",
+            label: "이전 히스토리 깊게 동기화 (150개)",
+            shortcut: "H / s",
             action: Action::SyncHistory,
         },
         PaletteItem {
-            label: "이전 메시지 불러오기",
-            shortcut: "u",
+            label: "이전 메시지 더 불러오기",
+            shortcut: "o / u",
             action: Action::LoadOlder,
         },
         PaletteItem {

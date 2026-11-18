@@ -4,15 +4,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::{
-    config::Persona,
-    ui::{
-        action::Action,
-        app::Focus,
-        nav_pane::{TAB_CALENDAR, TAB_CONTACTS, TAB_MAIL, TAB_NOTES, TAB_TODO},
-        overlays::OverlayKind,
-    },
-};
+use crate::ui::{action::Action, app::Focus, overlays::OverlayKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Key {
@@ -206,26 +198,21 @@ impl Keymap {
         map.bind(any, End, M::NONE, Action::NavLast);
         map.bind(any, Left, M::NONE, Action::ToggleNarrowPane);
         map.bind(any, Right, M::NONE, Action::ToggleNarrowPane);
-        map.bind(any, PageUp, M::NONE, Action::LoadOlder);
+        map.bind(any, PageUp, M::NONE, Action::ScrollPageUp);
+        map.bind(any, PageDown, M::NONE, Action::ScrollPageDown);
+        map.bind(any, Char('o'), M::NONE, Action::LoadOlder);
         map.bind(any, Char('u'), M::NONE, Action::LoadOlder);
+        map.bind(any, Char('H'), M::NONE, Action::SyncHistory);
         map.bind(any, Char('s'), M::NONE, Action::SyncHistory);
         map.bind(any, Char('R'), M::NONE, Action::RefreshAll);
         map.bind(any, F(5), M::NONE, Action::RefreshAll);
         map.bind(any, Char('d'), M::NONE, Action::DownloadLatest);
         map.bind(any, Char('m'), M::NONE, Action::ContextMenuCurrent);
 
-        // Nav tabs
+        // Nav tabs (pure Teams: 0 = 채팅, 1 = 팀/채널, 2 = 활동)
         map.bind(any, Char('1'), M::CONTROL, Action::SelectNavTab(0));
         map.bind(any, Char('2'), M::CONTROL, Action::SelectNavTab(1));
         map.bind(any, Char('3'), M::CONTROL, Action::SelectNavTab(2));
-        map.bind(any, Char('4'), M::CONTROL, Action::SelectNavTab(3));
-        map.bind(any, Char('5'), M::CONTROL, Action::SelectNavTab(4));
-        map.bind(any, Char('6'), M::CONTROL, Action::SelectNavTab(5));
-        map.bind(any, Char('7'), M::CONTROL, Action::SelectNavTab(6));
-        map.bind(any, Char('8'), M::CONTROL, Action::SelectNavTab(7));
-        map.bind(any, Char('t'), M::ALT, Action::SwitchPersona(Persona::Teams));
-        map.bind(any, Char('o'), M::ALT, Action::SwitchPersona(Persona::Outlook));
-        map.bind(any, Char('n'), M::ALT, Action::SwitchPersona(Persona::OneNote));
         map.bind(any, Char('v'), M::NONE, Action::OpenImagePreview);
 
         // Overlays & Teams actions
@@ -307,17 +294,9 @@ impl Keymap {
     pub fn resolve_for_tab(
         &self,
         focus: Focus,
-        active_nav_tab: usize,
+        _active_nav_tab: usize,
         key: KeyEvent,
     ) -> Option<Action> {
-        if key.kind != KeyEventKind::Press {
-            return None;
-        }
-        if matches!(focus, Focus::Nav | Focus::Chat) {
-            if let Some(tab_act) = resolve_outlook_tab_key(active_nav_tab, key) {
-                return Some(tab_act);
-            }
-        }
         self.resolve_with(focus, key, true)
     }
 
@@ -336,74 +315,6 @@ impl Keymap {
                     && key_matches(binding.key, key)
             })
             .map(|binding| binding.action.clone())
-    }
-}
-
-fn resolve_outlook_tab_key(active_nav_tab: usize, key: KeyEvent) -> Option<Action> {
-    use KeyCode::*;
-    if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
-        return None;
-    }
-    match active_nav_tab {
-        TAB_MAIL => match key.code {
-            Char('c') => Some(Action::OpenMailComposeNew),
-            Char('r') => Some(Action::OpenMailReply { reply_all: false }),
-            Char('R') => Some(Action::OpenMailReply { reply_all: true }),
-            Char('f') => Some(Action::OpenMailForward),
-            Char('u') => Some(Action::MailToggleRead),
-            Char('g') => Some(Action::MailToggleFlag),
-            Char('a') => Some(Action::MailArchive),
-            Char('d') => Some(Action::MailDownloadAttachment),
-            Delete => Some(Action::MailDeleteRequest),
-            _ => None,
-        },
-        TAB_CALENDAR => match key.code {
-            Char('j') | Char('o') => Some(Action::JoinCalendarMeeting),
-            Char('n') => Some(Action::OpenOverlay(OverlayKind::EventCreate)),
-            Char('y') => Some(Action::RespondCalendarEvent("accept".to_string())),
-            Char('t') => Some(Action::RespondCalendarEvent(
-                "tentativelyAccept".to_string(),
-            )),
-            Char('x') => Some(Action::RespondCalendarEvent("decline".to_string())),
-            Delete => Some(Action::DeleteCalendarEventRequest),
-            _ => None,
-        },
-        TAB_CONTACTS => match key.code {
-            Char('m') => Some(Action::ContactSendMail),
-            Char('c') => Some(Action::ContactStartChat),
-            Char('n') => Some(Action::OpenOverlay(OverlayKind::ContactCreate)),
-            Delete => Some(Action::DeleteContactRequest),
-            _ => None,
-        },
-        TAB_TODO => match key.code {
-            Char(' ') | Char('x') => Some(Action::TodoToggleSelected),
-            Char('n') => Some(Action::TodoFocusInput),
-            Char('c') => Some(Action::TodoToggleShowCompleted),
-            Char('[') => Some(Action::TodoCycleList(-1)),
-            Char(']') => Some(Action::TodoCycleList(1)),
-            Delete => Some(Action::TodoDeleteRequest),
-            _ => None,
-        },
-        TAB_NOTES => match key.code {
-            Char(' ') | Char('x') => Some(Action::OnenoteToggleTodo),
-            Char('n') => Some(Action::OnenoteOpenCreatePage { subpage: false }),
-            Char('N') => Some(Action::OnenoteOpenCreatePage { subpage: true }),
-            Char('S') => Some(Action::OnenoteOpenCreateSection),
-            Char('B') => Some(Action::OnenoteOpenCreateNotebook),
-            Char('a') => Some(Action::OnenoteOpenAppendBlock),
-            Char('e') => Some(Action::OnenoteOpenEditBlock),
-            Char('E') => Some(Action::OnenoteOpenEditFullPage),
-            Char('[') => Some(Action::OnenoteCycleSection(-1)),
-            Char(']') => Some(Action::OnenoteCycleSection(1)),
-            Char('J') => Some(Action::OnenoteCyclePage(1)),
-            Char('K') => Some(Action::OnenoteCyclePage(-1)),
-            Char('o') => Some(Action::OnenoteOpenWeb),
-            Char('r') => Some(Action::OnenoteRefresh),
-            Char('d') | Delete => Some(Action::OnenoteDeletePageRequest),
-            Char('D') => Some(Action::OnenoteDownloadAttachment),
-            _ => None,
-        },
-        _ => None,
     }
 }
 
@@ -469,55 +380,35 @@ mod tests {
     }
 
     #[test]
-    fn onenote_tab_and_persona_shortcuts_map_correctly() {
+    fn teams_tabs_and_history_shortcuts_map_correctly() {
         let map = Keymap::default_teams();
         assert_eq!(
-            map.resolve(Focus::Nav, key(KeyCode::Char('8'), KeyModifiers::CONTROL)),
-            Some(Action::SelectNavTab(7))
+            map.resolve(Focus::Nav, key(KeyCode::Char('1'), KeyModifiers::CONTROL)),
+            Some(Action::SelectNavTab(0))
         );
         assert_eq!(
-            map.resolve(Focus::Nav, key(KeyCode::Char('n'), KeyModifiers::ALT)),
-            Some(Action::SwitchPersona(Persona::OneNote))
+            map.resolve(Focus::Nav, key(KeyCode::Char('2'), KeyModifiers::CONTROL)),
+            Some(Action::SelectNavTab(1))
         );
         assert_eq!(
-            map.resolve_for_tab(
-                Focus::Chat,
-                TAB_NOTES,
-                key(KeyCode::Char(' '), KeyModifiers::NONE)
-            ),
-            Some(Action::OnenoteToggleTodo)
+            map.resolve(Focus::Nav, key(KeyCode::Char('3'), KeyModifiers::CONTROL)),
+            Some(Action::SelectNavTab(2))
         );
         assert_eq!(
-            map.resolve_for_tab(
-                Focus::Chat,
-                TAB_NOTES,
-                key(KeyCode::Char('n'), KeyModifiers::NONE)
-            ),
-            Some(Action::OnenoteOpenCreatePage { subpage: false })
+            map.resolve(Focus::Chat, key(KeyCode::Char('o'), KeyModifiers::NONE)),
+            Some(Action::LoadOlder)
         );
         assert_eq!(
-            map.resolve_for_tab(
-                Focus::Chat,
-                TAB_NOTES,
-                key(KeyCode::Char('N'), KeyModifiers::SHIFT)
-            ),
-            Some(Action::OnenoteOpenCreatePage { subpage: true })
+            map.resolve(Focus::Chat, key(KeyCode::Char('H'), KeyModifiers::SHIFT)),
+            Some(Action::SyncHistory)
         );
         assert_eq!(
-            map.resolve_for_tab(
-                Focus::Chat,
-                TAB_NOTES,
-                key(KeyCode::Char('e'), KeyModifiers::NONE)
-            ),
-            Some(Action::OnenoteOpenEditBlock)
+            map.resolve(Focus::Chat, key(KeyCode::PageUp, KeyModifiers::NONE)),
+            Some(Action::ScrollPageUp)
         );
         assert_eq!(
-            map.resolve_for_tab(
-                Focus::Chat,
-                TAB_NOTES,
-                key(KeyCode::Char('E'), KeyModifiers::SHIFT)
-            ),
-            Some(Action::OnenoteOpenEditFullPage)
+            map.resolve(Focus::Chat, key(KeyCode::PageDown, KeyModifiers::NONE)),
+            Some(Action::ScrollPageDown)
         );
     }
 }

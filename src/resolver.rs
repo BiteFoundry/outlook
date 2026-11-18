@@ -154,7 +154,7 @@ pub async fn resolve_conversation(
     if let Ok(found) = resolve_from_slice(&cached, query) {
         return Ok(found);
     }
-    let chats = graph.list_chats(50).await.unwrap_or_default();
+    let chats = graph.list_chats(150).await.unwrap_or_default();
     storage.upsert_conversations(&chats)?;
     let teams = graph
         .list_joined_teams_with_channels()

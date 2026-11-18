@@ -10,7 +10,6 @@
 use std::{io::Write, path::PathBuf};
 
 use anyhow::Result;
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -18,10 +17,7 @@ use crate::{
     cli,
     config::AppConfig,
     graph::GraphClient,
-    models::{
-        ConversationSummary, ConversationTarget, MentionInfo, OutgoingEvent, OutgoingMail,
-        OutgoingTodoTask,
-    },
+    models::{ConversationSummary, ConversationTarget, MentionInfo},
     parser, resolver,
     storage::Storage,
     sync,
@@ -216,35 +212,30 @@ async fn call_tool(
                 1,
                 1_000,
             )?;
+            let before = args.optional_str("before")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
 
             let conv = cli::resolve_target(storage, graph, &target, offline)
                 .await
                 .map_err(format_error)?;
 
-            let fetched = if !offline {
-                let msgs = graph
-                    .list_messages(&conv.target, limit)
-                    .await
-                    .map_err(format_error)?;
-                storage.upsert_messages(&msgs).map_err(format_error)?;
-                Some(msgs)
-            } else {
-                None
-            };
-
-            let mut messages = storage
-                .list_root_messages(&conv.conv_key, limit, None)
-                .map_err(format_error)?;
-            if messages.is_empty() {
-                if let Some(f) = fetched {
-                    messages = f;
-                }
-            }
+            let res = cli::read_conversation_messages(
+                storage,
+                graph,
+                &conv,
+                limit,
+                before.as_deref(),
+                offline,
+                !offline,
+            )
+            .await
+            .map_err(format_error)?;
 
             Ok(json!({
                 "conversation": conv,
-                "messages": messages,
+                "messages": res.messages,
+                "has_more": res.has_more,
+                "next_before": res.next_before,
             }))
         }
 
@@ -608,869 +599,8 @@ async fn call_tool(
             }))
         }
 
-        // -------------------------------------------------------------------
-        // Outlook Mail tools
-        // -------------------------------------------------------------------
-        "list_mail_folders" => {
-            let offline = args.optional_bool("offline")?.unwrap_or(false);
-            let folders = if offline {
-                storage.list_mail_folders().map_err(format_error)?
-            } else {
-                let fetched = graph.list_mail_folders().await.map_err(format_error)?;
-                let _ = storage.upsert_mail_folders(&fetched);
-                fetched
-            };
-            Ok(json!({ "folders": folders }))
-        }
-
-        "list_mails" => {
-            let folder = args
-                .optional_str("folder")?
-                .unwrap_or_else(|| "inbox".to_string());
-            let limit = args
-                .optional_usize("limit")?
-                .map(|v| bounds("limit", v, 1, 200))
-                .transpose()?
-                .map(cli::clamp_limit)
-                .unwrap_or(25);
-            let unread = args.optional_bool("unread")?.unwrap_or(false);
-            let offline = args.optional_bool("offline")?.unwrap_or(false);
-
-            let folder_id = cli::resolve_mail_folder_id(storage, graph, &folder, offline)
-                .await
-                .map_err(format_error)?;
-
-            let mut messages = if offline {
-                storage
-                    .list_mail_messages(Some(&folder_id), limit)
-                    .map_err(format_error)?
-            } else {
-                let fetched = graph
-                    .list_mail_messages(&folder_id, limit)
-                    .await
-                    .map_err(format_error)?;
-                let _ = storage.upsert_mail_messages(&fetched);
-                fetched
-            };
-            if unread {
-                messages.retain(|m| !m.is_read);
-            }
-            messages.truncate(limit);
-
-            Ok(json!({
-                "folder": folder_id,
-                "messages": messages,
-            }))
-        }
-
-        "get_mail" => {
-            let mail_id = args.required_str("mail_id")?;
-            let offline = args.optional_bool("offline")?.unwrap_or(false);
-            let mail = if offline {
-                storage
-                    .get_mail_message(&mail_id)
-                    .map_err(format_error)?
-                    .ok_or_else(|| format!("mail message not found in cache: {mail_id}"))?
-            } else {
-                let fetched = graph.get_mail_message(&mail_id).await.map_err(format_error)?;
-                let _ = storage.upsert_mail_messages(std::slice::from_ref(&fetched));
-                fetched
-            };
-            Ok(json!({ "mail": mail }))
-        }
-
-        "send_mail" => {
-            let to = args.required_str_array("to")?;
-            let subject = args.required_str("subject")?;
-            let body = args.required_text("body")?;
-            let cc = args.optional_str_array("cc")?.unwrap_or_default();
-            let bcc = args.optional_str_array("bcc")?.unwrap_or_default();
-            let importance = args
-                .optional_str("importance")?
-                .map(|v| normalize_mail_importance(&v))
-                .transpose()?;
-            let attachments: Vec<PathBuf> = args
-                .optional_str_array("attachments")?
-                .unwrap_or_default()
-                .into_iter()
-                .map(PathBuf::from)
-                .collect();
-            for path in &attachments {
-                if !path.is_file() {
-                    return Err(format!("attachment file does not exist: {}", path.display()));
-                }
-            }
-            let save_to_sent_items = args.optional_bool("save_to_sent_items")?.unwrap_or(true);
-            let body_html = parser::compile_outgoing_markdown(
-                &body,
-                Some(subject.clone()),
-                vec![],
-                vec![],
-                vec![],
-                None,
-            )
-            .body_html;
-
-            let outgoing = OutgoingMail {
-                subject: subject.clone(),
-                body_html,
-                to: to.clone(),
-                cc,
-                bcc,
-                importance,
-                attachments,
-                save_to_sent_items,
-            };
-            graph.send_mail(&outgoing).await.map_err(format_error)?;
-
-            Ok(json!({
-                "ok": true,
-                "to": to,
-                "subject": subject,
-            }))
-        }
-
-        "reply_mail" => {
-            let mail_id = args.required_str("mail_id")?;
-            let body = args.required_text("body")?;
-            let reply_all = args.optional_bool("reply_all")?.unwrap_or(false);
-            let body_html =
-                parser::compile_outgoing_markdown(&body, None, vec![], vec![], vec![], None)
-                    .body_html;
-            graph
-                .reply_mail(&mail_id, &body_html, reply_all)
-                .await
-                .map_err(format_error)?;
-
-            Ok(json!({
-                "ok": true,
-                "mail_id": mail_id,
-                "reply_all": reply_all,
-            }))
-        }
-
-        "forward_mail" => {
-            let mail_id = args.required_str("mail_id")?;
-            let to = args.required_str_array("to")?;
-            let comment_html = match args.optional_str("comment")? {
-                Some(c) => {
-                    parser::compile_outgoing_markdown(&c, None, vec![], vec![], vec![], None)
-                        .body_html
-                }
-                None => String::new(),
-            };
-            graph
-                .forward_mail(&mail_id, &to, &comment_html)
-                .await
-                .map_err(format_error)?;
-
-            Ok(json!({
-                "ok": true,
-                "mail_id": mail_id,
-                "to": to,
-            }))
-        }
-
-        "update_mail" => {
-            let mail_id = args.required_str("mail_id")?;
-            let is_read = args.optional_bool("is_read")?;
-            let flagged = args.optional_bool("flagged")?;
-            let move_to_folder = args.optional_str("move_to_folder")?;
-            if is_read.is_none() && flagged.is_none() && move_to_folder.is_none() {
-                return Err(
-                    "at least one of is_read, flagged, or move_to_folder must be provided"
-                        .to_string(),
-                );
-            }
-
-            if let Some(read_val) = is_read {
-                graph
-                    .set_mail_read(&mail_id, read_val)
-                    .await
-                    .map_err(format_error)?;
-            }
-            if let Some(flag_val) = flagged {
-                graph
-                    .set_mail_flag(&mail_id, flag_val)
-                    .await
-                    .map_err(format_error)?;
-            }
-            if let Ok(Some(mut cached)) = storage.get_mail_message(&mail_id) {
-                if let Some(read_val) = is_read {
-                    cached.is_read = read_val;
-                }
-                if let Some(flag_val) = flagged {
-                    cached.flagged = flag_val;
-                }
-                let _ = storage.upsert_mail_messages(&[cached]);
-            }
-
-            let moved_message = if let Some(dest) = move_to_folder.as_deref() {
-                let dest_id = cli::resolve_mail_folder_id(storage, graph, dest, false)
-                    .await
-                    .map_err(format_error)?;
-                let moved = graph
-                    .move_mail_message(&mail_id, &dest_id)
-                    .await
-                    .map_err(format_error)?;
-                let _ = storage.upsert_mail_messages(std::slice::from_ref(&moved));
-                Some(moved)
-            } else {
-                None
-            };
-
-            Ok(json!({
-                "ok": true,
-                "mail_id": moved_message
-                    .as_ref()
-                    .map(|m| m.id.as_str())
-                    .unwrap_or(mail_id.as_str()),
-                "is_read": is_read,
-                "flagged": flagged,
-                "moved": moved_message,
-            }))
-        }
-
-        "delete_mail" => {
-            let mail_id = args.required_str("mail_id")?;
-            args.required_true("confirm")?;
-            graph
-                .delete_mail_message(&mail_id)
-                .await
-                .map_err(format_error)?;
-            let _ = storage.delete_mail_messages_by_ids(&[mail_id.clone()]);
-            Ok(json!({
-                "ok": true,
-                "mail_id": mail_id,
-            }))
-        }
-
-        "download_mail_attachment" => {
-            let mail_id = args.required_str("mail_id")?;
-            let attachment_index = args.optional_usize("attachment_index")?;
-            let attachment = args.optional_str("attachment")?;
-            let output_dir = args
-                .optional_str("output_dir")?
-                .map(PathBuf::from)
-                .unwrap_or_else(|| config.resolved_download_dir());
-
-            let mail = graph.get_mail_message(&mail_id).await.map_err(format_error)?;
-            let _ = storage.upsert_mail_messages(std::slice::from_ref(&mail));
-            let selected =
-                cli::select_mail_attachment(&mail, attachment_index, attachment.as_deref())
-                    .map_err(format_error)?;
-            let downloaded = graph
-                .download_mail_attachment(&mail_id, &selected.id, &output_dir)
-                .await
-                .map_err(format_error)?;
-
-            Ok(json!({
-                "ok": true,
-                "attachment": {
-                    "id": selected.id,
-                    "name": selected.name,
-                    "content_type": selected.content_type,
-                    "size": selected.size,
-                },
-                "file": {
-                    "path": downloaded.path,
-                    "file_name": downloaded.file_name,
-                    "bytes_written": downloaded.bytes_written,
-                }
-            }))
-        }
-
-        "search_mails" => {
-            let query = args.required_str("query")?;
-            let folder = args.optional_str("folder")?;
-            let limit = args
-                .optional_usize("limit")?
-                .map(|v| bounds("limit", v, 1, 200))
-                .transpose()?
-                .map(cli::clamp_limit)
-                .unwrap_or(25);
-            let offline = args.optional_bool("offline")?.unwrap_or(false);
-
-            let folder_id = match folder.as_deref() {
-                Some(f) => Some(
-                    cli::resolve_mail_folder_id(storage, graph, f, offline)
-                        .await
-                        .map_err(format_error)?,
-                ),
-                None => None,
-            };
-
-            if offline {
-                let hits = storage
-                    .search_mail_messages(&query, folder_id.as_deref(), limit)
-                    .map_err(format_error)?;
-                Ok(json!({ "query": query, "hits": hits }))
-            } else {
-                let mut messages = graph
-                    .search_mail_remote(&query, limit)
-                    .await
-                    .map_err(format_error)?;
-                let _ = storage.upsert_mail_messages(&messages);
-                if let Some(ref fid) = folder_id {
-                    messages.retain(|m| m.folder_id.as_deref() == Some(fid.as_str()));
-                }
-                Ok(json!({ "query": query, "messages": messages }))
-            }
-        }
-
-        // -------------------------------------------------------------------
-        // Outlook Calendar tools
-        // -------------------------------------------------------------------
-        "list_calendar_events" => {
-            let start = args.optional_str("start")?;
-            let end = args.optional_str("end")?;
-            let days = args
-                .optional_i64("days")?
-                .map(|v| bounds("days", usize::try_from(v).unwrap_or(0), 1, 365))
-                .transpose()?
-                .unwrap_or(7) as i64;
-            let limit = args
-                .optional_usize("limit")?
-                .map(|v| bounds("limit", v, 1, 200))
-                .transpose()?
-                .map(cli::clamp_limit)
-                .unwrap_or(50);
-            let offline = args.optional_bool("offline")?.unwrap_or(false);
-
-            let (start_iso, end_iso) =
-                cli::default_calendar_window(start.as_deref(), end.as_deref(), days)
-                    .map_err(format_error)?;
-
-            let events = if offline {
-                storage
-                    .list_calendar_events(
-                        start.as_deref().map(|_| start_iso.as_str()),
-                        end.as_deref().map(|_| end_iso.as_str()),
-                        limit,
-                    )
-                    .map_err(format_error)?
-            } else {
-                let fetched = graph
-                    .list_calendar_view(&start_iso, &end_iso, limit)
-                    .await
-                    .map_err(format_error)?;
-                let _ = storage.upsert_calendar_events(&fetched);
-                fetched
-            };
-
-            Ok(json!({
-                "start": start_iso,
-                "end": end_iso,
-                "events": events,
-            }))
-        }
-
-        "create_calendar_event" => {
-            let subject = args.required_str("subject")?;
-            let start_raw = args.required_str("start")?;
-            let end_raw = args.required_str("end")?;
-            let start_iso = cli::normalize_datetime_iso(&start_raw).map_err(format_error)?;
-            let end_iso = cli::normalize_datetime_iso(&end_raw).map_err(format_error)?;
-            let time_zone = args.optional_str("time_zone")?;
-            let is_all_day = args.optional_bool("is_all_day")?.unwrap_or(false);
-            let location = args.optional_str("location")?;
-            let body_html = args.optional_str("body")?.map(|md| {
-                parser::compile_outgoing_markdown(&md, None, vec![], vec![], vec![], None)
-                    .body_html
-            });
-            let attendees = args.optional_str_array("attendees")?.unwrap_or_default();
-            let is_online_meeting = args.optional_bool("is_online_meeting")?.unwrap_or(false);
-
-            let outgoing = OutgoingEvent {
-                subject,
-                start_iso,
-                end_iso,
-                time_zone,
-                is_all_day,
-                location,
-                body_html,
-                attendees,
-                is_online_meeting,
-            };
-            let created = graph
-                .create_calendar_event(&outgoing)
-                .await
-                .map_err(format_error)?;
-            let _ = storage.upsert_calendar_events(std::slice::from_ref(&created));
-
-            Ok(json!({
-                "ok": true,
-                "event": created,
-            }))
-        }
-
-        "respond_calendar_event" => {
-            let event_id = args.required_str("event_id")?;
-            let response_raw = args.required_str("response")?;
-            let normalized =
-                cli::normalize_rsvp_response(&response_raw).map_err(format_error)?;
-            let comment = args.optional_str("comment")?;
-            graph
-                .respond_calendar_event(&event_id, normalized, comment.as_deref())
-                .await
-                .map_err(format_error)?;
-
-            Ok(json!({
-                "ok": true,
-                "event_id": event_id,
-                "response": normalized,
-            }))
-        }
-
-        "delete_calendar_event" => {
-            let event_id = args.required_str("event_id")?;
-            args.required_true("confirm")?;
-            graph
-                .delete_calendar_event(&event_id)
-                .await
-                .map_err(format_error)?;
-            let _ = storage.delete_calendar_event(&event_id);
-
-            Ok(json!({
-                "ok": true,
-                "event_id": event_id,
-            }))
-        }
-
-        // -------------------------------------------------------------------
-        // Outlook Contacts & Directory tools
-        // -------------------------------------------------------------------
-        "search_contacts" => {
-            let query = args.optional_str("query")?;
-            let limit = args
-                .optional_usize("limit")?
-                .map(|v| bounds("limit", v, 1, 200))
-                .transpose()?
-                .map(cli::clamp_limit)
-                .unwrap_or(25);
-            let offline = args.optional_bool("offline")?.unwrap_or(false);
-
-            let contacts = if offline {
-                storage
-                    .list_contacts(query.as_deref(), limit)
-                    .map_err(format_error)?
-            } else if let Some(ref q) = query {
-                let fetched = graph
-                    .search_contacts_and_directory(q, limit)
-                    .await
-                    .map_err(format_error)?;
-                let _ = storage.upsert_contacts(&fetched);
-                fetched
-            } else {
-                let fetched = graph.list_contacts(limit).await.map_err(format_error)?;
-                let _ = storage.upsert_contacts(&fetched);
-                fetched
-            };
-
-            Ok(json!({ "contacts": contacts }))
-        }
-
-        // -------------------------------------------------------------------
-        // Microsoft To Do tools
-        // -------------------------------------------------------------------
-        "list_todo_tasks" => {
-            let list_query = args.optional_str("list")?;
-            let include_completed = args.optional_bool("include_completed")?.unwrap_or(false);
-            let limit = args
-                .optional_usize("limit")?
-                .map(|v| bounds("limit", v, 1, 200))
-                .transpose()?
-                .map(cli::clamp_limit)
-                .unwrap_or(50);
-            let offline = args.optional_bool("offline")?.unwrap_or(false);
-
-            let resolved_list_id =
-                match resolve_optional_todo_list_id(storage, graph, list_query.as_deref(), offline)
-                    .await?
-                {
-                    Some(id) => id,
-                    None => {
-                        return Ok(json!({
-                            "list_id": Value::Null,
-                            "tasks": [],
-                        }));
-                    }
-                };
-
-            let mut tasks = if offline {
-                storage
-                    .list_todo_tasks(&resolved_list_id, include_completed, limit)
-                    .map_err(format_error)?
-            } else {
-                let fetched = graph
-                    .list_todo_tasks(&resolved_list_id, include_completed, limit)
-                    .await
-                    .map_err(format_error)?;
-                let _ = storage.upsert_todo_tasks(&fetched);
-                fetched
-            };
-            tasks.truncate(limit);
-
-            Ok(json!({
-                "list_id": resolved_list_id,
-                "tasks": tasks,
-            }))
-        }
-
-        "create_todo_task" => {
-            let list_query = args.optional_str("list")?;
-            let title = args.required_str("title")?;
-            let body_plain = args.optional_str("body")?;
-            let due_date_iso = args
-                .optional_str("due_date_iso")?
-                .map(|raw| cli::normalize_todo_due_iso(&raw))
-                .transpose()
-                .map_err(format_error)?;
-            let importance = args
-                .optional_str("importance")?
-                .map(|raw| cli::normalize_todo_importance(&raw))
-                .transpose()
-                .map_err(format_error)?
-                .map(str::to_string);
-
-            let resolved_list_id =
-                resolve_optional_todo_list_id(storage, graph, list_query.as_deref(), false)
-                    .await?
-                    .ok_or_else(|| "no To Do list found".to_string())?;
-
-            let outgoing = OutgoingTodoTask {
-                title,
-                body_plain,
-                due_date_iso,
-                importance,
-            };
-            let created = graph
-                .create_todo_task(&resolved_list_id, &outgoing)
-                .await
-                .map_err(format_error)?;
-            let _ = storage.upsert_todo_tasks(std::slice::from_ref(&created));
-
-            Ok(json!({
-                "ok": true,
-                "task": created,
-            }))
-        }
-
-        "complete_todo_task" => {
-            let list_query = args.optional_str("list")?;
-            let task_id = args.required_str("task_id")?;
-            let completed = args.optional_bool("completed")?.unwrap_or(true);
-
-            let resolved_list_id =
-                resolve_optional_todo_list_id(storage, graph, list_query.as_deref(), false)
-                    .await?
-                    .ok_or_else(|| "no To Do list found".to_string())?;
-            let updated = graph
-                .set_todo_task_completed(&resolved_list_id, &task_id, completed)
-                .await
-                .map_err(format_error)?;
-            let _ = storage.upsert_todo_tasks(std::slice::from_ref(&updated));
-
-            Ok(json!({
-                "ok": true,
-                "task": updated,
-            }))
-        }
-
-        "delete_todo_task" => {
-            let list_query = args.optional_str("list")?;
-            let task_id = args.required_str("task_id")?;
-            args.required_true("confirm")?;
-
-            let resolved_list_id =
-                resolve_optional_todo_list_id(storage, graph, list_query.as_deref(), false)
-                    .await?
-                    .ok_or_else(|| "no To Do list found".to_string())?;
-            graph
-                .delete_todo_task(&resolved_list_id, &task_id)
-                .await
-                .map_err(format_error)?;
-            let _ = storage.delete_todo_task(&task_id);
-
-            Ok(json!({
-                "ok": true,
-                "list_id": resolved_list_id,
-                "task_id": task_id,
-            }))
-        }
-
-        // -------------------------------------------------------------------
-        // Microsoft OneNote (personal + team/group shared notebooks)
-        // -------------------------------------------------------------------
-        "onenote_list_notebooks" => {
-            let include_teams = args.optional_bool("include_teams")?.unwrap_or(true);
-            let refresh = args.optional_bool("refresh")?.unwrap_or(false);
-            let notebooks =
-                cli::load_onenote_notebooks(storage, graph, include_teams, refresh, false)
-                    .await
-                    .map_err(format_error)?;
-            Ok(json!({ "notebooks": notebooks }))
-        }
-
-        "onenote_create_notebook" => {
-            let name = args.required_str("name")?;
-            let group_id = args.optional_str("group_id")?;
-            let site_id = args.optional_str("site_id")?;
-            let scope =
-                cli::build_onenote_scope_from_args(group_id.as_deref(), site_id.as_deref())
-                    .map_err(format_error)?;
-            let created = graph
-                .create_onenote_notebook(&scope, name.trim())
-                .await
-                .map_err(format_error)?;
-            let _ = storage.upsert_onenote_notebooks(std::slice::from_ref(&created));
-            Ok(json!({ "ok": true, "notebook": created }))
-        }
-
-        "onenote_list_sections" => {
-            let notebook = args.optional_str("notebook")?;
-            let refresh = args.optional_bool("refresh")?.unwrap_or(false);
-            let (nb, sections) =
-                cli::load_onenote_sections(storage, graph, notebook.as_deref(), refresh, false)
-                    .await
-                    .map_err(format_error)?;
-            Ok(json!({ "notebook": nb, "sections": sections }))
-        }
-
-        "onenote_create_section" => {
-            let notebook = args.required_str("notebook")?;
-            let name = args.required_str("name")?;
-            let nb = cli::resolve_onenote_notebook(storage, graph, &notebook, true, false, false)
-                .await
-                .map_err(format_error)?;
-            let mut created = graph
-                .create_onenote_section(&nb.scope, &nb.id, name.trim())
-                .await
-                .map_err(format_error)?;
-            if created.notebook_id.is_none() {
-                created.notebook_id = Some(nb.id.clone());
-            }
-            if created.notebook_name.is_none() {
-                created.notebook_name = Some(nb.display_name.clone());
-            }
-            let _ = storage.upsert_onenote_sections(std::slice::from_ref(&created));
-            Ok(json!({ "ok": true, "notebook": nb, "section": created }))
-        }
-
-        "onenote_list_pages" => {
-            let section = args.required_str("section")?;
-            let limit = bounds(
-                "limit",
-                args.optional_usize("limit")?.unwrap_or(50),
-                1,
-                1_000,
-            )?;
-            let refresh = args.optional_bool("refresh")?.unwrap_or(false);
-            let (sec, pages) =
-                cli::list_onenote_pages_helper(storage, graph, &section, limit, refresh, false)
-                    .await
-                    .map_err(format_error)?;
-            Ok(json!({ "section": sec, "pages": pages }))
-        }
-
-        "onenote_get_page" => {
-            let page = args.required_str("page")?;
-            let offline = args.optional_bool("offline")?.unwrap_or(false);
-            let detail = cli::load_onenote_page_detail(storage, graph, &page, offline)
-                .await
-                .map_err(format_error)?;
-            Ok(json!({ "page": detail }))
-        }
-
-        "onenote_download_resource" => {
-            let page = args.required_str("page")?;
-            let index = args.optional_usize("index")?;
-            let detail = cli::load_onenote_page_detail(storage, graph, &page, false)
-                .await
-                .map_err(format_error)?;
-            let (resolved_idx, res) = cli::select_onenote_resource(&detail, index, false)
-                .map_err(format_error)?;
-            let url = res.fullres_url.as_deref().unwrap_or(&res.resource_url);
-            let bytes = graph
-                .download_onenote_resource_bytes(url)
-                .await
-                .map_err(format_error)?;
-            Ok(json!({
-                "page_key": detail.summary.page_key,
-                "index": resolved_idx,
-                "content_type": res.mime_type,
-                "file_name": res.file_name,
-                "is_image": res.is_image,
-                "size": bytes.len(),
-                "bytes_base64": BASE64_STANDARD.encode(&bytes),
-            }))
-        }
-
-        "onenote_create_page" => {
-            let section = args.required_str("section")?;
-            let title = args.required_str("title")?;
-            let markdown_body = args.optional_text("markdown_body")?.unwrap_or_default();
-            let image_paths: Vec<PathBuf> = args
-                .optional_str_array("image_paths")?
-                .unwrap_or_default()
-                .into_iter()
-                .map(PathBuf::from)
-                .collect();
-            let level = match args.optional_i64("level")? {
-                Some(l) => {
-                    bounds("level", usize::try_from(l).unwrap_or(usize::MAX), 0, 2)?;
-                    Some(l as i32)
-                }
-                None => None,
-            };
-            let (markdown, inline_images) =
-                cli::read_markdown_input_and_images(Some(markdown_body.as_str()), None, &image_paths)
-                    .map_err(format_error)?;
-            let (sec, page) = cli::create_onenote_page_helper(
-                storage,
-                graph,
-                &section,
-                &title,
-                &markdown,
-                inline_images,
-                level,
-            )
-            .await
-            .map_err(format_error)?;
-            Ok(json!({ "ok": true, "section": sec, "page": page }))
-        }
-
-        "onenote_append_page" => {
-            let page = args.required_str("page")?;
-            let markdown_body = args.optional_text("markdown_body")?.unwrap_or_default();
-            let image_paths: Vec<PathBuf> = args
-                .optional_str_array("image_paths")?
-                .unwrap_or_default()
-                .into_iter()
-                .map(PathBuf::from)
-                .collect();
-            let (markdown, inline_images) =
-                cli::read_markdown_input_and_images(Some(markdown_body.as_str()), None, &image_paths)
-                    .map_err(format_error)?;
-            cli::append_onenote_page_helper(storage, graph, &page, &markdown, &inline_images)
-                .await
-                .map_err(format_error)
-        }
-
-        "onenote_update_page" => {
-            let page = args.required_str("page")?;
-            let title = args.optional_str("title")?;
-            let markdown_body = args.optional_text("markdown_body")?;
-            let block_id = args.optional_str("block_id")?;
-            cli::update_onenote_page_helper(
-                storage,
-                graph,
-                &page,
-                title.as_deref(),
-                markdown_body.as_deref(),
-                block_id.as_deref(),
-            )
-            .await
-            .map_err(format_error)
-        }
-
-        "onenote_toggle_todo" => {
-            let page = args.required_str("page")?;
-            let block_id = args.optional_str("block_id")?;
-            let todo_index = args.optional_usize("todo_index")?;
-            cli::toggle_onenote_todo_helper(
-                storage,
-                graph,
-                &page,
-                block_id.as_deref(),
-                todo_index,
-            )
-            .await
-            .map_err(format_error)
-        }
-
-        "onenote_search" => {
-            let query = args.required_str("query")?;
-            let section = args.optional_str("section")?;
-            let limit = bounds(
-                "limit",
-                args.optional_usize("limit")?.unwrap_or(30),
-                1,
-                1_000,
-            )?;
-            let refresh = args.optional_bool("refresh")?.unwrap_or(false);
-            let hits = cli::search_onenote_pages_helper(
-                storage,
-                graph,
-                &query,
-                section.as_deref(),
-                refresh,
-                limit,
-            )
-            .await
-            .map_err(format_error)?;
-            Ok(json!({ "hits": hits }))
-        }
-
-        "onenote_delete_page" => {
-            let page = args.required_str("page")?;
-            args.required_true("confirm")?;
-            cli::delete_onenote_page_helper(storage, graph, &page)
-                .await
-                .map_err(format_error)
-        }
-
         other => Err(format!("unknown tool: {other}")),
     }
-}
-
-fn normalize_mail_importance(raw: &str) -> Result<String, String> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "low" => Ok("low".to_string()),
-        "normal" => Ok("normal".to_string()),
-        "high" => Ok("high".to_string()),
-        other => Err(format!(
-            "invalid mail importance '{other}' (expected low, normal, or high)"
-        )),
-    }
-}
-
-async fn resolve_optional_todo_list_id(
-    storage: &Storage,
-    graph: &GraphClient,
-    list_query: Option<&str>,
-    offline: bool,
-) -> Result<Option<String>, String> {
-    if let Some(q) = list_query.map(str::trim).filter(|s| !s.is_empty()) {
-        let id = cli::resolve_todo_list_id(storage, graph, q, offline)
-            .await
-            .map_err(format_error)?;
-        return Ok(Some(id));
-    }
-
-    let lists = if offline {
-        storage.list_todo_lists().map_err(format_error)?
-    } else {
-        let cached = storage.list_todo_lists().map_err(format_error)?;
-        if cached.is_empty() {
-            let fetched = graph.list_todo_lists().await.map_err(format_error)?;
-            let _ = storage.upsert_todo_lists(&fetched);
-            fetched
-        } else {
-            cached
-        }
-    };
-
-    Ok(lists
-        .iter()
-        .find(|l| l.wellknown_list_name.as_deref() == Some("defaultList"))
-        .or_else(|| {
-            lists.iter().find(|l| {
-                l.display_name.eq_ignore_ascii_case("tasks") || l.display_name == "할 일"
-            })
-        })
-        .or_else(|| lists.first())
-        .map(|l| l.id.clone()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1556,12 +686,12 @@ fn initialize_result(message: &Value) -> Value {
             "name": SERVER_NAME,
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Microsoft 365 (Teams + Outlook Mail, Calendar, Contacts, To Do + OneNote) tools via Microsoft Graph v1.0. Teams targets accept conv_key (chat:... or chan:team:channel), \"Team/Channel\", or a unique conversation title substring. OneNote sections/pages accept \"Notebook/Section\", names, composite keys (me|id, group:{gid}|id), or raw Graph IDs; onenote_get_page returns block element_ids for onenote_update_page / onenote_toggle_todo. onenote_download_resource is JSON-only and returns resource bytes base64-encoded. Destructive operations require confirm: true."
+        "instructions": "Microsoft Teams tools via Microsoft Graph v1.0. Teams targets accept conv_key (chat:... or chan:team:channel), \"Team/Channel\", or a unique conversation title substring. Use get_messages with optional before (ISO-8601 timestamp, YYYY-MM-DD, or msg_id) and limit to paginate older history. Destructive operations require confirm: true."
     })
 }
 
 // ---------------------------------------------------------------------------
-// Tool catalog (49 tools: 36 Teams/Outlook + 13 OneNote)
+// Tool catalog (17 Teams tools)
 // ---------------------------------------------------------------------------
 
 fn tool_catalog() -> Vec<Value> {
@@ -1609,12 +739,13 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "get_messages",
-            "description": "Read recent messages from a chat or team channel, oldest first.",
+            "description": "Read messages from a chat or team channel, oldest first. Supports pagination into older history via optional before (ISO-8601 timestamp, YYYY-MM-DD, or msg_id) and limit.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "target": { "type": "string", "description": "conv_key, \"Team/Channel\", or unique conversation title." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
+                    "before": { "type": "string", "description": "Optional ISO-8601 timestamp, YYYY-MM-DD date, or cached msg_id to read older messages preceding it." },
                     "offline": { "type": "boolean", "default": false, "description": "Read from local SQLite cache without hitting Graph." }
                 },
                 "required": ["target"],
@@ -1831,472 +962,6 @@ fn tool_catalog() -> Vec<Value> {
                 "additionalProperties": false
             }
         }),
-        json!({
-            "name": "list_mail_folders",
-            "description": "List Outlook mail folders (Inbox, Sent Items, Drafts, custom folders, etc.).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "offline": { "type": "boolean", "description": "Read from local SQLite cache only." }
-                },
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "list_mails",
-            "description": "List Outlook mail messages in a folder (well-known name like 'inbox'/'sentitems', folder display name, or folder ID).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "folder": { "type": "string", "description": "Mail folder well-known name, display name, or folder ID (default: 'inbox')." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
-                    "unread": { "type": "boolean", "description": "Filter to unread messages only." },
-                    "offline": { "type": "boolean", "description": "Read from local SQLite cache only." }
-                },
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "get_mail",
-            "description": "Get full details, body, and attachment metadata for an Outlook mail message.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "mail_id": { "type": "string", "description": "Outlook mail message ID." },
-                    "offline": { "type": "boolean", "description": "Read from local SQLite cache only." }
-                },
-                "required": ["mail_id"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "send_mail",
-            "description": "Send a new Outlook email (Markdown body compiled to HTML) with optional Cc/Bcc recipients and local file attachments.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "to": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
-                    "subject": { "type": "string" },
-                    "body": { "type": "string", "description": "Email body in Markdown." },
-                    "cc": { "type": "array", "items": { "type": "string" } },
-                    "bcc": { "type": "array", "items": { "type": "string" } },
-                    "importance": { "type": "string", "enum": ["low", "normal", "high"] },
-                    "attachments": { "type": "array", "items": { "type": "string" }, "description": "Optional local file paths to attach." },
-                    "save_to_sent_items": { "type": "boolean", "description": "Defaults to true." }
-                },
-                "required": ["to", "subject", "body"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "reply_mail",
-            "description": "Reply (or reply-all) to an Outlook mail message with a Markdown body.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "mail_id": { "type": "string" },
-                    "body": { "type": "string", "description": "Reply body in Markdown." },
-                    "reply_all": { "type": "boolean" }
-                },
-                "required": ["mail_id", "body"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "forward_mail",
-            "description": "Forward an Outlook mail message to one or more recipient email addresses.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "mail_id": { "type": "string" },
-                    "to": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
-                    "comment": { "type": "string", "description": "Optional Markdown comment added above forwarded message." }
-                },
-                "required": ["mail_id", "to"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "update_mail",
-            "description": "Update an Outlook mail message's read/flagged state and/or move it to another folder.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "mail_id": { "type": "string" },
-                    "is_read": { "type": "boolean" },
-                    "flagged": { "type": "boolean" },
-                    "move_to_folder": { "type": "string", "description": "Destination folder name, well-known name, or folder ID." }
-                },
-                "required": ["mail_id"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "delete_mail",
-            "description": "Delete an Outlook mail message permanently/to trash. Requires confirm: true.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "mail_id": { "type": "string" },
-                    "confirm": { "type": "boolean", "const": true }
-                },
-                "required": ["mail_id", "confirm"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "download_mail_attachment",
-            "description": "Download an attachment from an Outlook mail message to disk.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "mail_id": { "type": "string" },
-                    "attachment_index": { "type": "integer", "minimum": 0 },
-                    "attachment": { "type": "string", "description": "Attachment ID or filename." },
-                    "output_dir": { "type": "string" }
-                },
-                "required": ["mail_id"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "search_mails",
-            "description": "Search Outlook mail messages online via Graph $search or offline in the local FTS5 cache.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string" },
-                    "folder": { "type": "string" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
-                    "offline": { "type": "boolean" }
-                },
-                "required": ["query"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "list_calendar_events",
-            "description": "List Outlook calendar events within a time window (defaults to now through +7 days).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "start": { "type": "string", "description": "Start date/datetime (RFC3339 or YYYY-MM-DD)." },
-                    "end": { "type": "string", "description": "End date/datetime (RFC3339 or YYYY-MM-DD)." },
-                    "days": { "type": "integer", "minimum": 1, "maximum": 365 },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
-                    "offline": { "type": "boolean" }
-                },
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "create_calendar_event",
-            "description": "Create an Outlook calendar event (optionally with attendees and Teams online meeting link).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "subject": { "type": "string" },
-                    "start": { "type": "string", "description": "Start time (RFC3339, YYYY-MM-DD HH:MM, or YYYY-MM-DD)." },
-                    "end": { "type": "string", "description": "End time (RFC3339, YYYY-MM-DD HH:MM, or YYYY-MM-DD)." },
-                    "time_zone": { "type": "string" },
-                    "is_all_day": { "type": "boolean" },
-                    "location": { "type": "string" },
-                    "body": { "type": "string", "description": "Optional event description in Markdown." },
-                    "attendees": { "type": "array", "items": { "type": "string" } },
-                    "is_online_meeting": { "type": "boolean" }
-                },
-                "required": ["subject", "start", "end"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "respond_calendar_event",
-            "description": "Accept, tentatively accept, or decline an Outlook calendar meeting invitation.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "event_id": { "type": "string" },
-                    "response": { "type": "string", "enum": ["accept", "tentative", "decline"] },
-                    "comment": { "type": "string" }
-                },
-                "required": ["event_id", "response"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "delete_calendar_event",
-            "description": "Delete/cancel an Outlook calendar event. Requires confirm: true.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "event_id": { "type": "string" },
-                    "confirm": { "type": "boolean", "const": true }
-                },
-                "required": ["event_id", "confirm"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "search_contacts",
-            "description": "List or search Outlook personal contacts and Entra ID organization directory users.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
-                    "offline": { "type": "boolean" }
-                },
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "list_todo_tasks",
-            "description": "List Microsoft To Do tasks in a task list (defaults to the default Tasks list).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "list": { "type": "string", "description": "Task list name or ID (default: default Tasks list)." },
-                    "include_completed": { "type": "boolean" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
-                    "offline": { "type": "boolean" }
-                },
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "create_todo_task",
-            "description": "Create a Microsoft To Do task in a task list.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "list": { "type": "string", "description": "Task list name or ID (default: default Tasks list)." },
-                    "title": { "type": "string" },
-                    "body": { "type": "string" },
-                    "due_date_iso": { "type": "string", "description": "Due date (YYYY-MM-DD or RFC3339)." },
-                    "importance": { "type": "string", "enum": ["low", "normal", "high"] }
-                },
-                "required": ["title"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "complete_todo_task",
-            "description": "Mark a Microsoft To Do task as completed or reopen it.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "list": { "type": "string", "description": "Task list name or ID (default: default Tasks list)." },
-                    "task_id": { "type": "string" },
-                    "completed": { "type": "boolean", "description": "Defaults to true." }
-                },
-                "required": ["task_id"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "delete_todo_task",
-            "description": "Delete a Microsoft To Do task. Requires confirm: true.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "list": { "type": "string", "description": "Task list name or ID (default: default Tasks list)." },
-                    "task_id": { "type": "string" },
-                    "confirm": { "type": "boolean", "const": true }
-                },
-                "required": ["task_id", "confirm"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "onenote_list_notebooks",
-            "description": "List Microsoft OneNote notebooks: personal (/me/onenote) plus joined Teams/M365 group shared notebooks. Each notebook has a stable notebook_key (\"me|id\" or \"group:{gid}|id\").",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "include_teams": { "type": "boolean", "default": true, "description": "Include notebooks shared through joined Teams / M365 groups." },
-                    "refresh": { "type": "boolean", "default": false, "description": "Sync notebooks from Microsoft Graph before returning." }
-                },
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "onenote_create_notebook",
-            "description": "Create a OneNote notebook for /me by default, or under a Teams/M365 group (group_id) or SharePoint site (site_id). Irreversible side effect.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "minLength": 1, "description": "Notebook display name." },
-                    "group_id": { "type": "string", "description": "Create under this M365 group / Team instead of /me." },
-                    "site_id": { "type": "string", "description": "Create under this SharePoint site (mutually exclusive with group_id)." }
-                },
-                "required": ["name"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "onenote_list_sections",
-            "description": "List OneNote sections of one notebook (fuzzy notebook name, notebook_key, or ID) or of all accessible notebooks when omitted.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "notebook": { "type": "string", "description": "Notebook name, \"Owner/Notebook\", notebook_key, or Graph ID." },
-                    "refresh": { "type": "boolean", "default": false }
-                },
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "onenote_create_section",
-            "description": "Create a OneNote section inside an existing notebook (fuzzy notebook name, notebook_key, or Graph ID). Irreversible side effect.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "notebook": { "type": "string", "minLength": 1, "description": "Notebook name, \"Owner/Notebook\", notebook_key, or Graph ID." },
-                    "name": { "type": "string", "minLength": 1, "description": "New section display name." }
-                },
-                "required": ["notebook", "name"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "onenote_list_pages",
-            "description": "List pages in a OneNote section. section accepts \"Notebook/Section\", a unique section name, section_key, or Graph ID.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "section": { "type": "string", "minLength": 1 },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
-                    "refresh": { "type": "boolean", "default": false }
-                },
-                "required": ["section"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "onenote_get_page",
-            "description": "Read a OneNote page (page_key, Graph ID, or title search). Returns body_markdown, body_plain, blocks (with element_id and data-tag such as to-do), resources, and primary_div_id from ?includeIDs=true.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "page": { "type": "string", "minLength": 1 },
-                    "offline": { "type": "boolean", "default": false, "description": "Read from local SQLite cache only." }
-                },
-                "required": ["page"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "onenote_download_resource",
-            "description": "Download an image or file attachment from a OneNote page. Responses are JSON-only: raw bytes are never streamed, instead the tool returns { content_type, file_name, is_image, size, bytes_base64 } with the payload base64-encoded. index defaults to 0.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "page": { "type": "string", "minLength": 1, "description": "page_key, Graph ID, or title search." },
-                    "index": { "type": "integer", "minimum": 0, "description": "Zero-based resource index from onenote_get_page resources (default 0)." }
-                },
-                "required": ["page"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "onenote_create_page",
-            "description": "Create a OneNote page from GitHub-flavored Markdown (tables, task lists \"- [ ]\" become OneNote to-do tags) with optional local inline images. Irreversible side effect.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "section": { "type": "string", "minLength": 1, "description": "\"Notebook/Section\", section name, section_key, or ID." },
-                    "title": { "type": "string", "minLength": 1 },
-                    "markdown_body": { "type": "string" },
-                    "image_paths": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "Local image files embedded inline (png/jpg/gif/webp/bmp)." },
-                    "level": { "type": "integer", "minimum": 0, "maximum": 2, "description": "Page indentation level (0 = root, 1 = subpage, 2 = sub-subpage)." }
-                },
-                // Rule (mirrored by `validate_tool_args`): markdown_body and image_paths are each optional,
-                // but at least one must be non-empty — image-only pages are allowed (same as the CLI).
-                "required": ["section", "title"],
-                "anyOf": [
-                    { "required": ["markdown_body"], "properties": { "markdown_body": { "minLength": 1 } } },
-                    { "required": ["image_paths"], "properties": { "image_paths": { "minItems": 1 } } }
-                ],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "onenote_append_page",
-            "description": "Append Markdown (and optional inline images) to the end of an existing OneNote page via PATCH. Irreversible side effect.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "page": { "type": "string", "minLength": 1 },
-                    "markdown_body": { "type": "string" },
-                    "image_paths": { "type": "array", "items": { "type": "string", "minLength": 1 } }
-                },
-                // Rule (mirrored by `validate_tool_args`): markdown_body and image_paths are each optional,
-                // but at least one must be non-empty — image-only appends are allowed (same as the CLI).
-                "required": ["page"],
-                "anyOf": [
-                    { "required": ["markdown_body"], "properties": { "markdown_body": { "minLength": 1 } } },
-                    { "required": ["image_paths"], "properties": { "image_paths": { "minItems": 1 } } }
-                ],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "onenote_update_page",
-            "description": "Update a OneNote page title and/or body. With block_id (an element_id from onenote_get_page) only that block is replaced with markdown_body; otherwise the whole body is replaced.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "page": { "type": "string", "minLength": 1 },
-                    "title": { "type": "string" },
-                    "markdown_body": { "type": "string" },
-                    "block_id": { "type": "string", "description": "Target element_id (e.g. \"p:{guid}{40}\")." }
-                },
-                "required": ["page"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "onenote_toggle_todo",
-            "description": "Toggle a OneNote to-do checkbox (data-tag to-do <-> to-do:completed) by element block_id or zero-based todo_index.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "page": { "type": "string", "minLength": 1 },
-                    "block_id": { "type": "string" },
-                    "todo_index": { "type": "integer", "minimum": 0 }
-                },
-                "required": ["page"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "onenote_search",
-            "description": "Full-text search cached OneNote pages (SQLite FTS5 trigram + LIKE). Bootstraps the OneNote cache first when empty or refresh=true.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "minLength": 1 },
-                    "section": { "type": "string", "description": "Optional section filter (\"Notebook/Section\", name, key, or ID)." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 30 },
-                    "refresh": { "type": "boolean", "default": false }
-                },
-                "required": ["query"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "onenote_delete_page",
-            "description": "Delete a OneNote page. Requires confirm: true.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "page": { "type": "string", "minLength": 1 },
-                    "confirm": { "type": "boolean", "const": true }
-                },
-                "required": ["page", "confirm"],
-                "additionalProperties": false
-            }
-        }),
     ]
 }
 
@@ -2348,6 +1013,7 @@ fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
                 1,
                 1_000,
             )?;
+            args.optional_str("before")?;
             args.optional_bool("offline")?;
         }
         "get_thread" => {
@@ -2430,243 +1096,6 @@ fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
                 bounds("expiration_mins", mins as usize, 1, 1440)?;
             }
         }
-        "list_mail_folders" => {
-            args.optional_bool("offline")?;
-        }
-        "list_mails" => {
-            args.optional_str("folder")?;
-            if let Some(limit) = args.optional_usize("limit")? {
-                bounds("limit", limit, 1, 200)?;
-            }
-            args.optional_bool("unread")?;
-            args.optional_bool("offline")?;
-        }
-        "get_mail" => {
-            args.required_str("mail_id")?;
-            args.optional_bool("offline")?;
-        }
-        "send_mail" => {
-            args.required_str_array("to")?;
-            args.required_str("subject")?;
-            args.required_text("body")?;
-            args.optional_str_array("cc")?;
-            args.optional_str_array("bcc")?;
-            if let Some(imp) = args.optional_str("importance")? {
-                normalize_mail_importance(&imp)?;
-            }
-            args.optional_str_array("attachments")?;
-            args.optional_bool("save_to_sent_items")?;
-        }
-        "reply_mail" => {
-            args.required_str("mail_id")?;
-            args.required_text("body")?;
-            args.optional_bool("reply_all")?;
-        }
-        "forward_mail" => {
-            args.required_str("mail_id")?;
-            args.required_str_array("to")?;
-            args.optional_str("comment")?;
-        }
-        "update_mail" => {
-            args.required_str("mail_id")?;
-            let is_read = args.optional_bool("is_read")?;
-            let flagged = args.optional_bool("flagged")?;
-            let move_to = args.optional_str("move_to_folder")?;
-            if is_read.is_none() && flagged.is_none() && move_to.is_none() {
-                return Err(
-                    "at least one of is_read, flagged, or move_to_folder must be provided"
-                        .to_string(),
-                );
-            }
-        }
-        "delete_mail" => {
-            args.required_str("mail_id")?;
-            args.required_true("confirm")?;
-        }
-        "download_mail_attachment" => {
-            args.required_str("mail_id")?;
-            args.optional_usize("attachment_index")?;
-            args.optional_str("attachment")?;
-            args.optional_str("output_dir")?;
-        }
-        "search_mails" => {
-            args.required_str("query")?;
-            args.optional_str("folder")?;
-            if let Some(limit) = args.optional_usize("limit")? {
-                bounds("limit", limit, 1, 200)?;
-            }
-            args.optional_bool("offline")?;
-        }
-        "list_calendar_events" => {
-            let start = args.optional_str("start")?;
-            let end = args.optional_str("end")?;
-            let days = if let Some(d) = args.optional_i64("days")? {
-                bounds("days", usize::try_from(d).unwrap_or(0), 1, 365)?;
-                d
-            } else {
-                7
-            };
-            cli::default_calendar_window(start.as_deref(), end.as_deref(), days)
-                .map_err(format_error)?;
-            if let Some(limit) = args.optional_usize("limit")? {
-                bounds("limit", limit, 1, 200)?;
-            }
-            args.optional_bool("offline")?;
-        }
-        "create_calendar_event" => {
-            args.required_str("subject")?;
-            let start = args.required_str("start")?;
-            let end = args.required_str("end")?;
-            cli::normalize_datetime_iso(&start).map_err(format_error)?;
-            cli::normalize_datetime_iso(&end).map_err(format_error)?;
-            args.optional_str("time_zone")?;
-            args.optional_bool("is_all_day")?;
-            args.optional_str("location")?;
-            args.optional_str("body")?;
-            args.optional_str_array("attendees")?;
-            args.optional_bool("is_online_meeting")?;
-        }
-        "respond_calendar_event" => {
-            args.required_str("event_id")?;
-            let resp = args.required_str("response")?;
-            cli::normalize_rsvp_response(&resp).map_err(format_error)?;
-            args.optional_str("comment")?;
-        }
-        "delete_calendar_event" => {
-            args.required_str("event_id")?;
-            args.required_true("confirm")?;
-        }
-        "search_contacts" => {
-            args.optional_str("query")?;
-            if let Some(limit) = args.optional_usize("limit")? {
-                bounds("limit", limit, 1, 200)?;
-            }
-            args.optional_bool("offline")?;
-        }
-        "list_todo_tasks" => {
-            args.optional_str("list")?;
-            args.optional_bool("include_completed")?;
-            if let Some(limit) = args.optional_usize("limit")? {
-                bounds("limit", limit, 1, 200)?;
-            }
-            args.optional_bool("offline")?;
-        }
-        "create_todo_task" => {
-            args.optional_str("list")?;
-            args.required_str("title")?;
-            args.optional_str("body")?;
-            if let Some(due) = args.optional_str("due_date_iso")? {
-                cli::normalize_todo_due_iso(&due).map_err(format_error)?;
-            }
-            if let Some(imp) = args.optional_str("importance")? {
-                cli::normalize_todo_importance(&imp).map_err(format_error)?;
-            }
-        }
-        "complete_todo_task" => {
-            args.optional_str("list")?;
-            args.required_str("task_id")?;
-            args.optional_bool("completed")?;
-        }
-        "delete_todo_task" => {
-            args.optional_str("list")?;
-            args.required_str("task_id")?;
-            args.required_true("confirm")?;
-        }
-        "onenote_list_notebooks" => {
-            args.optional_bool("include_teams")?;
-            args.optional_bool("refresh")?;
-        }
-        "onenote_create_notebook" => {
-            args.required_str("name")?;
-            let group_id = args.optional_str("group_id")?;
-            let site_id = args.optional_str("site_id")?;
-            if group_id.is_some() && site_id.is_some() {
-                return Err("group_id and site_id are mutually exclusive".to_string());
-            }
-        }
-        "onenote_list_sections" => {
-            args.optional_str("notebook")?;
-            args.optional_bool("refresh")?;
-        }
-        "onenote_create_section" => {
-            args.required_str("notebook")?;
-            args.required_str("name")?;
-        }
-        "onenote_list_pages" => {
-            args.required_str("section")?;
-            if let Some(limit) = args.optional_usize("limit")? {
-                bounds("limit", limit, 1, 1_000)?;
-            }
-            args.optional_bool("refresh")?;
-        }
-        "onenote_get_page" => {
-            args.required_str("page")?;
-            args.optional_bool("offline")?;
-        }
-        "onenote_download_resource" => {
-            args.required_str("page")?;
-            args.optional_usize("index")?;
-        }
-        "onenote_create_page" => {
-            args.required_str("section")?;
-            args.required_str("title")?;
-            let body = args.optional_text("markdown_body")?;
-            let images = args.optional_str_array("image_paths")?.unwrap_or_default();
-            // Same rule as the JSON schema's `anyOf`: text or images, at least one.
-            if body.is_none() && images.is_empty() {
-                return Err(
-                    "at least one of markdown_body or image_paths must be provided".to_string(),
-                );
-            }
-            if let Some(l) = args.optional_i64("level")? {
-                if !(0..=2).contains(&l) {
-                    return Err("level must be between 0 and 2".to_string());
-                }
-            }
-        }
-        "onenote_append_page" => {
-            args.required_str("page")?;
-            let body = args.optional_text("markdown_body")?;
-            let images = args.optional_str_array("image_paths")?.unwrap_or_default();
-            // Same rule as the JSON schema's `anyOf`: text or images, at least one.
-            if body.is_none() && images.is_empty() {
-                return Err(
-                    "at least one of markdown_body or image_paths must be provided".to_string(),
-                );
-            }
-        }
-        "onenote_update_page" => {
-            args.required_str("page")?;
-            let title = args.optional_str("title")?;
-            let body = args.optional_text("markdown_body")?;
-            let block_id = args.optional_str("block_id")?;
-            if title.is_none() && body.is_none() {
-                return Err("at least one of title or markdown_body must be provided".to_string());
-            }
-            if block_id.is_some() && body.is_none() {
-                return Err("block_id requires markdown_body".to_string());
-            }
-        }
-        "onenote_toggle_todo" => {
-            args.required_str("page")?;
-            let block_id = args.optional_str("block_id")?;
-            let todo_index = args.optional_usize("todo_index")?;
-            if block_id.is_none() && todo_index.is_none() {
-                return Err("one of block_id or todo_index must be provided".to_string());
-            }
-        }
-        "onenote_search" => {
-            args.required_str("query")?;
-            args.optional_str("section")?;
-            if let Some(limit) = args.optional_usize("limit")? {
-                bounds("limit", limit, 1, 1_000)?;
-            }
-            args.optional_bool("refresh")?;
-        }
-        "onenote_delete_page" => {
-            args.required_str("page")?;
-            args.required_true("confirm")?;
-        }
         other => return Err(format!("unknown tool: {other}")),
     }
 
@@ -2721,16 +1150,6 @@ impl<'a> Args<'a> {
             None | Some(Value::Null) => Err(format!("missing required argument: {key}")),
             Some(Value::String(value)) if !value.trim().is_empty() => Ok(value.clone()),
             Some(Value::String(_)) => Err(format!("{key} must not be empty")),
-            Some(_) => Err(format!("{key} must be a string")),
-        }
-    }
-
-    /// Optional Markdown/body text preserved verbatim (no trimming); blank strings become `None`.
-    fn optional_text(&self, key: &str) -> Result<Option<String>, String> {
-        match self.object()?.get(key) {
-            None | Some(Value::Null) => Ok(None),
-            Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
-            Some(Value::String(value)) => Ok(Some(value.clone())),
             Some(_) => Err(format!("{key} must be a string")),
         }
     }
@@ -2981,45 +1400,27 @@ mod tests {
                 "mark_read",
                 "get_presence",
                 "set_presence",
-                "list_mail_folders",
-                "list_mails",
-                "get_mail",
-                "send_mail",
-                "reply_mail",
-                "forward_mail",
-                "update_mail",
-                "delete_mail",
-                "download_mail_attachment",
-                "search_mails",
-                "list_calendar_events",
-                "create_calendar_event",
-                "respond_calendar_event",
-                "delete_calendar_event",
-                "search_contacts",
-                "list_todo_tasks",
-                "create_todo_task",
-                "complete_todo_task",
-                "delete_todo_task",
-                "onenote_list_notebooks",
-                "onenote_create_notebook",
-                "onenote_list_sections",
-                "onenote_create_section",
-                "onenote_list_pages",
-                "onenote_get_page",
-                "onenote_download_resource",
-                "onenote_create_page",
-                "onenote_append_page",
-                "onenote_update_page",
-                "onenote_toggle_todo",
-                "onenote_search",
-                "onenote_delete_page",
             ]
         );
+        for name in &names {
+            assert!(
+                !name.contains("mail")
+                    && !name.contains("calendar")
+                    && !name.contains("contact")
+                    && !name.contains("todo")
+                    && !name.starts_with("outlook_")
+                    && !name.starts_with("onenote_"),
+                "unexpected non-Teams tool: {name}"
+            );
+        }
 
         for tool in tools {
             assert_eq!(tool["inputSchema"]["type"], "object", "{}", tool["name"]);
             assert!(tool["description"].as_str().is_some_and(|d| !d.is_empty()));
         }
+
+        let get_msgs = tools.iter().find(|t| t["name"] == "get_messages").unwrap();
+        assert!(get_msgs["inputSchema"]["properties"]["before"].is_object());
     }
 
     #[tokio::test]
@@ -3059,6 +1460,17 @@ mod tests {
 
     #[test]
     fn argument_validation_covers_tools() {
+        assert!(validate_tool_args(
+            "get_messages",
+            &json!({ "target": "chat:1", "limit": 100, "before": "2026-11-01" })
+        )
+        .is_ok());
+        assert!(validate_tool_args(
+            "get_messages",
+            &json!({ "target": "chat:1", "before": 123 })
+        )
+        .is_err());
+
         assert!(validate_tool_args(
             "send_message",
             &json!({
@@ -3106,131 +1518,10 @@ mod tests {
             &json!({ "availability": "Offline" })
         )
         .is_err());
-
-        // Outlook Mail / Calendar / Contacts / To Do validation
-        assert!(validate_tool_args(
-            "send_mail",
-            &json!({ "to": ["a@b.com"], "subject": "Hi", "body": "Body" })
-        )
-        .is_ok());
-        assert!(validate_tool_args(
-            "send_mail",
-            &json!({ "to": [], "subject": "Hi", "body": "Body" })
-        )
-        .is_err());
-        assert!(validate_tool_args(
-            "send_mail",
-            &json!({ "to": ["a@b.com"], "subject": "Hi", "body": "Body", "importance": "urgent" })
-        )
-        .is_err());
-        assert!(validate_tool_args("update_mail", &json!({ "mail_id": "m1" })).is_err());
-        assert!(
-            validate_tool_args("update_mail", &json!({ "mail_id": "m1", "is_read": true })).is_ok()
-        );
-        assert!(validate_tool_args(
-            "create_calendar_event",
-            &json!({ "subject": "Sync", "start": "2026-11-16 09:00", "end": "2026-11-16 10:00" })
-        )
-        .is_ok());
-        assert!(validate_tool_args(
-            "create_calendar_event",
-            &json!({ "subject": "Sync", "start": "not-a-date", "end": "2026-11-16 10:00" })
-        )
-        .is_err());
-        assert!(validate_tool_args(
-            "respond_calendar_event",
-            &json!({ "event_id": "ev1", "response": "accept" })
-        )
-        .is_ok());
-        assert!(validate_tool_args(
-            "respond_calendar_event",
-            &json!({ "event_id": "ev1", "response": "maybe_later" })
-        )
-        .is_err());
-        assert!(validate_tool_args(
-            "create_todo_task",
-            &json!({ "title": "Ship release", "due_date_iso": "2026-11-20", "importance": "high" })
-        )
-        .is_ok());
-        assert!(validate_tool_args(
-            "create_todo_task",
-            &json!({ "title": "Ship release", "importance": "critical" })
-        )
-        .is_err());
     }
 
     #[tokio::test]
-    async fn outlook_destructive_tools_require_confirm_true() {
-        let (cfg, graph, storage) = test_ctx();
-
-        for (tool, id_key, id_val) in [
-            ("delete_mail", "mail_id", "m-1"),
-            ("delete_calendar_event", "event_id", "ev-1"),
-            ("delete_todo_task", "task_id", "t-1"),
-        ] {
-            for bad_confirm in [
-                json!({}),
-                json!({ "confirm": false }),
-                json!({ "confirm": "true" }),
-                json!({ "confirm": 1 }),
-            ] {
-                let mut args = bad_confirm;
-                args.as_object_mut()
-                    .unwrap()
-                    .insert(id_key.to_string(), json!(id_val));
-                let line = json!({
-                    "jsonrpc": "2.0",
-                    "id": 100,
-                    "method": "tools/call",
-                    "params": {
-                        "name": tool,
-                        "arguments": args,
-                    }
-                })
-                .to_string();
-                let resp = handle_rpc_line(&cfg, &graph, &storage, &line).await.unwrap();
-                assert_eq!(resp["result"]["isError"], true, "{tool}: {resp}");
-                let msg = resp["result"]["content"][0]["text"].as_str().unwrap();
-                assert!(msg.contains("confirm"), "{tool}: {msg}");
-            }
-
-            let mut ok_args = json!({ "confirm": true });
-            ok_args
-                .as_object_mut()
-                .unwrap()
-                .insert(id_key.to_string(), json!(id_val));
-            assert!(validate_tool_args(tool, &ok_args).is_ok(), "{tool}");
-        }
-    }
-
-    #[tokio::test]
-    async fn offline_outlook_tools_return_valid_empty_payloads_on_fresh_cache() {
-        let (cfg, graph, storage) = test_ctx();
-
-        for (tool, args) in [
-            ("list_mail_folders", json!({ "offline": true })),
-            ("list_mails", json!({ "folder": "inbox", "offline": true })),
-            ("list_calendar_events", json!({ "days": 7, "offline": true })),
-            ("search_contacts", json!({ "offline": true })),
-            ("list_todo_tasks", json!({ "offline": true })),
-        ] {
-            let line = json!({
-                "jsonrpc": "2.0",
-                "id": 101,
-                "method": "tools/call",
-                "params": {
-                    "name": tool,
-                    "arguments": args,
-                }
-            })
-            .to_string();
-            let resp = handle_rpc_line(&cfg, &graph, &storage, &line).await.unwrap();
-            assert_eq!(resp["result"]["isError"], false, "{tool}: {resp}");
-        }
-    }
-
-    #[tokio::test]
-    async fn offline_get_messages_and_search_messages_work_against_sqlite() {
+    async fn offline_get_messages_before_and_search_messages_work_against_sqlite() {
         use crate::models::{ConversationKind, MessageItem};
 
         let (cfg, graph, storage) = test_ctx();
@@ -3247,7 +1538,7 @@ mod tests {
                 topic: Some("개발 논의방".to_string()),
                 unread_count: 0,
                 last_read_at: None,
-                last_msg_id: Some("msg-1".to_string()),
+                last_msg_id: Some("msg-2".to_string()),
                 last_msg_author: Some("김철수".to_string()),
                 last_msg_preview: Some("릴리스 태그 확인".to_string()),
                 last_updated_at: Some("2026-11-15T06:00:00Z".to_string()),
@@ -3257,31 +1548,58 @@ mod tests {
             }])
             .unwrap();
         storage
-            .upsert_messages(&[MessageItem {
-                msg_key: "chat:19:c1|msg-1".to_string(),
-                conv_key: "chat:19:c1".to_string(),
-                msg_id: "msg-1".to_string(),
-                parent_msg_id: None,
-                reply_to_id: None,
-                reply_to_author: None,
-                reply_to_preview: None,
-                subject: None,
-                author_id: Some("u1".to_string()),
-                author_name: "김철수".to_string(),
-                is_me: false,
-                created_at: "2026-11-15T06:00:00Z".to_string(),
-                last_modified_at: None,
-                deleted: false,
-                importance: "normal".to_string(),
-                message_type: "message".to_string(),
-                body_html: "<p>릴리스 태그 확인 부탁합니다</p>".to_string(),
-                body_plain: "릴리스 태그 확인 부탁합니다".to_string(),
-                attachments: vec![],
-                mentions: vec![],
-                reactions: vec![],
-                reply_count: 0,
-                web_url: None,
-            }])
+            .upsert_messages(&[
+                MessageItem {
+                    msg_key: "chat:19:c1|msg-1".to_string(),
+                    conv_key: "chat:19:c1".to_string(),
+                    msg_id: "msg-1".to_string(),
+                    parent_msg_id: None,
+                    reply_to_id: None,
+                    reply_to_author: None,
+                    reply_to_preview: None,
+                    subject: None,
+                    author_id: Some("u1".to_string()),
+                    author_name: "김철수".to_string(),
+                    is_me: false,
+                    created_at: "2026-11-10T06:00:00Z".to_string(),
+                    last_modified_at: None,
+                    deleted: false,
+                    importance: "normal".to_string(),
+                    message_type: "message".to_string(),
+                    body_html: "<p>과거 메시지</p>".to_string(),
+                    body_plain: "과거 메시지".to_string(),
+                    attachments: vec![],
+                    mentions: vec![],
+                    reactions: vec![],
+                    reply_count: 0,
+                    web_url: None,
+                },
+                MessageItem {
+                    msg_key: "chat:19:c1|msg-2".to_string(),
+                    conv_key: "chat:19:c1".to_string(),
+                    msg_id: "msg-2".to_string(),
+                    parent_msg_id: None,
+                    reply_to_id: None,
+                    reply_to_author: None,
+                    reply_to_preview: None,
+                    subject: None,
+                    author_id: Some("u1".to_string()),
+                    author_name: "김철수".to_string(),
+                    is_me: false,
+                    created_at: "2026-11-15T06:00:00Z".to_string(),
+                    last_modified_at: None,
+                    deleted: false,
+                    importance: "normal".to_string(),
+                    message_type: "message".to_string(),
+                    body_html: "<p>릴리스 태그 확인 부탁합니다</p>".to_string(),
+                    body_plain: "릴리스 태그 확인 부탁합니다".to_string(),
+                    attachments: vec![],
+                    mentions: vec![],
+                    reactions: vec![],
+                    reply_count: 0,
+                    web_url: None,
+                },
+            ])
             .unwrap();
 
         let resp = handle_rpc_line(
@@ -3294,7 +1612,7 @@ mod tests {
                 "method": "tools/call",
                 "params": {
                     "name": "get_messages",
-                    "arguments": { "target": "개발 논의방", "offline": true }
+                    "arguments": { "target": "개발 논의방", "offline": true, "before": "msg-2" }
                 }
             })
             .to_string(),
@@ -3304,7 +1622,10 @@ mod tests {
         assert_eq!(resp["result"]["isError"], false, "{resp}");
         let payload: Value =
             serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["messages"].as_array().unwrap().len(), 1);
         assert_eq!(payload["messages"][0]["msg_id"], "msg-1");
+        assert_eq!(payload["has_more"], false);
+        assert_eq!(payload["next_before"], "msg-1");
 
         let resp = handle_rpc_line(
             &cfg,
@@ -3327,215 +1648,5 @@ mod tests {
         let payload: Value =
             serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(payload["hits"].as_array().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn onenote_tools_are_cataloged_with_unique_names() {
-        let catalog = tool_catalog();
-        let names: Vec<&str> = catalog
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
-        let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
-        assert_eq!(unique.len(), names.len(), "duplicate tool names: {names:?}");
-        assert_eq!(names.len(), 49);
-
-        let onenote: Vec<&str> = names
-            .iter()
-            .copied()
-            .filter(|n| n.starts_with("onenote_"))
-            .collect();
-        assert_eq!(
-            onenote,
-            vec![
-                "onenote_list_notebooks",
-                "onenote_create_notebook",
-                "onenote_list_sections",
-                "onenote_create_section",
-                "onenote_list_pages",
-                "onenote_get_page",
-                "onenote_download_resource",
-                "onenote_create_page",
-                "onenote_append_page",
-                "onenote_update_page",
-                "onenote_toggle_todo",
-                "onenote_search",
-                "onenote_delete_page",
-            ]
-        );
-        for tool in &catalog {
-            assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
-        }
-    }
-
-    #[test]
-    fn onenote_page_tool_schemas_allow_image_only_payloads() {
-        let catalog = tool_catalog();
-        for name in ["onenote_create_page", "onenote_append_page"] {
-            let tool = catalog
-                .iter()
-                .find(|t| t["name"] == name)
-                .unwrap_or_else(|| panic!("missing tool {name}"));
-            let required = tool["inputSchema"]["required"].as_array().unwrap();
-            assert!(
-                !required.iter().any(|v| v == "markdown_body"),
-                "{name} must not require markdown_body (image-only payloads are valid)"
-            );
-            assert_eq!(
-                tool["inputSchema"]["anyOf"].as_array().unwrap().len(),
-                2,
-                "{name} must accept markdown_body or image_paths"
-            );
-        }
-    }
-
-    #[test]
-    fn onenote_tool_argument_validation() {
-        assert!(validate_tool_args("onenote_list_notebooks", &json!({})).is_ok());
-        assert!(validate_tool_args("onenote_list_notebooks", &json!({ "include_teams": "yes" })).is_err());
-        assert!(validate_tool_args("onenote_list_sections", &json!({ "notebook": "업무" })).is_ok());
-        assert!(validate_tool_args("onenote_list_pages", &json!({})).is_err());
-        assert!(validate_tool_args("onenote_list_pages", &json!({ "section": "업무/회의", "limit": 0 })).is_err());
-        assert!(validate_tool_args("onenote_list_pages", &json!({ "section": "업무/회의", "limit": 20 })).is_ok());
-        assert!(validate_tool_args("onenote_get_page", &json!({ "page": "me|1-abc" })).is_ok());
-        assert!(validate_tool_args("onenote_get_page", &json!({})).is_err());
-
-        assert!(validate_tool_args(
-            "onenote_create_page",
-            &json!({ "section": "s", "title": "t", "markdown_body": "# hi" })
-        )
-        .is_ok());
-        assert!(validate_tool_args(
-            "onenote_create_page",
-            &json!({ "section": "s", "title": "t" })
-        )
-        .is_err());
-        assert!(validate_tool_args(
-            "onenote_create_page",
-            &json!({ "section": "s", "title": "t", "markdown_body": "x", "level": 3 })
-        )
-        .is_err());
-        // Image-only pages are accepted (schema `anyOf` + validator agree).
-        assert!(validate_tool_args(
-            "onenote_create_page",
-            &json!({ "section": "s", "title": "t", "image_paths": ["/tmp/a.png"] })
-        )
-        .is_ok());
-
-        assert!(validate_tool_args("onenote_create_notebook", &json!({ "name": "업무" })).is_ok());
-        assert!(validate_tool_args("onenote_create_notebook", &json!({ "name": "  " })).is_err());
-        assert!(validate_tool_args(
-            "onenote_create_notebook",
-            &json!({ "name": "업무", "group_id": "g", "site_id": "s" })
-        )
-        .is_err());
-        assert!(validate_tool_args(
-            "onenote_create_section",
-            &json!({ "notebook": "업무", "name": "회의" })
-        )
-        .is_ok());
-        assert!(validate_tool_args("onenote_create_section", &json!({ "notebook": "업무" })).is_err());
-        assert!(validate_tool_args("onenote_download_resource", &json!({ "page": "p" })).is_ok());
-        assert!(validate_tool_args("onenote_download_resource", &json!({})).is_err());
-
-        assert!(validate_tool_args("onenote_append_page", &json!({ "page": "p" })).is_err());
-        assert!(validate_tool_args("onenote_append_page", &json!({ "page": "p", "markdown_body": "- [ ] 할 일" })).is_ok());
-        assert!(validate_tool_args(
-            "onenote_append_page",
-            &json!({ "page": "p", "image_paths": ["/tmp/a.png"] })
-        )
-        .is_ok());
-
-        assert!(validate_tool_args("onenote_update_page", &json!({ "page": "p" })).is_err());
-        assert!(validate_tool_args("onenote_update_page", &json!({ "page": "p", "block_id": "p:{x}" })).is_err());
-        assert!(validate_tool_args("onenote_update_page", &json!({ "page": "p", "title": "새 제목" })).is_ok());
-        assert!(validate_tool_args(
-            "onenote_update_page",
-            &json!({ "page": "p", "block_id": "p:{x}", "markdown_body": "교체" })
-        )
-        .is_ok());
-
-        assert!(validate_tool_args("onenote_toggle_todo", &json!({ "page": "p" })).is_err());
-        assert!(validate_tool_args("onenote_toggle_todo", &json!({ "page": "p", "todo_index": 0 })).is_ok());
-        assert!(validate_tool_args("onenote_toggle_todo", &json!({ "page": "p", "todo_index": -1 })).is_err());
-
-        assert!(validate_tool_args("onenote_search", &json!({ "query": "회의" })).is_ok());
-        assert!(validate_tool_args("onenote_search", &json!({ "query": " " })).is_err());
-
-        assert!(validate_tool_args("onenote_delete_page", &json!({ "page": "p" })).is_err());
-        assert!(validate_tool_args("onenote_delete_page", &json!({ "page": "p", "confirm": false })).is_err());
-        assert!(validate_tool_args("onenote_delete_page", &json!({ "page": "p", "confirm": true })).is_ok());
-    }
-
-    #[tokio::test]
-    async fn onenote_get_page_offline_reads_cached_detail() {
-        use crate::models::{OnenotePageSummary, OnenoteScope};
-
-        let (cfg, graph, storage) = test_ctx();
-        let summary = OnenotePageSummary {
-            page_key: "me|page-1".to_string(),
-            id: "page-1".to_string(),
-            scope: OnenoteScope::Me,
-            section_id: "sec-1".to_string(),
-            section_name: Some("회의".to_string()),
-            notebook_id: Some("nb-1".to_string()),
-            notebook_name: Some("업무".to_string()),
-            title: "주간 회의록".to_string(),
-            level: 0,
-            order: 0,
-            created_at: None,
-            last_modified_at: Some("2026-11-15T09:00:00Z".to_string()),
-            content_url: None,
-            web_url: None,
-            preview_text: None,
-            has_todo: false,
-        };
-        let xhtml = r#"<html><head><title>주간 회의록</title></head><body><div id="div:{d1}{1}"><p id="p:{a1}{2}">배포 일정 공유</p><p id="p:{a2}{3}" data-tag="to-do">릴리스 노트 작성</p></div></body></html>"#;
-        let detail = parser::onenote::parse_onenote_page_xhtml(summary.clone(), xhtml);
-        storage.upsert_onenote_pages(std::slice::from_ref(&summary)).unwrap();
-        storage.upsert_onenote_page_detail(&detail).unwrap();
-
-        let resp = handle_rpc_line(
-            &cfg,
-            &graph,
-            &storage,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": 40,
-                "method": "tools/call",
-                "params": {
-                    "name": "onenote_get_page",
-                    "arguments": { "page": "me|page-1", "offline": true }
-                }
-            })
-            .to_string(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(resp["result"]["isError"], false, "{resp}");
-        let payload: Value =
-            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(payload["page"]["summary"]["page_key"], "me|page-1");
-        assert!(payload["page"]["body_markdown"]
-            .as_str()
-            .unwrap()
-            .contains("배포 일정 공유"));
-
-        // Missing destructive confirmation is rejected before any Graph call.
-        let resp = handle_rpc_line(
-            &cfg,
-            &graph,
-            &storage,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": 41,
-                "method": "tools/call",
-                "params": { "name": "onenote_delete_page", "arguments": { "page": "me|page-1" } }
-            })
-            .to_string(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(resp["result"]["isError"], true, "{resp}");
     }
 }

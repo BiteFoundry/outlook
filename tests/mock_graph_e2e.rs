@@ -8,13 +8,13 @@ use std::{
 
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Path, RawQuery, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, patch, post, put},
+    routing::{get, post, put},
     Json, Router,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use image::{ImageBuffer, Rgba, RgbaImage};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -22,14 +22,13 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 
 use teams_cli::{
-    auth::{AuthManager, StoredTokens},
+    auth::{
+        diagnose_access_token_scopes, explain_graph_permission_error, AuthManager, StoredTokens,
+    },
     config::AppConfig,
     graph::GraphClient,
     img_preview, mcp,
-    models::{
-        AttachmentInfo, ConversationTarget, MentionInfo, MessageItem, OutgoingContact,
-        OutgoingEvent, OutgoingMail, OutgoingTodoTask, TeamSummary,
-    },
+    models::{AttachmentInfo, ConversationTarget, MentionInfo, MessageItem, TeamSummary},
     parser, resolver, serve,
     storage::Storage,
     updater,
@@ -663,7 +662,6 @@ async fn download_share_content_handler(
     let Some(encoded) = share_token.strip_prefix("u!") else {
         return (StatusCode::BAD_REQUEST, "missing u! prefix").into_response();
     };
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     let Ok(decoded_bytes) = URL_SAFE_NO_PAD.decode(encoded) else {
         return (StatusCode::BAD_REQUEST, "bad share token").into_response();
     };
@@ -1203,554 +1201,10 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
 }
 
 // ===========================================================================
-// v0.2.0 Outlook (Mail / Calendar / Contacts / To Do), Image Preview & Updater E2E
+// Pure Teams E2E: Deep @odata.nextLink History, SQLite Tie-Breaking & Scope Diagnostics
 // ===========================================================================
 
-struct OutlookMockState {
-    token: String,
-    mail_messages: RwLock<Vec<Value>>,
-    mail_attachments: RwLock<HashMap<(String, String), Value>>,
-    sent_mails: RwLock<Vec<Value>>,
-    mail_replies: RwLock<Vec<(String, Value)>>,
-    calendar_events: RwLock<Vec<Value>>,
-    calendar_rsvps: RwLock<Vec<(String, String, Value)>>,
-    contacts: RwLock<Vec<Value>>,
-    directory_users: RwLock<Vec<Value>>,
-    todo_lists: RwLock<Vec<Value>>,
-    todo_tasks: RwLock<HashMap<String, Vec<Value>>>,
-}
-
-impl OutlookMockState {
-    fn new(token: &str) -> Self {
-        let att_b64 = BASE64_STANDARD.encode(b"Outlook Attachment Payload \xed\x95\x9c\xea\xb8\x80");
-        let att_obj = json!({
-            "id": "att-1",
-            "name": "architecture-note.txt",
-            "contentType": "text/plain",
-            "size": 34,
-            "isInline": false,
-            "contentBytes": att_b64
-        });
-        let mut mail_attachments = HashMap::new();
-        mail_attachments.insert(("mail-1".to_string(), "att-1".to_string()), att_obj.clone());
-
-        let mail_messages = vec![
-            json!({
-                "id": "mail-1",
-                "conversationId": "conv-mail-1",
-                "parentFolderId": "folder-inbox",
-                "subject": "아키텍처 리뷰 및 Kubernetes 결재 요청",
-                "from": {
-                    "emailAddress": { "name": "김철수", "address": "kim@contoso.com" }
-                },
-                "toRecipients": [
-                    { "emailAddress": { "name": "나(테스터)", "address": "tester@contoso.com" } }
-                ],
-                "receivedDateTime": "2026-11-15T08:00:00Z",
-                "sentDateTime": "2026-11-15T07:59:50Z",
-                "isRead": false,
-                "isDraft": false,
-                "flag": { "flagStatus": "notFlagged" },
-                "importance": "high",
-                "hasAttachments": true,
-                "bodyPreview": "아키텍처 문서와 Kubernetes 배포 일정 확인 부탁드립니다.",
-                "body": {
-                    "contentType": "html",
-                    "content": "<p>안녕하세요, <strong>아키텍처</strong> 문서와 <em>Kubernetes</em> 배포 결재 요청드립니다.</p>"
-                },
-                "attachments": [att_obj],
-                "webLink": "https://outlook.office.com/mail/id/mail-1"
-            }),
-            json!({
-                "id": "mail-2",
-                "conversationId": "conv-mail-2",
-                "parentFolderId": "folder-inbox",
-                "subject": "Weekly Sprint Sync",
-                "from": {
-                    "emailAddress": { "name": "Alice", "address": "alice@contoso.com" }
-                },
-                "toRecipients": [
-                    { "emailAddress": { "name": "나(테스터)", "address": "tester@contoso.com" } }
-                ],
-                "receivedDateTime": "2026-11-15T07:00:00Z",
-                "isRead": true,
-                "isDraft": false,
-                "flag": { "flagStatus": "notFlagged" },
-                "importance": "normal",
-                "hasAttachments": false,
-                "bodyPreview": "Sprint sync notes inside.",
-                "body": { "contentType": "text", "content": "Sprint sync notes inside." }
-            }),
-        ];
-
-        let calendar_events = vec![json!({
-            "id": "ev-seed-1",
-            "subject": "주간 스탠드업",
-            "start": { "dateTime": "2026-11-16T01:00:00", "timeZone": "UTC" },
-            "end": { "dateTime": "2026-11-16T01:30:00", "timeZone": "UTC" },
-            "isAllDay": false,
-            "location": { "displayName": "본사 3층" },
-            "organizer": { "emailAddress": { "name": "김철수", "address": "kim@contoso.com" } },
-            "attendees": [{
-                "emailAddress": { "name": "나(테스터)", "address": "tester@contoso.com" },
-                "type": "required",
-                "status": { "response": "notResponded" }
-            }],
-            "responseStatus": { "response": "notResponded" },
-            "isOnlineMeeting": false
-        })];
-
-        let contacts = vec![json!({
-            "id": "contact-1",
-            "displayName": "김철수 (개인)",
-            "givenName": "철수",
-            "surname": "김",
-            "emailAddresses": [{ "address": "kim@contoso.com", "name": "김철수" }],
-            "mobilePhone": "010-1111-2222",
-            "companyName": "Contoso",
-            "jobTitle": "Staff Engineer",
-            "department": "Platform"
-        })];
-
-        let directory_users = vec![json!({
-            "id": "dir-user-1",
-            "displayName": "김영희 (조직)",
-            "givenName": "영희",
-            "surname": "김",
-            "mail": "younghee.kim@contoso.com",
-            "userPrincipalName": "younghee.kim@contoso.com",
-            "companyName": "Contoso",
-            "jobTitle": "Product Manager",
-            "department": "Core"
-        })];
-
-        let todo_lists = vec![json!({
-            "id": "list-default",
-            "displayName": "Tasks",
-            "wellknownListName": "defaultList",
-            "isOwner": true,
-            "isShared": false
-        })];
-
-        let mut todo_tasks = HashMap::new();
-        todo_tasks.insert(
-            "list-default".to_string(),
-            vec![json!({
-                "id": "task-seed-1",
-                "title": "기존 할 일",
-                "status": "notStarted",
-                "importance": "normal"
-            })],
-        );
-
-        Self {
-            token: token.to_string(),
-            mail_messages: RwLock::new(mail_messages),
-            mail_attachments: RwLock::new(mail_attachments),
-            sent_mails: RwLock::new(Vec::new()),
-            mail_replies: RwLock::new(Vec::new()),
-            calendar_events: RwLock::new(calendar_events),
-            calendar_rsvps: RwLock::new(Vec::new()),
-            contacts: RwLock::new(contacts),
-            directory_users: RwLock::new(directory_users),
-            todo_lists: RwLock::new(todo_lists),
-            todo_tasks: RwLock::new(todo_tasks),
-        }
-    }
-
-    fn check_bearer(&self, headers: &HeaderMap) -> Result<(), Response> {
-        check_bearer_header(headers, &self.token)
-    }
-}
-
-async fn outlook_mail_folders_handler(
-    State(state): State<Arc<OutlookMockState>>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-    Json(json!({
-        "value": [
-            {
-                "id": "folder-inbox",
-                "displayName": "받은 편지함",
-                "unreadItemCount": 1,
-                "totalItemCount": 2
-            },
-            {
-                "id": "folder-sent",
-                "displayName": "보낸 편지함",
-                "unreadItemCount": 0,
-                "totalItemCount": 0
-            }
-        ]
-    }))
-    .into_response()
-}
-
-async fn outlook_folder_messages_handler(
-    State(state): State<Arc<OutlookMockState>>,
-    headers: HeaderMap,
-    Path(folder): Path<String>,
-) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-    let msgs = state.mail_messages.read().unwrap();
-    let filtered: Vec<Value> = msgs
-        .iter()
-        .filter(|m| {
-            folder.eq_ignore_ascii_case("inbox")
-                && m["parentFolderId"].as_str() == Some("folder-inbox")
-                || m["parentFolderId"].as_str() == Some(folder.as_str())
-        })
-        .cloned()
-        .collect();
-    Json(json!({ "value": filtered })).into_response()
-}
-
-async fn outlook_get_message_handler(
-    State(state): State<Arc<OutlookMockState>>,
-    headers: HeaderMap,
-    Path(msg_id): Path<String>,
-) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-    let guard = state.mail_messages.read().unwrap();
-    match guard.iter().find(|m| m["id"].as_str() == Some(msg_id.as_str())) {
-        Some(m) => Json(m.clone()).into_response(),
-        None => (StatusCode::NOT_FOUND, Json(json!({ "error": { "code": "NotFound", "message": "mail not found" } }))).into_response(),
-    }
-}
-
-async fn outlook_patch_message_handler(
-    State(state): State<Arc<OutlookMockState>>,
-    headers: HeaderMap,
-    Path(msg_id): Path<String>,
-    Json(payload): Json<Value>,
-) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-    let mut guard = state.mail_messages.write().unwrap();
-    let Some(msg) = guard
-        .iter_mut()
-        .find(|m| m["id"].as_str() == Some(msg_id.as_str()))
-    else {
-        return (StatusCode::NOT_FOUND, Json(json!({ "error": { "code": "NotFound", "message": "mail not found" } }))).into_response();
-    };
-    if let Some(is_read) = payload.get("isRead").and_then(|v| v.as_bool()) {
-        msg["isRead"] = Value::Bool(is_read);
-    }
-    if let Some(flag_status) = payload.pointer("/flag/flagStatus").and_then(|v| v.as_str()) {
-        msg["flag"] = json!({ "flagStatus": flag_status });
-    }
-    Json(msg.clone()).into_response()
-}
-
-async fn outlook_send_mail_handler(
-    State(state): State<Arc<OutlookMockState>>,
-    headers: HeaderMap,
-    Json(payload): Json<Value>,
-) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-    state.sent_mails.write().unwrap().push(payload);
-    StatusCode::ACCEPTED.into_response()
-}
-
-async fn outlook_reply_mail_handler(
-    State(state): State<Arc<OutlookMockState>>,
-    headers: HeaderMap,
-    Path(msg_id): Path<String>,
-    Json(payload): Json<Value>,
-) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-    state.mail_replies.write().unwrap().push((msg_id, payload));
-    StatusCode::ACCEPTED.into_response()
-}
-
-async fn outlook_get_attachment_handler(
-    State(state): State<Arc<OutlookMockState>>,
-    headers: HeaderMap,
-    Path((msg_id, att_id)): Path<(String, String)>,
-) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-    let guard = state.mail_attachments.read().unwrap();
-    match guard.get(&(msg_id, att_id)) {
-        Some(att) => Json(att.clone()).into_response(),
-        None => (StatusCode::NOT_FOUND, Json(json!({ "error": { "code": "NotFound", "message": "attachment not found" } }))).into_response(),
-    }
-}
-
-async fn outlook_calendar_view_handler(
-    State(state): State<Arc<OutlookMockState>>,
-    headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
-) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-    assert_eq!(
-        headers.get("prefer").and_then(|v| v.to_str().ok()),
-        Some("outlook.timezone=\"UTC\"")
-    );
-    assert!(params.contains_key("startDateTime"));
-    assert!(params.contains_key("endDateTime"));
-    let events = state.calendar_events.read().unwrap().clone();
-    Json(json!({ "value": events })).into_response()
-}
-
-async fn outlook_create_event_handler(
-    State(state): State<Arc<OutlookMockState>>,
-    headers: HeaderMap,
-    Json(payload): Json<Value>,
-) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-    let is_online = payload
-        .get("isOnlineMeeting")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let mut created = json!({
-        "id": "ev-created-1",
-        "subject": payload["subject"],
-        "start": payload["start"],
-        "end": payload["end"],
-        "isAllDay": payload["isAllDay"],
-        "location": payload.get("location").cloned().unwrap_or(Value::Null),
-        "attendees": payload.get("attendees").cloned().unwrap_or_else(|| json!([])),
-        "responseStatus": { "response": "organizer" },
-        "isOnlineMeeting": is_online,
-        "body": payload.get("body").cloned().unwrap_or(Value::Null),
-    });
-    if is_online {
-        created["onlineMeeting"] = json!({
-            "joinUrl": "https://teams.microsoft.com/l/meetup-join/19%3ameeting_v2_e2e/0"
-        });
-    }
-    state.calendar_events.write().unwrap().push(created.clone());
-    (StatusCode::CREATED, Json(created)).into_response()
-}
-
-async fn outlook_rsvp_event_handler(
-    State(state): State<Arc<OutlookMockState>>,
-    headers: HeaderMap,
-    Path((event_id, action)): Path<(String, String)>,
-    Json(payload): Json<Value>,
-) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-    state
-        .calendar_rsvps
-        .write()
-        .unwrap()
-        .push((event_id.clone(), action.clone(), payload));
-
-    let mapped_resp = match action.as_str() {
-        "accept" => "accepted",
-        "tentativelyAccept" => "tentativelyAccepted",
-        "decline" => "declined",
-        other => other,
-    };
-    let mut guard = state.calendar_events.write().unwrap();
-    if let Some(ev) = guard.iter_mut().find(|e| e["id"].as_str() == Some(event_id.as_str())) {
-        ev["responseStatus"] = json!({ "response": mapped_resp });
-    }
-    StatusCode::ACCEPTED.into_response()
-}
-
-async fn outlook_contacts_handler(
-    State(state): State<Arc<OutlookMockState>>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-    let list = state.contacts.read().unwrap().clone();
-    Json(json!({ "value": list })).into_response()
-}
-
-async fn outlook_create_contact_handler(
-    State(state): State<Arc<OutlookMockState>>,
-    headers: HeaderMap,
-    Json(payload): Json<Value>,
-) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-    let created = json!({
-        "id": "contact-created-1",
-        "displayName": payload["displayName"],
-        "givenName": payload.get("givenName").cloned().unwrap_or(Value::Null),
-        "surname": payload.get("surname").cloned().unwrap_or(Value::Null),
-        "emailAddresses": payload.get("emailAddresses").cloned().unwrap_or_else(|| json!([])),
-        "mobilePhone": payload.get("mobilePhone").cloned().unwrap_or(Value::Null),
-        "companyName": payload.get("companyName").cloned().unwrap_or(Value::Null),
-        "jobTitle": payload.get("jobTitle").cloned().unwrap_or(Value::Null),
-        "department": payload.get("department").cloned().unwrap_or(Value::Null),
-        "personalNotes": payload.get("personalNotes").cloned().unwrap_or(Value::Null),
-    });
-    state.contacts.write().unwrap().push(created.clone());
-    (StatusCode::CREATED, Json(created)).into_response()
-}
-
-async fn outlook_directory_users_handler(
-    State(state): State<Arc<OutlookMockState>>,
-    headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
-) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-    let users = state.directory_users.read().unwrap().clone();
-    let search_q = params
-        .get("$search")
-        .map(|s| s.to_lowercase())
-        .unwrap_or_default();
-    let filtered: Vec<Value> = if search_q.is_empty() {
-        users
-    } else {
-        users
-            .into_iter()
-            .filter(|u| {
-                let dn = u["displayName"].as_str().unwrap_or("").to_lowercase();
-                let mail = u["mail"].as_str().unwrap_or("").to_lowercase();
-                search_q.contains("김") && (dn.contains("김") || mail.contains("kim"))
-                    || (!dn.is_empty() && search_q.contains(&dn))
-            })
-            .collect()
-    };
-    Json(json!({ "value": filtered })).into_response()
-}
-
-async fn outlook_todo_lists_handler(
-    State(state): State<Arc<OutlookMockState>>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-    let lists = state.todo_lists.read().unwrap().clone();
-    Json(json!({ "value": lists })).into_response()
-}
-
-async fn outlook_create_todo_task_handler(
-    State(state): State<Arc<OutlookMockState>>,
-    headers: HeaderMap,
-    Path(list_id): Path<String>,
-    Json(payload): Json<Value>,
-) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-    let created = json!({
-        "id": "task-created-1",
-        "title": payload["title"],
-        "status": "notStarted",
-        "importance": payload.get("importance").cloned().unwrap_or_else(|| json!("normal")),
-        "body": payload.get("body").cloned().unwrap_or(Value::Null),
-        "dueDateTime": payload.get("dueDateTime").cloned().unwrap_or(Value::Null),
-    });
-    state
-        .todo_tasks
-        .write()
-        .unwrap()
-        .entry(list_id)
-        .or_default()
-        .push(created.clone());
-    (StatusCode::CREATED, Json(created)).into_response()
-}
-
-async fn outlook_patch_todo_task_handler(
-    State(state): State<Arc<OutlookMockState>>,
-    headers: HeaderMap,
-    Path((list_id, task_id)): Path<(String, String)>,
-    Json(payload): Json<Value>,
-) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
-        return resp;
-    }
-    let mut guard = state.todo_tasks.write().unwrap();
-    let list = guard.entry(list_id).or_default();
-    let Some(task) = list
-        .iter_mut()
-        .find(|t| t["id"].as_str() == Some(task_id.as_str()))
-    else {
-        return (StatusCode::NOT_FOUND, Json(json!({ "error": { "code": "NotFound", "message": "task not found" } }))).into_response();
-    };
-    if let Some(status) = payload.get("status").and_then(|v| v.as_str()) {
-        task["status"] = Value::String(status.to_string());
-    }
-    Json(task.clone()).into_response()
-}
-
-async fn spawn_mock_outlook_graph_server(token: &str) -> (String, Arc<OutlookMockState>) {
-    let state = Arc::new(OutlookMockState::new(token));
-    let app = Router::new()
-        .route("/v1.0/me/mailFolders", get(outlook_mail_folders_handler))
-        .route(
-            "/v1.0/me/mailFolders/{folder}/messages",
-            get(outlook_folder_messages_handler),
-        )
-        .route(
-            "/v1.0/me/messages/{msg_id}",
-            get(outlook_get_message_handler).patch(outlook_patch_message_handler),
-        )
-        .route("/v1.0/me/sendMail", post(outlook_send_mail_handler))
-        .route(
-            "/v1.0/me/messages/{msg_id}/reply",
-            post(outlook_reply_mail_handler),
-        )
-        .route(
-            "/v1.0/me/messages/{msg_id}/attachments/{att_id}",
-            get(outlook_get_attachment_handler),
-        )
-        .route("/v1.0/me/calendarView", get(outlook_calendar_view_handler))
-        .route("/v1.0/me/events", post(outlook_create_event_handler))
-        .route(
-            "/v1.0/me/events/{event_id}/{action}",
-            post(outlook_rsvp_event_handler),
-        )
-        .route(
-            "/v1.0/me/contacts",
-            get(outlook_contacts_handler).post(outlook_create_contact_handler),
-        )
-        .route("/v1.0/users", get(outlook_directory_users_handler))
-        .route("/v1.0/me/todo/lists", get(outlook_todo_lists_handler))
-        .route(
-            "/v1.0/me/todo/lists/{list_id}/tasks",
-            post(outlook_create_todo_task_handler),
-        )
-        .route(
-            "/v1.0/me/todo/lists/{list_id}/tasks/{task_id}",
-            patch(outlook_patch_todo_task_handler),
-        )
-        .with_state(state.clone());
-
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock Outlook Graph server");
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("serve mock Outlook Graph");
-    });
-
-    (format!("http://{addr}"), state)
-}
-
-fn build_outlook_graph_client(
+fn build_direct_graph_client(
     base_url: &str,
     download_dir: &std::path::Path,
     token: &str,
@@ -1769,299 +1223,502 @@ fn build_outlook_graph_client(
     };
     let auth = AuthManager::from_tokens(cfg.clone(), tokens);
     let graph = GraphClient::new(cfg.clone(), auth)
-        .expect("build Outlook GraphClient")
+        .expect("build direct GraphClient")
         .with_my_user_id("me-user-1");
     (cfg, graph)
 }
 
-#[tokio::test]
-async fn e2e_mock_graph_outlook_mail() {
-    ensure_isolated_env();
-    let temp = tempfile::tempdir().expect("create mail test tempdir");
-    let db_path = temp.path().join("data").join("cache.db");
-    let download_dir = temp.path().join("downloads");
-    let token = "outlook-mail-tok-2026";
-
-    let (base_url, mock) = spawn_mock_outlook_graph_server(token).await;
-    let (_cfg, graph) = build_outlook_graph_client(&base_url, &download_dir, token);
-    let storage = Storage::open(&db_path).expect("open SQLite storage");
-
-    // 1. Mail folders + Inbox listing
-    let folders = graph.list_mail_folders().await.expect("list_mail_folders");
-    assert_eq!(folders.len(), 2);
-    assert_eq!(folders[0].well_known_name.as_deref(), Some("inbox"));
-    storage
-        .upsert_mail_folders(&folders)
-        .expect("upsert_mail_folders");
-
-    let inbox = graph
-        .list_mail_messages("inbox", 20)
-        .await
-        .expect("list_mail_messages");
-    assert_eq!(inbox.len(), 2);
-    assert_eq!(inbox[0].id, "mail-1");
-    assert!(inbox[0].has_attachments);
-
-    // 2. Get mail message with expanded attachments + download attachment
-    let detail = graph
-        .get_mail_message("mail-1")
-        .await
-        .expect("get_mail_message");
-    assert_eq!(detail.attachments.len(), 1);
-    assert_eq!(detail.attachments[0].name, "architecture-note.txt");
-
-    let downloaded = graph
-        .download_mail_attachment("mail-1", &detail.attachments[0].id, &download_dir)
-        .await
-        .expect("download_mail_attachment");
-    assert!(downloaded.path.exists());
-    assert_eq!(
-        std::fs::read(&downloaded.path).expect("read downloaded mail attachment"),
-        b"Outlook Attachment Payload \xed\x95\x9c\xea\xb8\x80"
-    );
-
-    // 3. send_mail (with file attachment) & reply_mail
-    let attach_path = temp.path().join("release-summary.txt");
-    std::fs::write(&attach_path, b"Release v0.2.0 summary").expect("write mail attachment");
-    graph
-        .send_mail(&OutgoingMail {
-            subject: "v0.2.0 릴리즈 보고".to_string(),
-            body_html: "<p>첨부파일 확인 부탁드립니다.</p>".to_string(),
-            to: vec!["alice@contoso.com".to_string()],
-            cc: vec![],
-            bcc: vec![],
-            importance: Some("high".to_string()),
-            attachments: vec![attach_path],
-            save_to_sent_items: true,
-        })
-        .await
-        .expect("send_mail");
-
-    {
-        let sent = mock.sent_mails.read().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0]["saveToSentItems"], true);
-        assert_eq!(sent[0]["message"]["subject"], "v0.2.0 릴리즈 보고");
-        assert_eq!(
-            sent[0]["message"]["attachments"][0]["name"],
-            "release-summary.txt"
-        );
+fn mock_graph_message(
+    id: &str,
+    created_at: &str,
+    body_text: &str,
+    reply_to_id: Option<&str>,
+    replies: Option<Vec<Value>>,
+) -> Value {
+    let mut obj = json!({
+        "id": id,
+        "replyToId": reply_to_id,
+        "messageType": "message",
+        "createdDateTime": created_at,
+        "subject": Value::Null,
+        "importance": "normal",
+        "from": {
+            "user": {
+                "id": "peer-kim",
+                "displayName": "김철수"
+            }
+        },
+        "body": {
+            "contentType": "html",
+            "content": format!("<p>{body_text}</p>")
+        },
+        "mentions": [],
+        "attachments": [],
+        "reactions": []
+    });
+    if let Some(r) = replies {
+        obj["replies"] = Value::Array(r);
     }
-
-    graph
-        .reply_mail("mail-1", "<p>검토 완료했습니다.</p>", false)
-        .await
-        .expect("reply_mail");
-    assert_eq!(mock.mail_replies.read().unwrap().len(), 1);
-
-    // 4. set_mail_read & set_mail_flag
-    graph
-        .set_mail_read("mail-1", true)
-        .await
-        .expect("set_mail_read");
-    graph
-        .set_mail_flag("mail-1", true)
-        .await
-        .expect("set_mail_flag");
-    let updated_mail = graph
-        .get_mail_message("mail-1")
-        .await
-        .expect("get_mail_message after patch");
-    assert!(updated_mail.is_read);
-    assert!(updated_mail.flagged);
-
-    // 5. SQLite upsert_mail_messages + Korean/English search_mail_messages
-    let mut persisted = inbox;
-    persisted[0] = updated_mail;
-    storage
-        .upsert_mail_messages(&persisted)
-        .expect("upsert_mail_messages");
-
-    let ko_hits = storage
-        .search_mail_messages("아키텍처", None, 10)
-        .expect("Korean trigram search");
-    assert_eq!(ko_hits.len(), 1);
-    assert_eq!(ko_hits[0].id, "mail-1");
-
-    let ko_2char = storage
-        .search_mail_messages("결재", Some("inbox"), 10)
-        .expect("Korean 2-char fallback search");
-    assert_eq!(ko_2char.len(), 1);
-    assert_eq!(ko_2char[0].id, "mail-1");
-
-    let en_hits = storage
-        .search_mail_messages("Kubernetes", None, 10)
-        .expect("English search");
-    assert_eq!(en_hits.len(), 1);
-    assert_eq!(en_hits[0].id, "mail-1");
-
-    let en_mail2 = storage
-        .search_mail_messages("Sprint", None, 10)
-        .expect("English mail-2 search");
-    assert_eq!(en_mail2.len(), 1);
-    assert_eq!(en_mail2[0].id, "mail-2");
+    obj
 }
 
 #[tokio::test]
-async fn e2e_mock_graph_outlook_calendar() {
+async fn e2e_mock_graph_multipage_chat_history_and_sqlite_tiebreak() {
     ensure_isolated_env();
-    let temp = tempfile::tempdir().expect("create calendar test tempdir");
+    let temp = tempfile::tempdir().expect("create history test tempdir");
     let db_path = temp.path().join("data").join("cache.db");
     let download_dir = temp.path().join("downloads");
-    let token = "outlook-cal-tok-2026";
+    let token = "history-e2e-tok-2026";
+    let chat_id = "19:history-chat@thread.v2";
 
-    let (base_url, mock) = spawn_mock_outlook_graph_server(token).await;
-    let (_cfg, graph) = build_outlook_graph_client(&base_url, &download_dir, token);
-    let storage = Storage::open(&db_path).expect("open SQLite storage");
-
-    // 1. list_calendar_view
-    let initial_events = graph
-        .list_calendar_view("2026-11-15T00:00:00Z", "2026-11-22T00:00:00Z", 50)
+    let listener = TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("list_calendar_view");
-    assert_eq!(initial_events.len(), 1);
-    assert_eq!(initial_events[0].id, "ev-seed-1");
+        .expect("bind history mock server");
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    let graph_base = format!("{base_url}/v1.0");
 
-    // 2. create_calendar_event with is_online_meeting: true -> Teams joinUrl
-    let created = graph
-        .create_calendar_event(&OutgoingEvent {
-            subject: "v0.2.0 릴리즈 아키텍처 회의".to_string(),
-            start_iso: "2026-11-17T02:00:00".to_string(),
-            end_iso: "2026-11-17T03:00:00".to_string(),
-            time_zone: Some("UTC".to_string()),
-            is_all_day: false,
-            location: Some("Teams 온라인".to_string()),
-            body_html: Some("<p>릴리즈 체크리스트 점검</p>".to_string()),
-            attendees: vec!["alice@contoso.com".to_string()],
-            is_online_meeting: true,
-        })
-        .await
-        .expect("create_calendar_event");
-    assert_eq!(created.id, "ev-created-1");
-    assert!(created.is_online_meeting);
-    assert_eq!(
-        created.online_meeting_url.as_deref(),
-        Some("https://teams.microsoft.com/l/meetup-join/19%3ameeting_v2_e2e/0")
-    );
+    let encoded_chat = urlencoding::encode(chat_id).into_owned();
+    let p2_link = format!("{graph_base}/chats/{encoded_chat}/messages?$skiptoken=p2");
+    let p3_link = format!("{graph_base}/chats/{encoded_chat}/messages?$skiptoken=p3");
+    let expired_link = format!("{graph_base}/chats/{encoded_chat}/messages?$skiptoken=expired");
 
-    // 3. respond_calendar_event("accept")
-    graph
-        .respond_calendar_event("ev-seed-1", "accept", Some("참석하겠습니다"))
-        .await
-        .expect("respond_calendar_event");
-    assert_eq!(mock.calendar_rsvps.read().unwrap().len(), 1);
-    assert_eq!(mock.calendar_rsvps.read().unwrap()[0].1, "accept");
+    let requested_queries = Arc::new(RwLock::new(Vec::<String>::new()));
+    let rq_clone = requested_queries.clone();
+    let (p2_c, p3_c) = (p2_link.clone(), p3_link.clone());
 
-    // 4. SQLite persistence
-    let refreshed = graph
-        .list_calendar_view("2026-11-15T00:00:00Z", "2026-11-22T00:00:00Z", 50)
-        .await
-        .expect("list_calendar_view after rsvp");
-    assert_eq!(refreshed.len(), 2);
-    storage
-        .upsert_calendar_events(&refreshed)
-        .expect("upsert_calendar_events");
-
-    let stored = storage
-        .list_calendar_events(Some("2026-11-15T00:00:00"), Some("2026-11-22T00:00:00"), 20)
-        .expect("list_calendar_events from SQLite");
-    assert_eq!(stored.len(), 2);
-    let stored_seed = stored.iter().find(|e| e.id == "ev-seed-1").unwrap();
-    assert_eq!(stored_seed.response_status, "accepted");
-    let stored_created = stored.iter().find(|e| e.id == "ev-created-1").unwrap();
-    assert_eq!(
-        stored_created.online_meeting_url.as_deref(),
-        Some("https://teams.microsoft.com/l/meetup-join/19%3ameeting_v2_e2e/0")
-    );
-}
-
-#[tokio::test]
-async fn e2e_mock_graph_outlook_contacts_and_todo() {
-    ensure_isolated_env();
-    let temp = tempfile::tempdir().expect("create contacts/todo test tempdir");
-    let db_path = temp.path().join("data").join("cache.db");
-    let download_dir = temp.path().join("downloads");
-    let token = "outlook-contacts-todo-tok-2026";
-
-    let (base_url, _mock) = spawn_mock_outlook_graph_server(token).await;
-    let (_cfg, graph) = build_outlook_graph_client(&base_url, &download_dir, token);
-    let storage = Storage::open(&db_path).expect("open SQLite storage");
-
-    // 1. Contacts: list_contacts, search_contacts_and_directory, create_contact
-    let contacts = graph.list_contacts(20).await.expect("list_contacts");
-    assert_eq!(contacts.len(), 1);
-    assert_eq!(contacts[0].source, "contact");
-
-    let merged = graph
-        .search_contacts_and_directory("김", 20)
-        .await
-        .expect("search_contacts_and_directory");
-    assert!(merged.iter().any(|c| c.source == "contact" && c.primary_email() == Some("kim@contoso.com")));
-    assert!(merged.iter().any(|c| c.source == "directory" && c.primary_email() == Some("younghee.kim@contoso.com")));
-
-    let created_contact = graph
-        .create_contact(&OutgoingContact {
-            display_name: "박민수".to_string(),
-            given_name: Some("민수".to_string()),
-            surname: Some("박".to_string()),
-            email_addresses: vec!["park@contoso.com".to_string()],
-            mobile_phone: Some("010-9999-8888".to_string()),
-            company_name: Some("Contoso".to_string()),
-            job_title: Some("Security Lead".to_string()),
-            department: Some("Security".to_string()),
-            notes: Some("E2E 연락처".to_string()),
-        })
-        .await
-        .expect("create_contact");
-    assert_eq!(created_contact.id, "contact-created-1");
-    assert_eq!(created_contact.primary_email(), Some("park@contoso.com"));
-
-    storage
-        .upsert_contacts(&[created_contact])
-        .expect("upsert_contacts");
-    let stored_contacts = storage
-        .list_contacts(Some("박민수"), 10)
-        .expect("list_contacts from SQLite");
-    assert_eq!(stored_contacts.len(), 1);
-    assert_eq!(stored_contacts[0].id, "contact-created-1");
-
-    // 2. Microsoft To Do: list_todo_lists, create_todo_task, set_todo_task_completed(true)
-    let lists = graph.list_todo_lists().await.expect("list_todo_lists");
-    assert_eq!(lists.len(), 1);
-    assert_eq!(lists[0].id, "list-default");
-    storage
-        .upsert_todo_lists(&lists)
-        .expect("upsert_todo_lists");
-
-    let created_task = graph
-        .create_todo_task(
-            "default",
-            &OutgoingTodoTask {
-                title: "v0.2.0 통합 테스트 검증".to_string(),
-                body_plain: Some("Mail/Cal/Contacts/ToDo E2E".to_string()),
-                due_date_iso: Some("2026-11-18T09:00:00".to_string()),
-                importance: Some("high".to_string()),
-            },
+    let app = Router::new()
+        .route(
+            "/v1.0/me",
+            get(|| async move {
+                Json(json!({
+                    "id": "me-user-1",
+                    "displayName": "나(테스터)",
+                    "mail": "tester@contoso.com",
+                    "userPrincipalName": "tester@contoso.com"
+                }))
+            }),
         )
-        .await
-        .expect("create_todo_task");
-    assert_eq!(created_task.id, "task-created-1");
-    assert!(!created_task.is_completed());
+        .route(
+            "/v1.0/chats/{chat_id}/messages",
+            get(move |RawQuery(q): RawQuery| {
+                let (p2_url, p3_url, queries) = (p2_c.clone(), p3_c.clone(), rq_clone.clone());
+                async move {
+                    let query = q.unwrap_or_default();
+                    queries.write().unwrap().push(query.clone());
+                    if query.contains("$skiptoken=expired") {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "error": {
+                                    "code": "InvalidSkipToken",
+                                    "message": "The skiptoken has expired."
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    if query.contains("$skiptoken=p2") {
+                        return Json(json!({
+                            "value": [
+                                mock_graph_message("m4", "2026-11-10T10:00:00Z", "메시지4(동일시각)", None, None),
+                                mock_graph_message("m3", "2026-11-10T10:00:00Z", "메시지3(동일시각)", None, None),
+                            ],
+                            "@odata.nextLink": p3_url
+                        }))
+                        .into_response();
+                    }
+                    if query.contains("$skiptoken=p3") {
+                        return Json(json!({
+                            "value": [
+                                mock_graph_message("m2", "2026-11-10T09:00:00Z", "메시지2", None, None),
+                                mock_graph_message("m1", "2026-11-10T08:00:00Z", "메시지1(최초)", None, None),
+                            ]
+                        }))
+                        .into_response();
+                    }
+                    Json(json!({
+                        "value": [
+                            mock_graph_message("m6", "2026-11-10T12:00:00Z", "메시지6(최신)", None, None),
+                            mock_graph_message("m5", "2026-11-10T11:00:00Z", "메시지5", None, None),
+                        ],
+                        "@odata.nextLink": p2_url
+                    }))
+                    .into_response()
+                }
+            }),
+        );
 
-    let completed_task = graph
-        .set_todo_task_completed("default", &created_task.id, true)
-        .await
-        .expect("set_todo_task_completed");
-    assert!(completed_task.is_completed());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve history mock Graph");
+    });
 
-    storage
-        .upsert_todo_tasks(std::slice::from_ref(&completed_task))
-        .expect("upsert_todo_tasks");
-    let stored_tasks = storage
-        .list_todo_tasks("list-default", true, 20)
-        .expect("list_todo_tasks from SQLite");
-    assert_eq!(stored_tasks.len(), 1);
-    assert!(stored_tasks[0].is_completed());
+    let (_cfg, graph) = build_direct_graph_client(&base_url, &download_dir, token);
+    let storage = Storage::open(&db_path).expect("open SQLite storage");
+    let target = ConversationTarget::Chat {
+        chat_id: chat_id.to_string(),
+    };
+    let conv_key = target.conv_key();
+
+    // 1. Page 1 -> returns newest messages (m5, m6) + @odata.nextLink pointing to p2
+    let (p1_msgs, next_after_p1) = graph
+        .list_messages_page(&target, 50, None)
+        .await
+        .expect("list_messages_page page 1");
+    let p1_ids: Vec<&str> = p1_msgs.iter().map(|m| m.msg_id.as_str()).collect();
+    assert_eq!(p1_ids, vec!["m5", "m6"]);
+    assert_eq!(next_after_p1.as_deref(), Some(p2_link.as_str()));
+    storage.upsert_messages(&p1_msgs).expect("upsert page 1");
+
+    // 2. Page 2 via fetch_older_messages(saved_next_link = p2) -> same-timestamp m3, m4 + p3 link
+    let (p2_msgs, next_after_p2) = graph
+        .fetch_older_messages(&target, next_after_p1.as_deref(), Some("2026-11-10T11:00:00Z"), 2)
+        .await
+        .expect("fetch_older_messages page 2");
+    let p2_ids: Vec<&str> = p2_msgs.iter().map(|m| m.msg_id.as_str()).collect();
+    assert_eq!(p2_ids, vec!["m3", "m4"]);
+    assert_eq!(
+        next_after_p2.as_deref(),
+        Some(p3_link.as_str()),
+        "nextLink should still point to page 3 before EOF"
+    );
+    storage.upsert_messages(&p2_msgs).expect("upsert page 2");
+
+    // 3. Page 3 via fetch_older_messages(saved_next_link = p3) -> m1, m2 + None (EOF)
+    let (p3_msgs, next_after_p3) = graph
+        .fetch_older_messages(&target, next_after_p2.as_deref(), Some("2026-11-10T10:00:00Z"), 2)
+        .await
+        .expect("fetch_older_messages page 3");
+    let p3_ids: Vec<&str> = p3_msgs.iter().map(|m| m.msg_id.as_str()).collect();
+    assert_eq!(p3_ids, vec!["m1", "m2"]);
+    assert_eq!(next_after_p3, None, "new_next_link must be None only at EOF");
+    storage.upsert_messages(&p3_msgs).expect("upsert page 3");
+
+    // 4. SQLite tie-breaking cursor walk from m6 back to m1 without skipping m3/m4
+    let mut walked_desc = vec!["m6".to_string()];
+    let mut cursor_ts = "2026-11-10T12:00:00Z".to_string();
+    let mut cursor_id = Some("m6".to_string());
+    loop {
+        let older = storage
+            .list_older_root_messages(&conv_key, 1, &cursor_ts, cursor_id.as_deref())
+            .expect("list_older_root_messages step");
+        if older.is_empty() {
+            break;
+        }
+        assert_eq!(older.len(), 1);
+        walked_desc.push(older[0].msg_id.clone());
+        cursor_ts = older[0].created_at.clone();
+        cursor_id = Some(older[0].msg_id.clone());
+    }
+    assert_eq!(walked_desc, vec!["m6", "m5", "m4", "m3", "m2", "m1"]);
+
+    // Also verify batch retrieval strictly before m4 includes m3 (same timestamp) + m2 + m1
+    let before_m4 = storage
+        .list_older_root_messages(&conv_key, 10, "2026-11-10T10:00:00Z", Some("m4"))
+        .expect("list_older_root_messages before m4");
+    let before_m4_ids: Vec<&str> = before_m4.iter().map(|m| m.msg_id.as_str()).collect();
+    assert_eq!(before_m4_ids, vec!["m1", "m2", "m3"]);
+
+    // 5. Expired $skiptoken=expired -> 400 InvalidSkipToken -> transparent fallback to Page 1 -> p2 -> p3
+    let (fallback_msgs, fallback_next) = graph
+        .fetch_older_messages(&target, Some(&expired_link), None, 6)
+        .await
+        .expect("fetch_older_messages should fall back on expired skiptoken");
+    let fallback_ids: Vec<&str> = fallback_msgs.iter().map(|m| m.msg_id.as_str()).collect();
+    assert_eq!(fallback_ids, vec!["m1", "m2", "m3", "m4", "m5", "m6"]);
+    assert_eq!(fallback_next, None);
+    assert!(
+        requested_queries
+            .read()
+            .unwrap()
+            .iter()
+            .any(|q| q.contains("$skiptoken=expired")),
+        "expected expired skiptoken to be attempted before fallback"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn e2e_mock_graph_channel_expand_replies_pagination_and_chats_orderby_fallback() {
+    ensure_isolated_env();
+    let temp = tempfile::tempdir().expect("create channel/chats pagination tempdir");
+    let download_dir = temp.path().join("downloads");
+    let token = "channel-chats-e2e-tok-2026";
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind channel/chats mock server");
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    let graph_base = format!("{base_url}/v1.0");
+
+    let chan_p2_link =
+        format!("{graph_base}/teams/team-dev/channels/chan-general/messages?$skiptoken=chan_p2");
+    let chats_p2_link = format!("{graph_base}/me/chats?$skiptoken=chats_p2");
+
+    let channel_queries = Arc::new(RwLock::new(Vec::<String>::new()));
+    let chat_queries = Arc::new(RwLock::new(Vec::<String>::new()));
+    let cq_clone = channel_queries.clone();
+    let chq_clone = chat_queries.clone();
+
+    let app = Router::new()
+        .route(
+            "/v1.0/me",
+            get(|| async move {
+                Json(json!({
+                    "id": "me-user-1",
+                    "displayName": "나(테스터)",
+                    "mail": "tester@contoso.com",
+                    "userPrincipalName": "tester@contoso.com"
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/teams/{team_id}/channels/{channel_id}/messages",
+            get(move |RawQuery(q): RawQuery| {
+                let (chan_p2, queries) = (chan_p2_link.clone(), cq_clone.clone());
+                async move {
+                    let query = q.unwrap_or_default();
+                    queries.write().unwrap().push(query.clone());
+                    if query.contains("$skiptoken=chan_p2") {
+                        return Json(json!({
+                            "value": [
+                                mock_graph_message(
+                                    "root-1",
+                                    "2026-11-10T09:00:00Z",
+                                    "이전 채널 루트 1",
+                                    None,
+                                    Some(vec![mock_graph_message(
+                                        "reply-1a",
+                                        "2026-11-10T09:05:00Z",
+                                        "이전 답글 1a",
+                                        Some("root-1"),
+                                        None,
+                                    )]),
+                                )
+                            ]
+                        }))
+                        .into_response();
+                    }
+                    assert!(
+                        query.contains("$expand=replies"),
+                        "initial channel page must include $expand=replies, got: {query}"
+                    );
+                    Json(json!({
+                        "value": [
+                            mock_graph_message(
+                                "root-2",
+                                "2026-11-10T12:00:00Z",
+                                "최신 채널 루트 2",
+                                None,
+                                Some(vec![mock_graph_message(
+                                    "reply-2a",
+                                    "2026-11-10T12:05:00Z",
+                                    "최신 답글 2a",
+                                    Some("root-2"),
+                                    None,
+                                )]),
+                            )
+                        ],
+                        "@odata.nextLink": chan_p2
+                    }))
+                    .into_response()
+                }
+            }),
+        )
+        .route(
+            "/v1.0/me/chats",
+            get(move |RawQuery(q): RawQuery| {
+                let (chats_p2, queries) = (chats_p2_link.clone(), chq_clone.clone());
+                async move {
+                    let query = q.unwrap_or_default();
+                    queries.write().unwrap().push(query.clone());
+
+                    if query.contains("$orderby") {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "error": {
+                                    "code": "BadRequest",
+                                    "message": "Query option '$orderby' is not supported for this request."
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+
+                    let make_chat_batch = |start: usize, count: usize| -> Vec<Value> {
+                        (start..start + count)
+                            .map(|idx| {
+                                json!({
+                                    "id": format!("19:chat-{idx:03}@thread.v2"),
+                                    "chatType": "group",
+                                    "topic": format!("채팅방 {idx:03}"),
+                                    "lastUpdatedDateTime": "2026-11-15T05:00:00Z",
+                                    "members": [
+                                        { "userId": "me-user-1", "displayName": "나(테스터)" },
+                                        { "userId": format!("user-{idx}"), "displayName": format!("사용자 {idx}") }
+                                    ]
+                                })
+                            })
+                            .collect()
+                    };
+
+                    if query.contains("$skiptoken=chats_p2") {
+                        return Json(json!({
+                            "value": make_chat_batch(51, 30)
+                        }))
+                        .into_response();
+                    }
+
+                    Json(json!({
+                        "value": make_chat_batch(1, 50),
+                        "@odata.nextLink": chats_p2
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve channel/chats mock Graph");
+    });
+
+    let (_cfg, graph) = build_direct_graph_client(&base_url, &download_dir, token);
+
+    // 1. Channel multi-page pagination with $expand=replies
+    let chan_target = ConversationTarget::Channel {
+        team_id: "team-dev".to_string(),
+        channel_id: "chan-general".to_string(),
+    };
+    let (chan_msgs, chan_next) = graph
+        .fetch_older_messages(&chan_target, None, None, 2)
+        .await
+        .expect("fetch_older_messages across 2 channel pages");
+    assert_eq!(chan_next, None);
+    let chan_ids: Vec<&str> = chan_msgs.iter().map(|m| m.msg_id.as_str()).collect();
+    assert_eq!(chan_ids, vec!["root-1", "reply-1a", "root-2", "reply-2a"]);
+    let reply_1a = chan_msgs.iter().find(|m| m.msg_id == "reply-1a").unwrap();
+    assert_eq!(reply_1a.parent_msg_id.as_deref(), Some("root-1"));
+    assert_eq!(channel_queries.read().unwrap().len(), 2);
+
+    // 2. /me/chats multi-page list_chats(75) with $orderby 400 fallback
+    let chats = graph
+        .list_chats(75)
+        .await
+        .expect("list_chats(75) with $orderby fallback across 2 pages");
+    assert_eq!(chats.len(), 75);
+    assert_eq!(chats[0].title, "채팅방 001");
+    assert_eq!(chats[49].title, "채팅방 050");
+    assert_eq!(chats[74].title, "채팅방 075");
+
+    let recorded_chat_queries = chat_queries.read().unwrap();
+    assert!(
+        recorded_chat_queries.iter().any(|q| q.contains("$orderby")),
+        "expected $orderby to be attempted first"
+    );
+    assert!(
+        recorded_chat_queries
+            .iter()
+            .any(|q| q.contains("$skiptoken=chats_p2")),
+        "expected page 2 $skiptoken=chats_p2 to be fetched"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn e2e_mock_graph_restricted_chat_read_basic_token_and_403_diagnostics() {
+    ensure_isolated_env();
+    let temp = tempfile::tempdir().expect("create restricted token test tempdir");
+    let download_dir = temp.path().join("downloads");
+
+    // Construct JWT with "scp": "User.Read Chat.ReadBasic"
+    let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload_json = json!({
+        "oid": "me-user-1",
+        "name": "나(테스터)",
+        "upn": "tester@contoso.com",
+        "scp": "User.Read Chat.ReadBasic",
+        "exp": 4_102_444_800_i64
+    });
+    let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json.to_string().as_bytes());
+    let restricted_jwt = format!("{header_b64}.{payload_b64}.mock-signature");
+
+    let diag = diagnose_access_token_scopes(&restricted_jwt);
+    assert!(diag.has_scope_claims);
+    assert!(diag.chat_read_basic_only);
+    assert!(!diag.can_read_chats);
+    assert!(
+        diag.warnings
+            .iter()
+            .any(|w| w.contains("Chat.ReadBasic") && w.contains("본문")),
+        "expected clear Korean Chat.ReadBasic warning, got: {:?}",
+        diag.warnings
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind 403 mock server");
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    let app = Router::new()
+        .route(
+            "/v1.0/me",
+            get(|| async move {
+                Json(json!({
+                    "id": "me-user-1",
+                    "displayName": "나(테스터)",
+                    "mail": "tester@contoso.com",
+                    "userPrincipalName": "tester@contoso.com"
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/chats/{chat_id}/messages",
+            get(|| async move {
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": {
+                            "code": "Authorization_RequestDenied",
+                            "message": "Insufficient privileges to complete the operation."
+                        }
+                    })),
+                )
+            }),
+        );
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve 403 mock Graph");
+    });
+
+    let (_cfg, graph) = build_direct_graph_client(&base_url, &download_dir, &restricted_jwt);
+    let target = ConversationTarget::Chat {
+        chat_id: "19:restricted-chat@thread.v2".to_string(),
+    };
+
+    let err = graph
+        .fetch_older_messages(&target, None, None, 20)
+        .await
+        .expect_err("403 Forbidden must return Err, not empty Ok");
+
+    let explanation = explain_graph_permission_error(&err.to_string(), Some(&restricted_jwt))
+        .expect("explain_graph_permission_error should explain 403");
+    assert!(
+        explanation.contains("권한 부족 (403)") && explanation.contains("Chat.ReadBasic"),
+        "expected Chat.ReadBasic explanation, got: {explanation}"
+    );
+
+    server.abort();
 }
 
 #[tokio::test]

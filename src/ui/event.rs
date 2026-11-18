@@ -14,7 +14,7 @@ pub fn key_to_action(
     key_to_action_for_tab(key, focus, 0, keymap, text_input)
 }
 
-/// Tab-aware variant of `key_to_action` supporting Outlook Mail / Calendar / Contacts / To Do keys.
+/// Tab-aware variant of `key_to_action`.
 pub fn key_to_action_for_tab(
     key: KeyEvent,
     focus: Focus,
@@ -24,19 +24,6 @@ pub fn key_to_action_for_tab(
 ) -> Option<Action> {
     if key.kind != KeyEventKind::Press {
         return None;
-    }
-
-    if text_input && focus == Focus::Chat {
-        match key.code {
-            KeyCode::Backspace => return Some(Action::Backspace),
-            KeyCode::Enter => return Some(Action::Activate),
-            KeyCode::Esc => return Some(Action::CloseOverlay),
-            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return Some(Action::PasteClipboard)
-            }
-            KeyCode::Char(ch) if is_plain_text(key) => return Some(Action::Input(ch)),
-            _ => {}
-        }
     }
 
     if text_input || focus == Focus::Overlay {
@@ -71,8 +58,16 @@ pub fn mouse_to_action(mouse: MouseEvent, _hitmap: &HitMap) -> Option<Action> {
             column: mouse.column,
             row: mouse.row,
         }),
-        MouseEventKind::ScrollUp => Some(Action::ScrollUp),
-        MouseEventKind::ScrollDown => Some(Action::ScrollDown),
+        MouseEventKind::ScrollUp => Some(Action::MouseScroll {
+            delta: -3,
+            column: mouse.column,
+            row: mouse.row,
+        }),
+        MouseEventKind::ScrollDown => Some(Action::MouseScroll {
+            delta: 3,
+            column: mouse.column,
+            row: mouse.row,
+        }),
         _ => None,
     }
 }
@@ -133,77 +128,37 @@ mod tests {
     }
 
     #[test]
-    fn unified_tabs_persona_image_and_outlook_keys() {
+    fn teams_tabs_image_and_history_keys() {
         let keymap = Keymap::default_teams();
         assert_eq!(
             key_to_action_for_tab(
-                press(KeyCode::Char('4'), KeyModifiers::CONTROL),
+                press(KeyCode::Char('1'), KeyModifiers::CONTROL),
                 Focus::Nav,
                 0,
                 &keymap,
                 false,
             ),
-            Some(Action::SelectNavTab(3))
+            Some(Action::SelectNavTab(0))
         );
         assert_eq!(
             key_to_action_for_tab(
-                press(KeyCode::Char('7'), KeyModifiers::CONTROL),
-                Focus::Nav,
-                3,
-                &keymap,
-                false,
-            ),
-            Some(Action::SelectNavTab(6))
-        );
-        assert_eq!(
-            key_to_action_for_tab(
-                press(KeyCode::Char('8'), KeyModifiers::CONTROL),
+                press(KeyCode::Char('2'), KeyModifiers::CONTROL),
                 Focus::Nav,
                 0,
                 &keymap,
                 false,
             ),
-            Some(Action::SelectNavTab(7))
+            Some(Action::SelectNavTab(1))
         );
         assert_eq!(
             key_to_action_for_tab(
-                press(KeyCode::Char('n'), KeyModifiers::ALT),
+                press(KeyCode::Char('3'), KeyModifiers::CONTROL),
                 Focus::Nav,
                 0,
                 &keymap,
                 false,
             ),
-            Some(Action::SwitchPersona(crate::config::Persona::OneNote))
-        );
-        assert_eq!(
-            key_to_action_for_tab(
-                press(KeyCode::Char('a'), KeyModifiers::NONE),
-                Focus::Chat,
-                7,
-                &keymap,
-                false,
-            ),
-            Some(Action::OnenoteOpenAppendBlock)
-        );
-        assert_eq!(
-            key_to_action_for_tab(
-                press(KeyCode::Char('o'), KeyModifiers::ALT),
-                Focus::Nav,
-                0,
-                &keymap,
-                false,
-            ),
-            Some(Action::SwitchPersona(crate::config::Persona::Outlook))
-        );
-        assert_eq!(
-            key_to_action_for_tab(
-                press(KeyCode::Char('t'), KeyModifiers::ALT),
-                Focus::Nav,
-                3,
-                &keymap,
-                false,
-            ),
-            Some(Action::SwitchPersona(crate::config::Persona::Teams))
+            Some(Action::SelectNavTab(2))
         );
         assert_eq!(
             key_to_action_for_tab(
@@ -217,43 +172,23 @@ mod tests {
         );
         assert_eq!(
             key_to_action_for_tab(
-                press(KeyCode::Char('c'), KeyModifiers::NONE),
-                Focus::Nav,
-                3,
-                &keymap,
-                false,
-            ),
-            Some(Action::OpenMailComposeNew)
-        );
-        assert_eq!(
-            key_to_action_for_tab(
-                press(KeyCode::Char('j'), KeyModifiers::NONE),
+                press(KeyCode::Char('o'), KeyModifiers::NONE),
                 Focus::Chat,
-                4,
+                0,
                 &keymap,
                 false,
             ),
-            Some(Action::JoinCalendarMeeting)
+            Some(Action::LoadOlder)
         );
         assert_eq!(
             key_to_action_for_tab(
-                press(KeyCode::Char(' '), KeyModifiers::NONE),
-                Focus::Nav,
-                6,
-                &keymap,
-                false,
-            ),
-            Some(Action::TodoToggleSelected)
-        );
-        assert_eq!(
-            key_to_action_for_tab(
-                press(KeyCode::Char('q'), KeyModifiers::NONE),
+                press(KeyCode::Char('H'), KeyModifiers::SHIFT),
                 Focus::Chat,
-                6,
+                0,
                 &keymap,
-                true,
+                false,
             ),
-            Some(Action::Input('q'))
+            Some(Action::SyncHistory)
         );
     }
 }

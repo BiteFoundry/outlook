@@ -182,8 +182,6 @@ jobs:
           done
 
           test -f bin/teams.js
-          test -f bin/outlook.js
-          test -f bin/onenote.js
           test -f scripts/postinstall.mjs
           test -f dist/teams-win32-x64/bin/teams.exe
           test -f dist/teams-win32-arm64/bin/teams.exe
@@ -233,7 +231,7 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo 'Single unified binary (`teams` / `teams.exe`) powers `teams`, `outlook` (`TEAMS_PERSONA=outlook`), and `onenote` (`TEAMS_PERSONA=onenote`).'
+            echo 'Prebuilt pure Microsoft Teams binary (`teams` / `teams.exe`) — CLI, TUI, HTTP API, and MCP server.'
             if [ -f "release-notes/${GITHUB_REF_NAME}.md" ]; then
               echo ""
               cat "release-notes/${GITHUB_REF_NAME}.md"
