@@ -17,7 +17,7 @@ pub fn upsert_conversations(conn: &mut Connection, items: &[ConversationSummary]
     }
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "
             INSERT INTO conversations (
                 conv_key, target_json, kind, team_id, team_name, title, topic,
@@ -90,7 +90,7 @@ pub fn upsert_teams(conn: &mut Connection, teams: &[TeamSummary]) -> Result<()> 
     }
     let tx = conn.transaction()?;
     {
-        let mut team_stmt = tx.prepare(
+        let mut team_stmt = tx.prepare_cached(
             "
             INSERT INTO teams (team_id, display_name, description, channels_json)
             VALUES (?1, ?2, ?3, ?4)
@@ -101,7 +101,7 @@ pub fn upsert_teams(conn: &mut Connection, teams: &[TeamSummary]) -> Result<()> 
             ",
         )?;
 
-        let mut conv_stmt = tx.prepare(
+        let mut conv_stmt = tx.prepare_cached(
             "
             INSERT INTO conversations (
                 conv_key, target_json, kind, team_id, team_name, title, topic,
@@ -158,7 +158,7 @@ pub fn upsert_teams(conn: &mut Connection, teams: &[TeamSummary]) -> Result<()> 
 }
 
 pub fn list_conversations(conn: &Connection) -> Result<Vec<ConversationSummary>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT
             conv_key, target_json, kind, team_id, team_name, title, topic,
@@ -177,7 +177,7 @@ pub fn list_conversations(conn: &Connection) -> Result<Vec<ConversationSummary>>
 }
 
 pub fn list_teams(conn: &Connection) -> Result<Vec<TeamSummary>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT team_id, display_name, description, channels_json
         FROM teams
@@ -203,7 +203,7 @@ pub fn list_teams(conn: &Connection) -> Result<Vec<TeamSummary>> {
 }
 
 pub fn get_conversation(conn: &Connection, conv_key: &str) -> Result<Option<ConversationSummary>> {
-    conn.query_row(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT
             conv_key, target_json, kind, team_id, team_name, title, topic,
@@ -212,18 +212,17 @@ pub fn get_conversation(conn: &Connection, conv_key: &str) -> Result<Option<Conv
         FROM conversations
         WHERE conv_key = ?1
         ",
-        params![conv_key],
-        map_conversation_row,
-    )
-    .optional()
-    .map_err(Into::into)
+    )?;
+    stmt.query_row(params![conv_key], map_conversation_row)
+        .optional()
+        .map_err(Into::into)
 }
 
 pub fn mark_conversation_read(conn: &Connection, conv_key: &str, read_at: &str) -> Result<()> {
-    conn.execute(
+    let mut stmt = conn.prepare_cached(
         "UPDATE conversations SET unread_count = 0, last_read_at = ?1 WHERE conv_key = ?2",
-        params![read_at, conv_key],
     )?;
+    stmt.execute(params![read_at, conv_key])?;
     Ok(())
 }
 
@@ -237,7 +236,15 @@ pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Resul
     let mut newest_by_conv: HashMap<String, &MessageItem> = HashMap::new();
 
     {
-        let mut msg_stmt = tx.prepare(
+        let mut check_stmt = tx.prepare_cached(
+            "
+            SELECT last_modified_at, deleted, reply_count, reactions_json, body_plain, author_name, subject
+            FROM messages
+            WHERE msg_key = ?1
+            ",
+        )?;
+
+        let mut msg_stmt = tx.prepare_cached(
             "
             INSERT INTO messages (
                 msg_key, conv_key, msg_id, parent_msg_id, reply_to_id, reply_to_author, reply_to_preview,
@@ -274,8 +281,8 @@ pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Resul
             ",
         )?;
 
-        let mut fts_del_stmt = tx.prepare("DELETE FROM messages_fts WHERE msg_key = ?1")?;
-        let mut fts_ins_stmt = tx.prepare(
+        let mut fts_del_stmt = tx.prepare_cached("DELETE FROM messages_fts WHERE msg_key = ?1")?;
+        let mut fts_ins_stmt = tx.prepare_cached(
             "
             INSERT INTO messages_fts (msg_key, conv_key, author_name, body_plain, subject)
             VALUES (?1, ?2, ?3, ?4, ?5)
@@ -283,14 +290,67 @@ pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Resul
         )?;
 
         for msg in messages {
-            let attachments_json = serde_json::to_string(&msg.attachments)?;
-            let mentions_json = serde_json::to_string(&msg.mentions)?;
-            let reactions_json = serde_json::to_string(&msg.reactions)?;
             let msg_key = if msg.msg_key.is_empty() {
                 MessageItem::make_msg_key(&msg.conv_key, &msg.msg_id)
             } else {
                 msg.msg_key.clone()
             };
+            let reactions_json = serde_json::to_string(&msg.reactions)?;
+            let deleted_int = if msg.deleted { 1i32 } else { 0i32 };
+            let reply_count_i64 = msg.reply_count as i64;
+
+            let existing: Option<(
+                Option<String>,
+                i32,
+                i64,
+                String,
+                String,
+                String,
+                Option<String>,
+            )> = check_stmt
+                .query_row(params![&msg_key], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                })
+                .optional()?;
+
+            let fts_unchanged = if let Some((
+                ref ex_last_mod,
+                ex_deleted,
+                ex_reply_count,
+                ref ex_reactions_json,
+                ref ex_body_plain,
+                ref ex_author_name,
+                ref ex_subject,
+            )) = existing
+            {
+                let row_unchanged = *ex_last_mod == msg.last_modified_at
+                    && ex_deleted == deleted_int
+                    && reply_count_i64 <= ex_reply_count
+                    && *ex_reactions_json == reactions_json
+                    && *ex_body_plain == msg.body_plain
+                    && *ex_author_name == msg.author_name
+                    && *ex_subject == msg.subject;
+                if row_unchanged {
+                    continue;
+                }
+                ex_deleted == deleted_int
+                    && *ex_author_name == msg.author_name
+                    && *ex_body_plain == msg.body_plain
+                    && *ex_subject == msg.subject
+            } else {
+                false
+            };
+
+            let attachments_json = serde_json::to_string(&msg.attachments)?;
+            let mentions_json = serde_json::to_string(&msg.mentions)?;
 
             msg_stmt.execute(params![
                 msg_key,
@@ -306,7 +366,7 @@ pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Resul
                 if msg.is_me { 1i32 } else { 0i32 },
                 msg.created_at,
                 msg.last_modified_at,
-                if msg.deleted { 1i32 } else { 0i32 },
+                deleted_int,
                 msg.importance,
                 msg.message_type,
                 msg.body_html,
@@ -314,20 +374,24 @@ pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Resul
                 attachments_json,
                 mentions_json,
                 reactions_json,
-                msg.reply_count as i64,
+                reply_count_i64,
                 msg.web_url,
             ])?;
 
-            fts_del_stmt.execute(params![msg_key])?;
-            if !msg.deleted {
-                fts_ins_stmt.execute(params![
-                    msg_key,
-                    msg.conv_key,
-                    msg.author_name,
-                    msg.body_plain,
-                    msg.subject.as_deref().unwrap_or(""),
-                ])?;
+            if !fts_unchanged {
+                fts_del_stmt.execute(params![msg_key])?;
+                if !msg.deleted {
+                    fts_ins_stmt.execute(params![
+                        msg_key,
+                        msg.conv_key,
+                        msg.author_name,
+                        msg.body_plain,
+                        msg.subject.as_deref().unwrap_or(""),
+                    ])?;
+                }
+            }
 
+            if !msg.deleted {
                 newest_by_conv
                     .entry(msg.conv_key.clone())
                     .and_modify(|existing| {
@@ -347,7 +411,7 @@ pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Resul
     }
 
     if !touched_threads.is_empty() {
-        let mut reply_count_stmt = tx.prepare(
+        let mut reply_count_stmt = tx.prepare_cached(
             "
             UPDATE messages
             SET reply_count = MAX(
@@ -363,7 +427,7 @@ pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Resul
     }
 
     if !newest_by_conv.is_empty() {
-        let mut conv_update_stmt = tx.prepare(
+        let mut conv_update_stmt = tx.prepare_cached(
             "
             UPDATE conversations
             SET
@@ -401,7 +465,7 @@ pub fn list_root_messages(
         return Ok(Vec::new());
     }
     let mut out = if let Some(before) = before_created_at {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 msg_key, conv_key, msg_id, parent_msg_id, reply_to_id, reply_to_author, reply_to_preview,
@@ -417,7 +481,7 @@ pub fn list_root_messages(
         let rows = stmt.query_map(params![conv_key, before, limit as i64], map_message_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     } else {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 msg_key, conv_key, msg_id, parent_msg_id, reply_to_id, reply_to_author, reply_to_preview,
@@ -447,7 +511,7 @@ pub fn list_thread_replies(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT
             msg_key, conv_key, msg_id, parent_msg_id, reply_to_id, reply_to_author, reply_to_preview,
@@ -473,7 +537,7 @@ pub fn get_message(
     conv_key: &str,
     msg_id: &str,
 ) -> Result<Option<MessageItem>> {
-    conn.query_row(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT
             msg_key, conv_key, msg_id, parent_msg_id, reply_to_id, reply_to_author, reply_to_preview,
@@ -483,11 +547,10 @@ pub fn get_message(
         FROM messages
         WHERE conv_key = ?1 AND msg_id = ?2
         ",
-        params![conv_key, msg_id],
-        map_message_row,
-    )
-    .optional()
-    .map_err(Into::into)
+    )?;
+    stmt.query_row(params![conv_key, msg_id], map_message_row)
+        .optional()
+        .map_err(Into::into)
 }
 
 pub fn get_thread(
@@ -516,7 +579,7 @@ pub fn list_mentions_for_user(
         return Ok(Vec::new());
     }
     let pattern = format!("%{}%", escape_like(my_user_id));
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT
             msg_key, conv_key, msg_id, parent_msg_id, reply_to_id, reply_to_author, reply_to_preview,
@@ -548,7 +611,7 @@ pub fn upsert_members(conn: &mut Connection, conv_key: &str, members: &[MemberIn
     }
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "
             INSERT INTO members (conv_key, user_id, member_id, display_name, email, roles_json)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -576,7 +639,7 @@ pub fn upsert_members(conn: &mut Connection, conv_key: &str, members: &[MemberIn
 }
 
 pub fn list_members(conn: &Connection, conv_key: &str) -> Result<Vec<MemberInfo>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT
             m.user_id, m.member_id, m.display_name, m.email, m.roles_json,
@@ -621,7 +684,7 @@ pub fn upsert_presences(conn: &mut Connection, presences: &[PresenceStatus]) -> 
     let now = chrono::Utc::now().to_rfc3339();
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "
             INSERT INTO presences (user_id, availability, activity, updated_at)
             VALUES (?1, ?2, ?3, ?4)
@@ -640,7 +703,7 @@ pub fn upsert_presences(conn: &mut Connection, presences: &[PresenceStatus]) -> 
 }
 
 pub fn get_presences(conn: &Connection) -> Result<HashMap<String, PresenceStatus>> {
-    let mut stmt = conn.prepare("SELECT user_id, availability, activity FROM presences")?;
+    let mut stmt = conn.prepare_cached("SELECT user_id, availability, activity FROM presences")?;
     let rows = stmt.query_map([], |row| {
         Ok(PresenceStatus {
             user_id: row.get(0)?,
@@ -657,24 +720,23 @@ pub fn get_presences(conn: &Connection) -> Result<HashMap<String, PresenceStatus
 }
 
 pub fn get_sync_cursor(conn: &Connection, scope_key: &str) -> Result<Option<SyncCursor>> {
-    conn.query_row(
+    let mut stmt = conn.prepare_cached(
         "SELECT scope_key, delta_link, oldest_msg_ts, synced_at FROM sync_cursors WHERE scope_key = ?1",
-        params![scope_key],
-        |row| {
-            Ok(SyncCursor {
-                scope_key: row.get(0)?,
-                delta_link: row.get(1)?,
-                oldest_msg_ts: row.get(2)?,
-                synced_at: row.get(3)?,
-            })
-        },
-    )
+    )?;
+    stmt.query_row(params![scope_key], |row| {
+        Ok(SyncCursor {
+            scope_key: row.get(0)?,
+            delta_link: row.get(1)?,
+            oldest_msg_ts: row.get(2)?,
+            synced_at: row.get(3)?,
+        })
+    })
     .optional()
     .map_err(Into::into)
 }
 
 pub fn save_sync_cursor(conn: &Connection, cursor: &SyncCursor) -> Result<()> {
-    conn.execute(
+    let mut stmt = conn.prepare_cached(
         "
         INSERT INTO sync_cursors (scope_key, delta_link, oldest_msg_ts, synced_at)
         VALUES (?1, ?2, ?3, ?4)
@@ -683,13 +745,13 @@ pub fn save_sync_cursor(conn: &Connection, cursor: &SyncCursor) -> Result<()> {
             oldest_msg_ts = COALESCE(excluded.oldest_msg_ts, sync_cursors.oldest_msg_ts),
             synced_at = excluded.synced_at
         ",
-        params![
-            cursor.scope_key,
-            cursor.delta_link,
-            cursor.oldest_msg_ts,
-            cursor.synced_at,
-        ],
     )?;
+    stmt.execute(params![
+        cursor.scope_key,
+        cursor.delta_link,
+        cursor.oldest_msg_ts,
+        cursor.synced_at,
+    ])?;
     Ok(())
 }
 

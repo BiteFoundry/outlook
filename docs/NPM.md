@@ -39,17 +39,16 @@ and MCP server:
 
 ## Supported platforms
 
-| npm package                   | OS      | CPU   | Rust target                 |
-| ----------------------------- | ------- | ----- | --------------------------- |
-| `@shinick/teams-win32-x64`    | Windows | x64   | `x86_64-pc-windows-msvc`    |
-| `@shinick/teams-win32-arm64`  | Windows | arm64 | `aarch64-pc-windows-msvc`   |
-| `@shinick/teams-darwin-x64`   | macOS   | x64   | `x86_64-apple-darwin`       |
-| `@shinick/teams-darwin-arm64` | macOS   | arm64 | `aarch64-apple-darwin`      |
-| `@shinick/teams-linux-x64`    | Linux   | x64   | `x86_64-unknown-linux-gnu`  |
-| `@shinick/teams-linux-arm64`  | Linux   | arm64 | `aarch64-unknown-linux-gnu` |
+| npm package                   | OS      | CPU   | Rust target                         |
+| ----------------------------- | ------- | ----- | ----------------------------------- |
+| `@shinick/teams-win32-x64`    | Windows | x64   | `x86_64-pc-windows-msvc`            |
+| `@shinick/teams-win32-arm64`  | Windows | arm64 | `aarch64-pc-windows-msvc`           |
+| `@shinick/teams-darwin-x64`   | macOS   | x64   | `x86_64-apple-darwin`               |
+| `@shinick/teams-darwin-arm64` | macOS   | arm64 | `aarch64-apple-darwin`              |
+| `@shinick/teams-linux-x64`    | Linux   | x64   | `x86_64-unknown-linux-gnu` (2.28)   |
+| `@shinick/teams-linux-arm64`  | Linux   | arm64 | `aarch64-unknown-linux-gnu` (2.28)  |
 
-Linux packages are built against glibc. Alpine/musl users should build from
-source with Cargo; there is no musl package yet.
+Linux packages are cross-compiled in CI with `cargo-zigbuild` against **GLIBC 2.28** (`*.2.28`) and verified with `scripts/verify-glibc.mjs` plus an `almalinux:8` container smoke test, so prebuilt binaries run out of the box on **AlmaLinux 8 / RHEL 8+ / Rocky Linux 8+ / Ubuntu 20.04+ / Debian 10+**. Older glibc distributions (e.g., CentOS 7 with `GLIBC < 2.28`) and Alpine/musl Linux should build from source with Cargo (`cargo build --release`).
 
 ## How resolution works
 
@@ -79,6 +78,7 @@ npm/teams-<platform>/         # one package per platform
   bin/teams[.exe]             # added by scripts/build-npm.mjs, never committed
 scripts/build-npm.mjs         # copy target/<triple>/release/teams[.exe]
 scripts/sync-version.mjs      # Cargo.toml version -> all package.json files
+scripts/verify-glibc.mjs      # verify Linux ELF GLIBC <= 2.28 symbol ceiling
 .github/workflows/release.yml # tag-triggered build, publish, GitHub Release
 ```
 
@@ -102,8 +102,8 @@ version because the root package pins its platform packages exactly.
 Tag the release with a matching `v` prefix:
 
 ```sh
-git tag v0.3.0
-git push origin v0.3.0
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 ## Publishing
@@ -151,6 +151,51 @@ back to `target/release/` when a plain `cargo build --release` was used.
 `--all` attempts every supported target and warns about the ones not built on
 the current host.
 
+## External token brokers & environment variables
+
+When using an external Microsoft Graph token broker (`tc-auth`, `az account get-access-token`, Vault CLI, etc.), configure `token_file` / `token_refresh_cmd` instead of shell wrappers (avoids `cmd.exe` 1023-char `set /p` truncation and `.ps1`/`.cmd` shim issues). Setting `TEAMS_TOKEN_FILE` (`token_file`) or `TEAMS_ACCESS_TOKEN` automatically skips OS keyring reads.
+
+### 1. `config.toml` (recommended persistent setup)
+
+```toml
+token_file = "~/.cursor/tc-auth/access_token"
+token_refresh_cmd = "python ~/.cursor/tc-auth/graph-auth.py refresh"
+token_refresh_mins = 5
+```
+
+### 2. Environment variables
+
+```sh
+export TEAMS_TOKEN_FILE="$HOME/.cursor/tc-auth/access_token"
+export TEAMS_TOKEN_REFRESH_CMD="python $HOME/.cursor/tc-auth/graph-auth.py refresh"
+export TEAMS_TOKEN_REFRESH_MINS=5
+```
+
+### 3. Azure CLI (`az account get-access-token`) JSON/stdout integration
+
+If `token_file` is omitted, `token_refresh_cmd` stdout (raw JWT or Azure CLI camelCase JSON `accessToken` / `expiresOn`) is parsed and cached in memory:
+
+```toml
+token_refresh_cmd = "az account get-access-token --resource https://graph.microsoft.com --output json"
+token_refresh_mins = 5
+```
+
+### Key environment variables
+
+| Variable | Summary |
+| --- | --- |
+| `TEAMS_PERSONA` | Force persona (`teams` \| `outlook` \| `onenote`) |
+| `TEAMS_TOKEN_FILE` | External token file path (raw JWT or JSON; skips OS keyring) |
+| `TEAMS_TOKEN_REFRESH_CMD` | Shell command run to refresh expiring/`401` tokens |
+| `TEAMS_TOKEN_REFRESH_MINS` | Refresh lead window in minutes before expiry (default `5`) |
+| `TEAMS_ACCESS_TOKEN` | Static Bearer token override (automatically skips OS keyring) |
+| `TEAMS_DISABLE_KEYRING=1` | Disable OS keyring and use `credentials.json` only |
+| `TEAMS_CLIENT_ID` | Override Entra ID application client ID |
+| `TEAMS_TENANT_ID` | Override Entra ID tenant ID (default `common`) |
+| `TEAMS_CONFIG_DIR` | Override config/credentials directory |
+| `TEAMS_DATA_DIR` | Override SQLite cache (`cache.db`) directory |
+| `TEAMS_NO_BROWSER` | Disable automatic browser launch during login (`1` / `true`) |
+
 ## Troubleshooting
 
 - **`no prebuilt binary found for <platform>-<arch>`** — the optional
@@ -162,7 +207,7 @@ the current host.
   `os`/`cpu` package. Cross-installing (for example x64 Node on ARM Windows via
   emulation) still reports the Node architecture, so install under the native
   Node build.
-- **Alpine/musl Linux** — unsupported; build with Cargo.
+- **Older Linux (`GLIBC < 2.28`, e.g. CentOS 7) or Alpine/musl Linux** — prebuilt Linux binaries require **GLIBC >= 2.28** (AlmaLinux 8 / RHEL 8+ / Rocky Linux 8+ / Ubuntu 20.04+ / Debian 10+). On older glibc or musl systems, build from source with Cargo (`cargo build --release`).
 - **macOS Gatekeeper** — npm-installed binaries are not notarized. If macOS
   blocks execution, allow the binary in System Settings → Privacy & Security, or
   build from source.

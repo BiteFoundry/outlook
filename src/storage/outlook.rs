@@ -35,7 +35,7 @@ pub fn upsert_mail_folders(conn: &mut Connection, folders: &[MailFolder]) -> Res
     }
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "
             INSERT INTO mail_folders (
                 id, display_name, well_known_name, parent_folder_id,
@@ -65,7 +65,7 @@ pub fn upsert_mail_folders(conn: &mut Connection, folders: &[MailFolder]) -> Res
 }
 
 pub fn list_mail_folders(conn: &Connection) -> Result<Vec<MailFolder>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT
             id, display_name, well_known_name, parent_folder_id,
@@ -97,13 +97,48 @@ pub fn list_mail_folders(conn: &Connection) -> Result<Vec<MailFolder>> {
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
 }
 
+struct ExistingMailRow {
+    folder_id: Option<String>,
+    subject: String,
+    from_display: String,
+    received_at: String,
+    is_read: i32,
+    is_draft: i32,
+    flagged: i32,
+    importance: String,
+    has_attachments: i32,
+    preview: String,
+    body_html: String,
+    body_plain: String,
+    attachments_json: String,
+    conversation_id: Option<String>,
+    from_json: Option<String>,
+    to_json: String,
+    cc_json: String,
+    bcc_json: String,
+    sent_at: Option<String>,
+    web_link: Option<String>,
+}
+
 pub fn upsert_mail_messages(conn: &mut Connection, messages: &[MailMessage]) -> Result<usize> {
     if messages.is_empty() {
         return Ok(0);
     }
     let tx = conn.transaction()?;
     {
-        let mut msg_stmt = tx.prepare(
+        let mut check_stmt = tx.prepare_cached(
+            "
+            SELECT
+                folder_id, subject, from_display, received_at,
+                is_read, is_draft, flagged, importance,
+                has_attachments, preview, body_html, body_plain, attachments_json,
+                conversation_id, from_json, to_json, cc_json, bcc_json, sent_at, web_link
+            FROM mail_messages
+            WHERE id = ?1
+            ",
+        )?;
+
+        let mut msg_stmt = tx.prepare_cached(
             "
             INSERT INTO mail_messages (
                 id, conversation_id, folder_id, subject, from_json,
@@ -167,8 +202,8 @@ pub fn upsert_mail_messages(conn: &mut Connection, messages: &[MailMessage]) -> 
             ",
         )?;
 
-        let mut fts_del_stmt = tx.prepare("DELETE FROM mail_fts WHERE msg_id = ?1")?;
-        let mut fts_ins_stmt = tx.prepare(
+        let mut fts_del_stmt = tx.prepare_cached("DELETE FROM mail_fts WHERE msg_id = ?1")?;
+        let mut fts_ins_stmt = tx.prepare_cached(
             "
             INSERT INTO mail_fts (msg_id, folder_id, subject, from_display, body_plain)
             SELECT id, COALESCE(folder_id, ''), subject, from_display, body_plain
@@ -188,6 +223,110 @@ pub fn upsert_mail_messages(conn: &mut Connection, messages: &[MailMessage]) -> 
             let bcc_json = serde_json::to_string(&msg.bcc_recipients)?;
             let attachments_json = serde_json::to_string(&msg.attachments)?;
             let from_display = msg.from_display();
+            let is_read_i = bool_to_i32(msg.is_read);
+            let is_draft_i = bool_to_i32(msg.is_draft);
+            let flagged_i = bool_to_i32(msg.flagged);
+            let has_att_i = bool_to_i32(msg.has_attachments);
+
+            let existing = check_stmt
+                .query_row(params![&msg.id], |row| {
+                    Ok(ExistingMailRow {
+                        folder_id: row.get(0)?,
+                        subject: row.get(1)?,
+                        from_display: row.get(2)?,
+                        received_at: row.get(3)?,
+                        is_read: row.get(4)?,
+                        is_draft: row.get(5)?,
+                        flagged: row.get(6)?,
+                        importance: row.get(7)?,
+                        has_attachments: row.get(8)?,
+                        preview: row.get(9)?,
+                        body_html: row.get(10)?,
+                        body_plain: row.get(11)?,
+                        attachments_json: row.get(12)?,
+                        conversation_id: row.get(13)?,
+                        from_json: row.get(14)?,
+                        to_json: row.get(15)?,
+                        cc_json: row.get(16)?,
+                        bcc_json: row.get(17)?,
+                        sent_at: row.get(18)?,
+                        web_link: row.get(19)?,
+                    })
+                })
+                .optional()?;
+
+            let fts_unchanged = if let Some(ref ex) = existing {
+                let eff_folder_id = msg.folder_id.as_deref().or(ex.folder_id.as_deref());
+                let eff_conversation_id = msg
+                    .conversation_id
+                    .as_deref()
+                    .or(ex.conversation_id.as_deref());
+                let eff_from_json = from_json.as_deref().or(ex.from_json.as_deref());
+                let eff_sent_at = msg.sent_at.as_deref().or(ex.sent_at.as_deref());
+                let eff_web_link = msg.web_link.as_deref().or(ex.web_link.as_deref());
+                let keep_existing_att = attachments_json == "[]"
+                    && ex.attachments_json != "[]"
+                    && !ex.attachments_json.is_empty();
+                let eff_attachments_json = if keep_existing_att {
+                    ex.attachments_json.as_str()
+                } else {
+                    attachments_json.as_str()
+                };
+                let eff_has_attachments = if msg.has_attachments || keep_existing_att {
+                    1i32
+                } else {
+                    0i32
+                };
+                let eff_preview = if msg.preview.is_empty() && !ex.preview.is_empty() {
+                    ex.preview.as_str()
+                } else {
+                    msg.preview.as_str()
+                };
+                let eff_body_html = if msg.body_html.is_empty() && !ex.body_html.is_empty() {
+                    ex.body_html.as_str()
+                } else {
+                    msg.body_html.as_str()
+                };
+                let eff_body_plain = if msg.body_html.is_empty()
+                    && !ex.body_html.is_empty()
+                    && !ex.body_plain.is_empty()
+                {
+                    ex.body_plain.as_str()
+                } else {
+                    msg.body_plain.as_str()
+                };
+
+                let row_unchanged = eff_folder_id == ex.folder_id.as_deref()
+                    && msg.subject == ex.subject
+                    && from_display == ex.from_display
+                    && msg.received_at == ex.received_at
+                    && is_read_i == ex.is_read
+                    && is_draft_i == ex.is_draft
+                    && flagged_i == ex.flagged
+                    && msg.importance == ex.importance
+                    && eff_has_attachments == ex.has_attachments
+                    && eff_preview == ex.preview
+                    && eff_body_html == ex.body_html
+                    && eff_body_plain == ex.body_plain
+                    && eff_attachments_json == ex.attachments_json
+                    && eff_conversation_id == ex.conversation_id.as_deref()
+                    && eff_from_json == ex.from_json.as_deref()
+                    && to_json == ex.to_json
+                    && cc_json == ex.cc_json
+                    && bcc_json == ex.bcc_json
+                    && eff_sent_at == ex.sent_at.as_deref()
+                    && eff_web_link == ex.web_link.as_deref();
+                if row_unchanged {
+                    continue;
+                }
+
+                eff_folder_id.unwrap_or("") == ex.folder_id.as_deref().unwrap_or("")
+                    && msg.subject == ex.subject
+                    && from_display == ex.from_display
+                    && eff_body_plain == ex.body_plain
+            } else {
+                false
+            };
 
             msg_stmt.execute(params![
                 msg.id,
@@ -201,11 +340,11 @@ pub fn upsert_mail_messages(conn: &mut Connection, messages: &[MailMessage]) -> 
                 from_display,
                 msg.received_at,
                 msg.sent_at,
-                bool_to_i32(msg.is_read),
-                bool_to_i32(msg.is_draft),
-                bool_to_i32(msg.flagged),
+                is_read_i,
+                is_draft_i,
+                flagged_i,
                 msg.importance,
-                bool_to_i32(msg.has_attachments),
+                has_att_i,
                 msg.preview,
                 msg.body_html,
                 msg.body_plain,
@@ -213,8 +352,10 @@ pub fn upsert_mail_messages(conn: &mut Connection, messages: &[MailMessage]) -> 
                 msg.web_link,
             ])?;
 
-            fts_del_stmt.execute(params![msg.id])?;
-            fts_ins_stmt.execute(params![msg.id])?;
+            if !fts_unchanged {
+                fts_del_stmt.execute(params![msg.id])?;
+                fts_ins_stmt.execute(params![msg.id])?;
+            }
         }
     }
     tx.commit()?;
@@ -243,7 +384,7 @@ pub fn list_mail_messages(
             LIMIT ?2
             "
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![folder, limit as i64], map_mail_message_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     } else {
@@ -255,7 +396,7 @@ pub fn list_mail_messages(
             LIMIT ?1
             "
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![limit as i64], map_mail_message_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
@@ -269,7 +410,8 @@ pub fn get_mail_message(conn: &Connection, message_id: &str) -> Result<Option<Ma
         WHERE m.id = ?1
         "
     );
-    conn.query_row(&sql, params![message_id], map_mail_message_row)
+    let mut stmt = conn.prepare_cached(&sql)?;
+    stmt.query_row(params![message_id], map_mail_message_row)
         .optional()
         .map_err(Into::into)
 }
@@ -280,8 +422,8 @@ pub fn delete_mail_messages_by_ids(conn: &mut Connection, ids: &[String]) -> Res
     }
     let tx = conn.transaction()?;
     {
-        let mut del_msg = tx.prepare("DELETE FROM mail_messages WHERE id = ?1")?;
-        let mut del_fts = tx.prepare("DELETE FROM mail_fts WHERE msg_id = ?1")?;
+        let mut del_msg = tx.prepare_cached("DELETE FROM mail_messages WHERE id = ?1")?;
+        let mut del_fts = tx.prepare_cached("DELETE FROM mail_fts WHERE msg_id = ?1")?;
         for id in ids {
             del_msg.execute(params![id])?;
             del_fts.execute(params![id])?;
@@ -323,7 +465,7 @@ pub fn upsert_calendar_events(conn: &mut Connection, events: &[CalendarEvent]) -
     }
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "
             INSERT INTO calendar_events (
                 id, subject, start_iso, end_iso, time_zone, is_all_day,
@@ -396,7 +538,7 @@ pub fn list_calendar_events(
 
     match (start, end) {
         (Some(s), Some(e)) => {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "
                 SELECT
                     id, subject, start_iso, end_iso, time_zone, is_all_day,
@@ -414,7 +556,7 @@ pub fn list_calendar_events(
             rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
         }
         (Some(s), None) => {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "
                 SELECT
                     id, subject, start_iso, end_iso, time_zone, is_all_day,
@@ -431,7 +573,7 @@ pub fn list_calendar_events(
             rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
         }
         (None, Some(e)) => {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "
                 SELECT
                     id, subject, start_iso, end_iso, time_zone, is_all_day,
@@ -448,7 +590,7 @@ pub fn list_calendar_events(
             rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
         }
         (None, None) => {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "
                 SELECT
                     id, subject, start_iso, end_iso, time_zone, is_all_day,
@@ -467,7 +609,8 @@ pub fn list_calendar_events(
 }
 
 pub fn delete_calendar_event(conn: &Connection, event_id: &str) -> Result<()> {
-    conn.execute("DELETE FROM calendar_events WHERE id = ?1", params![event_id])?;
+    let mut stmt = conn.prepare_cached("DELETE FROM calendar_events WHERE id = ?1")?;
+    stmt.execute(params![event_id])?;
     Ok(())
 }
 
@@ -477,7 +620,7 @@ pub fn upsert_contacts(conn: &mut Connection, contacts: &[ContactItem]) -> Resul
     }
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "
             INSERT INTO contacts (
                 id, display_name, given_name, surname, emails_json,
@@ -532,7 +675,7 @@ pub fn list_contacts(
     let q = query.map(str::trim).filter(|s| !s.is_empty());
     if let Some(q_str) = q {
         let pattern = format!("%{}%", escape_like(&q_str.to_lowercase()));
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 id, display_name, given_name, surname, emails_json,
@@ -554,7 +697,7 @@ pub fn list_contacts(
         let rows = stmt.query_map(params![pattern, limit as i64], map_contact_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     } else {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 id, display_name, given_name, surname, emails_json,
@@ -571,7 +714,8 @@ pub fn list_contacts(
 }
 
 pub fn delete_contact(conn: &Connection, contact_id: &str) -> Result<()> {
-    conn.execute("DELETE FROM contacts WHERE id = ?1", params![contact_id])?;
+    let mut stmt = conn.prepare_cached("DELETE FROM contacts WHERE id = ?1")?;
+    stmt.execute(params![contact_id])?;
     Ok(())
 }
 
@@ -581,7 +725,7 @@ pub fn upsert_todo_lists(conn: &mut Connection, lists: &[TodoList]) -> Result<()
     }
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "
             INSERT INTO todo_lists (id, display_name, wellknown_list_name, is_owner, is_shared)
             VALUES (?1, ?2, ?3, ?4, ?5)
@@ -607,7 +751,7 @@ pub fn upsert_todo_lists(conn: &mut Connection, lists: &[TodoList]) -> Result<()
 }
 
 pub fn list_todo_lists(conn: &Connection) -> Result<Vec<TodoList>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT id, display_name, wellknown_list_name, is_owner, is_shared
         FROM todo_lists
@@ -637,7 +781,7 @@ pub fn upsert_todo_tasks(conn: &mut Connection, tasks: &[TodoTask]) -> Result<()
     }
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "
             INSERT INTO todo_tasks (
                 id, list_id, title, status, importance, body_plain,
@@ -711,13 +855,14 @@ pub fn list_todo_tasks(
         LIMIT ?2
         "
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(params![list_id, limit as i64], map_todo_task_row)?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
 }
 
 pub fn delete_todo_task(conn: &Connection, task_id: &str) -> Result<()> {
-    conn.execute("DELETE FROM todo_tasks WHERE id = ?1", params![task_id])?;
+    let mut stmt = conn.prepare_cached("DELETE FROM todo_tasks WHERE id = ?1")?;
+    stmt.execute(params![task_id])?;
     Ok(())
 }
 
@@ -741,7 +886,7 @@ fn run_mail_fts_search(
             LIMIT ?3
             "
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![folder, fts_query, limit as i64], |row| {
             map_mail_search_hit_row(row, raw_query)
         })?;
@@ -757,7 +902,7 @@ fn run_mail_fts_search(
             LIMIT ?2
             "
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
             map_mail_search_hit_row(row, raw_query)
         })?;
@@ -789,7 +934,7 @@ fn run_mail_like_search(
             LIMIT ?3
             "
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![folder, pattern, limit as i64], |row| {
             map_mail_search_hit_row(row, raw_query)
         })?;
@@ -809,7 +954,7 @@ fn run_mail_like_search(
             LIMIT ?2
             "
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![pattern, limit as i64], |row| {
             map_mail_search_hit_row(row, raw_query)
         })?;
@@ -1399,5 +1544,76 @@ mod tests {
         assert_eq!(with_done[0].id, "t1");
         storage.delete_todo_task("t1").unwrap();
         assert_eq!(storage.list_todo_tasks("list-1", true, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_mail_upsert_idempotency_and_fts_skip() {
+        let storage = Storage::open_in_memory().unwrap();
+        let mut msg = sample_mail(
+            "m-idem",
+            "fld-inbox",
+            "초기 메일 제목",
+            "홍길동",
+            "hong@example.com",
+            "2026-11-15T10:00:00Z",
+            "<p>Kubernetes 장애 대응</p>",
+            "Kubernetes 장애 대응",
+        );
+        assert_eq!(storage.upsert_mail_messages(&[msg.clone()]).unwrap(), 1);
+        assert_eq!(
+            storage
+                .search_mail_messages("Kubernetes", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Identical re-upsert performs 0 SQLite row modifications.
+        let changes_before_noop = storage.conn().lock().unwrap().total_changes();
+        assert_eq!(storage.upsert_mail_messages(&[msg.clone()]).unwrap(), 1);
+        let changes_after_noop = storage.conn().lock().unwrap().total_changes();
+        assert_eq!(changes_after_noop - changes_before_noop, 0);
+        assert_eq!(
+            storage
+                .search_mail_messages("Kubernetes", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Read/flag toggle updates mail_messages (1 change) without touching mail_fts.
+        msg.is_read = true;
+        msg.flagged = true;
+        let changes_before_flag = storage.conn().lock().unwrap().total_changes();
+        assert_eq!(storage.upsert_mail_messages(&[msg.clone()]).unwrap(), 1);
+        let changes_after_flag = storage.conn().lock().unwrap().total_changes();
+        assert_eq!(changes_after_flag - changes_before_flag, 1);
+        let loaded = storage.get_mail_message("m-idem").unwrap().unwrap();
+        assert!(loaded.is_read && loaded.flagged);
+        assert_eq!(
+            storage
+                .search_mail_messages("Kubernetes", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Subject & body update refreshes mail_fts too.
+        msg.subject = "수정된 메일 제목".to_string();
+        msg.preview = "PostgreSQL 점검 보고".to_string();
+        msg.body_plain = "PostgreSQL 점검 보고".to_string();
+        msg.body_html = "<p>PostgreSQL 점검 보고</p>".to_string();
+        storage.upsert_mail_messages(&[msg]).unwrap();
+        assert!(storage
+            .search_mail_messages("Kubernetes", None, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            storage
+                .search_mail_messages("PostgreSQL", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

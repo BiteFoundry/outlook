@@ -12,6 +12,11 @@ pub mod presence;
 pub mod teams;
 pub mod todo;
 
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
+
 use anyhow::Result;
 
 use crate::{
@@ -26,29 +31,41 @@ pub struct GraphClient {
     config: AppConfig,
     http: reqwest::Client,
     my_user_id: Option<String>,
+    cached_my_user_id: Arc<OnceLock<String>>,
 }
 
 impl GraphClient {
     pub fn new(config: AppConfig, auth: AuthManager) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(concat!("teams-cli/", env!("CARGO_PKG_VERSION")))
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(Duration::from_secs(60))
+            .tcp_nodelay(true)
+            .pool_max_idle_per_host(16)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(30))
             .build()?;
         Ok(Self {
             auth,
             config,
             http,
             my_user_id: None,
+            cached_my_user_id: Arc::new(OnceLock::new()),
         })
     }
 
     pub fn with_my_user_id(mut self, user_id: impl Into<String>) -> Self {
-        self.my_user_id = Some(user_id.into());
+        let uid = user_id.into();
+        let lock = OnceLock::new();
+        let _ = lock.set(uid.clone());
+        self.cached_my_user_id = Arc::new(lock);
+        self.my_user_id = Some(uid);
         self
     }
 
     pub fn my_user_id(&self) -> Option<&str> {
-        self.my_user_id.as_deref()
+        self.my_user_id
+            .as_deref()
+            .or_else(|| self.cached_my_user_id.get().map(String::as_str))
     }
 
     pub fn auth(&self) -> &AuthManager {

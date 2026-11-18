@@ -9,7 +9,7 @@ use crate::{
     ui::{
         action::Action,
         app::Focus,
-        nav_pane::{TAB_CALENDAR, TAB_CONTACTS, TAB_MAIL, TAB_TODO},
+        nav_pane::{TAB_CALENDAR, TAB_CONTACTS, TAB_MAIL, TAB_NOTES, TAB_TODO},
         overlays::OverlayKind,
     },
 };
@@ -222,8 +222,10 @@ impl Keymap {
         map.bind(any, Char('5'), M::CONTROL, Action::SelectNavTab(4));
         map.bind(any, Char('6'), M::CONTROL, Action::SelectNavTab(5));
         map.bind(any, Char('7'), M::CONTROL, Action::SelectNavTab(6));
+        map.bind(any, Char('8'), M::CONTROL, Action::SelectNavTab(7));
         map.bind(any, Char('t'), M::ALT, Action::SwitchPersona(Persona::Teams));
         map.bind(any, Char('o'), M::ALT, Action::SwitchPersona(Persona::Outlook));
+        map.bind(any, Char('n'), M::ALT, Action::SwitchPersona(Persona::OneNote));
         map.bind(any, Char('v'), M::NONE, Action::OpenImagePreview);
 
         // Overlays & Teams actions
@@ -382,6 +384,25 @@ fn resolve_outlook_tab_key(active_nav_tab: usize, key: KeyEvent) -> Option<Actio
             Delete => Some(Action::TodoDeleteRequest),
             _ => None,
         },
+        TAB_NOTES => match key.code {
+            Char(' ') | Char('x') => Some(Action::OnenoteToggleTodo),
+            Char('n') => Some(Action::OnenoteOpenCreatePage { subpage: false }),
+            Char('N') => Some(Action::OnenoteOpenCreatePage { subpage: true }),
+            Char('S') => Some(Action::OnenoteOpenCreateSection),
+            Char('B') => Some(Action::OnenoteOpenCreateNotebook),
+            Char('a') => Some(Action::OnenoteOpenAppendBlock),
+            Char('e') => Some(Action::OnenoteOpenEditBlock),
+            Char('E') => Some(Action::OnenoteOpenEditFullPage),
+            Char('[') => Some(Action::OnenoteCycleSection(-1)),
+            Char(']') => Some(Action::OnenoteCycleSection(1)),
+            Char('J') => Some(Action::OnenoteCyclePage(1)),
+            Char('K') => Some(Action::OnenoteCyclePage(-1)),
+            Char('o') => Some(Action::OnenoteOpenWeb),
+            Char('r') => Some(Action::OnenoteRefresh),
+            Char('d') | Delete => Some(Action::OnenoteDeletePageRequest),
+            Char('D') => Some(Action::OnenoteDownloadAttachment),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -444,6 +465,59 @@ mod tests {
         assert_eq!(
             map.resolve(Focus::Chat, key(KeyCode::Char('e'), KeyModifiers::NONE)),
             Some(Action::OpenReactionsForSelected)
+        );
+    }
+
+    #[test]
+    fn onenote_tab_and_persona_shortcuts_map_correctly() {
+        let map = Keymap::default_teams();
+        assert_eq!(
+            map.resolve(Focus::Nav, key(KeyCode::Char('8'), KeyModifiers::CONTROL)),
+            Some(Action::SelectNavTab(7))
+        );
+        assert_eq!(
+            map.resolve(Focus::Nav, key(KeyCode::Char('n'), KeyModifiers::ALT)),
+            Some(Action::SwitchPersona(Persona::OneNote))
+        );
+        assert_eq!(
+            map.resolve_for_tab(
+                Focus::Chat,
+                TAB_NOTES,
+                key(KeyCode::Char(' '), KeyModifiers::NONE)
+            ),
+            Some(Action::OnenoteToggleTodo)
+        );
+        assert_eq!(
+            map.resolve_for_tab(
+                Focus::Chat,
+                TAB_NOTES,
+                key(KeyCode::Char('n'), KeyModifiers::NONE)
+            ),
+            Some(Action::OnenoteOpenCreatePage { subpage: false })
+        );
+        assert_eq!(
+            map.resolve_for_tab(
+                Focus::Chat,
+                TAB_NOTES,
+                key(KeyCode::Char('N'), KeyModifiers::SHIFT)
+            ),
+            Some(Action::OnenoteOpenCreatePage { subpage: true })
+        );
+        assert_eq!(
+            map.resolve_for_tab(
+                Focus::Chat,
+                TAB_NOTES,
+                key(KeyCode::Char('e'), KeyModifiers::NONE)
+            ),
+            Some(Action::OnenoteOpenEditBlock)
+        );
+        assert_eq!(
+            map.resolve_for_tab(
+                Focus::Chat,
+                TAB_NOTES,
+                key(KeyCode::Char('E'), KeyModifiers::SHIFT)
+            ),
+            Some(Action::OnenoteOpenEditFullPage)
         );
     }
 }

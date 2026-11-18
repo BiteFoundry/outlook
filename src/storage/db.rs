@@ -6,17 +6,28 @@ use rusqlite::Connection;
 /// Initializes SQLite PRAGMAs, tables, indexes, and FTS5 virtual table.
 /// Returns `true` if `messages_fts` uses the `trigram` tokenizer, `false` if using `unicode61`.
 pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
+    conn.set_prepared_statement_cache_capacity(64);
     if !is_memory {
-        let _ = conn.execute_batch("PRAGMA journal_mode = WAL;");
+        let _ = conn.execute_batch(
+            "
+            PRAGMA journal_mode = WAL;
+            PRAGMA journal_size_limit = 67108864;
+            ",
+        );
     }
     conn.execute_batch(
         "
         PRAGMA synchronous = NORMAL;
         PRAGMA foreign_keys = ON;
         PRAGMA busy_timeout = 5000;
+        PRAGMA temp_store = MEMORY;
+        PRAGMA cache_size = -16000;
         ",
     )
     .context("SQLite PRAGMA 설정 실패")?;
+    if !is_memory {
+        let _ = conn.execute_batch("PRAGMA mmap_size = 67108864;");
+    }
 
     conn.execute_batch(
         "
@@ -38,6 +49,9 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             peer_user_id TEXT,
             web_url TEXT
         );
+
+        CREATE INDEX IF NOT EXISTS idx_conversations_sort
+            ON conversations(pinned DESC, last_updated_at DESC);
 
         CREATE TABLE IF NOT EXISTS teams (
             team_id TEXT PRIMARY KEY,
@@ -77,6 +91,9 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
 
         CREATE INDEX IF NOT EXISTS idx_messages_conv_msg
             ON messages(conv_key, msg_id);
+
+        CREATE INDEX IF NOT EXISTS idx_messages_created
+            ON messages(created_at DESC);
 
         CREATE TABLE IF NOT EXISTS members (
             conv_key TEXT NOT NULL,
@@ -363,6 +380,22 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
     )?;
 
     Ok(messages_trigram && mail_trigram && onenote_trigram)
+}
+
+/// Configures a read-only WAL reader connection for concurrent UI reads.
+pub fn init_reader_connection(conn: &Connection) -> Result<()> {
+    conn.set_prepared_statement_cache_capacity(64);
+    conn.execute_batch(
+        "
+        PRAGMA query_only = ON;
+        PRAGMA busy_timeout = 5000;
+        PRAGMA temp_store = MEMORY;
+        PRAGMA cache_size = -16000;
+        ",
+    )
+    .context("SQLite reader PRAGMA 설정 실패")?;
+    let _ = conn.execute_batch("PRAGMA mmap_size = 67108864;");
+    Ok(())
 }
 
 fn ensure_fts5_table(

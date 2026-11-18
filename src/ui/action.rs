@@ -268,6 +268,15 @@ pub enum Action {
     OnenoteOpenCreateNotebook,
     OnenoteOpenCreateSection,
     OnenoteOpenCreatePage { subpage: bool },
+    OnenoteOpenAppendBlock,
+    OnenoteOpenEditBlock,
+    OnenoteOpenEditFullPage,
+    OnenoteToggleTodo,
+    OnenoteCycleSection(isize),
+    OnenoteCyclePage(isize),
+    OnenoteOpenWeb,
+    OnenoteRefresh,
+    OnenoteDeletePageRequest,
     OnenoteCreateNotebook {
         display_name: String,
     },
@@ -456,7 +465,9 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             ui.todo_input_active = false;
             ui.narrow_pane = NarrowPane::List;
             ui.set_focus(Focus::Nav);
-            if ui.active_nav_tab >= TAB_MAIL {
+            if ui.active_nav_tab == TAB_NOTES {
+                ui.persona = Persona::OneNote;
+            } else if ui.active_nav_tab >= TAB_MAIL {
                 ui.persona = Persona::Outlook;
             } else {
                 ui.persona = Persona::Teams;
@@ -506,6 +517,8 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 let _ = dispatch(Action::NavFirst, app, ui);
             }
             Focus::Thread => ui.thread_scroll.top(),
+            _ if ui.active_nav_tab == TAB_NOTES => ui.onenote_scroll.top(),
+            _ if ui.active_nav_tab >= TAB_MAIL => ui.mail_scroll.top(),
             _ => ui.chat_scroll.top(),
         },
         Action::ScrollBottom => match ui.focus() {
@@ -513,6 +526,8 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 let _ = dispatch(Action::NavLast, app, ui);
             }
             Focus::Thread => ui.thread_scroll.bottom(),
+            _ if ui.active_nav_tab == TAB_NOTES => ui.onenote_scroll.bottom(),
+            _ if ui.active_nav_tab >= TAB_MAIL => ui.mail_scroll.bottom(),
             _ => ui.chat_scroll.bottom(),
         },
         Action::Activate => handle_activate(app, ui),
@@ -712,7 +727,21 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             }
         }
         Action::CopySelectedMessage | Action::CopyFocused => {
-            if let Some((scope, msg_index)) = selected_message_scope_and_index(app, ui) {
+            if ui.active_nav_tab == TAB_NOTES {
+                if let Some(detail) = app.active_page_detail.as_ref() {
+                    let md = detail
+                        .blocks
+                        .get(ui.onenote_selected_block)
+                        .map(|b| {
+                            crate::parser::onenote::onenote_blocks_to_markdown(
+                                std::slice::from_ref(b),
+                            )
+                        })
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| detail.body_markdown.clone());
+                    copy_to_clipboard(&md, ui);
+                }
+            } else if let Some((scope, msg_index)) = selected_message_scope_and_index(app, ui) {
                 let _ = dispatch(Action::CopyMessage { scope, msg_index }, app, ui);
             }
         }
@@ -859,8 +888,9 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::RefreshAll => {
             app.sync_ctrl.request(SyncCommand::RefreshConversations);
             app.sync_ctrl.request(SyncCommand::RefreshOutlook);
+            app.sync_ctrl.request(SyncCommand::RefreshOneNote);
             app.sync_ctrl.request(SyncCommand::SyncActiveNow);
-            ui.info("Teams · Outlook 목록과 메시지를 새로고침합니다...");
+            ui.info("Teams · Outlook · OneNote 동기화를 새로고침합니다...");
         }
         Action::SyncHistory => {
             if let Some(ConversationTarget::Channel {
@@ -982,7 +1012,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     ui.info("Teams 워크스페이스 모드로 전환했습니다");
                 }
                 Persona::Outlook => {
-                    if ui.active_nav_tab < TAB_MAIL {
+                    if ui.active_nav_tab < TAB_MAIL || ui.active_nav_tab == TAB_NOTES {
                         ui.active_nav_tab = TAB_MAIL;
                         ui.nav_selected = 0;
                     }
@@ -1281,6 +1311,34 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::OnenoteOpenCreatePage { subpage } => {
             app.open_onenote_create_page(ui, subpage);
         }
+        Action::OnenoteOpenAppendBlock => {
+            open_onenote_append_form(app, ui);
+        }
+        Action::OnenoteOpenEditBlock => {
+            open_onenote_edit_block_form(app, ui);
+        }
+        Action::OnenoteOpenEditFullPage => {
+            open_onenote_edit_page_form(app, ui);
+        }
+        Action::OnenoteToggleTodo => {
+            let idx = ui.onenote_selected_block;
+            app.toggle_onenote_todo(ui, idx);
+        }
+        Action::OnenoteCycleSection(delta) => {
+            app.cycle_onenote_section(ui, delta);
+        }
+        Action::OnenoteCyclePage(delta) => {
+            app.cycle_onenote_page(ui, delta);
+        }
+        Action::OnenoteOpenWeb => {
+            app.open_active_onenote_in_browser(ui);
+        }
+        Action::OnenoteRefresh => {
+            app.refresh_onenote(ui);
+        }
+        Action::OnenoteDeletePageRequest => {
+            request_onenote_page_delete(app, ui);
+        }
         Action::OnenoteCreateNotebook { display_name } => {
             app.create_onenote_notebook(ui, display_name);
         }
@@ -1317,7 +1375,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             app.delete_active_onenote_page(ui);
         }
         Action::OnenoteDownloadAttachment => {
-            ui.info("미리보기에서 저장하세요");
+            download_selected_onenote_attachment(app, ui);
         }
     }
 
@@ -1338,6 +1396,7 @@ fn open_overlay(kind: OverlayKind, app: &mut AppState, ui: &mut UiState) {
             let scope = match ui.active_nav_tab {
                 TAB_MAIL => SearchScope::Mail,
                 TAB_CONTACTS => SearchScope::Contacts,
+                TAB_NOTES => SearchScope::Notes,
                 _ => SearchScope::TeamsMessages,
             };
             Overlay::Search(SearchOverlay::with_scope(scope))
@@ -1367,6 +1426,21 @@ fn open_overlay(kind: OverlayKind, app: &mut AppState, ui: &mut UiState) {
 }
 
 fn open_image_preview(app: &mut AppState, ui: &mut UiState) {
+    if ui.active_nav_tab == TAB_NOTES {
+        let pref = app
+            .active_page_detail
+            .as_ref()
+            .and_then(|d| d.blocks.get(ui.onenote_selected_block))
+            .and_then(|b| match b.kind {
+                crate::models::OnenoteBlockKind::Image { resource_index, .. } => {
+                    Some(resource_index)
+                }
+                _ => None,
+            });
+        open_onenote_image_preview(app, ui, pref);
+        return;
+    }
+
     let preview_opt = if ui.active_nav_tab == TAB_MAIL {
         app.active_mail()
             .and_then(|mail| ImagePreviewOverlay::from_mail_message(mail, Some(ui.mail_attach_index)))
@@ -1469,6 +1543,26 @@ fn move_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
             ui.nav_selected = next;
         }
         Focus::Chat => {
+            if ui.active_nav_tab == TAB_NOTES {
+                let len = app
+                    .active_page_detail
+                    .as_ref()
+                    .map(|d| d.blocks.len())
+                    .unwrap_or(0);
+                if len == 0 {
+                    if delta < 0 {
+                        ui.onenote_scroll.scroll_up((-delta) as u16);
+                    } else if delta > 0 {
+                        ui.onenote_scroll.scroll_down(delta as u16);
+                    }
+                    return;
+                }
+                let cur = ui.onenote_selected_block.min(len - 1) as i32;
+                let next = (cur + delta).clamp(0, (len - 1) as i32) as usize;
+                ui.onenote_selected_block = next;
+                ui.onenote_follow_selection = true;
+                return;
+            }
             if ui.active_nav_tab >= TAB_MAIL {
                 if delta < 0 {
                     ui.mail_scroll.scroll_up((-delta) as u16);
@@ -1515,6 +1609,7 @@ fn move_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
 fn scroll_focused(ui: &mut UiState, delta: i32) {
     let target = match ui.focus() {
         Focus::Thread => &mut ui.thread_scroll,
+        _ if ui.active_nav_tab == TAB_NOTES => &mut ui.onenote_scroll,
         _ if ui.active_nav_tab >= TAB_MAIL => &mut ui.mail_scroll,
         _ => &mut ui.chat_scroll,
     };
@@ -1544,6 +1639,37 @@ fn handle_activate(app: &mut AppState, ui: &mut UiState) {
                 }
                 TAB_TODO => {
                     app.toggle_active_todo_completed(ui);
+                }
+                TAB_NOTES => {
+                    let idx = ui.onenote_selected_block;
+                    if let Some(block) = app
+                        .active_page_detail
+                        .as_ref()
+                        .and_then(|d| d.blocks.get(idx))
+                        .cloned()
+                    {
+                        match block.kind {
+                            crate::models::OnenoteBlockKind::Image { resource_index, .. } => {
+                                open_onenote_image_preview(app, ui, Some(resource_index));
+                            }
+                            crate::models::OnenoteBlockKind::Attachment {
+                                resource_index, ..
+                            } => {
+                                download_selected_onenote_attachment(app, ui);
+                                let _ = resource_index;
+                            }
+                            _ if matches!(
+                                block.tag,
+                                Some(crate::models::OnenoteTagKind::Todo { .. })
+                            ) =>
+                            {
+                                app.toggle_onenote_todo(ui, idx);
+                            }
+                            _ => {
+                                open_onenote_edit_block_form(app, ui);
+                            }
+                        }
+                    }
                 }
                 _ => {
                     if let Some(idx) = selected_chat_index(app, ui) {
@@ -1610,7 +1736,10 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
     let pos = Position { x: column, y: row };
     if ui.thread_drawer_open && ui.thread_scroll.area.contains(pos) {
         ui.set_focus(Focus::Thread);
-    } else if ui.chat_scroll.area.contains(pos) || ui.mail_scroll.area.contains(pos) {
+    } else if ui.chat_scroll.area.contains(pos)
+        || ui.mail_scroll.area.contains(pos)
+        || ui.onenote_scroll.area.contains(pos)
+    {
         ui.set_focus(Focus::Chat);
     }
     false
@@ -1737,8 +1866,15 @@ fn handle_onenote_hit(hit: HitTarget, app: &mut AppState, ui: &mut UiState) -> b
         } => {
             if is_image {
                 open_onenote_image_preview(app, ui, Some(resource_index));
-            } else {
-                ui.info("이미지가 아닌 첨부파일입니다 ('d'로 저장)");
+            } else if let Some(detail) = app.active_page_detail.as_ref().cloned() {
+                if let Some(res) = detail.resources.get(resource_index).cloned() {
+                    app.download_onenote_attachment(
+                        ui,
+                        &detail.summary.page_key,
+                        resource_index,
+                        res,
+                    );
+                }
             }
             true
         }
@@ -1837,24 +1973,45 @@ fn open_onenote_edit_block_form(app: &AppState, ui: &mut UiState) {
     ui.push_overlay(Overlay::OnenoteForm(form));
 }
 
-/// Opens the whole-page markdown edit form (`E`), replacing the page body container.
+/// Launches `$EDITOR` external markdown edit for the whole active OneNote page (`E`).
 fn open_onenote_edit_page_form(app: &AppState, ui: &mut UiState) {
     let Some(detail) = app.active_page_detail.as_ref() else {
         ui.info("먼저 OneNote 페이지를 선택하세요");
         return;
     };
-    let Some(element_id) = detail.primary_div_id.clone() else {
-        ui.info("페이지 본문 컨테이너를 찾을 수 없어 전체 편집을 열 수 없습니다");
+    ui.onenote_external_edit = Some((
+        detail.summary.page_key.clone(),
+        detail.body_markdown.clone(),
+    ));
+}
+
+/// Downloads the resource referenced by the selected block (or first page attachment) (`D`).
+fn download_selected_onenote_attachment(app: &mut AppState, ui: &mut UiState) {
+    let Some(detail) = app.active_page_detail.as_ref().cloned() else {
+        ui.info("먼저 OneNote 페이지를 선택하세요");
         return;
     };
-    let form = OnenoteFormOverlay::edit_block(
-        detail.summary.page_key.clone(),
-        detail.summary.title.clone(),
-        element_id,
-        0,
-        detail.body_markdown.clone(),
-    );
-    ui.push_overlay(Overlay::OnenoteForm(form));
+    let selected_idx = detail
+        .blocks
+        .get(ui.onenote_selected_block)
+        .and_then(|b| match b.kind {
+            crate::models::OnenoteBlockKind::Attachment { resource_index, .. }
+            | crate::models::OnenoteBlockKind::Image { resource_index, .. } => {
+                Some(resource_index)
+            }
+            _ => None,
+        })
+        .or_else(|| (!detail.resources.is_empty()).then_some(0));
+
+    let Some(res_idx) = selected_idx else {
+        ui.info("다운로드할 OneNote 첨부/이미지 리소스가 없습니다");
+        return;
+    };
+    let Some(resource) = detail.resources.get(res_idx).cloned() else {
+        ui.info("리소스 메타데이터를 찾을 수 없습니다");
+        return;
+    };
+    app.download_onenote_attachment(ui, &detail.summary.page_key, res_idx, resource);
 }
 
 /// Opens the image preview overlay for the active page's resource at `resource_index`.
@@ -1904,34 +2061,79 @@ fn open_context_menu_at(column: u16, row: u16, app: &mut AppState, ui: &mut UiSt
 }
 
 fn copy_to_clipboard(text: &str, ui: &mut UiState) {
-    match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text.to_string())) {
-        Ok(()) => ui.info("클립보드에 복사했습니다"),
-        Err(err) => ui.info(format!("클립보드 복사 실패: {err}")),
+    let mut last_err: Option<String> = None;
+    #[allow(unused_mut)]
+    let mut native_ok = match with_clipboard(|cb| cb.set_text(text.to_string())) {
+        Ok(()) => true,
+        Err(err) => {
+            last_err = Some(err.to_string());
+            false
+        }
+    };
+
+    #[cfg(target_os = "linux")]
+    if !native_ok {
+        native_ok = linux_cli_copy_clipboard(text);
+    }
+
+    let is_ssh = has_nonempty_env("SSH_TTY") || has_nonempty_env("SSH_CONNECTION");
+    let osc_ok = if !native_ok || is_ssh {
+        emit_osc52(text)
+    } else {
+        false
+    };
+
+    if native_ok {
+        ui.info("클립보드에 복사했습니다");
+    } else if osc_ok {
+        ui.info("클립보드에 복사했습니다 (OSC 52)");
+    } else if let Some(err) = last_err {
+        ui.info(format!("클립보드 복사 실패: {err}"));
+    } else {
+        ui.info("클립보드 복사 실패: 사용 가능한 클립보드 백엔드가 없습니다");
     }
 }
 
-fn paste_clipboard(app: &mut AppState, ui: &mut UiState) {
-    let Ok(mut cb) = arboard::Clipboard::new() else {
-        ui.info("클립보드를 열 수 없습니다");
+fn paste_text_into_ui(text: String, app: &mut AppState, ui: &mut UiState) {
+    if !ui.overlays.is_empty() {
+        dispatch(Action::Paste(text), app, ui);
         return;
-    };
+    }
+    if !matches!(ui.focus(), Focus::Composer) {
+        ui.set_focus(Focus::Composer);
+    }
+    ui.composer.insert_str(&text);
+    ui.composer.reference_mentions(&app.members);
+}
 
-    if let Ok(text) = cb.get_text() {
+fn paste_clipboard(app: &mut AppState, ui: &mut UiState) {
+    let mut arboard_opened = false;
+    if let Ok(text) = with_clipboard(|cb| {
+        arboard_opened = true;
+        cb.get_text()
+    }) {
         if !text.is_empty() {
-            if !ui.overlays.is_empty() {
-                dispatch(Action::Paste(text), app, ui);
-                return;
-            }
-            if !matches!(ui.focus(), Focus::Composer) {
-                ui.set_focus(Focus::Composer);
-            }
-            ui.composer.insert_str(&text);
-            ui.composer.reference_mentions(&app.members);
+            paste_text_into_ui(text, app, ui);
             return;
         }
     }
 
-    if let Ok(img) = cb.get_image() {
+    #[cfg(target_os = "linux")]
+    if has_nonempty_env("WAYLAND_DISPLAY") {
+        if let Some(text) = linux_wayland_paste_text() {
+            if !text.is_empty() {
+                paste_text_into_ui(text, app, ui);
+                return;
+            }
+        }
+    }
+
+    if !arboard_opened {
+        ui.info("클립보드를 열 수 없습니다");
+        return;
+    }
+
+    if let Ok(img) = with_clipboard(|cb| cb.get_image()) {
         let width = img.width as u32;
         let height = img.height as u32;
         match composer::encode_rgba_to_png(width, height, img.bytes.into_owned()) {
@@ -1949,5 +2151,181 @@ fn paste_clipboard(app: &mut AppState, ui: &mut UiState) {
                 ui.error(format!("이미지 인코딩 실패: {err}"));
             }
         }
+    }
+}
+
+thread_local! {
+    static CLIPBOARD: std::cell::RefCell<Option<arboard::Clipboard>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn has_nonempty_env(key: &str) -> bool {
+    std::env::var_os(key).is_some_and(|v| !v.is_empty())
+}
+
+fn with_clipboard<T>(
+    f: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>,
+) -> Result<T, arboard::Error> {
+    #[cfg(target_os = "linux")]
+    if !has_nonempty_env("DISPLAY") && !has_nonempty_env("WAYLAND_DISPLAY") {
+        return Err(arboard::Error::ClipboardNotSupported);
+    }
+
+    CLIPBOARD.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        if guard.is_none() {
+            *guard = Some(arboard::Clipboard::new()?);
+        }
+        let cb = guard
+            .as_mut()
+            .ok_or(arboard::Error::ClipboardNotSupported)?;
+        f(cb)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn pipe_to_clipboard_cmd(program: &str, args: &[&str], text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let Ok(mut child) = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(text.as_bytes()).is_err() {
+            let _ = child.wait();
+            return false;
+        }
+    }
+    child.wait().is_ok_and(|s| s.success())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cli_copy_clipboard(text: &str) -> bool {
+    if has_nonempty_env("WAYLAND_DISPLAY") && pipe_to_clipboard_cmd("wl-copy", &[], text) {
+        return true;
+    }
+    if has_nonempty_env("DISPLAY") {
+        if pipe_to_clipboard_cmd("xclip", &["-selection", "clipboard"], text) {
+            return true;
+        }
+        if pipe_to_clipboard_cmd("xsel", &["--clipboard", "--input"], text) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn linux_wayland_paste_text() -> Option<String> {
+    use std::process::{Command, Stdio};
+
+    let output = Command::new("wl-paste")
+        .arg("--no-newline")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+const OSC52_MAX_RAW_BYTES: usize = 74_994;
+
+fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+
+        out.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+pub(crate) fn format_osc52_sequence(text: &str, in_tmux: bool) -> String {
+    let clipped = truncate_utf8_bytes(text, OSC52_MAX_RAW_BYTES);
+    let encoded = encode_base64(clipped.as_bytes());
+    if in_tmux {
+        format!("\x1bPtmux;\x1b\x1b]52;c;{encoded}\x07\x1b\\")
+    } else {
+        format!("\x1b]52;c;{encoded}\x07")
+    }
+}
+
+fn emit_osc52(text: &str) -> bool {
+    use std::io::Write;
+    let seq = format_osc52_sequence(text, has_nonempty_env("TMUX"));
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(seq.as_bytes()).is_ok() && stdout.flush().is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_base64_matches_rfc4648_vectors() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
+        assert_eq!(encode_base64(b"hello world"), "aGVsbG8gd29ybGQ=");
+    }
+
+    #[test]
+    fn format_osc52_sequence_plain_and_tmux() {
+        assert_eq!(
+            format_osc52_sequence("hello", false),
+            "\x1b]52;c;aGVsbG8=\x07"
+        );
+        assert_eq!(
+            format_osc52_sequence("hello", true),
+            "\x1bPtmux;\x1b\x1b]52;c;aGVsbG8=\x07\x1b\\"
+        );
+    }
+
+    #[test]
+    fn format_osc52_sequence_caps_oversized_utf8_cleanly() {
+        // 3-byte Korean char repeated to exceed 74,994 bytes.
+        let big = "가".repeat(30_000);
+        let seq = format_osc52_sequence(&big, false);
+        assert!(seq.starts_with("\x1b]52;c;"));
+        assert!(seq.ends_with('\x07'));
+        // 74,994 raw bytes -> 99,992 base64 bytes + 8 bytes framing = 100,000 bytes.
+        assert!(seq.len() <= 100_000);
     }
 }

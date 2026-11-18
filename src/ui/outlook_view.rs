@@ -4,6 +4,9 @@
 //! - Tab 5 (`연락처`): Personal contacts & Entra directory card + Mail/Chat quick actions
 //! - Tab 6 (`할 일`): Microsoft To Do task details, completion toggle & quick-add input bar
 
+use std::cell::RefCell;
+use std::sync::Arc;
+
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -19,12 +22,40 @@ use crate::{
     parser,
     ui::{
         app::{AppState, Focus, UiState},
-        chat_view::{self, RenderedLine},
+        chat_view::{self, hash_theme_sig, DualHasher, LineSliceCache, RenderedLine},
         hitmap::{ButtonId, HitMap, HitTarget},
         nav_pane::{TAB_CALENDAR, TAB_CONTACTS, TAB_MAIL, TAB_TODO},
         theme::Theme,
     },
 };
+
+thread_local! {
+    static MAIL_LINES_CACHE: RefCell<LineSliceCache> = RefCell::new(LineSliceCache::new(4));
+}
+
+fn compute_mail_sig(
+    mail: &MailMessage,
+    cached_thumbs_len: usize,
+    inline_images: bool,
+    theme: &Theme,
+    width: usize,
+    hyperlinks: bool,
+) -> (u64, u64) {
+    let mut h = DualHasher::new(0x4d41_494c_5f4c_494e);
+    h.write_str(&mail.id);
+    h.write_str(&mail.subject);
+    h.write_hash(&mail.is_read);
+    h.write_hash(&mail.flagged);
+    h.write_hash(&mail.body_html.len());
+    h.write_hash(&mail.body_plain.len());
+    h.write_hash(&mail.attachments.len());
+    h.write_hash(&cached_thumbs_len);
+    h.write_hash(&inline_images);
+    h.write_hash(&width.max(16));
+    h.write_hash(&hyperlinks);
+    hash_theme_sig(&mut h, theme);
+    h.finish()
+}
 
 pub fn pane_title(tab: usize) -> &'static str {
     match tab {
@@ -143,30 +174,55 @@ fn draw_mail_pane(
     let width = body_area.width as usize;
     let thumb_cols = width.saturating_sub(4).clamp(16, 40) as u16;
     let thumb_rows = 10u16;
+    let hyperlinks = chat_view::hyperlinks_enabled();
 
-    // Request lazy inline image previews for any image attachments if inline_images is enabled.
-    let mut cached_thumbs: Vec<(String, RenderedTerminalImage)> = Vec::new();
-    if ui.inline_images {
-        for att in &mail.attachments {
-            if img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name)) {
-                let key = AppState::image_cache_key(&mail.id, &att.id, thumb_cols, thumb_rows);
-                if let Some(rendered) = app.image_cache.get(&key) {
-                    cached_thumbs.push((att.id.clone(), rendered.clone()));
-                } else {
-                    app.request_mail_image(mail.id.clone(), att.clone(), thumb_cols, thumb_rows);
+    let thumb_count = if ui.inline_images {
+        mail.attachments
+            .iter()
+            .filter(|att| {
+                img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name))
+                    && app.image_cache.contains_key(&AppState::image_cache_key(
+                        &mail.id,
+                        &att.id,
+                        thumb_cols,
+                        thumb_rows,
+                    ))
+            })
+            .count()
+    } else {
+        0
+    };
+
+    let sig = compute_mail_sig(&mail, thumb_count, ui.inline_images, theme, width, hyperlinks);
+    let lines = if let Some(cached) = MAIL_LINES_CACHE.with(|cache| cache.borrow_mut().get(sig)) {
+        cached
+    } else {
+        // Request lazy inline image previews for any image attachments if inline_images is enabled.
+        let mut cached_thumbs: Vec<(String, RenderedTerminalImage)> = Vec::new();
+        if ui.inline_images {
+            for att in &mail.attachments {
+                if img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name)) {
+                    let key = AppState::image_cache_key(&mail.id, &att.id, thumb_cols, thumb_rows);
+                    if let Some(rendered) = app.image_cache.get(&key) {
+                        cached_thumbs.push((att.id.clone(), rendered.clone()));
+                    } else {
+                        app.request_mail_image(mail.id.clone(), att.clone(), thumb_cols, thumb_rows);
+                    }
                 }
             }
         }
-    }
 
-    let lines = build_mail_lines(
-        &mail,
-        &cached_thumbs,
-        ui.inline_images,
-        theme,
-        width,
-        chat_view::hyperlinks_enabled(),
-    );
+        let built: Arc<[RenderedLine]> = Arc::from(build_mail_lines(
+            &mail,
+            &cached_thumbs,
+            ui.inline_images,
+            theme,
+            width,
+            hyperlinks,
+        ));
+        MAIL_LINES_CACHE.with(|cache| cache.borrow_mut().insert(sig, Arc::clone(&built)));
+        built
+    };
 
     let height = body_area.height as usize;
     ui.mail_scroll.total_lines = lines.len();

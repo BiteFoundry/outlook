@@ -99,6 +99,12 @@ pub struct AppConfig {
     pub chat_poll_ms: u64,
     /// Background channel delta, Outlook mail/calendar, & presence interval (ms).
     pub channel_poll_ms: u64,
+    /// Optional external token file path (`TEAMS_TOKEN_FILE` or `config.toml`), read live on demand.
+    pub token_file: String,
+    /// Optional external token refresh command hook (`TEAMS_TOKEN_REFRESH_CMD` or `config.toml`), executed when token is missing or within `token_refresh_mins` of expiry.
+    pub token_refresh_cmd: String,
+    /// Refresh threshold in minutes before token `exp` to trigger `token_refresh_cmd` (`TEAMS_TOKEN_REFRESH_MINS`, default 5).
+    pub token_refresh_mins: u64,
 }
 
 impl Default for AppConfig {
@@ -135,6 +141,18 @@ impl Default for AppConfig {
             active_poll_ms: 2_500,
             chat_poll_ms: 8_000,
             channel_poll_ms: 30_000,
+            token_file: std::env::var("TEAMS_TOKEN_FILE")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default(),
+            token_refresh_cmd: std::env::var("TEAMS_TOKEN_REFRESH_CMD")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default(),
+            token_refresh_mins: std::env::var("TEAMS_TOKEN_REFRESH_MINS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(5),
         }
     }
 }
@@ -166,6 +184,21 @@ impl AppConfig {
         if let Ok(repo) = std::env::var("TEAMS_GITHUB_REPO") {
             if !repo.trim().is_empty() {
                 cfg.github_repo = repo.trim().to_string();
+            }
+        }
+        if let Ok(tf) = std::env::var("TEAMS_TOKEN_FILE") {
+            if !tf.trim().is_empty() {
+                cfg.token_file = tf.trim().to_string();
+            }
+        }
+        if let Ok(rcmd) = std::env::var("TEAMS_TOKEN_REFRESH_CMD") {
+            if !rcmd.trim().is_empty() {
+                cfg.token_refresh_cmd = rcmd.trim().to_string();
+            }
+        }
+        if let Ok(rmins) = std::env::var("TEAMS_TOKEN_REFRESH_MINS") {
+            if let Ok(parsed) = rmins.trim().parse::<u64>() {
+                cfg.token_refresh_mins = parsed;
             }
         }
         cfg
@@ -217,6 +250,15 @@ impl AppConfig {
             default_download_dir()
         } else {
             expand_tilde(self.download_dir.trim())
+        }
+    }
+
+    pub fn resolved_token_file(&self) -> Option<PathBuf> {
+        let trimmed = self.token_file.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(expand_tilde(trimmed))
         }
     }
 }

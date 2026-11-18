@@ -1,6 +1,69 @@
 //! Desktop notifications via `notify-rust` on a background thread.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 pub const MAX_BODY_CHARS: usize = 120;
+const MAX_IN_FLIGHT_NOTIFICATIONS: usize = 2;
+static IN_FLIGHT_NOTIFICATIONS: AtomicUsize = AtomicUsize::new(0);
+
+fn has_non_empty_env(val: Option<&str>) -> bool {
+    val.map(|s| !s.trim().is_empty()).unwrap_or(false)
+}
+
+#[allow(dead_code)]
+fn linux_desktop_notifications_available_with(
+    dbus_addr: Option<&str>,
+    display: Option<&str>,
+    wayland_display: Option<&str>,
+) -> bool {
+    has_non_empty_env(dbus_addr)
+        && (has_non_empty_env(display) || has_non_empty_env(wayland_display))
+}
+
+fn desktop_notifications_supported() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        return linux_desktop_notifications_available_with(
+            std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref(),
+            std::env::var("DISPLAY").ok().as_deref(),
+            std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+struct InFlightGuard {
+    counter: &'static AtomicUsize,
+}
+
+impl InFlightGuard {
+    fn try_acquire(counter: &'static AtomicUsize, limit: usize) -> Option<Self> {
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            if current >= limit {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self { counter }),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Returns whether a notification should be emitted for an incoming message.
 pub fn should_notify(notify_enabled: bool, is_active_conv: bool, is_self: bool) -> bool {
@@ -23,22 +86,39 @@ pub fn chat_body(sender: &str, preview: &str) -> String {
 }
 
 /// Fires a desktop notification on a detached thread; errors are silently ignored.
+/// On headless Linux (missing D-Bus session bus or X11/Wayland display) or when
+/// too many notification threads are already in flight, this returns immediately.
 pub fn show(summary: &str, body: &str) {
+    if !desktop_notifications_supported() {
+        return;
+    }
+    let Some(guard) =
+        InFlightGuard::try_acquire(&IN_FLIGHT_NOTIFICATIONS, MAX_IN_FLIGHT_NOTIFICATIONS)
+    else {
+        return;
+    };
     let summary = summary.to_string();
     let body = body.to_string();
-    std::thread::spawn(move || {
-        let _ = notify_rust::Notification::new()
-            .appname("teams")
-            .summary(&summary)
-            .body(&body)
-            .timeout(notify_rust::Timeout::Milliseconds(6000))
-            .show();
-    });
+    let _ = std::thread::Builder::new()
+        .name("teams-notify".to_string())
+        .spawn(move || {
+            let _guard = guard;
+            let _ = notify_rust::Notification::new()
+                .appname("teams")
+                .summary(&summary)
+                .body(&body)
+                .timeout(notify_rust::Timeout::Milliseconds(6000))
+                .show();
+        });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{chat_body, should_notify, truncate, MAX_BODY_CHARS};
+    use super::{
+        chat_body, linux_desktop_notifications_available_with, should_notify, truncate,
+        InFlightGuard, MAX_BODY_CHARS, MAX_IN_FLIGHT_NOTIFICATIONS,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn notify_skips_active_room_self_and_disabled() {
@@ -60,5 +140,59 @@ mod tests {
         let body = chat_body("보낸이", "아주 긴 메시지");
         assert!(body.starts_with("보낸이: "));
         assert!(body.chars().count() <= MAX_BODY_CHARS + 1);
+    }
+
+    #[test]
+    fn headless_linux_notification_gate_requires_dbus_and_display() {
+        assert!(!linux_desktop_notifications_available_with(
+            None,
+            Some(":0"),
+            None
+        ));
+        assert!(!linux_desktop_notifications_available_with(
+            Some("  "),
+            Some(":0"),
+            None
+        ));
+        assert!(!linux_desktop_notifications_available_with(
+            Some("unix:path=/run/user/1000/bus"),
+            None,
+            None
+        ));
+        assert!(!linux_desktop_notifications_available_with(
+            Some("unix:path=/run/user/1000/bus"),
+            Some(""),
+            Some("   ")
+        ));
+        assert!(linux_desktop_notifications_available_with(
+            Some("unix:path=/run/user/1000/bus"),
+            Some(":0"),
+            None
+        ));
+        assert!(linux_desktop_notifications_available_with(
+            Some("unix:path=/run/user/1000/bus"),
+            None,
+            Some("wayland-0")
+        ));
+    }
+
+    #[test]
+    fn in_flight_notification_guard_caps_concurrency_and_releases_on_drop() {
+        static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+        let g1 = InFlightGuard::try_acquire(&TEST_COUNTER, MAX_IN_FLIGHT_NOTIFICATIONS).unwrap();
+        let g2 = InFlightGuard::try_acquire(&TEST_COUNTER, MAX_IN_FLIGHT_NOTIFICATIONS).unwrap();
+        assert!(InFlightGuard::try_acquire(&TEST_COUNTER, MAX_IN_FLIGHT_NOTIFICATIONS).is_none());
+        assert_eq!(TEST_COUNTER.load(Ordering::SeqCst), 2);
+
+        drop(g1);
+        assert_eq!(TEST_COUNTER.load(Ordering::SeqCst), 1);
+
+        let g3 = InFlightGuard::try_acquire(&TEST_COUNTER, MAX_IN_FLIGHT_NOTIFICATIONS).unwrap();
+        assert_eq!(TEST_COUNTER.load(Ordering::SeqCst), 2);
+
+        drop(g2);
+        drop(g3);
+        assert_eq!(TEST_COUNTER.load(Ordering::SeqCst), 0);
     }
 }

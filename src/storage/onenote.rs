@@ -23,7 +23,7 @@ pub fn upsert_onenote_notebooks(conn: &mut Connection, items: &[OnenoteNotebook]
     }
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "
             INSERT INTO onenote_notebooks (
                 notebook_key, id, scope_json, scope_key, display_name, color,
@@ -80,7 +80,7 @@ pub fn upsert_onenote_notebooks(conn: &mut Connection, items: &[OnenoteNotebook]
 }
 
 pub fn list_onenote_notebooks(conn: &Connection) -> Result<Vec<OnenoteNotebook>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT
             notebook_key, id, scope_json, scope_key, display_name, color,
@@ -107,7 +107,7 @@ pub fn upsert_onenote_section_groups(
     }
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "
             INSERT INTO onenote_section_groups (
                 section_group_key, id, scope_json, scope_key, notebook_id,
@@ -157,7 +157,7 @@ pub fn upsert_onenote_section_groups(
 }
 
 pub fn list_onenote_section_groups(conn: &Connection) -> Result<Vec<OnenoteSectionGroup>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT
             section_group_key, id, scope_json, scope_key, notebook_id,
@@ -179,7 +179,7 @@ pub fn upsert_onenote_sections(conn: &mut Connection, items: &[OnenoteSection]) 
     }
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "
             INSERT INTO onenote_sections (
                 section_key, id, scope_json, scope_key, notebook_id, notebook_name,
@@ -258,7 +258,7 @@ pub fn list_onenote_sections(
         .filter(|s| !s.is_empty());
 
     if let Some(nb_filter) = filter {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 section_key, id, scope_json, scope_key, notebook_id, notebook_name,
@@ -278,7 +278,7 @@ pub fn list_onenote_sections(
         let rows = stmt.query_map(params![nb_filter], map_section_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     } else {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 section_key, id, scope_json, scope_key, notebook_id, notebook_name,
@@ -297,13 +297,47 @@ pub fn list_onenote_sections(
     }
 }
 
+struct ExistingOnenotePageRow {
+    id: String,
+    scope_json: String,
+    scope_key: String,
+    section_key: String,
+    section_id: String,
+    section_name: Option<String>,
+    notebook_id: Option<String>,
+    notebook_name: Option<String>,
+    title: String,
+    level: i32,
+    page_order: i32,
+    created_at: Option<String>,
+    last_modified_at: Option<String>,
+    content_url: Option<String>,
+    web_url: Option<String>,
+    preview_text: Option<String>,
+    has_todo: i32,
+    has_detail: bool,
+    body_plain: Option<String>,
+}
+
 pub fn upsert_onenote_pages(conn: &mut Connection, items: &[OnenotePageSummary]) -> Result<()> {
     if items.is_empty() {
         return Ok(());
     }
     let tx = conn.transaction()?;
     {
-        let mut page_stmt = tx.prepare(
+        let mut check_stmt = tx.prepare_cached(
+            "
+            SELECT
+                id, scope_json, scope_key, section_key, section_id,
+                section_name, notebook_id, notebook_name, title, level, page_order,
+                created_at, last_modified_at, content_url, web_url,
+                preview_text, has_todo, detail_json IS NOT NULL, body_plain
+            FROM onenote_pages
+            WHERE page_key = ?1
+            ",
+        )?;
+
+        let mut page_stmt = tx.prepare_cached(
             "
             INSERT INTO onenote_pages (
                 page_key, id, scope_json, scope_key, section_key, section_id,
@@ -346,8 +380,8 @@ pub fn upsert_onenote_pages(conn: &mut Connection, items: &[OnenotePageSummary])
             ",
         )?;
 
-        let mut fts_del_stmt = tx.prepare("DELETE FROM onenote_fts WHERE page_key = ?1")?;
-        let mut fts_ins_stmt = tx.prepare(
+        let mut fts_del_stmt = tx.prepare_cached("DELETE FROM onenote_fts WHERE page_key = ?1")?;
+        let mut fts_ins_stmt = tx.prepare_cached(
             "
             INSERT INTO onenote_fts (
                 page_key, section_key, title, notebook_name, section_name, body_plain
@@ -379,6 +413,94 @@ pub fn upsert_onenote_pages(conn: &mut Connection, items: &[OnenotePageSummary])
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
 
+            let existing = check_stmt
+                .query_row(params![&page_key], |row| {
+                    let has_detail_int: i32 = row.get(17)?;
+                    Ok(ExistingOnenotePageRow {
+                        id: row.get(0)?,
+                        scope_json: row.get(1)?,
+                        scope_key: row.get(2)?,
+                        section_key: row.get(3)?,
+                        section_id: row.get(4)?,
+                        section_name: row.get(5)?,
+                        notebook_id: row.get(6)?,
+                        notebook_name: row.get(7)?,
+                        title: row.get(8)?,
+                        level: row.get(9)?,
+                        page_order: row.get(10)?,
+                        created_at: row.get(11)?,
+                        last_modified_at: row.get(12)?,
+                        content_url: row.get(13)?,
+                        web_url: row.get(14)?,
+                        preview_text: row.get(15)?,
+                        has_todo: row.get(16)?,
+                        has_detail: has_detail_int != 0,
+                        body_plain: row.get(18)?,
+                    })
+                })
+                .optional()?;
+
+            let fts_unchanged = if let Some(ref ex) = existing {
+                let eff_section_name = item.section_name.as_deref().or(ex.section_name.as_deref());
+                let eff_notebook_id = item.notebook_id.as_deref().or(ex.notebook_id.as_deref());
+                let eff_notebook_name = item
+                    .notebook_name
+                    .as_deref()
+                    .or(ex.notebook_name.as_deref());
+                let eff_created_at = item.created_at.as_deref().or(ex.created_at.as_deref());
+                let eff_last_modified_at = item
+                    .last_modified_at
+                    .as_deref()
+                    .or(ex.last_modified_at.as_deref());
+                let eff_content_url = item.content_url.as_deref().or(ex.content_url.as_deref());
+                let eff_web_url = item.web_url.as_deref().or(ex.web_url.as_deref());
+                let eff_preview_text = preview_clean.or(ex.preview_text.as_deref());
+                let eff_has_todo = if item.has_todo {
+                    1i32
+                } else if ex.has_detail {
+                    ex.has_todo
+                } else {
+                    0i32
+                };
+
+                let row_unchanged = item.id == ex.id
+                    && scope_json == ex.scope_json
+                    && scope_key == ex.scope_key
+                    && section_key == ex.section_key
+                    && item.section_id == ex.section_id
+                    && eff_section_name == ex.section_name.as_deref()
+                    && eff_notebook_id == ex.notebook_id.as_deref()
+                    && eff_notebook_name == ex.notebook_name.as_deref()
+                    && item.title == ex.title
+                    && item.level == ex.level
+                    && item.order == ex.page_order
+                    && eff_created_at == ex.created_at.as_deref()
+                    && eff_last_modified_at == ex.last_modified_at.as_deref()
+                    && eff_content_url == ex.content_url.as_deref()
+                    && eff_web_url == ex.web_url.as_deref()
+                    && eff_preview_text == ex.preview_text.as_deref()
+                    && eff_has_todo == ex.has_todo;
+                if row_unchanged {
+                    continue;
+                }
+
+                let ex_fts_body = ex
+                    .body_plain
+                    .as_deref()
+                    .or(ex.preview_text.as_deref())
+                    .unwrap_or("");
+                let new_fts_body = ex.body_plain.as_deref().or(eff_preview_text).unwrap_or("");
+                section_key == ex.section_key
+                    && item.title == ex.title
+                    && eff_notebook_name.unwrap_or("")
+                        == ex.notebook_name.as_deref().unwrap_or("")
+                    && eff_section_name.unwrap_or("")
+                        == ex.section_name.as_deref().unwrap_or("")
+                    && new_fts_body == ex_fts_body
+            } else {
+                false
+            };
+
             page_stmt.execute(params![
                 page_key,
                 item.id,
@@ -400,8 +522,10 @@ pub fn upsert_onenote_pages(conn: &mut Connection, items: &[OnenotePageSummary])
                 bool_to_i32(item.has_todo),
             ])?;
 
-            fts_del_stmt.execute(params![page_key])?;
-            fts_ins_stmt.execute(params![page_key])?;
+            if !fts_unchanged {
+                fts_del_stmt.execute(params![page_key])?;
+                fts_ins_stmt.execute(params![page_key])?;
+            }
         }
     }
     tx.commit()?;
@@ -423,7 +547,7 @@ pub fn list_onenote_pages(conn: &Connection, section_key: &str) -> Result<Vec<On
             ORDER BY page_order ASC, COALESCE(last_modified_at, '') DESC, id ASC
             "
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![trimmed], map_page_summary_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     } else {
@@ -436,7 +560,7 @@ pub fn list_onenote_pages(conn: &Connection, section_key: &str) -> Result<Vec<On
             ORDER BY page_order ASC, COALESCE(last_modified_at, '') DESC, id ASC
             "
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![me_key, trimmed], map_page_summary_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
@@ -473,7 +597,7 @@ pub fn upsert_onenote_page_detail(conn: &mut Connection, detail: &OnenotePageDet
 
     let tx = conn.transaction()?;
     {
-        tx.execute(
+        let mut page_stmt = tx.prepare_cached(
             "
             INSERT INTO onenote_pages (
                 page_key, id, scope_json, scope_key, section_key, section_id,
@@ -510,32 +634,33 @@ pub fn upsert_onenote_page_detail(conn: &mut Connection, detail: &OnenotePageDet
                 detail_json = excluded.detail_json,
                 body_plain = excluded.body_plain
             ",
-            params![
-                page_key,
-                normalized.summary.id,
-                scope_json,
-                scope_key,
-                section_key,
-                normalized.summary.section_id,
-                normalized.summary.section_name,
-                normalized.summary.notebook_id,
-                normalized.summary.notebook_name,
-                normalized.summary.title,
-                normalized.summary.level,
-                normalized.summary.order,
-                normalized.summary.created_at,
-                normalized.summary.last_modified_at,
-                normalized.summary.content_url,
-                normalized.summary.web_url,
-                preview_text,
-                bool_to_i32(has_todo),
-                detail_json,
-                normalized.body_plain,
-            ],
         )?;
+        page_stmt.execute(params![
+            page_key,
+            normalized.summary.id,
+            scope_json,
+            scope_key,
+            section_key,
+            normalized.summary.section_id,
+            normalized.summary.section_name,
+            normalized.summary.notebook_id,
+            normalized.summary.notebook_name,
+            normalized.summary.title,
+            normalized.summary.level,
+            normalized.summary.order,
+            normalized.summary.created_at,
+            normalized.summary.last_modified_at,
+            normalized.summary.content_url,
+            normalized.summary.web_url,
+            preview_text,
+            bool_to_i32(has_todo),
+            detail_json,
+            normalized.body_plain,
+        ])?;
 
-        tx.execute("DELETE FROM onenote_fts WHERE page_key = ?1", params![page_key])?;
-        tx.execute(
+        let mut fts_del = tx.prepare_cached("DELETE FROM onenote_fts WHERE page_key = ?1")?;
+        fts_del.execute(params![page_key])?;
+        let mut fts_ins = tx.prepare_cached(
             "
             INSERT INTO onenote_fts (
                 page_key, section_key, title, notebook_name, section_name, body_plain
@@ -550,8 +675,8 @@ pub fn upsert_onenote_page_detail(conn: &mut Connection, detail: &OnenotePageDet
             FROM onenote_pages
             WHERE page_key = ?1
             ",
-            params![page_key],
         )?;
+        fts_ins.execute(params![page_key])?;
     }
     tx.commit()?;
     Ok(())
@@ -566,22 +691,23 @@ pub fn get_onenote_page_detail(
         return Ok(None);
     }
 
-    let row_opt: Option<(Option<String>, String, i32, i32, Option<String>)> = conn
-        .query_row(
-            "
-            SELECT detail_json, title, level, page_order, last_modified_at
-            FROM onenote_pages
-            WHERE page_key = ?1
-            ",
-            params![key],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        )
+    let mut exact_stmt = conn.prepare_cached(
+        "
+        SELECT detail_json, title, level, page_order, last_modified_at
+        FROM onenote_pages
+        WHERE page_key = ?1
+        ",
+    )?;
+    let row_opt: Option<(Option<String>, String, i32, i32, Option<String>)> = exact_stmt
+        .query_row(params![key], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
         .optional()?;
 
     let row_data = match row_opt {
         Some(data) => Some(data),
-        None => conn
-            .query_row(
+        None => {
+            let mut fallback_stmt = conn.prepare_cached(
                 "
                 SELECT detail_json, title, level, page_order, last_modified_at
                 FROM onenote_pages
@@ -591,10 +717,13 @@ pub fn get_onenote_page_detail(
                     COALESCE(last_modified_at, '') DESC
                 LIMIT 1
                 ",
-                params![key],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .optional()?,
+            )?;
+            fallback_stmt
+                .query_row(params![key], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })
+                .optional()?
+        }
     };
 
     let Some((Some(detail_json), row_title, row_level, row_order, row_modified)) = row_data else {
@@ -627,8 +756,9 @@ pub fn get_onenote_page_summary(
         WHERE page_key = ?1
         "
     );
-    if let Some(found) = conn
-        .query_row(&exact_sql, params![key], map_page_summary_row)
+    let mut exact_stmt = conn.prepare_cached(&exact_sql)?;
+    if let Some(found) = exact_stmt
+        .query_row(params![key], map_page_summary_row)
         .optional()?
     {
         return Ok(Some(found));
@@ -643,7 +773,9 @@ pub fn get_onenote_page_summary(
         LIMIT 1
         "
     );
-    conn.query_row(&fallback_sql, params![key], map_page_summary_row)
+    let mut fallback_stmt = conn.prepare_cached(&fallback_sql)?;
+    fallback_stmt
+        .query_row(params![key], map_page_summary_row)
         .optional()
         .map_err(Into::into)
 }
@@ -655,7 +787,7 @@ pub fn delete_onenote_page(conn: &mut Connection, page_key_or_id: &str) -> Resul
     }
 
     let matched_keys: Vec<String> = {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT page_key FROM onenote_pages WHERE page_key = ?1 OR id = ?1",
         )?;
         let rows = stmt.query_map(params![key], |r| r.get(0))?;
@@ -664,11 +796,10 @@ pub fn delete_onenote_page(conn: &mut Connection, page_key_or_id: &str) -> Resul
 
     let tx = conn.transaction()?;
     {
-        tx.execute(
-            "DELETE FROM onenote_pages WHERE page_key = ?1 OR id = ?1",
-            params![key],
-        )?;
-        let mut del_fts = tx.prepare("DELETE FROM onenote_fts WHERE page_key = ?1")?;
+        let mut del_page =
+            tx.prepare_cached("DELETE FROM onenote_pages WHERE page_key = ?1 OR id = ?1")?;
+        del_page.execute(params![key])?;
+        let mut del_fts = tx.prepare_cached("DELETE FROM onenote_fts WHERE page_key = ?1")?;
         del_fts.execute(params![key])?;
         for pk in matched_keys {
             del_fts.execute(params![pk])?;
@@ -734,7 +865,7 @@ fn run_onenote_fts_search(
             LIMIT ?3
             "
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![fts_query, sec, limit as i64], |row| {
             map_onenote_search_hit_row(row, raw_query)
         })?;
@@ -750,7 +881,7 @@ fn run_onenote_fts_search(
             LIMIT ?2
             "
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
             map_onenote_search_hit_row(row, raw_query)
         })?;
@@ -787,7 +918,7 @@ fn run_onenote_like_search(
             LIMIT ?3
             "
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![sec, pattern, limit as i64], |row| {
             map_onenote_search_hit_row(row, raw_query)
         })?;
@@ -808,7 +939,7 @@ fn run_onenote_like_search(
             LIMIT ?2
             "
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![pattern, limit as i64], |row| {
             map_onenote_search_hit_row(row, raw_query)
         })?;
@@ -1390,5 +1521,80 @@ mod tests {
             .search_onenote_pages("PostgreSQL", None, 10)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn test_onenote_pages_upsert_idempotency_and_fts_skip() {
+        let storage = Storage::open_in_memory().unwrap();
+        let mut page = sample_page_summary(
+            OnenoteScope::Me,
+            "pg-idem",
+            "sec-1",
+            "Kubernetes 운영 노트",
+            0,
+            "2026-11-15T10:00:00Z",
+        );
+        page.notebook_name = Some("인프라".to_string());
+        page.section_name = Some("런북".to_string());
+        storage.upsert_onenote_pages(&[page.clone()]).unwrap();
+        assert_eq!(
+            storage
+                .search_onenote_pages("Kubernetes", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Identical re-upsert performs 0 SQLite row modifications.
+        let changes_before_noop = storage.conn().lock().unwrap().total_changes();
+        storage.upsert_onenote_pages(&[page.clone()]).unwrap();
+        let changes_after_noop = storage.conn().lock().unwrap().total_changes();
+        assert_eq!(changes_after_noop - changes_before_noop, 0);
+        assert_eq!(
+            storage
+                .search_onenote_pages("Kubernetes", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Non-FTS metadata change (order/level) updates onenote_pages (1 change) without touching onenote_fts.
+        page.order = 5;
+        page.level = 1;
+        let changes_before_meta = storage.conn().lock().unwrap().total_changes();
+        storage.upsert_onenote_pages(&[page.clone()]).unwrap();
+        let changes_after_meta = storage.conn().lock().unwrap().total_changes();
+        assert_eq!(changes_after_meta - changes_before_meta, 1);
+        assert_eq!(
+            storage
+                .get_onenote_page_summary("me|pg-idem")
+                .unwrap()
+                .unwrap()
+                .order,
+            5
+        );
+        assert_eq!(
+            storage
+                .search_onenote_pages("Kubernetes", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Title change updates both onenote_pages and onenote_fts.
+        page.title = "PostgreSQL 복구 가이드".to_string();
+        page.last_modified_at = Some("2026-11-15T10:15:00Z".to_string());
+        storage.upsert_onenote_pages(&[page]).unwrap();
+        assert!(storage
+            .search_onenote_pages("Kubernetes", None, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            storage
+                .search_onenote_pages("PostgreSQL", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

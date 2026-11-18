@@ -34,13 +34,25 @@ use crate::{
 
 const DELETE_JSON_REQUIRES_YES: &str = "--json 모드에서 삭제하려면 --yes 를 함께 지정해야 합니다.";
 
+const ENV_AFTER_HELP: &str = "\
+환경 변수 (Environment Variables):
+  TEAMS_PERSONA=teams|outlook|onenote   실행 페르소나 강제 지정
+  TEAMS_TOKEN_FILE=<PATH>               외부 토큰 파일(JWT 또는 JSON) 직접 로드 (키링 자동 생략)
+  TEAMS_TOKEN_REFRESH_CMD=<CMD>         토큰 만료 임박 시 자동 실행할 갱신 커맨드 훅
+  TEAMS_TOKEN_REFRESH_MINS=<MINS>       갱신 훅 실행 기준 남은 시간(분) [기본: 5]
+  TEAMS_ACCESS_TOKEN=<JWT>              직접 Bearer 액세스 토큰 주입 (키링 자동 생략)
+  TEAMS_DISABLE_KEYRING=1               OS 키링 비활성화 (credentials.json 파일 전용)
+  TEAMS_CLIENT_ID / TEAMS_TENANT_ID     Entra 앱 Client ID / Tenant ID 재정의
+  TEAMS_CONFIG_DIR / TEAMS_DATA_DIR     설정 및 로컬 SQLite 캐시 디렉터리 재정의";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "teams",
     version,
     about = "Microsoft Teams · Outlook · OneNote 터미널 클라이언트 (CLI · TUI · HTTP API · MCP)",
     long_about = "Microsoft Graph v1.0 기반 Microsoft Teams · Outlook · OneNote 터미널 클라이언트입니다.\n\
-                  인자 없이 실행하면 로그인 상태를 확인한 뒤 TUI를 엽니다."
+                  인자 없이 실행하면 로그인 상태를 확인한 뒤 TUI를 엽니다.",
+    after_help = ENV_AFTER_HELP
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -53,7 +65,8 @@ pub struct Cli {
     version,
     about = "Microsoft Outlook 터미널 클라이언트 (메일 · 캘린더 · 연락처 · To Do · OneNote · CLI · TUI · HTTP API · MCP)",
     long_about = "Microsoft Graph v1.0 기반 Microsoft Outlook / M365 터미널 클라이언트입니다.\n\
-                  인자 없이 실행하면 로그인 상태를 확인한 뒤 Outlook TUI를 엽니다."
+                  인자 없이 실행하면 로그인 상태를 확인한 뒤 Outlook TUI를 엽니다.",
+    after_help = ENV_AFTER_HELP
 )]
 pub struct OutlookCli {
     #[command(subcommand)]
@@ -66,7 +79,8 @@ pub struct OutlookCli {
     version,
     about = "Microsoft OneNote 터미널 클라이언트 (개인/팀 공유 필기장 · 섹션 · 페이지 · CLI · TUI · HTTP API · MCP)",
     long_about = "Microsoft Graph v1.0 기반 Microsoft OneNote 터미널 클라이언트입니다.\n\
-                  인자 없이 실행하면 로그인 상태를 확인한 뒤 OneNote TUI를 엽니다."
+                  인자 없이 실행하면 로그인 상태를 확인한 뒤 OneNote TUI를 엽니다.",
+    after_help = ENV_AFTER_HELP
 )]
 pub struct OnenoteCli {
     #[command(subcommand)]
@@ -115,7 +129,8 @@ pub enum Command {
     /// 1:1, 그룹 및 모임 채팅 목록을 표시합니다
     #[command(visible_alias = "ls")]
     Chats {
-        #[arg(long, default_value_t = 50)]
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 50)]
         limit: usize,
         #[arg(long)]
         refresh: bool,
@@ -154,7 +169,8 @@ pub enum Command {
     #[command(visible_alias = "cat")]
     Read {
         target: String,
-        #[arg(long, default_value_t = 50)]
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 50)]
         limit: usize,
         #[arg(long)]
         offline: bool,
@@ -165,7 +181,8 @@ pub enum Command {
     Thread {
         channel_target: String,
         root_msg_id: String,
-        #[arg(long, default_value_t = 50)]
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 50)]
         limit: usize,
         #[arg(long)]
         offline: bool,
@@ -273,7 +290,8 @@ pub enum Command {
         query: String,
         #[arg(long)]
         target: Option<String>,
-        #[arg(long, default_value_t = 50)]
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 50)]
         limit: usize,
         #[arg(long)]
         json: bool,
@@ -282,7 +300,8 @@ pub enum Command {
     Sync {
         #[arg(long)]
         target: Option<String>,
-        #[arg(long, default_value_t = 50)]
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 50)]
         limit: usize,
         #[arg(long)]
         json: bool,
@@ -294,7 +313,8 @@ pub enum Command {
         format: String,
         #[arg(long)]
         include_threads: bool,
-        #[arg(long, default_value_t = 200)]
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 200)]
         limit: usize,
         #[arg(long)]
         offline: bool,
@@ -317,6 +337,22 @@ pub enum Command {
         #[command(subcommand)]
         command: MailCommand,
     },
+    /// 받은편지함 또는 지정한 폴더의 메일 목록을 표시합니다 (teams mail list 단축 명령)
+    Inbox {
+        #[arg(long, default_value = "inbox")]
+        folder: String,
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 30)]
+        limit: usize,
+        #[arg(long)]
+        unread: bool,
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        offline: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Outlook 메일 검색 (`teams mail search` 단축 명령)
     #[command(name = "mail-search")]
     MailSearch {
@@ -325,7 +361,8 @@ pub enum Command {
         folder: Option<String>,
         #[arg(long)]
         remote: bool,
-        #[arg(long, default_value_t = 30)]
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 30)]
         limit: usize,
         #[arg(long)]
         json: bool,
@@ -454,7 +491,8 @@ pub enum OutlookCommand {
     Inbox {
         #[arg(long, default_value = "inbox")]
         folder: String,
-        #[arg(long, default_value_t = 30)]
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 30)]
         limit: usize,
         #[arg(long)]
         unread: bool,
@@ -569,7 +607,8 @@ pub enum OutlookCommand {
         folder: Option<String>,
         #[arg(long)]
         remote: bool,
-        #[arg(long, default_value_t = 30)]
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 30)]
         limit: usize,
         #[arg(long)]
         json: bool,
@@ -596,6 +635,11 @@ pub enum OutlookCommand {
         cols: Option<u16>,
         #[arg(long)]
         rows: Option<u16>,
+    },
+    /// Outlook 메일 명령 (outlook mail <subcmd> — teams mail 과 동일)
+    Mail {
+        #[command(subcommand)]
+        command: MailCommand,
     },
     /// Outlook 캘린더 명령 (`outlook cal <subcmd>`)
     Cal {
@@ -631,7 +675,8 @@ pub enum OutlookCommand {
     },
     /// Teams 1:1/그룹/모임 채팅 목록을 표시합니다
     Chats {
-        #[arg(long, default_value_t = 50)]
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 50)]
         limit: usize,
         #[arg(long)]
         refresh: bool,
@@ -676,7 +721,8 @@ pub enum MailCommand {
     List {
         #[arg(long, default_value = "inbox")]
         folder: String,
-        #[arg(long, default_value_t = 30)]
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 30)]
         limit: usize,
         #[arg(long)]
         unread: bool,
@@ -790,7 +836,8 @@ pub enum MailCommand {
         folder: Option<String>,
         #[arg(long)]
         remote: bool,
-        #[arg(long, default_value_t = 30)]
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 30)]
         limit: usize,
         #[arg(long)]
         json: bool,
@@ -821,7 +868,8 @@ pub enum CalCommand {
         start: Option<String>,
         #[arg(long)]
         end: Option<String>,
-        #[arg(long, default_value_t = 50)]
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 50)]
         limit: usize,
         #[arg(long)]
         offline: bool,
@@ -892,7 +940,8 @@ pub enum CalCommand {
 pub enum ContactsCommand {
     /// 개인 연락처 목록을 표시합니다
     List {
-        #[arg(long, default_value_t = 50)]
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 50)]
         limit: usize,
         #[arg(long)]
         refresh: bool,
@@ -904,7 +953,8 @@ pub enum ContactsCommand {
     /// 연락처 및 조직 디렉터리를 검색합니다
     Search {
         query: String,
-        #[arg(long, default_value_t = 30)]
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 30)]
         limit: usize,
         #[arg(long)]
         offline: bool,
@@ -955,7 +1005,8 @@ pub enum TodoCommand {
         list: String,
         #[arg(long)]
         all: bool,
-        #[arg(long, default_value_t = 50)]
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 50)]
         limit: usize,
         #[arg(long)]
         refresh: bool,
@@ -1057,7 +1108,8 @@ pub enum NotesCommand {
     #[command(visible_alias = "list")]
     Pages {
         section: String,
-        #[arg(long, default_value_t = 50)]
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 50)]
         limit: usize,
         #[arg(long)]
         refresh: bool,
@@ -1144,7 +1196,8 @@ pub enum NotesCommand {
         section: Option<String>,
         #[arg(long)]
         refresh: bool,
-        #[arg(long, default_value_t = 30)]
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 30)]
         limit: usize,
         #[arg(long)]
         json: bool,
@@ -1254,7 +1307,8 @@ pub enum OnenoteCommand {
     #[command(visible_alias = "list")]
     Pages {
         section: String,
-        #[arg(long, default_value_t = 50)]
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 50)]
         limit: usize,
         #[arg(long)]
         refresh: bool,
@@ -1341,7 +1395,8 @@ pub enum OnenoteCommand {
         section: Option<String>,
         #[arg(long)]
         refresh: bool,
-        #[arg(long, default_value_t = 30)]
+        /// 최대 조회 개수
+        #[arg(long, visible_alias = "top", default_value_t = 30)]
         limit: usize,
         #[arg(long)]
         json: bool,
@@ -1395,6 +1450,17 @@ pub enum OnenoteCommand {
     /// 에이전트용 stdio MCP(JSON-RPC 2.0) 서버를 실행합니다
     #[command(visible_alias = "mcp-server")]
     Mcp,
+    /// Microsoft OneNote 필기장·섹션·페이지 명령 (`onenote notes <subcmd>`)
+    #[command(visible_alias = "onenote")]
+    Notes {
+        #[command(subcommand)]
+        command: NotesCommand,
+    },
+    /// Outlook 메일 명령 (`onenote mail <subcmd>`)
+    Mail {
+        #[command(subcommand)]
+        command: MailCommand,
+    },
 }
 
 pub async fn run_from_env() -> Result<()> {
@@ -1659,6 +1725,14 @@ async fn dispatch_command(
             .await
         }
         Some(Command::Mail { command }) => Box::pin(dispatch_mail_command(cfg, command)).await,
+        Some(Command::Inbox {
+            folder,
+            limit,
+            unread,
+            refresh,
+            offline,
+            json,
+        }) => Box::pin(cmd_mail_list(cfg, &folder, limit, unread, refresh, offline, json)).await,
         Some(Command::MailSearch {
             query,
             folder,
@@ -1877,6 +1951,9 @@ async fn dispatch_outlook_command(
         }
         Some(OutlookCommand::PreviewFile { path, cols, rows }) => {
             cmd_preview_local_file(&path, cols, rows)
+        }
+        Some(OutlookCommand::Mail { command }) => {
+            Box::pin(dispatch_mail_command(cfg, command)).await
         }
         Some(OutlookCommand::Cal { command }) => Box::pin(dispatch_cal_command(cfg, command)).await,
         Some(OutlookCommand::Contacts { command }) => {
@@ -2412,6 +2489,12 @@ pub async fn dispatch_onenote_command(
             let (_auth, graph, storage) = Box::pin(open_runtime(cfg, false)).await?;
             Box::pin(crate::mcp::run(cfg.clone(), graph, storage)).await
         }
+        Some(OnenoteCommand::Notes { command }) => {
+            Box::pin(dispatch_notes_command(cfg, command)).await
+        }
+        Some(OnenoteCommand::Mail { command }) => {
+            Box::pin(dispatch_mail_command(cfg, command)).await
+        }
     }
 }
 
@@ -2666,16 +2749,97 @@ async fn cmd_logout(cfg: &AppConfig, json_out: bool) -> Result<()> {
 
 async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result<()> {
     let auth = AuthManager::new(cfg.clone())?;
-    let Some(tokens) = auth.current_tokens().await else {
-        bail!(
-            "로그인이 필요합니다. 먼저 `{} login` 을 실행하세요.",
-            persona.bin_name()
-        );
+    let mut tokens = match auth.current_tokens().await {
+        Some(t) => t,
+        None => {
+            if let Some(ref tf) = cfg.resolved_token_file() {
+                if !tf.exists() {
+                    bail!(
+                        "로그인이 필요합니다. 먼저 `{} login` 을 실행하거나 `TEAMS_TOKEN_FILE` / `TEAMS_ACCESS_TOKEN` 을 설정하세요. (설정된 TEAMS_TOKEN_FILE 경로를 찾을 수 없음: {})",
+                        persona.bin_name(),
+                        tf.display()
+                    );
+                }
+                bail!(
+                    "로그인이 필요합니다. 먼저 `{} login` 을 실행하거나 유효한 `TEAMS_TOKEN_FILE` ({}) / `TEAMS_ACCESS_TOKEN` 을 설정하세요.",
+                    persona.bin_name(),
+                    tf.display()
+                );
+            }
+            bail!(
+                "로그인이 필요합니다. 먼저 `{} login` 을 실행하거나 `TEAMS_TOKEN_FILE` / `TEAMS_ACCESS_TOKEN` 을 설정하세요.",
+                persona.bin_name()
+            );
+        }
     };
 
+    let refresh_skew_secs = (cfg.token_refresh_mins.max(1) * 60) as i64;
+    let mut refresh_failure: Option<anyhow::Error> = None;
+    if tokens.is_expired_soon(refresh_skew_secs) && auth.is_refreshable().await {
+        match auth.refresh_now().await {
+            Ok(refreshed) => {
+                tokens = refreshed;
+            }
+            Err(refresh_err) => {
+                if tokens.is_expired_soon(0) {
+                    refresh_failure = Some(refresh_err);
+                } else {
+                    eprintln!(
+                        "경고: 토큰 자동 갱신 실패 ({refresh_err}); 기존 토큰(만료: {})으로 계속 조회합니다.",
+                        format_unix_ts(tokens.expires_at)
+                    );
+                }
+            }
+        }
+    }
+
+    if tokens.is_expired_soon(0) {
+        let err_detail = match refresh_failure {
+            Some(ref err) => format!(
+                "토큰 만료 (exp: {}, auth_mode={}) — 자동 갱신 실패: {err:#}",
+                format_unix_ts(tokens.expires_at),
+                tokens.auth_mode
+            ),
+            None => format!(
+                "토큰 만료 (exp: {}, auth_mode={}) — 토큰을 갱신(refresh)한 뒤 재시도하세요.",
+                format_unix_ts(tokens.expires_at),
+                tokens.auth_mode
+            ),
+        };
+        if json_out {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "persona": persona,
+                    "user_id": tokens.user_id,
+                    "display_name": tokens.user_display_name,
+                    "email": tokens.user_email,
+                    "client_id": tokens.client_id,
+                    "tenant_id": tokens.tenant_id,
+                    "auth_mode": tokens.auth_mode,
+                    "expires_at": tokens.expires_at,
+                    "expires_at_human": format_unix_ts(tokens.expires_at),
+                    "expired": true,
+                    "expiring_soon": true,
+                    "status": "expired",
+                    "error": format!("토큰 만료 (exp: {}) — refresh 후 재시도하세요", format_unix_ts(tokens.expires_at)),
+                }))?
+            );
+            bail!("토큰 만료 (exp: {}) — 토큰을 갱신한 뒤 재시도하세요.", format_unix_ts(tokens.expires_at));
+        }
+        bail!("{err_detail}");
+    }
+
     let graph = GraphClient::new(cfg.clone(), auth.clone())?;
+    let mut profile_err: Option<anyhow::Error> = None;
     let live_profile = if tokens.user_id.is_none() || tokens.user_display_name.is_none() {
-        graph.get_me().await.ok()
+        match graph.get_me().await {
+            Ok(p) => Some(p),
+            Err(e) => {
+                profile_err = Some(e);
+                None
+            }
+        }
     } else {
         None
     };
@@ -2694,6 +2858,19 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
             .and_then(|p| p.mail.clone().or_else(|| p.user_principal_name.clone()))
     });
 
+    if display_name.is_none() && user_id.is_none() {
+        if let Some(err) = profile_err {
+            bail!(
+                "프로필 조회(/me) 실패 (auth_mode={}, 만료 시각: {}): {err:#}",
+                tokens.auth_mode,
+                format_unix_ts(tokens.expires_at)
+            );
+        }
+    }
+
+    let expiring_soon =
+        !tokens.is_expired_soon(0) && tokens.is_expired_soon(refresh_skew_secs);
+
     if json_out {
         println!(
             "{}",
@@ -2707,7 +2884,9 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
                 "auth_mode": tokens.auth_mode,
                 "expires_at": tokens.expires_at,
                 "expires_at_human": format_unix_ts(tokens.expires_at),
-                "expired": tokens.is_expired_soon(0),
+                "expired": false,
+                "expiring_soon": expiring_soon,
+                "status": if expiring_soon { "expiring_soon" } else { "valid" },
             }))?
         );
     } else {
@@ -2724,8 +2903,8 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
         println!(
             "토큰 만료: {} ({})",
             format_unix_ts(tokens.expires_at),
-            if tokens.is_expired_soon(0) {
-                "만료됨"
+            if expiring_soon {
+                "만료 임박 — 갱신 권장"
             } else {
                 "유효"
             }
@@ -2750,6 +2929,10 @@ async fn cmd_doctor(
     let db = config::db_path(user_id);
     let dl_dir = cfg.resolved_download_dir();
     let scopes = cfg.effective_scopes();
+    let token_file = cfg.resolved_token_file();
+    let token_refresh_cmd_configured = !cfg.token_refresh_cmd.trim().is_empty();
+    let auth_mode = tokens.as_ref().map(|t| t.auth_mode.clone());
+    let token_expires_at = tokens.as_ref().map(|t| format_unix_ts(t.expires_at));
 
     let keyring_status = describe_keyring_status(tokens.as_ref(), &cred_path);
 
@@ -2862,6 +3045,12 @@ async fn cmd_doctor(
                 "graph_base_url": cfg.graph_base_url,
                 "auth_base_url": cfg.auth_base_url,
                 "keyring_status": keyring_status,
+                "token_file": token_file,
+                "token_file_exists": token_file.as_ref().map(|p| p.exists()),
+                "token_refresh_cmd_configured": token_refresh_cmd_configured,
+                "token_refresh_mins": cfg.token_refresh_mins,
+                "auth_mode": auth_mode,
+                "token_expires_at": token_expires_at,
                 "logged_in": tokens.is_some(),
                 "cache_counts": {
                     "conversations": cached_conversations,
@@ -2907,6 +3096,22 @@ async fn cmd_doctor(
         println!("graph_base_url: {}", cfg.graph_base_url);
         println!("auth_base_url: {}", cfg.auth_base_url);
         println!("keyring_status: {keyring_status}");
+        println!(
+            "token_file: {}",
+            token_file
+                .as_ref()
+                .map(|p| format!("{} (exists={})", p.display(), p.exists()))
+                .unwrap_or_else(|| "(미설정)".to_string())
+        );
+        println!(
+            "token_refresh_cmd_configured: {token_refresh_cmd_configured} (token_refresh_mins={})",
+            cfg.token_refresh_mins
+        );
+        println!("auth_mode: {}", auth_mode.as_deref().unwrap_or("-"));
+        println!(
+            "token_expires_at: {}",
+            token_expires_at.as_deref().unwrap_or("-")
+        );
         if probe {
             let onenote_state = probe_onenote
                 .as_ref()
@@ -2942,6 +3147,9 @@ fn describe_keyring_status(tokens: Option<&StoredTokens>, fallback_path: &Path) 
         None => "미로그인 (저장된 토큰 없음)".to_string(),
         Some(tok) if tok.auth_mode == "env_token" => {
             "env_token (TEAMS_ACCESS_TOKEN 사용 중)".to_string()
+        }
+        Some(tok) if tok.auth_mode == "token_file" => {
+            "token_file (TEAMS_TOKEN_FILE 사용 중)".to_string()
         }
         Some(_) if fallback_path.exists() => {
             "credentials.json 파일 폴백 사용 중".to_string()
@@ -8209,5 +8417,152 @@ mod tests {
             build_onenote_scope_from_args(Some(" g1 "), None).unwrap().scope_key(),
             "group:g1"
         );
+    }
+
+    #[test]
+    fn unifies_cross_persona_subcommands_top_alias_and_env_help() {
+        // 1. `outlook mail <subcmd>`
+        let out = OutlookCli::try_parse_from(["outlook", "mail", "list", "--top", "5"]).unwrap();
+        assert!(matches!(
+            out.command.unwrap(),
+            OutlookCommand::Mail {
+                command: MailCommand::List { limit: 5, .. }
+            }
+        ));
+        let out = OutlookCli::try_parse_from(["outlook", "mail", "folders"]).unwrap();
+        assert!(matches!(
+            out.command.unwrap(),
+            OutlookCommand::Mail {
+                command: MailCommand::Folders { .. }
+            }
+        ));
+
+        // 2. `outlook inbox --top 5`
+        let out = OutlookCli::try_parse_from(["outlook", "inbox", "--top", "5"]).unwrap();
+        assert!(matches!(
+            out.command.unwrap(),
+            OutlookCommand::Inbox { limit: 5, .. }
+        ));
+
+        // 3. `teams mail list --top 5` & `teams inbox --top 5`
+        let cli = Cli::try_parse_from(["teams", "mail", "list", "--top", "5"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Mail {
+                command: MailCommand::List { limit: 5, .. }
+            }
+        ));
+        let cli = Cli::try_parse_from(["teams", "inbox", "--top", "5"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Inbox { limit: 5, .. }
+        ));
+
+        // 4. `onenote notes notebooks` & `onenote mail list --top 5`
+        let one = OnenoteCli::try_parse_from(["onenote", "notes", "notebooks"]).unwrap();
+        assert!(matches!(
+            one.command.unwrap(),
+            OnenoteCommand::Notes {
+                command: NotesCommand::Notebooks { .. }
+            }
+        ));
+        let one = OnenoteCli::try_parse_from(["onenote", "mail", "list", "--top", "5"]).unwrap();
+        assert!(matches!(
+            one.command.unwrap(),
+            OnenoteCommand::Mail {
+                command: MailCommand::List { limit: 5, .. }
+            }
+        ));
+
+        // 5. `--top` alias across all remaining commands with `limit`
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "chats", "--top", "7"]).unwrap().command.unwrap(),
+            Command::Chats { limit: 7, .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "read", "c1", "--top", "7"]).unwrap().command.unwrap(),
+            Command::Read { limit: 7, .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "thread", "c1", "m1", "--top", "7"]).unwrap().command.unwrap(),
+            Command::Thread { limit: 7, .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "search", "q", "--top", "7"]).unwrap().command.unwrap(),
+            Command::Search { limit: 7, .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "sync", "--top", "7"]).unwrap().command.unwrap(),
+            Command::Sync { limit: 7, .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "export", "c1", "--top", "7"]).unwrap().command.unwrap(),
+            Command::Export { limit: 7, .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "mail-search", "q", "--top", "7"]).unwrap().command.unwrap(),
+            Command::MailSearch { limit: 7, .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "mail", "search", "q", "--top", "7"]).unwrap().command.unwrap(),
+            Command::Mail { command: MailCommand::Search { limit: 7, .. } }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "cal", "list", "--top", "7"]).unwrap().command.unwrap(),
+            Command::Cal { command: CalCommand::List { limit: 7, .. } }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "contacts", "list", "--top", "7"]).unwrap().command.unwrap(),
+            Command::Contacts { command: ContactsCommand::List { limit: 7, .. } }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "contacts", "search", "q", "--top", "7"]).unwrap().command.unwrap(),
+            Command::Contacts { command: ContactsCommand::Search { limit: 7, .. } }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "todo", "tasks", "--top", "7"]).unwrap().command.unwrap(),
+            Command::Todo { command: TodoCommand::Tasks { limit: 7, .. } }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "notes", "pages", "s1", "--top", "7"]).unwrap().command.unwrap(),
+            Command::Notes { command: NotesCommand::Pages { limit: 7, .. } }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["teams", "notes", "search", "q", "--top", "7"]).unwrap().command.unwrap(),
+            Command::Notes { command: NotesCommand::Search { limit: 7, .. } }
+        ));
+        assert!(matches!(
+            OutlookCli::try_parse_from(["outlook", "search", "q", "--top", "7"]).unwrap().command.unwrap(),
+            OutlookCommand::Search { limit: 7, .. }
+        ));
+        assert!(matches!(
+            OutlookCli::try_parse_from(["outlook", "chats", "--top", "7"]).unwrap().command.unwrap(),
+            OutlookCommand::Chats { limit: 7, .. }
+        ));
+        assert!(matches!(
+            OnenoteCli::try_parse_from(["onenote", "pages", "s1", "--top", "7"]).unwrap().command.unwrap(),
+            OnenoteCommand::Pages { limit: 7, .. }
+        ));
+        assert!(matches!(
+            OnenoteCli::try_parse_from(["onenote", "search", "q", "--top", "7"]).unwrap().command.unwrap(),
+            OnenoteCommand::Search { limit: 7, .. }
+        ));
+
+        // 6. `--help` renders key environment variables across all three personas
+        let required_envs = [
+            "TEAMS_PERSONA",
+            "TEAMS_TOKEN_FILE",
+            "TEAMS_TOKEN_REFRESH_CMD",
+            "TEAMS_ACCESS_TOKEN",
+            "TEAMS_DISABLE_KEYRING",
+        ];
+        let teams_help = <Cli as clap::CommandFactory>::command().render_help().to_string();
+        let outlook_help = <OutlookCli as clap::CommandFactory>::command().render_help().to_string();
+        let onenote_help = <OnenoteCli as clap::CommandFactory>::command().render_help().to_string();
+        for env_name in required_envs {
+            assert!(teams_help.contains(env_name), "teams help missing {env_name}");
+            assert!(outlook_help.contains(env_name), "outlook help missing {env_name}");
+            assert!(onenote_help.contains(env_name), "onenote help missing {env_name}");
+        }
     }
 }

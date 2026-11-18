@@ -157,6 +157,36 @@ mod tests {
         );
         assert_eq!(
             key_to_action_for_tab(
+                press(KeyCode::Char('8'), KeyModifiers::CONTROL),
+                Focus::Nav,
+                0,
+                &keymap,
+                false,
+            ),
+            Some(Action::SelectNavTab(7))
+        );
+        assert_eq!(
+            key_to_action_for_tab(
+                press(KeyCode::Char('n'), KeyModifiers::ALT),
+                Focus::Nav,
+                0,
+                &keymap,
+                false,
+            ),
+            Some(Action::SwitchPersona(crate::config::Persona::OneNote))
+        );
+        assert_eq!(
+            key_to_action_for_tab(
+                press(KeyCode::Char('a'), KeyModifiers::NONE),
+                Focus::Chat,
+                7,
+                &keymap,
+                false,
+            ),
+            Some(Action::OnenoteOpenAppendBlock)
+        );
+        assert_eq!(
+            key_to_action_for_tab(
                 press(KeyCode::Char('o'), KeyModifiers::ALT),
                 Focus::Nav,
                 0,

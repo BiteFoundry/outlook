@@ -78,9 +78,13 @@ impl SyncController {
 
 /// Performs an initial bootstrap sync (chats + joined teams/channels) into SQLite.
 pub async fn bootstrap_conversations(graph: &GraphClient, storage: &Storage) -> Result<()> {
-    let chats = graph.list_chats(50).await?;
+    let (chats_res, teams_res) = tokio::join!(
+        graph.list_chats(50),
+        graph.list_joined_teams_with_channels(),
+    );
+    let chats = chats_res?;
     storage.upsert_conversations(&chats)?;
-    if let Ok(teams) = graph.list_joined_teams_with_channels().await {
+    if let Ok(teams) = teams_res {
         storage.upsert_teams(&teams)?;
     }
     Ok(())
@@ -89,24 +93,32 @@ pub async fn bootstrap_conversations(graph: &GraphClient, storage: &Storage) -> 
 /// Performs an initial bootstrap sync of Outlook Mail folders/inbox, Calendar, Contacts, and To Do into SQLite.
 /// Best-effort per service so Teams-only tokens without Outlook scopes never fail bootstrap.
 pub async fn bootstrap_outlook(graph: &GraphClient, storage: &Storage) -> Result<()> {
-    if let Ok(folders) = graph.list_mail_folders().await {
+    let (start_iso, end_iso) = default_calendar_window();
+    let (folders_res, messages_res, events_res, contacts_res, lists_res) = tokio::join!(
+        graph.list_mail_folders(),
+        graph.list_mail_messages("inbox", 40),
+        graph.list_calendar_view(&start_iso, &end_iso, 50),
+        graph.list_contacts(100),
+        graph.list_todo_lists(),
+    );
+
+    if let Ok(folders) = folders_res {
         storage.upsert_mail_folders(&folders)?;
     }
 
-    if let Ok(messages) = graph.list_mail_messages("inbox", 40).await {
+    if let Ok(messages) = messages_res {
         storage.upsert_mail_messages(&messages)?;
     }
 
-    let (start_iso, end_iso) = default_calendar_window();
-    if let Ok(events) = graph.list_calendar_view(&start_iso, &end_iso, 50).await {
+    if let Ok(events) = events_res {
         storage.upsert_calendar_events(&events)?;
     }
 
-    if let Ok(contacts) = graph.list_contacts(100).await {
+    if let Ok(contacts) = contacts_res {
         storage.upsert_contacts(&contacts)?;
     }
 
-    if let Ok(lists) = graph.list_todo_lists().await {
+    if let Ok(lists) = lists_res {
         storage.upsert_todo_lists(&lists)?;
         if let Some(default_list) = pick_default_todo_list(&lists) {
             if let Ok(tasks) = graph.list_todo_tasks(&default_list.id, true, 50).await {
@@ -146,7 +158,8 @@ pub async fn bootstrap_onenote(graph: &GraphClient, storage: &Storage) -> Result
     Ok(())
 }
 
-/// Spawns the background sync loop and returns a `SyncController` handle.
+/// Spawns the two-lane background sync engine (Fast Interactive Lane + Background Poll Lane)
+/// and returns a `SyncController` handle.
 pub fn spawn_sync_engine(
     config: AppConfig,
     graph: GraphClient,
@@ -155,29 +168,134 @@ pub fn spawn_sync_engine(
 ) -> SyncController {
     let (focus_tx, mut focus_rx) = watch::channel(FocusTarget::default());
     let (nudge_tx, mut nudge_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (bg_tx, mut bg_rx) = mpsc::unbounded_channel::<SyncCommand>();
 
     let active_ms = config.active_poll_ms.max(250);
     let chat_ms = config.chat_poll_ms.max(500);
     let channel_ms = config.channel_poll_ms.max(1_000);
 
+    // Lane 1: Fast Interactive Lane (never blocked by Outlook/OneNote/tier-2/tier-3 background polls)
+    let fast_graph = graph.clone();
+    let fast_storage = storage.clone();
+    let fast_event_tx = event_tx.clone();
+    let mut fast_shutdown_rx = shutdown_rx.clone();
     tokio::spawn(async move {
         let mut active_tick = time::interval(Duration::from_millis(active_ms));
         active_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        // Consume initial immediate tick so startup isn't flooded simultaneously before focus/commands arrive.
+        active_tick.tick().await;
+
+        loop {
+            if *fast_shutdown_rx.borrow() {
+                break;
+            }
+            tokio::select! {
+                _ = fast_shutdown_rx.changed() => {
+                    if *fast_shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                cmd = nudge_rx.recv() => {
+                    match cmd {
+                        None | Some(SyncCommand::Shutdown) => {
+                            let _ = shutdown_tx.send(true);
+                            break;
+                        }
+                        Some(
+                            cmd @ (SyncCommand::RefreshConversations
+                            | SyncCommand::RefreshOutlook
+                            | SyncCommand::RefreshOneNote),
+                        ) => {
+                            let _ = bg_tx.send(cmd);
+                        }
+                        Some(SyncCommand::SyncMailFolder { folder_id }) => {
+                            if let Err(err) = sync_mail_folder(&folder_id, &fast_graph, &fast_storage, &fast_event_tx).await {
+                                let _ = fast_event_tx.send(CoreEvent::SyncError(format!("메일 폴더 동기화 실패: {err}")));
+                            }
+                        }
+                        Some(SyncCommand::SyncTodoList { list_id }) => {
+                            if let Err(err) = sync_todo_list(&list_id, &fast_graph, &fast_storage, &fast_event_tx).await {
+                                let _ = fast_event_tx.send(CoreEvent::SyncError(format!("To Do 동기화 실패: {err}")));
+                            }
+                        }
+                        Some(SyncCommand::SyncOneNoteSection { section_key }) => {
+                            if let Err(err) = sync_onenote_section(&section_key, &fast_graph, &fast_storage, &fast_event_tx).await {
+                                let _ = fast_event_tx.send(CoreEvent::SyncError(format!("OneNote 섹션 동기화 실패: {err}")));
+                            }
+                        }
+                        Some(SyncCommand::SyncOneNotePage { page_key }) => {
+                            if let Err(err) = sync_onenote_page(&page_key, &fast_graph, &fast_storage, &fast_event_tx).await {
+                                let _ = fast_event_tx.send(CoreEvent::SyncError(format!("OneNote 페이지 동기화 실패: {err}")));
+                            }
+                        }
+                        Some(SyncCommand::SyncActiveNow) => {
+                            let focus = focus_rx.borrow_and_update().clone();
+                            if let Err(err) = sync_active_focus(&focus, &fast_graph, &fast_storage, &fast_event_tx).await {
+                                let _ = fast_event_tx.send(CoreEvent::SyncError(format!("활성 대화 동기화 실패: {err}")));
+                            }
+                        }
+                        Some(SyncCommand::SyncChannelHistory { team_id, channel_id }) => {
+                            let _ = fast_event_tx.send(CoreEvent::SyncStateChanged {
+                                busy: true,
+                                summary: "채널 히스토리 동기화 중...".to_string(),
+                            });
+                            if let Err(err) = sync_channel_history(&team_id, &channel_id, &fast_graph, &fast_storage, &fast_event_tx).await {
+                                let _ = fast_event_tx.send(CoreEvent::SyncError(format!("채널 동기화 실패: {err}")));
+                            }
+                            let _ = fast_event_tx.send(CoreEvent::SyncStateChanged {
+                                busy: false,
+                                summary: "동기화 완료".to_string(),
+                            });
+                        }
+                    }
+                }
+                changed = focus_rx.changed() => {
+                    if changed.is_err() {
+                        let _ = shutdown_tx.send(true);
+                        break;
+                    }
+                    let focus = focus_rx.borrow_and_update().clone();
+                    if let Err(err) = sync_active_focus(&focus, &fast_graph, &fast_storage, &fast_event_tx).await {
+                        let _ = fast_event_tx.send(CoreEvent::SyncError(format!("포커스 대화 동기화 실패: {err}")));
+                    }
+                }
+                _ = active_tick.tick() => {
+                    let focus = focus_rx.borrow().clone();
+                    if let Err(err) = sync_active_focus(&focus, &fast_graph, &fast_storage, &fast_event_tx).await {
+                        let _ = fast_event_tx.send(CoreEvent::SyncError(format!("활성 폴링 오류: {err}")));
+                    }
+                }
+            }
+        }
+    });
+
+    // Lane 2: Background Poll Lane (tier-2 chat poll, tier-3 presence + Outlook poll, bulk refreshes)
+    tokio::spawn(async move {
         let mut chat_tick = time::interval(Duration::from_millis(chat_ms));
         chat_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut channel_tick = time::interval(Duration::from_millis(channel_ms));
         channel_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         // Consume initial immediate ticks so startup isn't flooded simultaneously before focus/commands arrive.
-        active_tick.tick().await;
         chat_tick.tick().await;
         channel_tick.tick().await;
 
+        let mut shutdown_rx = shutdown_rx;
         loop {
+            if *shutdown_rx.borrow() {
+                break;
+            }
             tokio::select! {
-                cmd = nudge_rx.recv() => {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                cmd = bg_rx.recv() => {
                     match cmd {
-                        None | Some(SyncCommand::Shutdown) => break,
+                        None => break,
                         Some(SyncCommand::RefreshConversations) => {
                             let _ = event_tx.send(CoreEvent::SyncStateChanged {
                                 busy: true,
@@ -215,60 +333,7 @@ pub fn spawn_sync_engine(
                                 summary: "OneNote 동기화 완료".to_string(),
                             });
                         }
-                        Some(SyncCommand::SyncMailFolder { folder_id }) => {
-                            if let Err(err) = sync_mail_folder(&folder_id, &graph, &storage, &event_tx).await {
-                                let _ = event_tx.send(CoreEvent::SyncError(format!("메일 폴더 동기화 실패: {err}")));
-                            }
-                        }
-                        Some(SyncCommand::SyncTodoList { list_id }) => {
-                            if let Err(err) = sync_todo_list(&list_id, &graph, &storage, &event_tx).await {
-                                let _ = event_tx.send(CoreEvent::SyncError(format!("To Do 동기화 실패: {err}")));
-                            }
-                        }
-                        Some(SyncCommand::SyncOneNoteSection { section_key }) => {
-                            if let Err(err) = sync_onenote_section(&section_key, &graph, &storage, &event_tx).await {
-                                let _ = event_tx.send(CoreEvent::SyncError(format!("OneNote 섹션 동기화 실패: {err}")));
-                            }
-                        }
-                        Some(SyncCommand::SyncOneNotePage { page_key }) => {
-                            if let Err(err) = sync_onenote_page(&page_key, &graph, &storage, &event_tx).await {
-                                let _ = event_tx.send(CoreEvent::SyncError(format!("OneNote 페이지 동기화 실패: {err}")));
-                            }
-                        }
-                        Some(SyncCommand::SyncActiveNow) => {
-                            let focus = focus_rx.borrow().clone();
-                            if let Err(err) = sync_active_focus(&focus, &graph, &storage, &event_tx).await {
-                                let _ = event_tx.send(CoreEvent::SyncError(format!("활성 대화 동기화 실패: {err}")));
-                            }
-                        }
-                        Some(SyncCommand::SyncChannelHistory { team_id, channel_id }) => {
-                            let _ = event_tx.send(CoreEvent::SyncStateChanged {
-                                busy: true,
-                                summary: "채널 히스토리 동기화 중...".to_string(),
-                            });
-                            if let Err(err) = sync_channel_history(&team_id, &channel_id, &graph, &storage, &event_tx).await {
-                                let _ = event_tx.send(CoreEvent::SyncError(format!("채널 동기화 실패: {err}")));
-                            }
-                            let _ = event_tx.send(CoreEvent::SyncStateChanged {
-                                busy: false,
-                                summary: "동기화 완료".to_string(),
-                            });
-                        }
-                    }
-                }
-                changed = focus_rx.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                    let focus = focus_rx.borrow_and_update().clone();
-                    if let Err(err) = sync_active_focus(&focus, &graph, &storage, &event_tx).await {
-                        let _ = event_tx.send(CoreEvent::SyncError(format!("포커스 대화 동기화 실패: {err}")));
-                    }
-                }
-                _ = active_tick.tick() => {
-                    let focus = focus_rx.borrow().clone();
-                    if let Err(err) = sync_active_focus(&focus, &graph, &storage, &event_tx).await {
-                        let _ = event_tx.send(CoreEvent::SyncError(format!("활성 폴링 오류: {err}")));
+                        Some(_) => {}
                     }
                 }
                 _ = chat_tick.tick() => {
@@ -277,10 +342,13 @@ pub fn spawn_sync_engine(
                     }
                 }
                 _ = channel_tick.tick() => {
-                    if let Err(err) = poll_presences_tier3(&graph, &storage, &event_tx).await {
+                    let (presence_res, ()) = tokio::join!(
+                        poll_presences_tier3(&graph, &storage, &event_tx),
+                        refresh_outlook_best_effort(&graph, &storage, &event_tx),
+                    );
+                    if let Err(err) = presence_res {
                         let _ = event_tx.send(CoreEvent::SyncError(format!("상태 폴링 오류: {err}")));
                     }
-                    refresh_outlook_best_effort(&graph, &storage, &event_tx).await;
                 }
             }
         }
@@ -316,13 +384,23 @@ async fn sync_active_focus(
             channel_id,
         } => {
             let cursor = storage.get_sync_cursor(&conv_key)?;
-            let delta_res = graph
-                .sync_channel_messages_delta(
-                    team_id,
-                    channel_id,
-                    cursor.as_ref().and_then(|c| c.delta_link.as_deref()),
-                )
-                .await;
+            let delta_fut = graph.sync_channel_messages_delta(
+                team_id,
+                channel_id,
+                cursor.as_ref().and_then(|c| c.delta_link.as_deref()),
+            );
+            let replies_fut = async {
+                match &focus.thread_root_id {
+                    Some(root_id) => Some((
+                        root_id.clone(),
+                        graph
+                            .list_thread_replies(team_id, channel_id, root_id, 50)
+                            .await,
+                    )),
+                    None => None,
+                }
+            };
+            let (delta_res, replies_opt) = tokio::join!(delta_fut, replies_fut);
 
             match delta_res {
                 Ok((messages, new_delta_link)) => {
@@ -360,14 +438,12 @@ async fn sync_active_focus(
                 }
             }
 
-            if let Some(root_id) = &focus.thread_root_id {
-                let replies = graph
-                    .list_thread_replies(team_id, channel_id, root_id, 50)
-                    .await?;
+            if let Some((root_id, replies_res)) = replies_opt {
+                let replies = replies_res?;
                 storage.upsert_messages(&replies)?;
                 let _ = event_tx.send(CoreEvent::MessagesUpdated {
                     conv_key,
-                    parent_msg_id: Some(root_id.clone()),
+                    parent_msg_id: Some(root_id),
                     messages: replies,
                     notify_candidate: None,
                 });
@@ -463,8 +539,12 @@ async fn refresh_all_conversations(
     storage: &Storage,
     event_tx: &mpsc::UnboundedSender<CoreEvent>,
 ) -> Result<()> {
-    poll_chats_tier2(graph, storage, event_tx).await?;
-    if let Ok(teams) = graph.list_joined_teams_with_channels().await {
+    let (chats_res, teams_res) = tokio::join!(
+        poll_chats_tier2(graph, storage, event_tx),
+        graph.list_joined_teams_with_channels(),
+    );
+    chats_res?;
+    if let Ok(teams) = teams_res {
         storage.upsert_teams(&teams)?;
         let _ = event_tx.send(CoreEvent::TeamsUpdated(teams));
         let all_convs = storage.list_conversations()?;
@@ -520,13 +600,22 @@ async fn refresh_outlook_best_effort(
     storage: &Storage,
     event_tx: &mpsc::UnboundedSender<CoreEvent>,
 ) {
-    if let Ok(folders) = graph.list_mail_folders().await {
+    let (start_iso, end_iso) = default_calendar_window();
+    let (folders_res, messages_res, events_res, contacts_res, lists_res) = tokio::join!(
+        graph.list_mail_folders(),
+        graph.list_mail_messages("inbox", 40),
+        graph.list_calendar_view(&start_iso, &end_iso, 50),
+        graph.list_contacts(100),
+        graph.list_todo_lists(),
+    );
+
+    if let Ok(folders) = folders_res {
         if storage.upsert_mail_folders(&folders).is_ok() {
             let _ = event_tx.send(CoreEvent::MailFoldersUpdated(folders));
         }
     }
 
-    if let Ok(messages) = graph.list_mail_messages("inbox", 40).await {
+    if let Ok(messages) = messages_res {
         let had_initial = storage
             .list_mail_messages(Some("inbox"), 1)
             .map(|existing| !existing.is_empty())
@@ -545,20 +634,19 @@ async fn refresh_outlook_best_effort(
         }
     }
 
-    let (start_iso, end_iso) = default_calendar_window();
-    if let Ok(events) = graph.list_calendar_view(&start_iso, &end_iso, 50).await {
+    if let Ok(events) = events_res {
         if storage.upsert_calendar_events(&events).is_ok() {
             let _ = event_tx.send(CoreEvent::CalendarEventsUpdated(events));
         }
     }
 
-    if let Ok(contacts) = graph.list_contacts(100).await {
+    if let Ok(contacts) = contacts_res {
         if storage.upsert_contacts(&contacts).is_ok() {
             let _ = event_tx.send(CoreEvent::ContactsUpdated(contacts));
         }
     }
 
-    if let Ok(lists) = graph.list_todo_lists().await {
+    if let Ok(lists) = lists_res {
         if storage.upsert_todo_lists(&lists).is_ok() {
             let (list_id, tasks) = if let Some(default_list) = pick_default_todo_list(&lists) {
                 match graph.list_todo_tasks(&default_list.id, true, 50).await {
@@ -1001,6 +1089,58 @@ mod tests {
         );
         ctrl.request(SyncCommand::Shutdown);
         tokio::task::yield_now().await;
+    }
+
+    #[tokio::test]
+    async fn test_spawn_sync_engine_two_lane_routing_and_drop_shutdown() {
+        let config = AppConfig::default();
+        let auth = AuthManager::new(config.clone()).unwrap();
+        let graph = GraphClient::new(config.clone(), auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        let ctrl = spawn_sync_engine(config, graph, storage, event_tx);
+
+        // Coalesce rapid focus switches and verify both lanes process commands without deadlocking
+        ctrl.request(SyncCommand::RefreshOutlook);
+        ctrl.set_focus(
+            Some(ConversationTarget::Chat {
+                chat_id: "c-first".to_string(),
+            }),
+            None,
+        );
+        ctrl.set_focus(
+            Some(ConversationTarget::Chat {
+                chat_id: "c-latest".to_string(),
+            }),
+            None,
+        );
+        ctrl.request(SyncCommand::SyncActiveNow);
+
+        // Wait briefly for Background Poll Lane to emit Outlook SyncStateChanged and Fast Lane to process
+        let mut saw_outlook_state = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), event_rx.recv()).await {
+                Ok(Some(CoreEvent::SyncStateChanged { summary, .. }))
+                    if summary.contains("Outlook") =>
+                {
+                    saw_outlook_state = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(saw_outlook_state);
+
+        // Dropping controller closes nudge_tx + focus_tx and shuts down both lanes cleanly
+        drop(ctrl);
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            while event_rx.recv().await.is_some() {}
+        })
+        .await;
+        assert!(closed.is_ok(), "both sync lanes should terminate when controller is dropped");
     }
 
     #[tokio::test]

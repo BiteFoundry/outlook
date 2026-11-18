@@ -4,7 +4,10 @@
 use std::{
     collections::HashMap,
     path::Path,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -25,6 +28,17 @@ use crate::config::{credential_fallback_path, write_atomic, AppConfig};
 const KEYRING_SERVICE: &str = "teams-cli";
 const KEYRING_USER: &str = "default";
 const LOGIN_CALLBACK_TIMEOUT_SECS: u64 = 300;
+#[cfg(target_os = "linux")]
+const LINUX_KEYRING_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// Set when D-Bus Secret Service / keyring fails or times out so subsequent
+/// calls in the same process immediately fall back to `credentials.json`.
+static KEYRING_RUNTIME_FAILED: AtomicBool = AtomicBool::new(false);
+/// Emits the approaching-expiry warning for static external tokens at most once per process.
+static EXPIRY_SOON_WARNED: AtomicBool = AtomicBool::new(false);
+/// Emits the external refresh-command fallback warning at most once per process.
+static REFRESH_CMD_WARNED: AtomicBool = AtomicBool::new(false);
+const EXTERNAL_REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredTokens {
@@ -62,18 +76,24 @@ pub struct AuthManager {
     config: AppConfig,
     http: reqwest::Client,
     tokens: Arc<RwLock<Option<StoredTokens>>>,
+    refresh_mutex: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     token_path_override: Option<std::path::PathBuf>,
 }
 
 impl AuthManager {
     pub fn new(config: AppConfig) -> Result<Self> {
-        let loaded = load_stored_tokens()?;
+        let loaded = if should_skip_keyring_on_init(&config) {
+            None
+        } else {
+            load_stored_tokens()?
+        };
         let http = build_auth_http_client()?;
         Ok(Self {
             config,
             http,
             tokens: Arc::new(RwLock::new(loaded)),
+            refresh_mutex: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             token_path_override: None,
         })
@@ -85,6 +105,7 @@ impl AuthManager {
             config,
             http,
             tokens: Arc::new(RwLock::new(Some(tokens))),
+            refresh_mutex: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             token_path_override: None,
         }
@@ -116,36 +137,140 @@ impl AuthManager {
         &self.config
     }
 
-    pub async fn current_tokens(&self) -> Option<StoredTokens> {
-        if let Some(env_tok) = env_access_token(&self.config) {
-            return Some(env_tok);
-        }
-        self.tokens.read().await.clone()
+    fn has_refresh_cmd(&self) -> bool {
+        !self.config.token_refresh_cmd.trim().is_empty()
     }
 
-    /// Returns a valid Bearer access token, hot-reloading external `credentials.json` updates
-    /// or refreshing via OAuth `refresh_token` automatically when needed.
+    fn external_refresh_skew_secs(&self) -> i64 {
+        (self.config.token_refresh_mins.min(1440) * 60) as i64
+    }
+
+    async fn resolve_current_tokens_raw(&self) -> Option<StoredTokens> {
+        let mem_tok = self.tokens.read().await.clone();
+        let env_tok = env_access_token(&self.config);
+        let file_tok = self
+            .config
+            .resolved_token_file()
+            .and_then(|path| read_external_token_file(&path, &self.config).ok());
+
+        if let Some(ref mem) = mem_tok {
+            if mem.auth_mode == "refresh_cmd" {
+                let newer_than_env = match env_tok.as_ref() {
+                    None => true,
+                    Some(env) => {
+                        mem.expires_at > env.expires_at
+                            || (mem.expires_at == env.expires_at
+                                && mem.access_token != env.access_token)
+                    }
+                };
+                let newer_than_file = match file_tok.as_ref() {
+                    None => true,
+                    Some(file) => {
+                        mem.expires_at > file.expires_at
+                            || (mem.expires_at == file.expires_at
+                                && mem.access_token != file.access_token)
+                    }
+                };
+                if newer_than_env && newer_than_file {
+                    return Some(mem.clone());
+                }
+            }
+        }
+
+        if let Some(env) = env_tok {
+            return Some(env);
+        }
+        if let Some(file) = file_tok {
+            return Some(file);
+        }
+        mem_tok
+    }
+
+    pub async fn current_tokens(&self) -> Option<StoredTokens> {
+        if let Some(tok) = self.resolve_current_tokens_raw().await {
+            return Some(tok);
+        }
+        if self.has_refresh_cmd() {
+            return self.run_external_refresh_cmd(None).await.ok();
+        }
+        None
+    }
+
+    /// Returns a valid Bearer access token, hot-reloading external `credentials.json` / `token_file` updates,
+    /// running `TEAMS_TOKEN_REFRESH_CMD`, or refreshing via OAuth `refresh_token` automatically when needed.
     pub async fn valid_access_token(&self) -> Result<String> {
-        if let Some(tok) = self.current_tokens().await {
+        let has_refresh_cmd = self.has_refresh_cmd();
+
+        if let Some(tok) = self.resolve_current_tokens_raw().await {
+            let is_external = matches!(
+                tok.auth_mode.as_str(),
+                "env_token" | "token_file" | "refresh_cmd"
+            );
+            if is_external {
+                if has_refresh_cmd {
+                    let skew_secs = self.external_refresh_skew_secs();
+                    if !tok.is_expired_soon(skew_secs) {
+                        return Ok(tok.access_token);
+                    }
+                    let refreshed = self.run_external_refresh_cmd(Some(&tok)).await?;
+                    return Ok(refreshed.access_token);
+                }
+
+                if tok.is_expired_soon(0) {
+                    bail!(
+                        "토큰 만료 (exp: {}, auth_mode={}) — 토큰을 갱신한 뒤 재시도하세요. (자동 갱신: TEAMS_TOKEN_FILE + TEAMS_TOKEN_REFRESH_CMD 설정 지원)",
+                        format_local_exp(tok.expires_at),
+                        tok.auth_mode
+                    );
+                }
+                if tok.is_expired_soon(300) && !EXPIRY_SOON_WARNED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "경고: 토큰 만료 임박 (exp: {}) — 곧 갱신이 필요합니다.",
+                        format_local_exp(tok.expires_at)
+                    );
+                }
+                return Ok(tok.access_token);
+            }
+
             if !tok.is_expired_soon(90) {
                 return Ok(tok.access_token);
             }
-            if tok.auth_mode != "env_token" {
-                if let Some(reloaded) = self
-                    .try_hot_reload_from_disk(&tok.access_token, tok.expires_at)
-                    .await
-                {
-                    if !reloaded.is_expired_soon(30) {
-                        return Ok(reloaded.access_token);
-                    }
+            if has_refresh_cmd {
+                let refreshed = self.run_external_refresh_cmd(Some(&tok)).await?;
+                return Ok(refreshed.access_token);
+            }
+            if let Some(reloaded) = self
+                .try_hot_reload_from_disk(&tok.access_token, tok.expires_at)
+                .await
+            {
+                if !reloaded.is_expired_soon(30) {
+                    return Ok(reloaded.access_token);
                 }
-                if self.can_refresh_token(&tok) {
-                    let refreshed = self.refresh_now().await?;
-                    return Ok(refreshed.access_token);
-                }
+            }
+            if self.can_refresh_token(&tok) {
+                let refreshed = self.refresh_now().await?;
+                return Ok(refreshed.access_token);
             }
             return Ok(tok.access_token);
         }
+
+        if has_refresh_cmd {
+            let refreshed = self.run_external_refresh_cmd(None).await?;
+            return Ok(refreshed.access_token);
+        }
+
+        if let Some(token_path) = self.config.resolved_token_file() {
+            let tok = read_external_token_file(&token_path, &self.config)?;
+            if tok.is_expired_soon(0) {
+                bail!(
+                    "토큰 만료 (exp: {}, auth_mode={}) — 토큰을 갱신한 뒤 재시도하세요. (자동 갱신: TEAMS_TOKEN_FILE + TEAMS_TOKEN_REFRESH_CMD 설정 지원)",
+                    format_local_exp(tok.expires_at),
+                    tok.auth_mode
+                );
+            }
+            return Ok(tok.access_token);
+        }
+
         if let Ok(Some(reloaded)) = self.load_from_configured_source() {
             let mut guard = self.tokens.write().await;
             *guard = Some(reloaded.clone());
@@ -170,9 +295,12 @@ impl AuthManager {
         None
     }
 
-    /// Returns whether stored tokens can currently be refreshed (refresh token or client secret).
+    /// Returns whether stored tokens can currently be refreshed (`token_refresh_cmd`, refresh token, or client secret).
     pub async fn is_refreshable(&self) -> bool {
-        if env_access_token(&self.config).is_some() {
+        if self.has_refresh_cmd() {
+            return true;
+        }
+        if env_access_token(&self.config).is_some() || self.config.resolved_token_file().is_some() {
             return false;
         }
         let guard = self.tokens.read().await;
@@ -214,22 +342,35 @@ impl AuthManager {
         if let Some(raw_token) = opts
             .access_token
             .as_deref()
-            .map(str::trim)
+            .map(strip_bearer_prefix)
             .filter(|s| !s.is_empty())
         {
-            let expires_at = extract_jwt_exp(raw_token)
-                .unwrap_or_else(|| chrono::Utc::now().timestamp() + 3600);
-            let stored = StoredTokens {
-                access_token: raw_token.to_string(),
-                refresh_token: None,
-                expires_at,
-                client_id,
-                tenant_id,
-                user_id: None,
-                user_display_name: None,
-                user_email: None,
-                auth_mode: "access_token".to_string(),
-            };
+            let mut stored = stored_tokens_from_jwt(
+                raw_token,
+                None,
+                None,
+                &client_id,
+                &tenant_id,
+                "access_token",
+            );
+            if opts
+                .client_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_some()
+            {
+                stored.client_id = client_id;
+            }
+            if opts
+                .tenant_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_some()
+            {
+                stored.tenant_id = tenant_id;
+            }
             return self.store_tokens(stored).await;
         }
 
@@ -269,6 +410,16 @@ impl AuthManager {
     }
 
     pub async fn refresh_now(&self) -> Result<StoredTokens> {
+        if self.has_refresh_cmd() {
+            let current = self.resolve_current_tokens_raw().await;
+            return self.run_external_refresh_cmd(current.as_ref()).await;
+        }
+        if env_access_token(&self.config).is_some() {
+            bail!("TEAMS_ACCESS_TOKEN 환경 변수 토큰은 자동 갱신할 수 없습니다. (TEAMS_TOKEN_REFRESH_CMD 미설정)");
+        }
+        if let Some(path) = self.config.resolved_token_file() {
+            return read_external_token_file(&path, &self.config);
+        }
         let mut guard = self.tokens.write().await;
         self.refresh_locked(&mut guard).await
     }
@@ -278,8 +429,29 @@ impl AuthManager {
         &self,
         failed_access_token: &str,
     ) -> Result<StoredTokens> {
+        if self.has_refresh_cmd() {
+            let current = self.resolve_current_tokens_raw().await;
+            if let Some(ref cur) = current {
+                if cur.access_token != failed_access_token && !cur.is_expired_soon(30) {
+                    return Ok(cur.clone());
+                }
+            }
+            let refreshed = self.run_external_refresh_cmd(current.as_ref()).await?;
+            if refreshed.access_token == failed_access_token {
+                bail!("외부 토큰 갱신 후에도 거부된 토큰과 동일한 토큰이 반환되었습니다.");
+            }
+            return Ok(refreshed);
+        }
         if env_access_token(&self.config).is_some() {
             bail!("TEAMS_ACCESS_TOKEN 환경 변수 토큰은 자동 갱신할 수 없습니다.");
+        }
+        if let Some(path) = self.config.resolved_token_file() {
+            if let Ok(disk_tok) = read_external_token_file(&path, &self.config) {
+                if disk_tok.access_token != failed_access_token && !disk_tok.is_expired_soon(0) {
+                    return Ok(disk_tok);
+                }
+            }
+            bail!("외부 토큰 파일이 만료되었거나 거부되었습니다. 토큰을 갱신하거나 TEAMS_TOKEN_REFRESH_CMD를 설정하세요.");
         }
         let mut guard = self.tokens.write().await;
         if let Some(current) = guard.as_ref() {
@@ -294,6 +466,107 @@ impl AuthManager {
             }
         }
         self.refresh_locked(&mut guard).await
+    }
+
+    async fn run_external_refresh_cmd(
+        &self,
+        current: Option<&StoredTokens>,
+    ) -> Result<StoredTokens> {
+        let _lock = self.refresh_mutex.lock().await;
+        let skew_secs = self.external_refresh_skew_secs();
+        let old_token = current.map(|c| c.access_token.as_str());
+        let token_file = self.config.resolved_token_file();
+
+        // Double-check if another concurrent task/process already refreshed `token_file`.
+        if let Some(ref path) = token_file {
+            if let Ok(reloaded) = read_external_token_file(path, &self.config) {
+                if !reloaded.is_expired_soon(skew_secs.min(60))
+                    && Some(reloaded.access_token.as_str()) != old_token
+                {
+                    return Ok(reloaded);
+                }
+            }
+        } else if let Some(mem) = self.tokens.read().await.clone() {
+            if mem.auth_mode == "refresh_cmd"
+                && !mem.is_expired_soon(skew_secs.min(60))
+                && Some(mem.access_token.as_str()) != old_token
+            {
+                return Ok(mem);
+            }
+        }
+
+        let cmd_str = self.config.token_refresh_cmd.trim();
+        let exec_res = execute_external_refresh_shell(cmd_str, token_file.as_deref()).await;
+
+        match exec_res {
+            Ok(stdout) => {
+                let parsed = if let Some(ref path) = token_file {
+                    if path.exists() {
+                        match read_external_token_file(path, &self.config) {
+                            Ok(file_tok)
+                                if Some(file_tok.access_token.as_str()) != old_token
+                                    || stdout.trim().is_empty() =>
+                            {
+                                Ok(file_tok)
+                            }
+                            Ok(file_tok) => match parse_external_token_str(
+                                &stdout,
+                                "refresh_cmd",
+                                &self.config,
+                                "token_refresh_cmd stdout",
+                            ) {
+                                Ok(stdout_tok) => {
+                                    *self.tokens.write().await = Some(stdout_tok.clone());
+                                    Ok(stdout_tok)
+                                }
+                                Err(_) => Ok(file_tok),
+                            },
+                            Err(file_err) => parse_external_token_str(
+                                &stdout,
+                                "refresh_cmd",
+                                &self.config,
+                                "token_refresh_cmd stdout",
+                            )
+                            .map_err(|_| file_err),
+                        }
+                    } else {
+                        let tok = parse_external_token_str(
+                            &stdout,
+                            "refresh_cmd",
+                            &self.config,
+                            "token_refresh_cmd stdout",
+                        )?;
+                        *self.tokens.write().await = Some(tok.clone());
+                        Ok(tok)
+                    }
+                } else {
+                    let tok = parse_external_token_str(
+                        &stdout,
+                        "refresh_cmd",
+                        &self.config,
+                        "token_refresh_cmd stdout",
+                    )?;
+                    *self.tokens.write().await = Some(tok.clone());
+                    Ok(tok)
+                };
+
+                let new_tok = match parsed {
+                    Ok(t) => t,
+                    Err(err) => {
+                        return fallback_or_bail_refresh_error(current, &err.to_string());
+                    }
+                };
+
+                if new_tok.is_expired_soon(0) {
+                    bail!(
+                        "외부 토큰 갱신 실패 (exp: {}): 갱신 후에도 토큰이 이미 만료되어 있습니다.",
+                        format_local_exp(new_tok.expires_at)
+                    );
+                }
+                Ok(new_tok)
+            }
+            Err(err) => fallback_or_bail_refresh_error(current, &err.to_string()),
+        }
     }
 
     async fn refresh_locked(&self, guard: &mut Option<StoredTokens>) -> Result<StoredTokens> {
@@ -619,7 +892,12 @@ impl AuthManager {
             tok.user_id = Some(user_id);
             tok.user_display_name = Some(display_name);
             tok.user_email = email;
-            self.persist_tokens(tok)?;
+            if !matches!(
+                tok.auth_mode.as_str(),
+                "env_token" | "token_file" | "refresh_cmd"
+            ) {
+                self.persist_tokens(tok)?;
+            }
         }
         Ok(())
     }
@@ -633,12 +911,28 @@ impl AuthManager {
 
 pub fn load_stored_tokens() -> Result<Option<StoredTokens>> {
     let mut keyring_tok: Option<StoredTokens> = None;
-    if !keyring_disabled() {
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-            if let Ok(secret_json) = entry.get_password() {
+    if should_use_keyring() {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(Ok(secret_json)) = run_linux_keyring_op(|| {
+                let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
+                entry.get_password()
+            }) {
                 if !secret_json.trim().is_empty() {
                     if let Ok(parsed) = serde_json::from_str::<StoredTokens>(&secret_json) {
                         keyring_tok = Some(parsed);
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+                if let Ok(secret_json) = entry.get_password() {
+                    if !secret_json.trim().is_empty() {
+                        if let Ok(parsed) = serde_json::from_str::<StoredTokens>(&secret_json) {
+                            keyring_tok = Some(parsed);
+                        }
                     }
                 }
             }
@@ -661,33 +955,63 @@ pub fn load_stored_tokens() -> Result<Option<StoredTokens>> {
 
 pub fn save_stored_tokens(tokens: &StoredTokens) -> Result<()> {
     let fallback = credential_fallback_path();
-    if keyring_disabled() {
+    if !should_use_keyring() {
         return save_tokens_to_path(tokens, &fallback);
     }
 
     let json = serde_json::to_string_pretty(tokens)?;
-    match keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-        Ok(entry) => {
-            if entry.set_password(&json).is_ok() {
-                // Mirror to fallback file for consistency across environments.
-                let _ = save_tokens_to_path(tokens, &fallback);
-                return Ok(());
-            }
-            // Keyring failed (e.g., Windows Credential blob limit or headless daemon):
-            // remove any stale keyring entry and persist to fallback file.
-            let _ = entry.delete_credential();
-            save_tokens_to_path(tokens, &fallback)
+    #[cfg(target_os = "linux")]
+    {
+        let json_for_keyring = json;
+        if let Some(Ok(())) = run_linux_keyring_op(move || {
+            let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
+            entry.set_password(&json_for_keyring)
+        }) {
+            // Mirror to fallback file for consistency across environments.
+            let _ = save_tokens_to_path(tokens, &fallback);
+            return Ok(());
         }
-        Err(_) => save_tokens_to_path(tokens, &fallback),
+        // Secret Service unavailable, errored, or timed out: fall back to 0600 credentials.json.
+        return save_tokens_to_path(tokens, &fallback);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        match keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+            Ok(entry) => {
+                if entry.set_password(&json).is_ok() {
+                    // Mirror to fallback file for consistency across environments.
+                    let _ = save_tokens_to_path(tokens, &fallback);
+                    return Ok(());
+                }
+                // Keyring failed (e.g., Windows Credential blob limit or headless daemon):
+                // remove any stale keyring entry and persist to fallback file.
+                let _ = entry.delete_credential();
+                save_tokens_to_path(tokens, &fallback)
+            }
+            Err(_) => save_tokens_to_path(tokens, &fallback),
+        }
     }
 }
 
 pub fn delete_stored_tokens() -> Result<()> {
-    if !keyring_disabled() {
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-            match entry.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => {}
-                Err(_) => {}
+    if should_use_keyring() {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = run_linux_keyring_op(|| {
+                let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
+                match entry.delete_credential() {
+                    Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                    Err(e) => Err(e),
+                }
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+                match entry.delete_credential() {
+                    Ok(()) | Err(keyring::Error::NoEntry) => {}
+                    Err(_) => {}
+                }
             }
         }
     }
@@ -747,24 +1071,142 @@ fn build_auth_http_client() -> Result<reqwest::Client> {
         .context("HTTP 클라이언트 초기화 실패")
 }
 
+fn is_truthy_env(val: Option<&str>) -> bool {
+    val.map(|v| {
+        let t = v.trim().to_ascii_lowercase();
+        matches!(t.as_str(), "1" | "true" | "yes")
+    })
+    .unwrap_or(false)
+}
+
 fn keyring_disabled() -> bool {
-    std::env::var("TEAMS_DISABLE_KEYRING")
-        .ok()
-        .map(|v| {
-            let t = v.trim().to_ascii_lowercase();
-            matches!(t.as_str(), "1" | "true" | "yes")
+    is_truthy_env(std::env::var("TEAMS_DISABLE_KEYRING").ok().as_deref())
+}
+
+/// Checks whether a `DBUS_SESSION_BUS_ADDRESS` value points to a plausible session bus.
+/// Missing/empty addresses or `unix:path=<p>` entries whose socket path does not exist
+/// return `false` so headless Linux/SSH environments skip D-Bus Secret Service immediately.
+fn linux_secret_service_likely_available_with<F>(
+    dbus_addr: Option<&str>,
+    runtime_failed: bool,
+    path_exists: F,
+) -> bool
+where
+    F: Fn(&Path) -> bool,
+{
+    if runtime_failed {
+        return false;
+    }
+    let Some(raw) = dbus_addr.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+
+    for segment in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(params) = segment.strip_prefix("unix:") {
+            let mut socket_path: Option<&str> = None;
+            for kv in params.split(',') {
+                if let Some(p) = kv.trim().strip_prefix("path=") {
+                    socket_path = Some(p.trim());
+                    break;
+                }
+            }
+            match socket_path {
+                Some(p) if !p.is_empty() && path_exists(Path::new(p)) => return true,
+                Some(_) => continue,
+                None => return true, // e.g., unix:abstract=...
+            }
+        } else {
+            // Non-unix transport (e.g., tcp:, systemd:, launchd:)
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn linux_secret_service_likely_available() -> bool {
+    let addr = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
+    linux_secret_service_likely_available_with(
+        addr.as_deref(),
+        KEYRING_RUNTIME_FAILED.load(Ordering::Relaxed),
+        |p| p.exists(),
+    )
+}
+
+fn should_use_keyring() -> bool {
+    if keyring_disabled() || KEYRING_RUNTIME_FAILED.load(Ordering::Relaxed) {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if !linux_secret_service_likely_available() {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_keyring_op<T, F>(op: F) -> Option<std::result::Result<T, keyring::Error>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> std::result::Result<T, keyring::Error> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    if std::thread::Builder::new()
+        .name("teams-keyring".to_string())
+        .spawn(move || {
+            let _ = tx.send(op());
         })
-        .unwrap_or(false)
+        .is_err()
+    {
+        KEYRING_RUNTIME_FAILED.store(true, Ordering::Relaxed);
+        return None;
+    }
+
+    match rx.recv_timeout(LINUX_KEYRING_TIMEOUT) {
+        Ok(Ok(val)) => Some(Ok(val)),
+        Ok(Err(err)) => {
+            if !matches!(err, keyring::Error::NoEntry) {
+                KEYRING_RUNTIME_FAILED.store(true, Ordering::Relaxed);
+            }
+            Some(Err(err))
+        }
+        Err(_) => {
+            KEYRING_RUNTIME_FAILED.store(true, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+fn should_open_browser_with_env(
+    is_unix_non_macos: bool,
+    no_browser: Option<&str>,
+    display: Option<&str>,
+    wayland_display: Option<&str>,
+    wsl_distro_name: Option<&str>,
+) -> bool {
+    if is_truthy_env(no_browser) {
+        return false;
+    }
+    if !is_unix_non_macos {
+        return true;
+    }
+    let has_non_empty = |v: Option<&str>| v.map(|s| !s.trim().is_empty()).unwrap_or(false);
+    has_non_empty(display)
+        || has_non_empty(wayland_display)
+        || has_non_empty(wsl_distro_name)
 }
 
 fn should_open_browser() -> bool {
-    std::env::var("TEAMS_NO_BROWSER")
-        .ok()
-        .map(|v| {
-            let t = v.trim().to_ascii_lowercase();
-            !matches!(t.as_str(), "1" | "true" | "yes")
-        })
-        .unwrap_or(true)
+    should_open_browser_with_env(
+        cfg!(all(unix, not(target_os = "macos"))),
+        std::env::var("TEAMS_NO_BROWSER").ok().as_deref(),
+        std::env::var("DISPLAY").ok().as_deref(),
+        std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+        std::env::var("WSL_DISTRO_NAME").ok().as_deref(),
+    )
 }
 
 fn env_client_secret() -> Option<String> {
@@ -774,32 +1216,337 @@ fn env_client_secret() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn should_skip_keyring_on_init(config: &AppConfig) -> bool {
+    env_access_token(config).is_some()
+        || config.resolved_token_file().is_some()
+        || !config.token_refresh_cmd.trim().is_empty()
+}
+
 fn env_access_token(config: &AppConfig) -> Option<StoredTokens> {
     let raw = std::env::var("TEAMS_ACCESS_TOKEN").ok()?;
-    let trimmed = raw.trim();
+    env_access_token_from_str(&raw, config)
+}
+
+fn env_access_token_from_str(raw: &str, config: &AppConfig) -> Option<StoredTokens> {
+    let trimmed = strip_bearer_prefix(raw);
     if trimmed.is_empty() {
         return None;
     }
-    let expires_at =
-        extract_jwt_exp(trimmed).unwrap_or_else(|| chrono::Utc::now().timestamp() + 3600);
-    Some(StoredTokens {
-        access_token: trimmed.to_string(),
-        refresh_token: None,
-        expires_at,
-        client_id: config.client_id.clone(),
-        tenant_id: config.tenant_id.clone(),
-        user_id: None,
-        user_display_name: None,
-        user_email: None,
-        auth_mode: "env_token".to_string(),
+    Some(stored_tokens_from_jwt(
+        trimmed,
+        None,
+        None,
+        &config.client_id,
+        &config.tenant_id,
+        "env_token",
+    ))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct JwtClaims {
+    exp: Option<i64>,
+    user_id: Option<String>,
+    user_display_name: Option<String>,
+    user_email: Option<String>,
+    tenant_id: Option<String>,
+    client_id: Option<String>,
+}
+
+fn strip_bearer_prefix(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
+        trimmed[7..].trim()
+    } else {
+        trimmed
+    }
+}
+
+fn parse_jwt_claims(token: &str) -> Option<JwtClaims> {
+    let token = strip_bearer_prefix(token);
+    let payload_b64 = token.split('.').nth(1)?.trim();
+    if payload_b64.is_empty() {
+        return None;
+    }
+    let normalized: String = payload_b64
+        .trim_end_matches('=')
+        .chars()
+        .map(|c| match c {
+            '+' => '-',
+            '/' => '_',
+            _ => c,
+        })
+        .collect();
+    let decoded = URL_SAFE_NO_PAD.decode(&normalized).ok()?;
+    let val: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+
+    let claim_str = |key: &str| -> Option<String> {
+        val.get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let exp = val
+        .get("exp")
+        .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)));
+
+    Some(JwtClaims {
+        exp,
+        user_id: claim_str("oid").or_else(|| claim_str("sub")),
+        user_display_name: claim_str("name"),
+        user_email: claim_str("upn")
+            .or_else(|| claim_str("preferred_username"))
+            .or_else(|| claim_str("email")),
+        tenant_id: claim_str("tid"),
+        client_id: claim_str("appid").or_else(|| claim_str("azp")),
     })
 }
 
-fn extract_jwt_exp(token: &str) -> Option<i64> {
-    let payload_b64 = token.split('.').nth(1)?;
-    let decoded = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
-    let val: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-    val.get("exp").and_then(|v| v.as_i64())
+fn stored_tokens_from_jwt(
+    raw_token: &str,
+    refresh_token: Option<String>,
+    expires_at_override: Option<i64>,
+    fallback_client_id: &str,
+    fallback_tenant_id: &str,
+    auth_mode: &str,
+) -> StoredTokens {
+    let token = strip_bearer_prefix(raw_token).to_string();
+    let claims = parse_jwt_claims(&token).unwrap_or_default();
+    let expires_at = expires_at_override
+        .or(claims.exp)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp() + 3600);
+    StoredTokens {
+        access_token: token,
+        refresh_token,
+        expires_at,
+        client_id: claims
+            .client_id
+            .unwrap_or_else(|| fallback_client_id.to_string()),
+        tenant_id: claims
+            .tenant_id
+            .unwrap_or_else(|| fallback_tenant_id.to_string()),
+        user_id: claims.user_id,
+        user_display_name: claims.user_display_name,
+        user_email: claims.user_email,
+        auth_mode: auth_mode.to_string(),
+    }
+}
+
+fn json_non_empty_str(val: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|k| {
+        val.get(*k)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn parse_expiry_value(val: &serde_json::Value) -> Option<i64> {
+    use chrono::TimeZone;
+    if let Some(ts) = val.as_i64() {
+        return Some(ts);
+    }
+    if let Some(f) = val.as_f64() {
+        return Some(f as i64);
+    }
+    let s = val.as_str()?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(ts) = s.parse::<i64>() {
+        return Some(ts);
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp());
+    }
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S%.f%:z",
+        "%Y-%m-%d %H:%M:%S%:z",
+        "%Y-%m-%d %H:%M:%S%.f %z",
+        "%Y-%m-%d %H:%M:%S %z",
+    ] {
+        if let Ok(dt) = chrono::DateTime::parse_from_str(s, fmt) {
+            return Some(dt.timestamp());
+        }
+    }
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+    ] {
+        if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            if let Some(dt) = chrono::Local.from_local_datetime(&ndt).earliest() {
+                return Some(dt.timestamp());
+            }
+        }
+    }
+    None
+}
+
+fn parse_external_token_str(
+    raw: &str,
+    auth_mode: &str,
+    config: &AppConfig,
+    source_label: &str,
+) -> Result<StoredTokens> {
+    let cleaned = raw.trim_start_matches('\u{feff}').trim();
+    if cleaned.is_empty() {
+        bail!("토큰 파일이 비어 있습니다: {source_label}");
+    }
+
+    if cleaned.starts_with('{') {
+        let val: serde_json::Value = serde_json::from_str(cleaned)
+            .with_context(|| format!("외부 토큰 JSON 파싱 실패: {source_label}"))?;
+        let raw_token = json_non_empty_str(&val, &["access_token", "accessToken", "token"])
+            .ok_or_else(|| {
+                anyhow!("외부 토큰 JSON에 access_token/accessToken/token 필드가 없습니다: {source_label}")
+            })?;
+        let refresh_token = json_non_empty_str(&val, &["refresh_token", "refreshToken"]);
+        let claims_exp = parse_jwt_claims(&raw_token).and_then(|c| c.exp);
+        let exp_override = ["expires_at", "expires_on", "expiresOn"]
+            .iter()
+            .find_map(|k| val.get(*k).and_then(parse_expiry_value))
+            .or(claims_exp)
+            .or_else(|| {
+                val.get("expires_in")
+                    .and_then(|v| v.as_i64())
+                    .map(|secs| chrono::Utc::now().timestamp() + secs)
+            });
+
+        let mut tok = stored_tokens_from_jwt(
+            &raw_token,
+            refresh_token,
+            exp_override,
+            &config.client_id,
+            &config.tenant_id,
+            auth_mode,
+        );
+        if let Some(cid) = json_non_empty_str(&val, &["client_id", "clientId"]) {
+            tok.client_id = cid;
+        }
+        if let Some(tid) = json_non_empty_str(&val, &["tenant_id", "tenantId", "tenant"]) {
+            tok.tenant_id = tid;
+        }
+        if tok.user_id.is_none() {
+            tok.user_id = json_non_empty_str(&val, &["user_id", "userId"]);
+        }
+        if tok.user_display_name.is_none() {
+            tok.user_display_name =
+                json_non_empty_str(&val, &["user_display_name", "userDisplayName"]);
+        }
+        if tok.user_email.is_none() {
+            tok.user_email = json_non_empty_str(&val, &["user_email", "userEmail"]);
+        }
+        return Ok(tok);
+    }
+
+    let first_line = cleaned
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| anyhow!("토큰 파일이 비어 있습니다: {source_label}"))?;
+    let token = strip_bearer_prefix(first_line);
+    if token.is_empty() {
+        bail!("토큰 파일이 비어 있습니다: {source_label}");
+    }
+    Ok(stored_tokens_from_jwt(
+        token,
+        None,
+        None,
+        &config.client_id,
+        &config.tenant_id,
+        auth_mode,
+    ))
+}
+
+/// Reads an external access token (raw JWT or JSON from `tc-auth` / Azure CLI / `StoredTokens`)
+/// from `path`, normalizing BOM, optional `Bearer ` prefix, and JWT claims.
+pub fn read_external_token_file(path: &Path, config: &AppConfig) -> Result<StoredTokens> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("외부 토큰 파일 읽기 실패: {}", path.display()))?;
+    parse_external_token_str(&raw, "token_file", config, &path.display().to_string())
+}
+
+async fn execute_external_refresh_shell(cmd_str: &str, token_file: Option<&Path>) -> Result<String> {
+    #[cfg(windows)]
+    let mut cmd = {
+        use std::os::windows::process::CommandExt;
+        let mut std_cmd = std::process::Command::new("cmd");
+        std_cmd.raw_arg(format!("/S /C \"{cmd_str}\""));
+        tokio::process::Command::from(std_cmd)
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(cmd_str);
+        c
+    };
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+    if let Some(path) = token_file {
+        cmd.env("TEAMS_TOKEN_FILE", path);
+    }
+
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("외부 토큰 갱신 명령 실행 실패: {cmd_str}"))?;
+    let output = tokio::time::timeout(EXTERNAL_REFRESH_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| anyhow!("외부 토큰 갱신 명령 시간 초과 (60초)"))??;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            stdout.trim().to_string()
+        } else {
+            stderr
+        };
+        let code_str = output
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".to_string());
+        if detail.is_empty() {
+            bail!("exit code {code_str}");
+        }
+        bail!("exit code {code_str}: {detail}");
+    }
+    Ok(stdout)
+}
+
+fn fallback_or_bail_refresh_error(
+    current: Option<&StoredTokens>,
+    err: &str,
+) -> Result<StoredTokens> {
+    if let Some(cur) = current {
+        if !cur.is_expired_soon(0) {
+            if !REFRESH_CMD_WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "경고: 외부 토큰 갱신 명령 실패 ({err}); 기존 토큰 만료 시각({})까지 계속 사용합니다.",
+                    format_local_exp(cur.expires_at)
+                );
+            }
+            return Ok(cur.clone());
+        }
+        bail!(
+            "외부 토큰 갱신 실패 (exp: {}): {err}",
+            format_local_exp(cur.expires_at)
+        );
+    }
+    bail!("외부 토큰 갱신 실패 (exp: 없음): {err}");
+}
+
+fn format_local_exp(ts: i64) -> String {
+    use chrono::TimeZone;
+    match chrono::Local.timestamp_opt(ts, 0).single() {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
+        None => ts.to_string(),
+    }
 }
 
 async fn accept_pkce_callback(listener: &TcpListener, expected_state: &str) -> Result<String> {
@@ -1175,5 +1922,467 @@ mod tests {
         save_tokens_to_path(&externally_refreshed, &cred_path).unwrap();
 
         assert_eq!(mgr.valid_access_token().await.unwrap(), "f12-fresh-token");
+    }
+
+    #[test]
+    fn test_linux_secret_service_availability_detection() {
+        let dir = tempdir().unwrap();
+        let existing_socket = dir.path().join("bus");
+        std::fs::write(&existing_socket, b"").unwrap();
+        let existing_str = existing_socket.to_string_lossy().to_string();
+        let missing_str = dir.path().join("missing-bus").to_string_lossy().to_string();
+
+        // Missing or empty DBUS_SESSION_BUS_ADDRESS -> unavailable
+        assert!(!linux_secret_service_likely_available_with(
+            None,
+            false,
+            |p| p.exists()
+        ));
+        assert!(!linux_secret_service_likely_available_with(
+            Some("   "),
+            false,
+            |p| p.exists()
+        ));
+
+        // unix:path pointing to missing socket -> unavailable
+        let missing_addr = format!("unix:path={missing_str}");
+        assert!(!linux_secret_service_likely_available_with(
+            Some(&missing_addr),
+            false,
+            |p| p.exists()
+        ));
+
+        // unix:path pointing to existing socket (with extra attributes) -> available
+        let existing_addr = format!("unix:path={existing_str},guid=123456");
+        assert!(linux_secret_service_likely_available_with(
+            Some(&existing_addr),
+            false,
+            |p| p.exists()
+        ));
+
+        // Previously failed keyring runtime -> unavailable even with valid socket
+        assert!(!linux_secret_service_likely_available_with(
+            Some(&existing_addr),
+            true,
+            |p| p.exists()
+        ));
+
+        // Multi-segment where second segment exists -> available
+        let multi_addr = format!("unix:path={missing_str};unix:path={existing_str}");
+        assert!(linux_secret_service_likely_available_with(
+            Some(&multi_addr),
+            false,
+            |p| p.exists()
+        ));
+
+        // Abstract unix socket -> available
+        assert!(linux_secret_service_likely_available_with(
+            Some("unix:abstract=/tmp/dbus-test"),
+            false,
+            |p| p.exists()
+        ));
+    }
+
+    #[test]
+    fn test_should_open_browser_headless_linux_and_overrides() {
+        // Explicit opt-out disables browser everywhere
+        assert!(!should_open_browser_with_env(
+            false,
+            Some("1"),
+            Some(":0"),
+            None,
+            None
+        ));
+        assert!(!should_open_browser_with_env(
+            true,
+            Some("true"),
+            Some(":0"),
+            Some("wayland-0"),
+            Some("Ubuntu")
+        ));
+
+        // Windows / macOS defaults to true unless TEAMS_NO_BROWSER is set
+        assert!(should_open_browser_with_env(false, None, None, None, None));
+
+        // Headless Linux / SSH without DISPLAY, WAYLAND_DISPLAY, or WSL -> false
+        assert!(!should_open_browser_with_env(true, None, None, None, None));
+        assert!(!should_open_browser_with_env(
+            true,
+            Some("0"),
+            Some("  "),
+            Some(""),
+            None
+        ));
+
+        // X11, Wayland, or WSL -> true
+        assert!(should_open_browser_with_env(
+            true,
+            None,
+            Some(":0"),
+            None,
+            None
+        ));
+        assert!(should_open_browser_with_env(
+            true,
+            None,
+            None,
+            Some("wayland-0"),
+            None
+        ));
+        assert!(should_open_browser_with_env(
+            true,
+            None,
+            None,
+            None,
+            Some("AlmaLinux-8")
+        ));
+    }
+
+    fn make_test_jwt_with_encoder(payload: &serde_json::Value, standard_padded: bool) -> String {
+        use base64::engine::general_purpose::STANDARD;
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+        let json_bytes = serde_json::to_vec(payload).unwrap();
+        let body = if standard_padded {
+            STANDARD.encode(json_bytes)
+        } else {
+            URL_SAFE_NO_PAD.encode(json_bytes)
+        };
+        format!("{header}.{body}.sig")
+    }
+
+    #[test]
+    fn test_parse_jwt_claims_padded_and_standard_base64() {
+        let exp = 1_893_456_000_i64;
+        // Include characters that produce '+' / '/' and '=' padding in standard base64
+        let payload = serde_json::json!({
+            "exp": exp,
+            "oid": "oid-user-123?>",
+            "name": "김철수",
+            "upn": "chulsoo@contoso.com",
+            "tid": "tenant-abc",
+            "appid": "app-xyz"
+        });
+        let jwt_std = make_test_jwt_with_encoder(&payload, true);
+        let jwt_url = make_test_jwt_with_encoder(&payload, false);
+
+        for tok in [&jwt_std, &jwt_url, &format!("Bearer {jwt_std}")] {
+            let claims = parse_jwt_claims(tok).expect("claims must parse");
+            assert_eq!(claims.exp, Some(exp));
+            assert_eq!(claims.user_id.as_deref(), Some("oid-user-123?>"));
+            assert_eq!(claims.user_display_name.as_deref(), Some("김철수"));
+            assert_eq!(claims.user_email.as_deref(), Some("chulsoo@contoso.com"));
+            assert_eq!(claims.tenant_id.as_deref(), Some("tenant-abc"));
+            assert_eq!(claims.client_id.as_deref(), Some("app-xyz"));
+        }
+
+        // Fallbacks: sub, preferred_username, azp
+        let fallback_jwt = make_test_jwt_with_encoder(
+            &serde_json::json!({
+                "exp": exp,
+                "sub": "sub-999",
+                "preferred_username": "pref@contoso.com",
+                "azp": "azp-111"
+            }),
+            false,
+        );
+        let fallback_claims = parse_jwt_claims(&fallback_jwt).unwrap();
+        assert_eq!(fallback_claims.user_id.as_deref(), Some("sub-999"));
+        assert_eq!(
+            fallback_claims.user_email.as_deref(),
+            Some("pref@contoso.com")
+        );
+        assert_eq!(fallback_claims.client_id.as_deref(), Some("azp-111"));
+    }
+
+    #[test]
+    fn test_read_external_token_file_raw_and_azure_cli_json() {
+        let dir = tempdir().unwrap();
+        let cfg = AppConfig::default();
+        let future_exp = chrono::Utc::now().timestamp() + 3600;
+        let jwt = make_test_jwt_with_encoder(
+            &serde_json::json!({
+                "exp": future_exp,
+                "oid": "oid-42",
+                "name": "Hong",
+                "upn": "hong@example.com",
+                "tid": "tid-42",
+                "appid": "cid-42"
+            }),
+            true,
+        );
+
+        // 1. Raw JWT file with UTF-8 BOM, leading/trailing blank lines, and Bearer prefix
+        let raw_path = dir.path().join("access_token");
+        std::fs::write(&raw_path, format!("\u{feff}\n  Bearer {jwt}  \n\n")).unwrap();
+        let raw_tok = read_external_token_file(&raw_path, &cfg).unwrap();
+        assert_eq!(raw_tok.access_token, jwt);
+        assert_eq!(raw_tok.expires_at, future_exp);
+        assert_eq!(raw_tok.user_id.as_deref(), Some("oid-42"));
+        assert_eq!(raw_tok.user_display_name.as_deref(), Some("Hong"));
+        assert_eq!(raw_tok.user_email.as_deref(), Some("hong@example.com"));
+        assert_eq!(raw_tok.tenant_id, "tid-42");
+        assert_eq!(raw_tok.client_id, "cid-42");
+        assert_eq!(raw_tok.auth_mode, "token_file");
+
+        // 2. Azure CLI camelCase JSON (`accessToken`, `expiresOn`)
+        let az_path = dir.path().join("az.json");
+        let az_json = serde_json::json!({
+            "accessToken": jwt,
+            "expiresOn": "2030-01-15T12:00:00Z",
+            "tenant": "az-tenant",
+            "tokenType": "Bearer"
+        });
+        std::fs::write(&az_path, az_json.to_string()).unwrap();
+        let az_tok = read_external_token_file(&az_path, &cfg).unwrap();
+        assert_eq!(az_tok.access_token, jwt);
+        assert_eq!(az_tok.expires_at, 1_894_708_800);
+        assert_eq!(az_tok.tenant_id, "az-tenant");
+        assert_eq!(az_tok.user_id.as_deref(), Some("oid-42"));
+        assert_eq!(az_tok.auth_mode, "token_file");
+
+        // 3. Empty file returns clear error
+        let empty_path = dir.path().join("empty");
+        std::fs::write(&empty_path, "\u{feff}   \n").unwrap();
+        let err = read_external_token_file(&empty_path, &cfg).unwrap_err();
+        assert!(err.to_string().contains("비어 있습니다"));
+    }
+
+    #[tokio::test]
+    async fn test_token_refresh_cmd_auto_refreshes_expiring_token_file() {
+        let dir = tempdir().unwrap();
+        let token_path = dir.path().join("access_token");
+        let now = chrono::Utc::now().timestamp();
+
+        let soon_jwt = make_test_jwt_with_encoder(
+            &serde_json::json!({
+                "exp": now + 60, // within default 5-min (300s) skew
+                "oid": "u-1",
+                "name": "Tester",
+                "upn": "tester@example.com"
+            }),
+            false,
+        );
+        let fresh_jwt = make_test_jwt_with_encoder(
+            &serde_json::json!({
+                "exp": now + 3600,
+                "oid": "u-1",
+                "name": "Tester",
+                "upn": "tester@example.com"
+            }),
+            false,
+        );
+        std::fs::write(&token_path, &soon_jwt).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.token_file = token_path.to_string_lossy().to_string();
+        cfg.token_refresh_mins = 5;
+        #[cfg(windows)]
+        {
+            cfg.token_refresh_cmd = format!("echo {fresh_jwt}> \"{}\"", token_path.display());
+        }
+        #[cfg(not(windows))]
+        {
+            cfg.token_refresh_cmd =
+                format!("printf '%s\\n' '{fresh_jwt}' > '{}'", token_path.display());
+        }
+
+        let mgr = AuthManager::new(cfg).unwrap();
+        assert!(mgr.is_refreshable().await);
+
+        let returned = mgr.valid_access_token().await.unwrap();
+        assert_eq!(returned, fresh_jwt);
+        assert_eq!(
+            mgr.current_tokens().await.unwrap().access_token,
+            fresh_jwt
+        );
+    }
+
+    #[tokio::test]
+    async fn test_token_refresh_cmd_bootstraps_missing_token_file_and_stdout_only() {
+        let dir = tempdir().unwrap();
+        let missing_path = dir.path().join("bootstrapped_token");
+        let now = chrono::Utc::now().timestamp();
+        let fresh_jwt = make_test_jwt_with_encoder(
+            &serde_json::json!({
+                "exp": now + 3600,
+                "oid": "boot-oid",
+                "upn": "boot@example.com"
+            }),
+            false,
+        );
+
+        // 1. Missing token_file bootstrapped via token_refresh_cmd writing the file
+        let mut cfg = AppConfig::default();
+        cfg.token_file = missing_path.to_string_lossy().to_string();
+        #[cfg(windows)]
+        {
+            cfg.token_refresh_cmd = format!("echo {fresh_jwt}> \"{}\"", missing_path.display());
+        }
+        #[cfg(not(windows))]
+        {
+            cfg.token_refresh_cmd = format!(
+                "printf '%s\\n' '{fresh_jwt}' > '{}'",
+                missing_path.display()
+            );
+        }
+        let mgr = AuthManager::new(cfg).unwrap();
+        assert_eq!(mgr.valid_access_token().await.unwrap(), fresh_jwt);
+
+        // 2. Stdout-only token_refresh_cmd (no token_file)
+        let mut cfg_stdout = AppConfig::default();
+        #[cfg(windows)]
+        {
+            cfg_stdout.token_refresh_cmd = format!("echo {fresh_jwt}");
+        }
+        #[cfg(not(windows))]
+        {
+            cfg_stdout.token_refresh_cmd = format!("printf '%s\\n' '{fresh_jwt}'");
+        }
+        let mgr_stdout = AuthManager::new(cfg_stdout).unwrap();
+        let tok = mgr_stdout.current_tokens().await.unwrap();
+        assert_eq!(tok.access_token, fresh_jwt);
+        assert_eq!(tok.auth_mode, "refresh_cmd");
+        assert_eq!(tok.user_id.as_deref(), Some("boot-oid"));
+    }
+
+    #[tokio::test]
+    async fn test_token_refresh_cmd_failure_fallback_and_bail() {
+        let dir = tempdir().unwrap();
+        let token_path = dir.path().join("access_token");
+        let now = chrono::Utc::now().timestamp();
+
+        // Still-valid (not hard-expired) token within skew_secs -> falls back with warning
+        let soon_jwt = make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 120 }), false);
+        std::fs::write(&token_path, &soon_jwt).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.token_file = token_path.to_string_lossy().to_string();
+        cfg.token_refresh_mins = 5;
+        cfg.token_refresh_cmd = "exit 1".to_string();
+
+        let mgr = AuthManager::new(cfg.clone()).unwrap();
+        assert_eq!(mgr.valid_access_token().await.unwrap(), soon_jwt);
+
+        // Hard-expired token + failing refresh_cmd -> bails with clear error
+        let expired_jwt =
+            make_test_jwt_with_encoder(&serde_json::json!({ "exp": now - 60 }), false);
+        std::fs::write(&token_path, &expired_jwt).unwrap();
+        let err = mgr.valid_access_token().await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("외부 토큰 갱신 실패"), "unexpected error: {msg}");
+        assert!(msg.contains("exp:"), "missing exp in error: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_expired_external_tokens_return_clear_expiry_error() {
+        let dir = tempdir().unwrap();
+        let token_path = dir.path().join("expired_token");
+        let now = chrono::Utc::now().timestamp();
+        let expired_jwt =
+            make_test_jwt_with_encoder(&serde_json::json!({ "exp": now - 120 }), false);
+        std::fs::write(&token_path, &expired_jwt).unwrap();
+
+        // 1. token_file without refresh_cmd
+        let mut cfg = AppConfig::default();
+        cfg.token_file = token_path.to_string_lossy().to_string();
+        let mgr_file = AuthManager::new(cfg.clone()).unwrap();
+        assert!(!mgr_file.is_refreshable().await);
+        let err_file = mgr_file.valid_access_token().await.unwrap_err();
+        let msg_file = err_file.to_string();
+        assert!(
+            msg_file.contains("토큰 만료 (exp:") && msg_file.contains("auth_mode=token_file"),
+            "unexpected token_file error: {msg_file}"
+        );
+
+        // 2. env_token without refresh_cmd (constructed via env_access_token_from_str to avoid env races)
+        let env_tok = env_access_token_from_str(&expired_jwt, &AppConfig::default()).unwrap();
+        assert_eq!(env_tok.auth_mode, "env_token");
+        let mgr_env = AuthManager::from_tokens(AppConfig::default(), env_tok);
+        let err_env = mgr_env.valid_access_token().await.unwrap_err();
+        let msg_env = err_env.to_string();
+        assert!(
+            msg_env.contains("토큰 만료 (exp:") && msg_env.contains("auth_mode=env_token"),
+            "unexpected env_token error: {msg_env}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_external_token_skips_keyring_and_persistence() {
+        let dir = tempdir().unwrap();
+        let cred_path = dir.path().join("should_not_be_created_creds.json");
+        let token_path = dir.path().join("ext_token");
+        let now = chrono::Utc::now().timestamp();
+        let fresh_jwt =
+            make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 3600 }), false);
+        std::fs::write(&token_path, &fresh_jwt).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.token_file = token_path.to_string_lossy().to_string();
+        assert!(should_skip_keyring_on_init(&cfg));
+
+        // Even with a fresh AuthManager pointing at token_file, update_identity must NOT persist to disk/keyring
+        let ext_tok = read_external_token_file(&token_path, &cfg).unwrap();
+        let mgr = AuthManager::from_tokens(cfg, ext_tok).with_token_path(cred_path.clone());
+        mgr.update_identity(
+            "u-ext".into(),
+            "External User".into(),
+            Some("ext@example.com".into()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !cred_path.exists(),
+            "external token must never be persisted to credentials.json/keyring"
+        );
+        let updated = mgr.current_tokens().await.unwrap();
+        assert_eq!(updated.access_token, fresh_jwt);
+    }
+
+    #[tokio::test]
+    async fn test_token_refresh_cmd_coalesces_concurrent_calls() {
+        let dir = tempdir().unwrap();
+        let token_path = dir.path().join("access_token");
+        let count_path = dir.path().join("runs.log");
+        let now = chrono::Utc::now().timestamp();
+
+        let soon_jwt = make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 60 }), false);
+        let fresh_jwt =
+            make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 3600 }), false);
+        std::fs::write(&token_path, &soon_jwt).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.token_file = token_path.to_string_lossy().to_string();
+        cfg.token_refresh_mins = 5;
+        #[cfg(windows)]
+        {
+            cfg.token_refresh_cmd = format!(
+                "echo hit>> \"{}\" && echo {fresh_jwt}> \"{}\"",
+                count_path.display(),
+                token_path.display()
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            cfg.token_refresh_cmd = format!(
+                "echo hit >> '{}' && printf '%s\\n' '{fresh_jwt}' > '{}'",
+                count_path.display(),
+                token_path.display()
+            );
+        }
+
+        let mgr = Arc::new(AuthManager::new(cfg).unwrap());
+        let (r1, r2, r3) = tokio::join!(
+            mgr.valid_access_token(),
+            mgr.valid_access_token(),
+            mgr.valid_access_token(),
+        );
+        assert_eq!(r1.unwrap(), fresh_jwt);
+        assert_eq!(r2.unwrap(), fresh_jwt);
+        assert_eq!(r3.unwrap(), fresh_jwt);
+        let log = std::fs::read_to_string(&count_path).unwrap();
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "concurrent refresh_cmd calls must coalesce into one execution"
+        );
     }
 }

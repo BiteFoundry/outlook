@@ -3,6 +3,9 @@
 //! Shows the root post summary, scrollable chronological replies, composer target
 //! toggle (`스레드 답글` vs `채널 새 글`), and close button (`Esc` / `[닫기]`).
 
+use std::cell::RefCell;
+use std::sync::Arc;
+
 use ratatui::{
     layout::Rect,
     style::Modifier,
@@ -16,11 +19,39 @@ use crate::{
     models::ThreadView,
     ui::{
         app::{AppState, Focus, UiState},
-        chat_view::{hyperlinks_enabled, render_message_item, render_scrolled_lines, truncate, RenderedLine},
+        chat_view::{
+            hash_message_sig, hash_theme_sig, hyperlinks_enabled, render_message_item,
+            render_scrolled_lines, truncate, DualHasher, LineSliceCache, RenderedLine,
+        },
         hitmap::{ButtonId, HitMap, HitTarget, MessageScope},
         theme::Theme,
     },
 };
+
+thread_local! {
+    static THREAD_LINES_CACHE: RefCell<LineSliceCache> = RefCell::new(LineSliceCache::new(4));
+}
+
+fn compute_thread_sig(
+    thread: &ThreadView,
+    selected_reply: Option<usize>,
+    theme: &Theme,
+    width: usize,
+    hyperlinks: bool,
+) -> (u64, u64) {
+    let mut h = DualHasher::new(0x5448_5245_4144_5f4c);
+    h.write_str(&thread.conv_key);
+    hash_message_sig(&mut h, &thread.root);
+    h.write_hash(&thread.replies.len());
+    for reply in &thread.replies {
+        hash_message_sig(&mut h, reply);
+    }
+    h.write_hash(&selected_reply);
+    h.write_hash(&width);
+    h.write_hash(&hyperlinks);
+    hash_theme_sig(&mut h, theme);
+    h.finish()
+}
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hitmap: &mut HitMap) {
     let theme = &ui.theme;
@@ -60,7 +91,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hit
         return;
     };
 
-    let lines = build_thread_lines(
+    let lines = build_thread_lines_cached(
         thread,
         ui.thread_scroll.selected_idx,
         theme,
@@ -140,7 +171,22 @@ pub fn build_thread_lines(
     width: usize,
     hyperlinks: bool,
 ) -> Vec<RenderedLine> {
+    build_thread_lines_cached(thread, selected_reply, theme, width, hyperlinks).to_vec()
+}
+
+fn build_thread_lines_cached(
+    thread: &ThreadView,
+    selected_reply: Option<usize>,
+    theme: &Theme,
+    width: usize,
+    hyperlinks: bool,
+) -> Arc<[RenderedLine]> {
     let width = width.max(12);
+    let sig = compute_thread_sig(thread, selected_reply, theme, width, hyperlinks);
+    if let Some(cached) = THREAD_LINES_CACHE.with(|cache| cache.borrow_mut().get(sig)) {
+        return cached;
+    }
+
     let mut out = Vec::new();
 
     render_message_item(
@@ -182,7 +228,9 @@ pub fn build_thread_lines(
         }
     }
 
-    out
+    let arc: Arc<[RenderedLine]> = Arc::from(out);
+    THREAD_LINES_CACHE.with(|cache| cache.borrow_mut().insert(sig, Arc::clone(&arc)));
+    arc
 }
 
 #[cfg(test)]

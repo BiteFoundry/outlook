@@ -32,11 +32,11 @@ struct GitHubAsset {
     browser_download_url: String,
 }
 
-/// Silently cleans up any `<current_exe>.old` left behind by a previous Windows self-update.
+/// Silently cleans up any `<current_exe>.old` left behind by a previous self-update.
 pub fn cleanup_stale_old_binary() {
     if let Ok(exe) = std::env::current_exe() {
         let old_path = append_ext_suffix(&exe, ".old");
-        if old_path.exists() {
+        if old_path.symlink_metadata().is_ok() {
             let _ = std::fs::remove_file(&old_path);
         }
     }
@@ -490,11 +490,11 @@ pub(crate) fn replace_executable_at(target_exe: &Path, new_bytes: &[u8]) -> Resu
             .with_context(|| format!("실행 권한 설정 실패: {}", new_path.display()))?;
     }
 
-    if old_path.exists() {
+    if old_path.symlink_metadata().is_ok() {
         let _ = std::fs::remove_file(&old_path);
     }
 
-    let had_existing = target_exe.exists();
+    let had_existing = target_exe.symlink_metadata().is_ok();
     if had_existing {
         if let Err(err) = std::fs::rename(target_exe, &old_path) {
             let _ = std::fs::remove_file(&new_path);
@@ -509,7 +509,7 @@ pub(crate) fn replace_executable_at(target_exe: &Path, new_bytes: &[u8]) -> Resu
     }
 
     if let Err(err) = std::fs::rename(&new_path, target_exe) {
-        if had_existing && old_path.exists() {
+        if had_existing && old_path.symlink_metadata().is_ok() {
             let _ = std::fs::rename(&old_path, target_exe);
         }
         let _ = std::fs::remove_file(&new_path);
@@ -520,6 +520,13 @@ pub(crate) fn replace_executable_at(target_exe: &Path, new_bytes: &[u8]) -> Resu
                 target_exe.display()
             )
         });
+    }
+
+    // On Unix, unlinking the old binary immediately is safe because running
+    // processes keep their open inode valid, keeping the install dir clean.
+    #[cfg(unix)]
+    if had_existing {
+        let _ = std::fs::remove_file(&old_path);
     }
 
     Ok(())
@@ -735,7 +742,11 @@ mod tests {
         assert_eq!(apply_res.asset_name.as_deref(), Some(asset_name.as_str()));
         assert_eq!(std::fs::read(&fake_exe).unwrap(), new_binary);
         let old_exe = append_ext_suffix(&fake_exe, ".old");
-        assert_eq!(std::fs::read(&old_exe).unwrap(), b"OLD-TEAMS-BINARY-V0.2.0");
+        if cfg!(unix) {
+            assert!(!old_exe.exists());
+        } else {
+            assert_eq!(std::fs::read(&old_exe).unwrap(), b"OLD-TEAMS-BINARY-V0.2.0");
+        }
         assert!(!append_ext_suffix(&fake_exe, ".new").exists());
 
         server.abort();

@@ -13,6 +13,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DEFAULT_MAX_GLIBC, verifyGlibcBinary } from './verify-glibc.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -50,8 +51,23 @@ export const TARGETS = {
   },
 };
 
+/**
+ * Strip optional cargo-zigbuild GLIBC version suffix (e.g. `x86_64-unknown-linux-gnu.2.28`).
+ * @param {string} triple
+ * @returns {string}
+ */
+export function normalizeTriple(triple) {
+  return triple.trim().replace(/\.\d+\.\d+(?:\.\d+)?$/, '');
+}
+
 function parseArgs(argv) {
-  const options = { targets: [], all: false, help: false };
+  const options = {
+    targets: [],
+    all: false,
+    help: false,
+    verifyGlibc: false,
+    maxGlibc: DEFAULT_MAX_GLIBC,
+  };
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -59,13 +75,30 @@ function parseArgs(argv) {
       options.all = true;
     } else if (arg === '--help' || arg === '-h') {
       options.help = true;
+    } else if (arg === '--verify-glibc') {
+      options.verifyGlibc = true;
+    } else if (arg === '--max-glibc') {
+      const value = argv[i + 1];
+      if (!value) throw new Error(`${arg} requires a version value`);
+      options.maxGlibc = value;
+      options.verifyGlibc = true;
+      i += 1;
+    } else if (arg.startsWith('--max-glibc=')) {
+      options.maxGlibc = arg.slice('--max-glibc='.length);
+      options.verifyGlibc = true;
     } else if (arg === '--target' || arg === '-t') {
       const value = argv[i + 1];
       if (!value) throw new Error(`${arg} requires a value`);
-      options.targets.push(...value.split(','));
+      options.targets.push(...value.split(',').map(normalizeTriple).filter(Boolean));
       i += 1;
     } else if (arg.startsWith('--target=')) {
-      options.targets.push(...arg.slice('--target='.length).split(','));
+      options.targets.push(
+        ...arg
+          .slice('--target='.length)
+          .split(',')
+          .map(normalizeTriple)
+          .filter(Boolean),
+      );
     } else {
       throw new Error(`unknown argument: ${arg}`);
     }
@@ -131,32 +164,46 @@ function copyBinary(source, packageDir, binary) {
   return destination;
 }
 
-function build(triple) {
-  const mapping = TARGETS[triple];
+function build(triple, options = {}) {
+  const normalized = normalizeTriple(triple);
+  const mapping = TARGETS[normalized];
   if (!mapping) {
     throw new Error(
       `unsupported target "${triple}". Supported: ${Object.keys(TARGETS).join(', ')}`,
     );
   }
 
-  const source = findBinary(triple, mapping.source);
+  const source = findBinary(normalized, mapping.source);
   if (!source) {
     return {
-      triple,
+      triple: normalized,
       ok: false,
-      reason: `binary not found: ${candidatePaths(triple, mapping.source).join(' or ')}`,
+      reason: `binary not found: ${candidatePaths(normalized, mapping.source).join(' or ')}`,
     };
+  }
+
+  if (options.verifyGlibc && normalized.endsWith('-unknown-linux-gnu')) {
+    const report = verifyGlibcBinary(source, options.maxGlibc || DEFAULT_MAX_GLIBC);
+    if (!report.ok) {
+      return {
+        triple: normalized,
+        ok: false,
+        reason:
+          `GLIBC version check failed (max allowed: GLIBC_${report.maxAllowed}; ` +
+          `found: ${report.offending.map((v) => `GLIBC_${v}`).join(', ')})`,
+      };
+    }
   }
 
   const packageDir = path.join(ROOT, 'npm', mapping.package);
   const packageJson = path.join(packageDir, 'package.json');
   if (!fs.existsSync(packageJson)) {
-    return { triple, ok: false, reason: `missing package manifest: ${packageJson}` };
+    return { triple: normalized, ok: false, reason: `missing package manifest: ${packageJson}` };
   }
 
   const destination = copyBinary(source, packageDir, mapping.binary);
   return {
-    triple,
+    triple: normalized,
     ok: true,
     package: mapping.package,
     source,
@@ -169,7 +216,7 @@ function main() {
   const options = parseArgs(process.argv.slice(2));
 
   if (options.help) {
-    console.log(`Usage: node scripts/build-npm.mjs [--target <triple>]... [--all]
+    console.log(`Usage: node scripts/build-npm.mjs [--target <triple>]... [--all] [--verify-glibc] [--max-glibc 2.28]
 
 Supported targets:
 ${Object.keys(TARGETS).map((t) => `  ${t} -> ${TARGETS[t].package}`).join('\n')}`);
@@ -184,7 +231,7 @@ ${Object.keys(TARGETS).map((t) => `  ${t} -> ${TARGETS[t].package}`).join('\n')}
 
   const results = targets.map((triple) => {
     try {
-      return build(triple);
+      return build(triple, options);
     } catch (error) {
       return { triple, ok: false, reason: error.message };
     }

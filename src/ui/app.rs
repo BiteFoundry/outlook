@@ -300,6 +300,7 @@ pub struct UiState {
     pub onenote_selected_block: usize,
     pub onenote_scroll: ScrollState,
     pub onenote_follow_selection: bool,
+    pub onenote_external_edit: Option<(String, String)>,
 }
 
 impl Default for UiState {
@@ -358,6 +359,7 @@ impl UiState {
             onenote_selected_block: 0,
             onenote_scroll: ScrollState::default(),
             onenote_follow_selection: false,
+            onenote_external_edit: None,
         }
     }
 
@@ -660,15 +662,36 @@ impl AppState {
         Some(conv_key.to_string())
     }
 
-    pub fn stash_draft(&mut self, ui: &UiState) {
-        if let Some(key) = self.current_draft_key(ui) {
-            let text = ui.composer.text().trim_end_matches('\n').to_string();
-            if text.is_empty() {
-                self.drafts.remove(&key);
-            } else {
-                self.drafts.insert(key, text);
-            }
+    fn persist_drafts(&self) {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let snapshot = self.drafts.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = config::save_drafts(&snapshot);
+            });
+        } else {
             let _ = config::save_drafts(&self.drafts);
+        }
+    }
+
+    /// Updates the in-memory draft map from the composer and returns `true` if `self.drafts` changed.
+    fn stash_draft_in_memory(&mut self, ui: &UiState) -> bool {
+        let Some(key) = self.current_draft_key(ui) else {
+            return false;
+        };
+        let text = ui.composer.text().trim_end_matches('\n').to_string();
+        if text.is_empty() {
+            self.drafts.remove(&key).is_some()
+        } else if self.drafts.get(&key) != Some(&text) {
+            self.drafts.insert(key, text);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn stash_draft(&mut self, ui: &UiState) {
+        if self.stash_draft_in_memory(ui) {
+            self.persist_drafts();
         }
     }
 
@@ -684,8 +707,9 @@ impl AppState {
 
     pub fn clear_current_draft(&mut self, ui: &mut UiState) {
         if let Some(key) = self.current_draft_key(ui) {
-            self.drafts.remove(&key);
-            let _ = config::save_drafts(&self.drafts);
+            if self.drafts.remove(&key).is_some() {
+                self.persist_drafts();
+            }
         }
         ui.composer.reset_after_send();
     }
@@ -725,12 +749,48 @@ impl AppState {
             }
             self.todo_lists = lists;
         }
+        if let Ok(notebooks) = self.storage.list_onenote_notebooks() {
+            self.onenote_notebooks = notebooks;
+        }
+        if let Ok(sections) = self.storage.list_onenote_sections(None) {
+            self.onenote_sections = sections;
+        }
+        if self.active_notebook_key.is_none() {
+            self.active_notebook_key = self
+                .onenote_notebooks
+                .first()
+                .map(|nb| nb.notebook_key.clone());
+        }
+        if self.active_section_key.is_none() {
+            self.active_section_key = self
+                .sections_for_active_notebook()
+                .first()
+                .map(|sec| sec.section_key.clone())
+                .or_else(|| self.onenote_sections.first().map(|sec| sec.section_key.clone()));
+        }
+        if let Some(sec_key) = self.active_section_key.clone() {
+            if let Ok(pages) = self.storage.list_onenote_pages(&sec_key) {
+                if let Some(first_page) = pages.first() {
+                    self.active_page_key = Some(first_page.page_key.clone());
+                    self.active_page_detail = self
+                        .storage
+                        .get_onenote_page_detail(&first_page.page_key)
+                        .unwrap_or(None);
+                }
+                self.onenote_pages = pages;
+            }
+        }
     }
 
     pub fn spawn_bootstrap(&mut self, ui: &mut UiState) {
         if ui.active_todo_list_id.is_none() {
             ui.active_todo_list_id = self.todo_lists.first().map(|l| l.id.clone());
         }
+
+        let persona = self.persona;
+        let active_section_key = self.active_section_key.clone();
+        let active_page_key = self.active_page_key.clone();
+        let sync_ctrl = self.sync_ctrl.clone();
         let graph = self.graph.clone();
         let storage = self.storage.clone();
         let auth = self.auth.clone();
@@ -740,29 +800,73 @@ impl AppState {
         self.syncing = true;
         self.sync_summary = "동기화 중...".to_string();
 
+        let stagger_delay = std::time::Duration::from_millis(600);
+
+        let trigger_onenote = move |sync: &SyncController| {
+            sync.request(SyncCommand::RefreshOneNote);
+            if let Some(sec_key) = active_section_key {
+                sync.request(SyncCommand::SyncOneNoteSection {
+                    section_key: sec_key,
+                });
+            }
+            if let Some(page_key) = active_page_key {
+                sync.request(SyncCommand::SyncOneNotePage { page_key });
+            }
+        };
+        if persona == Persona::OneNote {
+            trigger_onenote(&sync_ctrl);
+        } else {
+            let onenote_sync = sync_ctrl.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(stagger_delay).await;
+                trigger_onenote(&onenote_sync);
+            });
+        }
+
         let outlook_graph = graph.clone();
         let outlook_storage = storage.clone();
         let outlook_tx = tx.clone();
+        let outlook_task_label = if persona == Persona::Outlook {
+            Some(task_label.clone())
+        } else {
+            None
+        };
         tokio::spawn(async move {
+            if persona != Persona::Outlook {
+                tokio::time::sleep(stagger_delay).await;
+            }
             let _ = sync::bootstrap_outlook(&outlook_graph, &outlook_storage).await;
-            let mail_folders = outlook_storage.list_mail_folders().unwrap_or_default();
-            let mails = outlook_storage
-                .list_mail_messages(Some("inbox"), 100)
-                .unwrap_or_default();
-            let calendar_events = outlook_storage
-                .list_calendar_events(None, None, 100)
-                .unwrap_or_default();
-            let contacts = outlook_storage.list_contacts(None, 200).unwrap_or_default();
-            let todo_lists = outlook_storage.list_todo_lists().unwrap_or_default();
-            let active_todo_list_id = todo_lists.first().map(|l| l.id.clone());
-            let todo_tasks = if let Some(ref lid) = active_todo_list_id {
-                outlook_storage
-                    .list_todo_tasks(lid, false, 200)
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            let _ = outlook_tx.send(UiMsg::OutlookBootstrapDone {
+            let snapshot = tokio::task::spawn_blocking(move || {
+                let mail_folders = outlook_storage.list_mail_folders().unwrap_or_default();
+                let mails = outlook_storage
+                    .list_mail_messages(Some("inbox"), 100)
+                    .unwrap_or_default();
+                let calendar_events = outlook_storage
+                    .list_calendar_events(None, None, 100)
+                    .unwrap_or_default();
+                let contacts = outlook_storage.list_contacts(None, 200).unwrap_or_default();
+                let todo_lists = outlook_storage.list_todo_lists().unwrap_or_default();
+                let active_todo_list_id = todo_lists.first().map(|l| l.id.clone());
+                let todo_tasks = if let Some(ref lid) = active_todo_list_id {
+                    outlook_storage
+                        .list_todo_tasks(lid, false, 200)
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                (
+                    mail_folders,
+                    mails,
+                    calendar_events,
+                    contacts,
+                    todo_lists,
+                    todo_tasks,
+                    active_todo_list_id,
+                )
+            })
+            .await;
+
+            if let Ok((
                 mail_folders,
                 mails,
                 calendar_events,
@@ -770,46 +874,99 @@ impl AppState {
                 todo_lists,
                 todo_tasks,
                 active_todo_list_id,
-            });
+            )) = snapshot
+            {
+                let _ = outlook_tx.send(UiMsg::OutlookBootstrapDone {
+                    mail_folders,
+                    mails,
+                    calendar_events,
+                    contacts,
+                    todo_lists,
+                    todo_tasks,
+                    active_todo_list_id,
+                });
+            }
+            if let Some(label) = outlook_task_label {
+                let _ = outlook_tx.send(UiMsg::TaskDone {
+                    label,
+                    error: None,
+                    toast: None,
+                });
+            }
         });
 
+        let teams_task_label = if persona != Persona::Outlook {
+            Some(task_label)
+        } else {
+            None
+        };
         tokio::spawn(async move {
-            let token_uid = auth.current_tokens().await.and_then(|t| t.user_id);
-            let me = graph.get_me().await.ok();
+            if persona != Persona::Teams {
+                tokio::time::sleep(stagger_delay).await;
+            }
+            let (token_uid, me_res, presence_res, _conv_res) = tokio::join!(
+                async { auth.current_tokens().await.and_then(|t| t.user_id) },
+                graph.get_me(),
+                graph.get_my_presence(),
+                sync::bootstrap_conversations(&graph, &storage),
+            );
+            let me = me_res.ok();
             if let Some(ref u) = me {
                 let _ = auth
                     .update_identity(u.id.clone(), u.display_name.clone(), u.mail.clone())
                     .await;
             }
-            let presence = graph.get_my_presence().await.ok();
-            let _ = sync::bootstrap_conversations(&graph, &storage).await;
-            let conversations = storage.list_conversations().unwrap_or_default();
-            let teams = storage.list_teams().unwrap_or_default();
-            let my_id = me
+            let presence = presence_res.ok();
+            let my_id_owned = me
                 .as_ref()
-                .map(|u| u.id.as_str())
-                .or(token_uid.as_deref())
-                .unwrap_or("");
-            let mentions = if !my_id.is_empty() {
-                storage.list_mentions_for_user(my_id, 50).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
+                .map(|u| u.id.clone())
+                .or(token_uid)
+                .unwrap_or_default();
+
+            let read_storage = storage.clone();
+            let (conversations, teams, mentions, cached_presences) =
+                tokio::task::spawn_blocking(move || {
+                    let conversations = read_storage.list_conversations().unwrap_or_default();
+                    let teams = read_storage.list_teams().unwrap_or_default();
+                    let mentions = if !my_id_owned.is_empty() {
+                        read_storage
+                            .list_mentions_for_user(&my_id_owned, 50)
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    let cached_presences = read_storage.get_presences().unwrap_or_default();
+                    (conversations, teams, mentions, cached_presences)
+                })
+                .await
+                .unwrap_or_default();
+
             let peer_ids: Vec<String> = conversations
                 .iter()
                 .filter_map(|c| c.peer_user_id.clone())
                 .collect();
             let presences = if !peer_ids.is_empty() {
-                let fetched = graph.get_presences_by_user_ids(&peer_ids).await.unwrap_or_default();
-                let _ = storage.upsert_presences(&fetched);
-                storage.get_presences().unwrap_or_else(|_| {
+                let fetched = graph
+                    .get_presences_by_user_ids(&peer_ids)
+                    .await
+                    .unwrap_or_default();
+                let write_storage = storage.clone();
+                let fetched_for_db = fetched.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = write_storage.upsert_presences(&fetched_for_db);
+                    write_storage.get_presences()
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_else(|| {
                     fetched
                         .into_iter()
                         .map(|p| (p.user_id.clone(), p))
                         .collect()
                 })
             } else {
-                storage.get_presences().unwrap_or_default()
+                cached_presences
             };
 
             let _ = tx.send(UiMsg::BootstrapDone {
@@ -820,11 +977,13 @@ impl AppState {
                 mentions,
                 presences,
             });
-            let _ = tx.send(UiMsg::TaskDone {
-                label: task_label,
-                error: None,
-                toast: None,
-            });
+            if let Some(label) = teams_task_label {
+                let _ = tx.send(UiMsg::TaskDone {
+                    label,
+                    error: None,
+                    toast: None,
+                });
+            }
         });
     }
 
@@ -863,7 +1022,6 @@ impl AppState {
             conv.unread_count = 0;
         }
         let now_ts = Utc::now().to_rfc3339();
-        let _ = self.storage.mark_conversation_read(&new_key, &now_ts);
 
         self.sync_ctrl.set_focus(Some(target.clone()), None);
         self.sync_ctrl.request(SyncCommand::SyncActiveNow);
@@ -873,22 +1031,43 @@ impl AppState {
         let tx = self.ui_tx.clone();
         let conv_key = new_key.clone();
         tokio::spawn(async move {
-            let fetched_msgs = graph.list_messages(&target, 60).await.unwrap_or_default();
-            if !fetched_msgs.is_empty() {
-                let _ = storage.upsert_messages(&fetched_msgs);
-            }
-            if let Ok(members) = graph.list_members(&target).await {
-                if !members.is_empty() {
-                    let _ = storage.upsert_members(&conv_key, &members);
+            let mark_storage = storage.clone();
+            let mark_conv_key = conv_key.clone();
+            let mark_read_fut = tokio::task::spawn_blocking(move || {
+                let _ = mark_storage.mark_conversation_read(&mark_conv_key, &now_ts);
+            });
+            let chat_read_fut = async {
+                if let ConversationTarget::Chat { ref chat_id } = target {
+                    let _ = graph.mark_chat_read(chat_id).await;
                 }
-            }
-            if let ConversationTarget::Chat { ref chat_id } = target {
-                let _ = graph.mark_chat_read(chat_id).await;
-            }
-            let messages = storage
-                .list_root_messages(&conv_key, 80, None)
-                .unwrap_or(fetched_msgs);
-            let members = storage.list_members(&conv_key).unwrap_or_default();
+            };
+            let (msgs_res, members_res, _, _) = tokio::join!(
+                graph.list_messages(&target, 60),
+                graph.list_members(&target),
+                mark_read_fut,
+                chat_read_fut,
+            );
+            let fetched_msgs = msgs_res.unwrap_or_default();
+            let fetched_members = members_res.ok();
+            let db_conv_key = conv_key.clone();
+            let (messages, members) = tokio::task::spawn_blocking(move || {
+                if !fetched_msgs.is_empty() {
+                    let _ = storage.upsert_messages(&fetched_msgs);
+                }
+                if let Some(ref members) = fetched_members {
+                    if !members.is_empty() {
+                        let _ = storage.upsert_members(&db_conv_key, members);
+                    }
+                }
+                let messages = storage
+                    .list_root_messages(&db_conv_key, 80, None)
+                    .unwrap_or(fetched_msgs);
+                let members = storage.list_members(&db_conv_key).unwrap_or_default();
+                (messages, members)
+            })
+            .await
+            .unwrap_or_default();
+
             let _ = tx.send(UiMsg::MessagesLoaded {
                 conv_key,
                 messages,
@@ -975,11 +1154,13 @@ impl AppState {
             }
             NavRow::OnenoteGroupHeader { .. } => {}
             NavRow::OnenoteNotebook { notebook_key, .. } => {
+                self.active_notebook_key = Some(notebook_key.clone());
                 self.toggle_onenote_notebook(ui, notebook_key);
             }
             NavRow::OnenoteSectionGroup { .. } => {}
             NavRow::OnenoteSection { section_key, .. } => {
                 self.open_onenote_section(ui, section_key);
+                self.focus_conversation_pane(ui);
             }
         }
     }
@@ -1054,7 +1235,10 @@ impl AppState {
                 let mut all = Vec::with_capacity(1 + thread.replies.len());
                 all.push(thread.root.clone());
                 all.extend(thread.replies.clone());
-                let _ = storage.upsert_messages(&all);
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = storage.upsert_messages(&all);
+                })
+                .await;
                 let _ = tx.send(UiMsg::ThreadLoaded {
                     conv_key,
                     root_msg_id,
@@ -1183,9 +1367,14 @@ impl AppState {
         ui.tasks.begin(task_label.clone());
 
         tokio::spawn(async move {
-            let older = storage
-                .list_root_messages(&conv_key, 50, before.as_deref())
-                .unwrap_or_default();
+            let db_conv_key = conv_key.clone();
+            let older = tokio::task::spawn_blocking(move || {
+                storage
+                    .list_root_messages(&db_conv_key, 50, before.as_deref())
+                    .unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default();
             let reached_end = older.is_empty();
             let _ = tx.send(UiMsg::OlderMessagesLoaded {
                 conv_key,
@@ -1432,7 +1621,14 @@ impl AppState {
         ui.tasks.begin(task_label.clone());
 
         tokio::spawn(async move {
-            let hits = storage.search_messages(&query, None, 100).unwrap_or_default();
+            let search_query = query.clone();
+            let hits = tokio::task::spawn_blocking(move || {
+                storage
+                    .search_messages(&search_query, None, 100)
+                    .unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default();
             let _ = tx.send(UiMsg::SearchResults { query, hits });
             let _ = tx.send(UiMsg::TaskDone {
                 label: task_label,
@@ -1877,10 +2073,15 @@ impl AppState {
         });
         tokio::spawn(async move {
             if let Ok(list) = graph.list_mail_messages(&folder_id, 50).await {
-                let _ = storage.upsert_mail_messages(&list);
-                let cached = storage
-                    .list_mail_messages(Some(&folder_id), 100)
-                    .unwrap_or(list);
+                let db_folder_id = folder_id.clone();
+                let cached = tokio::task::spawn_blocking(move || {
+                    let _ = storage.upsert_mail_messages(&list);
+                    storage
+                        .list_mail_messages(Some(&db_folder_id), 100)
+                        .unwrap_or(list)
+                })
+                .await
+                .unwrap_or_default();
                 let _ = tx.send(UiMsg::MailFolderLoaded {
                     folder_id,
                     mails: cached,
@@ -1914,7 +2115,11 @@ impl AppState {
             tokio::spawn(async move {
                 match graph.get_mail_message(&mail_id).await {
                     Ok(mail) => {
-                        let _ = storage.upsert_mail_messages(std::slice::from_ref(&mail));
+                        let mail_to_store = mail.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _ = storage.upsert_mail_messages(std::slice::from_ref(&mail_to_store));
+                        })
+                        .await;
                         let _ = tx.send(UiMsg::MailDetailLoaded { mail });
                     }
                     Err(err) => {
@@ -2382,7 +2587,11 @@ impl AppState {
                 .list_todo_tasks(&list_id, include_completed, 100)
                 .await
             {
-                let _ = storage.upsert_todo_tasks(&tasks);
+                let tasks_to_store = tasks.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = storage.upsert_todo_tasks(&tasks_to_store);
+                })
+                .await;
                 let _ = tx.send(UiMsg::TodoTasksLoaded { list_id, tasks });
             }
         });
@@ -2538,6 +2747,30 @@ impl AppState {
     // ------------------------------------------------------------------
     // Microsoft OneNote Workspace Actions
     // ------------------------------------------------------------------
+
+    pub fn active_onenote_notebook(&self) -> Option<&OnenoteNotebook> {
+        if let Some(key) = self.active_notebook_key.as_deref() {
+            if let Some(nb) = self
+                .onenote_notebooks
+                .iter()
+                .find(|nb| nb.notebook_key == key)
+            {
+                return Some(nb);
+            }
+        }
+        let sec = self.active_onenote_section()?;
+        let nb_id = sec.notebook_id.as_deref()?;
+        self.onenote_notebooks
+            .iter()
+            .find(|nb| nb.scope.scope_key() == sec.scope.scope_key() && nb.id == nb_id)
+    }
+
+    pub fn active_onenote_section(&self) -> Option<&OnenoteSection> {
+        let key = self.active_section_key.as_deref()?;
+        self.onenote_sections
+            .iter()
+            .find(|sec| sec.section_key == key)
+    }
 
     /// Sections that belong to the currently active notebook (clone of in-memory state).
     pub fn sections_for_active_notebook(&self) -> Vec<OnenoteSection> {
@@ -3016,6 +3249,93 @@ impl AppState {
         ui.onenote_scroll = ScrollState::default();
         self.sync_ctrl
             .request(SyncCommand::SyncOneNoteSection { section_key });
+        if let Some(first_page_key) = self.onenote_pages.first().map(|p| p.page_key.clone()) {
+            self.open_onenote_page(ui, first_page_key);
+        }
+    }
+
+    pub fn cycle_onenote_section(&mut self, ui: &mut UiState, delta: isize) {
+        let sections = self.sections_for_active_notebook();
+        if sections.is_empty() {
+            return;
+        }
+        let cur_idx = self
+            .active_section_key
+            .as_deref()
+            .and_then(|key| sections.iter().position(|s| s.section_key == key))
+            .unwrap_or(0);
+        let len = sections.len() as isize;
+        let next_idx = ((cur_idx as isize + delta) % len + len) as usize % sections.len();
+        self.open_onenote_section(ui, sections[next_idx].section_key.clone());
+    }
+
+    pub fn cycle_onenote_page(&mut self, ui: &mut UiState, delta: isize) {
+        if self.onenote_pages.is_empty() {
+            return;
+        }
+        let cur_idx = self
+            .active_page_key
+            .as_deref()
+            .and_then(|key| self.onenote_pages.iter().position(|p| p.page_key == key))
+            .unwrap_or(0);
+        let len = self.onenote_pages.len() as isize;
+        let next_idx =
+            ((cur_idx as isize + delta) % len + len) as usize % self.onenote_pages.len();
+        self.open_onenote_page(ui, self.onenote_pages[next_idx].page_key.clone());
+    }
+
+    pub fn replace_onenote_page_body(
+        &mut self,
+        ui: &mut UiState,
+        page_key: String,
+        markdown: String,
+    ) {
+        let detail = self
+            .active_page_detail
+            .as_ref()
+            .filter(|d| d.summary.page_key == page_key)
+            .cloned()
+            .or_else(|| self.storage.get_onenote_page_detail(&page_key).ok().flatten());
+        let Some(detail) = detail else {
+            ui.info("편집할 페이지 본문 정보를 찾을 수 없습니다");
+            return;
+        };
+        let commands =
+            parser::onenote::build_replace_page_body_commands(&detail, None, &markdown);
+        if commands.is_empty() {
+            return;
+        }
+        let (scope, page_id) = crate::models::split_onenote_entity_key(&page_key);
+        let graph = self.graph.clone();
+        let sync = self.sync_ctrl.clone();
+        let tx = self.ui_tx.clone();
+        let task_label = "페이지 전체 수정".to_string();
+        ui.tasks.begin(task_label.clone());
+
+        tokio::spawn(async move {
+            match graph
+                .patch_onenote_page_commands(&scope, &page_id, &commands)
+                .await
+            {
+                Ok(()) => {
+                    sync.request(SyncCommand::SyncOneNotePage {
+                        page_key: page_key.clone(),
+                    });
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: None,
+                        toast: Some(("페이지 본문을 업데이트했습니다".to_string(), ToastKind::Success)),
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: Some(err.to_string()),
+                        toast: Some((format!("페이지 수정 실패: {err}"), ToastKind::Error)),
+                    });
+                }
+            }
+        });
     }
 
     pub fn open_onenote_page(&mut self, ui: &mut UiState, page_key: String) {
@@ -3026,8 +3346,12 @@ impl AppState {
         self.active_page_key = Some(page_key.clone());
         self.loading_onenote_detail = true;
         ui.onenote_selected_block = 0;
-        ui.onenote_scroll = ScrollState::default();
-        ui.onenote_follow_selection = true;
+        ui.onenote_scroll = ScrollState {
+            follow_tail: false,
+            scroll_up: u16::MAX,
+            ..ScrollState::default()
+        };
+        ui.onenote_follow_selection = false;
         self.sync_ctrl
             .request(SyncCommand::SyncOneNotePage { page_key });
     }
@@ -3227,12 +3551,22 @@ impl AppState {
         let tx = self.ui_tx.clone();
 
         tokio::spawn(async move {
-            let mut hits = storage
-                .search_mail_messages(&query, None, 40)
-                .unwrap_or_default();
+            let db_storage = storage.clone();
+            let db_query = query.clone();
+            let mut hits = tokio::task::spawn_blocking(move || {
+                db_storage
+                    .search_mail_messages(&db_query, None, 40)
+                    .unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default();
             if hits.is_empty() {
                 if let Ok(remote) = graph.search_mail_remote(&query, 25).await {
-                    let _ = storage.upsert_mail_messages(&remote);
+                    let remote_to_store = remote.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = storage.upsert_mail_messages(&remote_to_store);
+                    })
+                    .await;
                     hits = remote
                         .into_iter()
                         .map(|m| MailSearchHit {
@@ -3265,12 +3599,22 @@ impl AppState {
         let tx = self.ui_tx.clone();
 
         tokio::spawn(async move {
-            let mut list = storage
-                .list_contacts(Some(&query), 50)
-                .unwrap_or_default();
+            let db_storage = storage.clone();
+            let db_query = query.clone();
+            let mut list = tokio::task::spawn_blocking(move || {
+                db_storage
+                    .list_contacts(Some(&db_query), 50)
+                    .unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default();
             if list.is_empty() {
                 if let Ok(remote) = graph.search_contacts_and_directory(&query, 30).await {
-                    let _ = storage.upsert_contacts(&remote);
+                    let remote_to_store = remote.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = storage.upsert_contacts(&remote_to_store);
+                    })
+                    .await;
                     list = remote;
                 }
             }
@@ -3469,6 +3813,17 @@ impl AppState {
                         .first()
                         .map(|nb| nb.notebook_key.clone());
                 }
+                if self.active_section_key.is_none() {
+                    let first_sec = self
+                        .sections_for_active_notebook()
+                        .first()
+                        .map(|sec| sec.section_key.clone())
+                        .or_else(|| self.onenote_sections.first().map(|sec| sec.section_key.clone()));
+                    if let Some(sec_key) = first_sec {
+                        self.open_onenote_section(ui, sec_key);
+                        return;
+                    }
+                }
                 self.loading_onenote_pages = false;
                 self.loading_onenote_detail = false;
             }
@@ -3476,11 +3831,27 @@ impl AppState {
                 if self.active_section_key.as_deref() == Some(section_key.as_str()) {
                     self.onenote_pages = pages;
                     self.loading_onenote_pages = false;
+                    let active_missing = self
+                        .active_page_key
+                        .as_deref()
+                        .is_none_or(|k| !self.onenote_pages.iter().any(|p| p.page_key == k));
+                    if active_missing {
+                        if let Some(first_key) =
+                            self.onenote_pages.first().map(|p| p.page_key.clone())
+                        {
+                            self.open_onenote_page(ui, first_key);
+                        }
+                    }
                 }
             }
             CoreEvent::OnenotePageDetailUpdated(detail) => {
-                self.active_page_detail = Some(*detail);
-                self.loading_onenote_detail = false;
+                if self.active_page_key.as_deref() == Some(detail.summary.page_key.as_str())
+                    || self.active_page_key.is_none()
+                {
+                    self.active_page_key = Some(detail.summary.page_key.clone());
+                    self.active_page_detail = Some(*detail);
+                    self.loading_onenote_detail = false;
+                }
             }
         }
     }
@@ -3527,7 +3898,7 @@ impl AppState {
                 self.syncing = false;
                 self.sync_summary = "최신 상태".to_string();
 
-                if self.active_conv_key.is_none() {
+                if self.active_conv_key.is_none() && ui.active_nav_tab < nav_pane::TAB_MAIL {
                     if let Some(first) = self.conversations.first().cloned() {
                         self.select_conversation(ui, first.target);
                     }
@@ -3741,6 +4112,10 @@ impl AppState {
                 if self.active_todo_task_id.is_none() {
                     self.active_todo_task_id = self.todo_tasks.first().map(|t| t.id.clone());
                 }
+                if self.persona == Persona::Outlook {
+                    self.syncing = false;
+                    self.sync_summary = "최신 상태".to_string();
+                }
             }
             UiMsg::MailFolderLoaded { folder_id, mails } => {
                 if ui.active_mail_folder_id == folder_id {
@@ -3752,11 +4127,11 @@ impl AppState {
                 }
             }
             UiMsg::MailDetailLoaded { mail } => {
-                self.loading_mail = false;
                 if let Some(existing) = self.mails.iter_mut().find(|m| m.id == mail.id) {
                     *existing = mail.clone();
                 }
                 if self.active_mail_id.as_deref() == Some(&mail.id) {
+                    self.loading_mail = false;
                     self.active_mail = Some(mail);
                 }
             }
@@ -3961,10 +4336,13 @@ mod tests {
         let cfg = AppConfig::default();
         let teams_ui = UiState::from_config_with_persona(&cfg, Persona::Teams);
         let outlook_ui = UiState::from_config_with_persona(&cfg, Persona::Outlook);
+        let onenote_ui = UiState::from_config_with_persona(&cfg, Persona::OneNote);
         assert_eq!(teams_ui.persona, Persona::Teams);
         assert_eq!(teams_ui.active_nav_tab, 0);
         assert_eq!(outlook_ui.persona, Persona::Outlook);
         assert_eq!(outlook_ui.active_nav_tab, 3);
+        assert_eq!(onenote_ui.persona, Persona::OneNote);
+        assert_eq!(onenote_ui.active_nav_tab, 7);
     }
 
     #[test]
@@ -3973,5 +4351,89 @@ mod tests {
             AppState::image_cache_key("msg-1", "att-9", 40, 14),
             "msg-1:att-9:40x14"
         );
+    }
+
+    #[tokio::test]
+    async fn stash_draft_noop_does_not_mark_dirty_and_ignores_stale_loads() {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let sync_ctrl = sync::spawn_sync_engine(cfg.clone(), graph.clone(), storage.clone(), event_tx);
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+
+        let mut app = AppState::new(cfg, auth, graph, storage, sync_ctrl.clone(), ui_tx);
+        let mut ui = UiState::new();
+        app.active_conv_key = Some("chat:room-a".to_string());
+        app.drafts.clear();
+
+        // Empty composer -> no-op (must not mark dirty or trigger disk write)
+        assert!(!app.stash_draft_in_memory(&ui));
+        app.stash_draft(&ui);
+
+        // Non-empty draft -> marks dirty; repeating unchanged text -> no-op
+        ui.composer.load_text("hello world");
+        assert!(app.stash_draft_in_memory(&ui));
+        assert_eq!(app.drafts.get("chat:room-a").map(String::as_str), Some("hello world"));
+        assert!(!app.stash_draft_in_memory(&ui));
+
+        // Clearing composer -> marks dirty, removes draft; repeating -> no-op
+        ui.composer.load_text("");
+        assert!(app.stash_draft_in_memory(&ui));
+        assert!(!app.drafts.contains_key("chat:room-a"));
+        assert!(!app.stash_draft_in_memory(&ui));
+
+        // Stale MessagesLoaded for another room must NOT overwrite active room's messages
+        app.loading_messages = true;
+        let stale_msg = MessageItem {
+            msg_key: "chat:room-b|m1".to_string(),
+            conv_key: "chat:room-b".to_string(),
+            msg_id: "m1".to_string(),
+            parent_msg_id: None,
+            reply_to_id: None,
+            reply_to_author: None,
+            reply_to_preview: None,
+            subject: None,
+            author_id: None,
+            author_name: "Other".to_string(),
+            is_me: false,
+            created_at: "2026-11-18T00:00:00Z".to_string(),
+            last_modified_at: None,
+            deleted: false,
+            importance: "normal".to_string(),
+            message_type: "message".to_string(),
+            body_html: String::new(),
+            body_plain: "stale".to_string(),
+            attachments: Vec::new(),
+            mentions: Vec::new(),
+            reactions: Vec::new(),
+            reply_count: 0,
+            web_url: None,
+        };
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::MessagesLoaded {
+                conv_key: "chat:room-b".to_string(),
+                messages: vec![stale_msg.clone()],
+                members: Vec::new(),
+            },
+        );
+        assert!(app.messages.is_empty());
+        assert!(app.loading_messages);
+
+        // Matching MessagesLoaded updates state
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::MessagesLoaded {
+                conv_key: "chat:room-a".to_string(),
+                messages: vec![stale_msg],
+                members: Vec::new(),
+            },
+        );
+        assert_eq!(app.messages.len(), 1);
+        assert!(!app.loading_messages);
+
+        sync_ctrl.request(SyncCommand::Shutdown);
     }
 }

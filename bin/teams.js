@@ -20,6 +20,17 @@ function fail(message) {
   process.exit(1);
 }
 
+function formatLinuxGlibcHint() {
+  return [
+    'Prebuilt Linux binaries target GLIBC >= 2.28 (AlmaLinux 8 / RHEL 8 / Rocky Linux 8 / Ubuntu 20.04+ / Debian 10+).',
+    'If you are on an older glibc distribution (such as CentOS 7 with GLIBC < 2.28) or Alpine/musl,',
+    'build from source with Cargo instead:',
+    '  cargo install --git https://github.com/shinick-dev/teams --locked',
+    'or clone the repository and run:',
+    '  cargo build --release',
+  ].join('\n');
+}
+
 const platform = process.platform;
 const arch = process.arch;
 const platformKey = `${platform}-${arch}`;
@@ -72,6 +83,14 @@ const child = spawn(binaryPath, process.argv.slice(2), {
 });
 
 child.on('error', (err) => {
+  if (
+    platform === 'linux' &&
+    (err.code === 'ENOENT' || /GLIBC_/i.test(String(err.message || '')))
+  ) {
+    fail(
+      `failed to launch ${binaryPath}: ${err.message}\n\n${formatLinuxGlibcHint()}`,
+    );
+  }
   fail(`failed to launch ${binaryPath}: ${err.message}`);
 });
 
@@ -97,6 +116,11 @@ child.on('exit', (code, signal) => {
   if (signal) {
     const number = os.constants.signals[signal] || 1;
     process.exit(128 + number);
+  }
+  if (platform === 'linux' && code === 127) {
+    process.stderr.write(
+      `teams: binary exited with code 127 (missing shared library, dynamic linker, or GLIBC symbol version).\n${formatLinuxGlibcHint()}\n`,
+    );
   }
   process.exit(code === null ? 1 : code);
 });

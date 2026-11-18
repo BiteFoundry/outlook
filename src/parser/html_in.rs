@@ -1,6 +1,8 @@
 //! Teams HTML + attachment parser into `Vec<RichBlock>`, plain text, and GFM Markdown.
 
-use std::collections::HashSet;
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::sync::{Mutex, OnceLock};
 
 use scraper::{ElementRef, Html, Node};
 
@@ -9,7 +11,152 @@ use crate::{
     parser::card_in::{is_card_content_type, parse_card_attachment},
 };
 
+const HTML_CACHE_MAX_ENTRIES: usize = 1024;
+const HTML_CACHE_MAX_HTML_BYTES: usize = 256 * 1024;
+
+type HtmlCacheKey = (u64, u64, usize);
+
+#[derive(Default)]
+struct HtmlParseCache {
+    entries: HashMap<HtmlCacheKey, Vec<RichBlock>>,
+    order: VecDeque<HtmlCacheKey>,
+}
+
+impl HtmlParseCache {
+    fn get(&self, key: &HtmlCacheKey) -> Option<&Vec<RichBlock>> {
+        self.entries.get(key)
+    }
+
+    fn insert(&mut self, key: HtmlCacheKey, value: Vec<RichBlock>) {
+        if self.entries.contains_key(&key) {
+            self.entries.insert(key, value);
+            return;
+        }
+        while self.entries.len() >= HTML_CACHE_MAX_ENTRIES {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.entries.insert(key, value);
+        self.order.push_back(key);
+    }
+}
+
+static HTML_PARSE_CACHE: OnceLock<Mutex<HtmlParseCache>> = OnceLock::new();
+
+struct Fnv1a64(u64);
+
+impl Fnv1a64 {
+    fn new() -> Self {
+        Self(0xcbf29ce484222325)
+    }
+
+    fn finish_mixed(&self) -> u64 {
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    }
+}
+
+impl Hasher for Fnv1a64 {
+    fn finish(&self) -> u64 {
+        self.finish_mixed()
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= b as u64;
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+}
+
+fn hash_str_field(h1: &mut DefaultHasher, h2: &mut Fnv1a64, s: &str) {
+    s.len().hash(h1);
+    s.as_bytes().hash(h1);
+    s.len().hash(h2);
+    s.as_bytes().hash(h2);
+}
+
+fn hash_opt_str_field(h1: &mut DefaultHasher, h2: &mut Fnv1a64, opt: Option<&str>) {
+    match opt {
+        Some(s) => {
+            1u8.hash(h1);
+            1u8.hash(h2);
+            hash_str_field(h1, h2, s);
+        }
+        None => {
+            0u8.hash(h1);
+            0u8.hash(h2);
+        }
+    }
+}
+
+fn compute_parse_fingerprint(
+    html: &str,
+    attachments: &[AttachmentInfo],
+    mentions: &[MentionInfo],
+) -> HtmlCacheKey {
+    let mut h1 = DefaultHasher::new();
+    let mut h2 = Fnv1a64::new();
+
+    0x4854_4d4c_u32.hash(&mut h1);
+    0x9e37_79b9_u32.hash(&mut h2);
+
+    hash_str_field(&mut h1, &mut h2, html);
+
+    attachments.len().hash(&mut h1);
+    attachments.len().hash(&mut h2);
+    for att in attachments {
+        hash_str_field(&mut h1, &mut h2, &att.id);
+        hash_str_field(&mut h1, &mut h2, &att.content_type);
+        hash_opt_str_field(&mut h1, &mut h2, att.name.as_deref());
+        hash_opt_str_field(&mut h1, &mut h2, att.content_url.as_deref());
+        hash_opt_str_field(&mut h1, &mut h2, att.content_json.as_deref());
+        hash_opt_str_field(&mut h1, &mut h2, att.thumbnail_url.as_deref());
+    }
+
+    mentions.len().hash(&mut h1);
+    mentions.len().hash(&mut h2);
+    for m in mentions {
+        m.id.hash(&mut h1);
+        m.id.hash(&mut h2);
+        m.user_id.hash(&mut h1);
+        m.user_id.hash(&mut h2);
+        hash_str_field(&mut h1, &mut h2, &m.display_name);
+    }
+
+    (h1.finish(), h2.finish(), html.len())
+}
+
 pub fn parse_message_blocks(
+    html: &str,
+    attachments: &[AttachmentInfo],
+    mentions: &[MentionInfo],
+) -> Vec<RichBlock> {
+    if html.len() > HTML_CACHE_MAX_HTML_BYTES {
+        return parse_message_blocks_uncached(html, attachments, mentions);
+    }
+
+    let key = compute_parse_fingerprint(html, attachments, mentions);
+    let cache = HTML_PARSE_CACHE.get_or_init(|| Mutex::new(HtmlParseCache::default()));
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = guard.get(&key) {
+            return cached.clone();
+        }
+    }
+
+    let parsed = parse_message_blocks_uncached(html, attachments, mentions);
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    guard.insert(key, parsed.clone());
+    parsed
+}
+
+fn parse_message_blocks_uncached(
     html: &str,
     attachments: &[AttachmentInfo],
     mentions: &[MentionInfo],
@@ -699,4 +846,89 @@ fn spans_to_markdown(spans: &[RichSpan]) -> String {
         out.push_str(&formatted);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_attachment(id: &str, name: &str) -> AttachmentInfo {
+        AttachmentInfo {
+            id: id.to_string(),
+            content_type: "reference".to_string(),
+            content_url: Some(format!("https://example.com/{name}")),
+            name: Some(name.to_string()),
+            content_json: None,
+            thumbnail_url: None,
+        }
+    }
+
+    fn sample_mention(id: i32, user_id: &str, display_name: &str) -> MentionInfo {
+        MentionInfo {
+            id,
+            user_id: user_id.to_string(),
+            display_name: display_name.to_string(),
+        }
+    }
+
+    #[test]
+    fn parse_message_blocks_cache_hit_matches_uncached() {
+        let html = "<p>Hello <b>Teams</b> <at id=\"0\"></at></p>";
+        let atts = vec![sample_attachment("a1", "spec.pdf")];
+        let mentions = vec![sample_mention(0, "u1", "Alice")];
+
+        let expected = parse_message_blocks_uncached(html, &atts, &mentions);
+        let first = parse_message_blocks(html, &atts, &mentions);
+        let second = parse_message_blocks(html, &atts, &mentions);
+
+        assert_eq!(first, expected);
+        assert_eq!(second, expected);
+    }
+
+    #[test]
+    fn parse_message_blocks_cache_distinguishes_attachments_and_mentions() {
+        let html = "<p>Check <at id=\"0\"></at></p>";
+        let att_a = vec![sample_attachment("a1", "alpha.txt")];
+        let att_b = vec![sample_attachment("a1", "beta.txt")];
+        let men_a = vec![sample_mention(0, "u1", "Alice")];
+        let men_b = vec![sample_mention(0, "u2", "Bob")];
+
+        assert_ne!(
+            compute_parse_fingerprint(html, &att_a, &men_a),
+            compute_parse_fingerprint(html, &att_b, &men_a)
+        );
+        assert_ne!(
+            compute_parse_fingerprint(html, &att_a, &men_a),
+            compute_parse_fingerprint(html, &att_a, &men_b)
+        );
+
+        let res_a = parse_message_blocks(html, &att_a, &men_a);
+        let res_b = parse_message_blocks(html, &att_b, &men_b);
+        assert_ne!(res_a, res_b);
+        assert!(blocks_to_plain(&res_a).contains("@Alice"));
+        assert!(blocks_to_plain(&res_a).contains("alpha.txt"));
+        assert!(blocks_to_plain(&res_b).contains("@Bob"));
+        assert!(blocks_to_plain(&res_b).contains("beta.txt"));
+    }
+
+    #[test]
+    fn parse_message_blocks_skips_cache_for_huge_html() {
+        let big_text = "x".repeat(HTML_CACHE_MAX_HTML_BYTES + 64);
+        let html = format!("<p>{big_text}</p>");
+        let blocks = parse_message_blocks(&html, &[], &[]);
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn html_cache_evicts_at_max_capacity() {
+        let mut cache = HtmlParseCache::default();
+        for i in 0..(HTML_CACHE_MAX_ENTRIES + 50) {
+            cache.insert((i as u64, (i as u64) ^ 0x55, i), Vec::new());
+        }
+        assert_eq!(cache.entries.len(), HTML_CACHE_MAX_ENTRIES);
+        assert_eq!(cache.order.len(), HTML_CACHE_MAX_ENTRIES);
+        assert!(cache.get(&(0, 0x55, 0)).is_none());
+        let last = HTML_CACHE_MAX_ENTRIES + 49;
+        assert!(cache.get(&(last as u64, (last as u64) ^ 0x55, last)).is_some());
+    }
 }

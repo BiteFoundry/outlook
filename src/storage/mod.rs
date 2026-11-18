@@ -21,11 +21,51 @@ use crate::models::{
     TeamSummary, ThreadView, TodoList, TodoTask,
 };
 
+const MAX_READER_POOL_SIZE: usize = 4;
+
 #[derive(Clone)]
 pub struct Storage {
     path: PathBuf,
     conn: Arc<Mutex<rusqlite::Connection>>,
+    readers: Option<Arc<Mutex<Vec<rusqlite::Connection>>>>,
     trigram_enabled: bool,
+}
+
+enum ReadConnInner<'a> {
+    Pooled {
+        conn: Option<rusqlite::Connection>,
+        pool: &'a Arc<Mutex<Vec<rusqlite::Connection>>>,
+    },
+    Writer(std::sync::MutexGuard<'a, rusqlite::Connection>),
+}
+
+struct ReadConnGuard<'a>(ReadConnInner<'a>);
+
+impl std::ops::Deref for ReadConnGuard<'_> {
+    type Target = rusqlite::Connection;
+
+    fn deref(&self) -> &Self::Target {
+        match &self.0 {
+            ReadConnInner::Pooled { conn, .. } => conn
+                .as_ref()
+                .expect("pooled reader connection available until Drop"),
+            ReadConnInner::Writer(guard) => guard,
+        }
+    }
+}
+
+impl Drop for ReadConnGuard<'_> {
+    fn drop(&mut self) {
+        if let ReadConnInner::Pooled { conn, pool } = &mut self.0 {
+            if let Some(c) = conn.take() {
+                if let Ok(mut guard) = pool.lock() {
+                    if guard.len() < MAX_READER_POOL_SIZE {
+                        guard.push(c);
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Storage {
@@ -36,6 +76,9 @@ impl Storage {
         Ok(Self {
             path: path.to_path_buf(),
             conn: Arc::new(Mutex::new(conn)),
+            readers: Some(Arc::new(Mutex::new(Vec::with_capacity(
+                MAX_READER_POOL_SIZE,
+            )))),
             trigram_enabled,
         })
     }
@@ -46,6 +89,7 @@ impl Storage {
         Ok(Self {
             path: PathBuf::from(":memory:"),
             conn: Arc::new(Mutex::new(conn)),
+            readers: None,
             trigram_enabled,
         })
     }
@@ -68,6 +112,33 @@ impl Storage {
             .map_err(|_| anyhow::anyhow!("SQLite 연결 잠금 획득 실패 (poisoned mutex)"))
     }
 
+    fn read_conn(&self) -> Result<ReadConnGuard<'_>> {
+        if let Some(pool) = &self.readers {
+            let existing = {
+                let mut guard = pool.lock().map_err(|_| {
+                    anyhow::anyhow!("SQLite reader pool 잠금 획득 실패 (poisoned mutex)")
+                })?;
+                guard.pop()
+            };
+            let conn = match existing {
+                Some(c) => c,
+                None => {
+                    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+                    let c = rusqlite::Connection::open_with_flags(&self.path, flags)?;
+                    db::init_reader_connection(&c)?;
+                    c
+                }
+            };
+            Ok(ReadConnGuard(ReadConnInner::Pooled {
+                conn: Some(conn),
+                pool,
+            }))
+        } else {
+            Ok(ReadConnGuard(ReadConnInner::Writer(self.lock_conn()?)))
+        }
+    }
+
     // --- Conversations & Teams ---
     pub fn upsert_conversations(&self, items: &[ConversationSummary]) -> Result<()> {
         let mut conn = self.lock_conn()?;
@@ -80,17 +151,17 @@ impl Storage {
     }
 
     pub fn list_conversations(&self) -> Result<Vec<ConversationSummary>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         repo::list_conversations(&conn)
     }
 
     pub fn list_teams(&self) -> Result<Vec<TeamSummary>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         repo::list_teams(&conn)
     }
 
     pub fn get_conversation(&self, conv_key: &str) -> Result<Option<ConversationSummary>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         repo::get_conversation(&conn, conv_key)
     }
 
@@ -112,7 +183,7 @@ impl Storage {
         limit: usize,
         before_created_at: Option<&str>,
     ) -> Result<Vec<MessageItem>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         repo::list_root_messages(&conn, conv_key, limit, before_created_at)
     }
 
@@ -122,12 +193,12 @@ impl Storage {
         root_msg_id: &str,
         limit: usize,
     ) -> Result<Vec<MessageItem>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         repo::list_thread_replies(&conn, conv_key, root_msg_id, limit)
     }
 
     pub fn get_message(&self, conv_key: &str, msg_id: &str) -> Result<Option<MessageItem>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         repo::get_message(&conn, conv_key, msg_id)
     }
 
@@ -137,7 +208,7 @@ impl Storage {
         root_msg_id: &str,
         limit: usize,
     ) -> Result<Option<ThreadView>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         repo::get_thread(&conn, conv_key, root_msg_id, limit)
     }
 
@@ -147,7 +218,7 @@ impl Storage {
         my_user_id: &str,
         limit: usize,
     ) -> Result<Vec<MessageItem>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         repo::list_mentions_for_user(&conn, my_user_id, limit)
     }
 
@@ -158,7 +229,7 @@ impl Storage {
     }
 
     pub fn list_members(&self, conv_key: &str) -> Result<Vec<MemberInfo>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         repo::list_members(&conn, conv_key)
     }
 
@@ -168,7 +239,7 @@ impl Storage {
     }
 
     pub fn get_presences(&self) -> Result<HashMap<String, PresenceStatus>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         repo::get_presences(&conn)
     }
 
@@ -179,12 +250,12 @@ impl Storage {
         conv_key_filter: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         search::search_messages(&conn, query, conv_key_filter, limit)
     }
 
     pub fn get_sync_cursor(&self, scope_key: &str) -> Result<Option<SyncCursor>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         repo::get_sync_cursor(&conn, scope_key)
     }
 
@@ -200,7 +271,7 @@ impl Storage {
     }
 
     pub fn list_mail_folders(&self) -> Result<Vec<MailFolder>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         outlook::list_mail_folders(&conn)
     }
 
@@ -214,12 +285,12 @@ impl Storage {
         folder_id_or_wellknown: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MailMessage>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         outlook::list_mail_messages(&conn, folder_id_or_wellknown, limit)
     }
 
     pub fn get_mail_message(&self, message_id: &str) -> Result<Option<MailMessage>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         outlook::get_mail_message(&conn, message_id)
     }
 
@@ -234,7 +305,7 @@ impl Storage {
         folder_filter: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MailSearchHit>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         outlook::search_mail_messages(&conn, query, folder_filter, limit, self.trigram_enabled)
     }
 
@@ -249,7 +320,7 @@ impl Storage {
         end_iso: Option<&str>,
         limit: usize,
     ) -> Result<Vec<CalendarEvent>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         outlook::list_calendar_events(&conn, start_iso, end_iso, limit)
     }
 
@@ -264,7 +335,7 @@ impl Storage {
     }
 
     pub fn list_contacts(&self, query: Option<&str>, limit: usize) -> Result<Vec<ContactItem>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         outlook::list_contacts(&conn, query, limit)
     }
 
@@ -279,7 +350,7 @@ impl Storage {
     }
 
     pub fn list_todo_lists(&self) -> Result<Vec<TodoList>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         outlook::list_todo_lists(&conn)
     }
 
@@ -294,7 +365,7 @@ impl Storage {
         include_completed: bool,
         limit: usize,
     ) -> Result<Vec<TodoTask>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         outlook::list_todo_tasks(&conn, list_id, include_completed, limit)
     }
 
@@ -310,7 +381,7 @@ impl Storage {
     }
 
     pub fn list_onenote_notebooks(&self) -> Result<Vec<OnenoteNotebook>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         onenote::list_onenote_notebooks(&conn)
     }
 
@@ -320,7 +391,7 @@ impl Storage {
     }
 
     pub fn list_onenote_section_groups(&self) -> Result<Vec<OnenoteSectionGroup>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         onenote::list_onenote_section_groups(&conn)
     }
 
@@ -333,7 +404,7 @@ impl Storage {
         &self,
         notebook_key_filter: Option<&str>,
     ) -> Result<Vec<OnenoteSection>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         onenote::list_onenote_sections(&conn, notebook_key_filter)
     }
 
@@ -343,7 +414,7 @@ impl Storage {
     }
 
     pub fn list_onenote_pages(&self, section_key: &str) -> Result<Vec<OnenotePageSummary>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         onenote::list_onenote_pages(&conn, section_key)
     }
 
@@ -353,7 +424,7 @@ impl Storage {
     }
 
     pub fn get_onenote_page_detail(&self, page_key_or_id: &str) -> Result<Option<OnenotePageDetail>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         onenote::get_onenote_page_detail(&conn, page_key_or_id)
     }
 
@@ -361,7 +432,7 @@ impl Storage {
         &self,
         page_key_or_id: &str,
     ) -> Result<Option<OnenotePageSummary>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         onenote::get_onenote_page_summary(&conn, page_key_or_id)
     }
 
@@ -376,7 +447,7 @@ impl Storage {
         section_key_filter: Option<&str>,
         limit: usize,
     ) -> Result<Vec<OnenoteSearchHit>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         onenote::search_onenote_pages(
             &conn,
             query,
@@ -768,5 +839,135 @@ mod tests {
         let reopened = Storage::open(&db_file).unwrap();
         let loaded = reopened.get_conversation("chat:c-disk").unwrap().unwrap();
         assert_eq!(loaded.title, "디스크방");
+    }
+
+    #[test]
+    fn test_file_backed_reader_pool_concurrent_with_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_file = dir.path().join("teams-concurrent.db");
+        let storage = Storage::open(&db_file).unwrap();
+
+        let chat = sample_chat("c-wal", "동시성 테스트방", true, Some("2026-11-15T12:00:00Z"));
+        let conv_key = chat.conv_key.clone();
+        storage.upsert_conversations(&[chat]).unwrap();
+        let m1 = sample_msg(
+            &conv_key,
+            "m1",
+            None,
+            "홍길동",
+            "WAL reader pool 동시 읽기 검증 메시지",
+            Some("성능 테스트"),
+            "2026-11-15T12:00:00Z",
+        );
+        storage.upsert_messages(&[m1]).unwrap();
+
+        // Hold the writer mutex while 6 reader threads query concurrently via the WAL reader pool.
+        {
+            let _writer_guard = storage.conn().lock().unwrap();
+            std::thread::scope(|s| {
+                for _ in 0..6 {
+                    s.spawn(|| {
+                        let convs = storage.list_conversations().unwrap();
+                        assert_eq!(convs.len(), 1);
+                        assert_eq!(convs[0].title, "동시성 테스트방");
+
+                        let roots = storage.list_root_messages(&conv_key, 10, None).unwrap();
+                        assert_eq!(roots.len(), 1);
+                        assert_eq!(roots[0].msg_id, "m1");
+
+                        let msg = storage.get_message(&conv_key, "m1").unwrap().unwrap();
+                        assert_eq!(msg.body_plain, "WAL reader pool 동시 읽기 검증 메시지");
+
+                        let hits = storage.search_messages("동시 읽기", None, 10).unwrap();
+                        assert_eq!(hits.len(), 1);
+                        assert_eq!(hits[0].msg_id, "m1");
+                    });
+                }
+            });
+        }
+
+        let pooled_count = storage.readers.as_ref().unwrap().lock().unwrap().len();
+        assert!((1..=MAX_READER_POOL_SIZE).contains(&pooled_count));
+
+        // Subsequent write is visible to pooled readers.
+        let m2 = sample_msg(
+            &conv_key,
+            "m2",
+            None,
+            "김철수",
+            "두 번째 커밋 메시지",
+            None,
+            "2026-11-15T12:05:00Z",
+        );
+        storage.upsert_messages(&[m2]).unwrap();
+        let roots_after = storage.list_root_messages(&conv_key, 10, None).unwrap();
+        assert_eq!(roots_after.len(), 2);
+        assert_eq!(roots_after[1].msg_id, "m2");
+    }
+
+    #[test]
+    fn test_upsert_messages_idempotency_and_partial_fts_skip() {
+        let storage = Storage::open_in_memory().unwrap();
+        let chat = sample_chat("c-idem", "멱등성 테스트", false, None);
+        let conv_key = chat.conv_key.clone();
+        storage.upsert_conversations(&[chat]).unwrap();
+
+        let mut m1 = sample_msg(
+            &conv_key,
+            "m1",
+            None,
+            "홍길동",
+            "초기 본문 Kubernetes 배포 안내",
+            Some("배포 공지"),
+            "2026-11-15T09:00:00Z",
+        );
+        assert_eq!(storage.upsert_messages(&[m1.clone()]).unwrap(), 1);
+        assert_eq!(
+            storage.search_messages("Kubernetes", None, 10).unwrap().len(),
+            1
+        );
+
+        // 1) Identical re-upsert must skip both messages and messages_fts writes (0 SQLite changes).
+        let changes_before_noop = storage.conn().lock().unwrap().total_changes();
+        assert_eq!(storage.upsert_messages(&[m1.clone()]).unwrap(), 1);
+        let changes_after_noop = storage.conn().lock().unwrap().total_changes();
+        assert_eq!(changes_after_noop - changes_before_noop, 0);
+        assert_eq!(
+            storage.search_messages("Kubernetes", None, 10).unwrap().len(),
+            1
+        );
+
+        // 2) Metadata-only change (reply_count / last_modified_at) updates messages without FTS churn.
+        m1.reply_count = 3;
+        m1.last_modified_at = Some("2026-11-15T09:02:00Z".to_string());
+        let changes_before_meta = storage.conn().lock().unwrap().total_changes();
+        assert_eq!(storage.upsert_messages(&[m1.clone()]).unwrap(), 1);
+        let changes_after_meta = storage.conn().lock().unwrap().total_changes();
+        assert_eq!(changes_after_meta - changes_before_meta, 1);
+        assert_eq!(
+            storage.get_message(&conv_key, "m1").unwrap().unwrap().reply_count,
+            3
+        );
+        assert_eq!(
+            storage.search_messages("Kubernetes", None, 10).unwrap().len(),
+            1
+        );
+
+        // 3) Body change updates both messages and messages_fts.
+        m1.body_plain = "수정된 본문 PostgreSQL 점검".to_string();
+        m1.last_modified_at = Some("2026-11-15T09:05:00Z".to_string());
+        storage.upsert_messages(&[m1.clone()]).unwrap();
+        assert!(storage.search_messages("Kubernetes", None, 10).unwrap().is_empty());
+        assert_eq!(
+            storage.search_messages("PostgreSQL", None, 10).unwrap().len(),
+            1
+        );
+
+        // 4) Soft delete removes from messages_fts while updating messages.
+        m1.deleted = true;
+        m1.last_modified_at = Some("2026-11-15T09:10:00Z".to_string());
+        storage.upsert_messages(&[m1]).unwrap();
+        assert!(storage.get_message(&conv_key, "m1").unwrap().unwrap().deleted);
+        assert!(storage.search_messages("PostgreSQL", None, 10).unwrap().is_empty());
     }
 }

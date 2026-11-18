@@ -1,4 +1,4 @@
-# teams · outlook · onenote (v0.3.0 Unified Microsoft Teams + Outlook + OneNote Suite)
+# teams · outlook · onenote (v0.4.0 Unified Microsoft Teams + Outlook + OneNote Suite)
 
 **Microsoft Teams**, **Microsoft Outlook(메일 · 캘린더 · 연락처 · Microsoft To Do)**, **Microsoft OneNote(개인 · 팀/그룹 공유 필기장)** 를 **터미널에서** 하나로 통합해 읽고, 검색하고, 답장하고, 파일·이미지·페이지를 주고받을 수 있는 **CLI · TUI · HTTP JSON API · MCP 서버 통합 도구**입니다.
 
@@ -13,6 +13,7 @@
 - [빠른 시작 (Quickstart)](#빠른-시작-quickstart)
   - [설치 방법 (프리빌트 / npm / 프로필)](#설치-방법-프리빌트--npm--프로필)
   - [단일 로그인 (Teams + Outlook + OneNote 공용)](#단일-로그인-teams--outlook--onenote-공용)
+  - [외부 토큰 브로커 연동 (`tc-auth`, Azure CLI 등)](#외부-토큰-브로커-연동-tc-auth-azure-cli-등)
   - [커스텀 Azure App (Entra ID) 설정 및 권한 스코프](#커스텀-azure-app-entra-id-설정-및-권한-스코프)
   - [원클릭 업데이트 (`teams update` / `outlook update`)](#원클릭-업데이트-teams-update--outlook-update)
 - [Outlook CLI 레퍼런스 (`outlook`)](#outlook-cli-레퍼런스-outlook)
@@ -71,10 +72,12 @@ npx --yes -p @shinick/teams onenote --version
 
 ```powershell
 # 방법 C: 소스 클론 없이 프리빌트 단일 실행 파일(teams.exe)만 직접 다운로드
-gh release download v0.3.0 -R shinick-dev/teams --pattern "teams.exe" --dir "$HOME\.local\bin" --clobber
+gh release download v0.4.0 -R shinick-dev/teams --pattern "teams.exe" --dir "$HOME\.local\bin" --clobber
 ```
 
-> GitHub [Releases -> v0.3.0](https://github.com/shinick-dev/teams/releases/tag/v0.3.0)에서 플랫폼별 아카이브(`teams-0.3.0-*.zip` / `.tar.gz`) 또는 `teams.exe`를 내려받아 바로 실행할 수 있습니다.
+> GitHub [Releases -> v0.4.0](https://github.com/shinick-dev/teams/releases/tag/v0.4.0)에서 플랫폼별 아카이브(`teams-0.4.0-*.zip` / `.tar.gz`) 또는 `teams.exe`를 내려받아 바로 실행할 수 있습니다.
+>
+> **Linux 지원 범위**: 프리빌트 Linux 바이너리(`x86_64` / `aarch64`)는 `cargo-zigbuild`로 **GLIBC 2.28** 타깃으로 빌드되어 **AlmaLinux 8 / RHEL 8+ / Rocky Linux 8+ / Ubuntu 20.04+ / Debian 10+** 에서 바로 실행됩니다. 헤드리스 SSH 서버에서는 `teams login --device-code`를 사용할 수 있으며, D-Bus Secret Service가 없는 환경에서는 자동으로 `0600` 권한의 `credentials.json`으로 안전하게 폴백합니다. (CentOS 7 등 GLIBC 2.28 미만 또는 Alpine/musl 환경은 `cargo build --release`로 소스 빌드하세요.)
 
 ### 단일 로그인 (Teams + Outlook + OneNote 공용)
 
@@ -98,6 +101,48 @@ export TEAMS_ACCESS_TOKEN="$GRAPH_TOKEN"
 # 로그인 상태 및 Graph 연결 진단
 teams whoami
 teams doctor --probe
+```
+
+### 외부 토큰 브로커 연동 (`tc-auth`, Azure CLI 등)
+
+`tc-auth`, `az account get-access-token`, HashiCorp Vault CLI 등 외부 브로커가 Graph 액세스 토큰을 발급·관리하는 경우, 셸 래퍼 없이 `teams`가 토큰 파일을 직접 읽고 만료 임박 또는 HTTP `401` 시 자동 갱신 명령을 실행할 수 있습니다. (`TEAMS_TOKEN_FILE` / `token_file` 또는 `TEAMS_ACCESS_TOKEN` 사용 시 OS 키링 및 `credentials.json` 접근을 자동으로 생략합니다.)
+
+#### 예시 1: `config.toml` 설정 (셸 래퍼 없이 영구 적용, 가장 권장)
+
+```toml
+# %APPDATA%\teams-cli\config.toml (Windows) 또는 ~/.config/teams-cli/config.toml (Linux/macOS)
+token_file = "~/.cursor/tc-auth/access_token"
+token_refresh_cmd = "python ~/.cursor/tc-auth/graph-auth.py refresh"
+token_refresh_mins = 5
+```
+
+#### 예시 2: 환경 변수로 지정 (`TEAMS_TOKEN_FILE`, `TEAMS_TOKEN_REFRESH_CMD`)
+
+```bash
+export TEAMS_TOKEN_FILE="$HOME/.cursor/tc-auth/access_token"
+export TEAMS_TOKEN_REFRESH_CMD="python $HOME/.cursor/tc-auth/graph-auth.py refresh"
+export TEAMS_TOKEN_REFRESH_MINS=5
+```
+
+```powershell
+$env:TEAMS_TOKEN_FILE = "$HOME\.cursor\tc-auth\access_token"
+$env:TEAMS_TOKEN_REFRESH_CMD = "python `"$HOME\.cursor\tc-auth\graph-auth.py`" refresh"
+$env:TEAMS_TOKEN_REFRESH_MINS = "5"
+```
+
+#### 예시 3: Azure CLI (`az account get-access-token`) JSON/표준출력 연동
+
+`token_file` 없이 `token_refresh_cmd`만 설정하면 명령의 표준출력(`stdout`, raw JWT 또는 Azure CLI camelCase JSON `accessToken` / `expiresOn` 모두 지원)을 읽어 메모리에 캐시합니다.
+
+```toml
+# config.toml (파일 저장 없이 az CLI stdout 직접 사용)
+token_refresh_cmd = "az account get-access-token --resource https://graph.microsoft.com --output json"
+token_refresh_mins = 5
+```
+
+```bash
+# 또는 환경 변수로 일회성 실행
+TEAMS_TOKEN_REFRESH_CMD="az account get-access-token --resource https://graph.microsoft.com --output json" teams whoami
 ```
 
 ### 커스텀 Azure App (Entra ID) 설정 및 권한 스코프
@@ -544,6 +589,7 @@ TEAMS_PERSONA=onenote ./target/release/teams --help
 
 - SQLite는 `rusqlite` `bundled` 기능으로 모든 플랫폼에 정적 포함됩니다.
 - TLS는 `rustls`를 사용하므로 Linux/macOS에서 별도의 OpenSSL 개발 패키지가 필요하지 않습니다.
+- CI 릴리즈의 Linux 바이너리(`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`)는 `cargo-zigbuild`로 **GLIBC 2.28**(`--target <triple>.2.28`)에 맞춰 크로스 컴파일되며, `node scripts/verify-glibc.mjs --max 2.28` 및 `almalinux:8` 컨테이너 스모크 테스트로 **AlmaLinux 8 / RHEL 8+** 호환성을 검증합니다.
 - 단일 `teams` / `teams.exe` 바이너리가 `teams`, `outlook`, `onenote` 세 명령을 모두 처리합니다 (`TEAMS_PERSONA=outlook|onenote` 또는 실행 파일명 `outlook*` / `onenote*` 감지).
 
 ### 저장소 내장 런처
@@ -588,6 +634,22 @@ npx --yes -p @shinick/teams onenote --version
 | 첨부파일 다운로드 폴더 | `~/Downloads/teams` (또는 `config.toml` `download_dir`) | - |
 | Graph / Auth 엔드포인트 | `https://graph.microsoft.com/v1.0` / `https://login.microsoftonline.com` | `TEAMS_GRAPH_BASE_URL`, `TEAMS_AUTH_BASE_URL` |
 | 실행 페르소나 / 업데이터 저장소 | `teams` (또는 `outlook` / `onenote`) / `shinick-dev/teams` | `TEAMS_PERSONA`, `TEAMS_GITHUB_REPO` |
+
+### 주요 환경 변수
+
+| 환경 변수 | 설명 |
+| --- | --- |
+| `TEAMS_PERSONA` | 실행 페르소나 강제 지정 (`teams` \| `outlook` \| `onenote`) |
+| `TEAMS_TOKEN_FILE` | 외부 토큰 파일 경로 (raw JWT 또는 JSON; 설정 시 OS 키링 접근 자동 생략) |
+| `TEAMS_TOKEN_REFRESH_CMD` | 토큰 만료 임박 또는 `401` 시 실행할 외부 토큰 갱신 명령 |
+| `TEAMS_TOKEN_REFRESH_MINS` | 만료 몇 분 전에 `TEAMS_TOKEN_REFRESH_CMD`를 선제 실행할지 지정 (기본 `5`) |
+| `TEAMS_ACCESS_TOKEN` | Bearer 액세스 토큰 직접 주입 (설정 시 OS 키링 접근 자동 생략) |
+| `TEAMS_DISABLE_KEYRING=1` | OS 키링 사용 비활성화 (`credentials.json` 파일만 사용) |
+| `TEAMS_CLIENT_ID` | 커스텀 Entra ID 앱 Client ID 재정의 |
+| `TEAMS_TENANT_ID` | Entra ID Tenant ID 재정의 (기본값 `common`) |
+| `TEAMS_CONFIG_DIR` | `config.toml` · `credentials.json` · `drafts.json` 디렉토리 재정의 |
+| `TEAMS_DATA_DIR` | SQLite 캐시(`cache.db`) 저장 디렉토리 재정의 |
+| `TEAMS_NO_BROWSER` | `1`/`true` 설정 시 로그인 과정에서 브라우저 자동 실행 비활성화 |
 
 ## 라이선스
 

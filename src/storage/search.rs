@@ -59,7 +59,7 @@ fn run_fts_search(
     limit: usize,
 ) -> Result<Vec<SearchHit>> {
     let hits = if let Some(conv_key) = conv_key_filter {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 m.conv_key,
@@ -86,7 +86,7 @@ fn run_fts_search(
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     } else {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 m.conv_key,
@@ -124,7 +124,7 @@ fn run_like_search(
 ) -> Result<Vec<SearchHit>> {
     let pattern = format!("%{}%", escape_like(&raw_query.to_lowercase()));
     let hits = if let Some(conv_key) = conv_key_filter {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 m.conv_key,
@@ -154,7 +154,7 @@ fn run_like_search(
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     } else {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 m.conv_key,

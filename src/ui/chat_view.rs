@@ -3,6 +3,11 @@
 //! Pure line builders (`ChatRender`, `build_lines_with_hyperlinks`, `render_message_item`)
 //! are decoupled from `GraphClient` / `Storage` so they can be unit tested directly.
 
+use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+
 use chrono::{DateTime, Datelike, Local};
 use ratatui::{
     layout::Rect,
@@ -141,7 +146,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut AppState, ui: &mut UiState,
         return;
     }
 
-    let lines = build_lines_with_images(app, ui, message_area.width as usize);
+    let lines = build_lines_with_images_cached(app, ui, message_area.width as usize);
     if lines.is_empty() {
         return;
     }
@@ -162,15 +167,12 @@ pub fn render_scrolled_lines(
     height: usize,
     hitmap: &mut HitMap,
 ) {
-    let visible: Vec<Line> = lines
-        .iter()
-        .skip(offset)
-        .take(height)
-        .map(|r| r.line.clone())
-        .collect();
+    let end = offset.saturating_add(height).min(lines.len());
+    let slice = lines.get(offset..end).unwrap_or(&[]);
+    let visible: Vec<Line> = slice.iter().map(|r| r.line.clone()).collect();
     frame.render_widget(Paragraph::new(visible), area);
 
-    for (row, rendered) in lines.iter().skip(offset).take(height).enumerate() {
+    for (row, rendered) in slice.iter().enumerate() {
         let y = area.y + row as u16;
         if let Some(target) = rendered.target {
             hitmap.add_line(area.x, y, area.width, target);
@@ -308,6 +310,136 @@ fn app_theme_presence(avail: &str) -> (&'static str, ratatui::style::Color) {
     Theme::default().presence_indicator(Some(avail))
 }
 
+pub(crate) struct DualHasher {
+    h1: DefaultHasher,
+    h2: DefaultHasher,
+}
+
+impl DualHasher {
+    pub(crate) fn new(domain: u64) -> Self {
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        domain.hash(&mut h1);
+        (domain ^ 0x9e37_79b9_7f4a_7c15).hash(&mut h2);
+        Self { h1, h2 }
+    }
+
+    pub(crate) fn write_hash<T: Hash>(&mut self, val: &T) {
+        val.hash(&mut self.h1);
+        val.hash(&mut self.h2);
+    }
+
+    pub(crate) fn write_str(&mut self, s: &str) {
+        s.len().hash(&mut self.h1);
+        s.as_bytes().hash(&mut self.h1);
+        s.len().hash(&mut self.h2);
+        s.as_bytes().hash(&mut self.h2);
+    }
+
+    pub(crate) fn finish(self) -> (u64, u64) {
+        (self.h1.finish(), self.h2.finish())
+    }
+}
+
+pub(crate) struct LineSliceCache {
+    entries: Vec<((u64, u64), Arc<[RenderedLine]>)>,
+    max_entries: usize,
+}
+
+impl LineSliceCache {
+    pub(crate) fn new(max_entries: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(max_entries),
+            max_entries: max_entries.max(1),
+        }
+    }
+
+    pub(crate) fn get(&mut self, key: (u64, u64)) -> Option<Arc<[RenderedLine]>> {
+        let pos = self.entries.iter().position(|(k, _)| *k == key)?;
+        let (_, val) = self.entries.remove(pos);
+        self.entries.push((key, Arc::clone(&val)));
+        Some(val)
+    }
+
+    pub(crate) fn insert(&mut self, key: (u64, u64), val: Arc<[RenderedLine]>) {
+        if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key) {
+            self.entries.remove(pos);
+        } else if self.entries.len() >= self.max_entries {
+            self.entries.remove(0);
+        }
+        self.entries.push((key, val));
+    }
+}
+
+pub(crate) fn hash_theme_sig(h: &mut DualHasher, theme: &Theme) {
+    h.write_hash(&theme.fg);
+    h.write_hash(&theme.accent);
+    h.write_hash(&theme.own);
+    h.write_hash(&theme.date_separator);
+    h.write_hash(&theme.unread);
+    h.write_hash(&theme.warning);
+    h.write_hash(&theme.error);
+}
+
+pub(crate) fn hash_message_sig(h: &mut DualHasher, msg: &MessageItem) {
+    h.write_str(&msg.msg_id);
+    match &msg.last_modified_at {
+        Some(ts) => {
+            h.write_hash(&1u8);
+            h.write_str(ts);
+        }
+        None => h.write_hash(&0u8),
+    }
+    h.write_hash(&msg.deleted);
+    h.write_hash(&msg.reply_count);
+    h.write_hash(&msg.reactions.len());
+    for r in &msg.reactions {
+        h.write_str(&r.reaction_type);
+        h.write_hash(&r.count);
+        h.write_hash(&r.me_reacted);
+    }
+    h.write_hash(&msg.attachments.len());
+    h.write_hash(&msg.body_html.len());
+    h.write_hash(&msg.body_plain.len());
+    h.write_hash(&msg.subject.as_deref().map(str::len));
+    h.write_str(&msg.importance);
+}
+
+fn compute_chat_lines_sig(
+    conv_key: Option<&str>,
+    view: &ChatRender,
+    width: usize,
+    hyperlinks: bool,
+    inline_images: bool,
+    image_cache_len: usize,
+    theme: &Theme,
+) -> (u64, u64) {
+    let mut h = DualHasher::new(0x4348_4154_5f4c_494e);
+    match conv_key {
+        Some(k) => {
+            h.write_hash(&1u8);
+            h.write_str(k);
+        }
+        None => h.write_hash(&0u8),
+    }
+    h.write_hash(&view.is_channel);
+    h.write_hash(&view.selected_index);
+    h.write_hash(&width);
+    h.write_hash(&hyperlinks);
+    h.write_hash(&inline_images);
+    h.write_hash(&image_cache_len);
+    hash_theme_sig(&mut h, theme);
+    h.write_hash(&view.messages.len());
+    for msg in view.messages {
+        hash_message_sig(&mut h, msg);
+    }
+    h.finish()
+}
+
+thread_local! {
+    static CHAT_LINES_CACHE: RefCell<LineSliceCache> = RefCell::new(LineSliceCache::new(4));
+}
+
 pub fn build_lines(app: &AppState, ui: &UiState, width: usize) -> Vec<RenderedLine> {
     build_lines_with_hyperlinks(
         &ChatRender::from_app(app, ui),
@@ -322,6 +454,31 @@ pub fn build_lines_with_images(
     ui: &UiState,
     width: usize,
 ) -> Vec<RenderedLine> {
+    build_lines_with_images_cached(app, ui, width).to_vec()
+}
+
+pub(crate) fn build_lines_with_images_cached(
+    app: &mut AppState,
+    ui: &UiState,
+    width: usize,
+) -> Arc<[RenderedLine]> {
+    let hyperlinks = hyperlinks_enabled();
+    let width = width.max(12);
+    let view = ChatRender::from_app(app, ui);
+    let sig = compute_chat_lines_sig(
+        app.active_conv_key.as_deref(),
+        &view,
+        width,
+        hyperlinks,
+        ui.inline_images,
+        app.image_cache.len(),
+        &ui.theme,
+    );
+
+    if let Some(cached) = CHAT_LINES_CACHE.with(|cache| cache.borrow_mut().get(sig)) {
+        return cached;
+    }
+
     let thumb_cols = width.saturating_sub(4).clamp(16, 40) as u16;
     let thumb_rows = 10u16;
     if ui.inline_images {
@@ -341,9 +498,7 @@ pub fn build_lines_with_images(
         }
     }
 
-    let hyperlinks = hyperlinks_enabled();
     let view = ChatRender::from_app(app, ui);
-    let width = width.max(12);
     let mut out = Vec::new();
     let mut last_date: Option<String> = None;
 
@@ -381,7 +536,9 @@ pub fn build_lines_with_images(
         );
     }
 
-    out
+    let arc: Arc<[RenderedLine]> = Arc::from(out);
+    CHAT_LINES_CACHE.with(|cache| cache.borrow_mut().insert(sig, Arc::clone(&arc)));
+    arc
 }
 
 fn theme_date_color(theme: &Theme) -> ratatui::style::Color {
@@ -1196,5 +1353,88 @@ mod tests {
             .inline_targets
             .iter()
             .any(|(_, _, t)| matches!(t, HitTarget::Attachment { msg_index: 0, attach_index: 0, .. }))));
+    }
+
+    #[test]
+    fn chat_render_signature_and_line_cache_behavior() {
+        let mut msgs = vec![sample_msg("m1", Some("주간 보고"), 3)];
+        let theme = Theme::default();
+        let sig_base = {
+            let view = ChatRender {
+                messages: &msgs,
+                is_channel: true,
+                selected_index: Some(0),
+            };
+            compute_chat_lines_sig(Some("chan:t1:c1"), &view, 80, false, true, 0, &theme)
+        };
+
+        // Same inputs produce identical signature and cache hit returns identical lines.
+        let mut cache = LineSliceCache::new(2);
+        let lines: Arc<[RenderedLine]> = Arc::from(build_lines_with_hyperlinks(
+            &ChatRender {
+                messages: &msgs,
+                is_channel: true,
+                selected_index: Some(0),
+            },
+            &theme,
+            80,
+            false,
+        ));
+        cache.insert(sig_base, Arc::clone(&lines));
+        let hit = cache.get(sig_base).expect("expected cache hit");
+        assert_eq!(hit.len(), lines.len());
+
+        // Selection, width, reaction me_reacted, and image_cache_len changes invalidate signature.
+        let sig_sel = compute_chat_lines_sig(
+            Some("chan:t1:c1"),
+            &ChatRender {
+                messages: &msgs,
+                is_channel: true,
+                selected_index: None,
+            },
+            80,
+            false,
+            true,
+            0,
+            &theme,
+        );
+        assert_ne!(sig_base, sig_sel);
+
+        let sig_width = compute_chat_lines_sig(
+            Some("chan:t1:c1"),
+            &ChatRender {
+                messages: &msgs,
+                is_channel: true,
+                selected_index: Some(0),
+            },
+            100,
+            false,
+            true,
+            0,
+            &theme,
+        );
+        assert_ne!(sig_base, sig_width);
+
+        msgs[0].reactions[0].me_reacted = false;
+        let sig_react = compute_chat_lines_sig(
+            Some("chan:t1:c1"),
+            &ChatRender {
+                messages: &msgs,
+                is_channel: true,
+                selected_index: Some(0),
+            },
+            80,
+            false,
+            true,
+            0,
+            &theme,
+        );
+        assert_ne!(sig_base, sig_react);
+
+        // Capacity bound evicts oldest entry.
+        cache.insert(sig_sel, Arc::clone(&lines));
+        cache.insert(sig_width, Arc::clone(&lines));
+        assert!(cache.get(sig_base).is_none());
+        assert!(cache.get(sig_width).is_some());
     }
 }

@@ -83,17 +83,28 @@ impl GraphClient {
         )
     }
 
-    /// Resolves current user's Entra object ID using cached field, stored tokens, or `/me`.
+    /// Resolves current user's Entra object ID using cached field, shared OnceLock, stored tokens, or `/me`.
     pub(crate) async fn resolve_my_user_id(&self) -> Option<String> {
         if let Some(id) = self.my_user_id.as_deref().filter(|s| !s.trim().is_empty()) {
             return Some(id.to_string());
         }
+        if let Some(id) = self
+            .cached_my_user_id
+            .get()
+            .filter(|s| !s.trim().is_empty())
+        {
+            return Some(id.to_string());
+        }
         if let Some(tok) = self.auth.current_tokens().await {
             if let Some(id) = tok.user_id.filter(|s| !s.trim().is_empty()) {
+                let _ = self.cached_my_user_id.set(id.clone());
                 return Some(id);
             }
         }
         if let Ok(me) = self.get_me().await {
+            if !me.id.trim().is_empty() {
+                let _ = self.cached_my_user_id.set(me.id.clone());
+            }
             let _ = self
                 .auth
                 .update_identity(
@@ -111,8 +122,16 @@ impl GraphClient {
         if let Some(id) = self.my_user_id.as_deref().filter(|s| !s.trim().is_empty()) {
             return Ok(id.to_string());
         }
+        if let Some(id) = self
+            .cached_my_user_id
+            .get()
+            .filter(|s| !s.trim().is_empty())
+        {
+            return Ok(id.to_string());
+        }
         if let Some(tok) = self.auth.current_tokens().await {
             if let Some(id) = tok.user_id.filter(|s| !s.trim().is_empty()) {
+                let _ = self.cached_my_user_id.set(id.clone());
                 return Ok(id);
             }
         }
@@ -120,6 +139,9 @@ impl GraphClient {
             .get_me()
             .await
             .context("현재 사용자 ID(/me)를 확인할 수 없습니다.")?;
+        if !me.id.trim().is_empty() {
+            let _ = self.cached_my_user_id.set(me.id.clone());
+        }
         let _ = self
             .auth
             .update_identity(
