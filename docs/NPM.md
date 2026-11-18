@@ -27,9 +27,10 @@ npx teams chats
 
 All workflows share the same Entra ID login, SQLite WAL + FTS5 cache (`cache.db`),
 background sync daemon (`teams daemon start | status | stop | restart`), HTTP API
-(`teams serve`), and MCP server (`teams mcp`). Read commands also support
-`--cached` / `--fast` for instant local cache reads, or run with zero Graph
-round-trips while the daemon is warm:
+(`teams serve`), MCP server (`teams mcp`), and multi-protocol terminal image
+preview (`Kitty` / `iTerm2` / `Sixel` / `Halfblock` via `teams preview` and the TUI).
+Read commands also support `--cached` / `--fast` for instant local cache reads,
+or run with zero Graph round-trips while the daemon is warm:
 
 - `teams login`, `teams whoami`, `teams doctor --probe`
 - `teams chats --limit 200`, `teams teams`, `teams channels <team>`
@@ -101,8 +102,8 @@ version because the root package pins its platform packages exactly.
 Tag the release with a matching `v` prefix:
 
 ```sh
-git tag v0.7.1
-git push origin v0.7.1
+git tag v0.7.2
+git push origin v0.7.2
 ```
 
 ## Publishing
@@ -201,6 +202,7 @@ token_refresh_mins = 5
 | `TEAMS_NO_BROWSER` | Disable automatic browser launch during login (`1` / `true`) |
 | `TEAMS_CLI_CACHE_SECS` | CLI read cache TTL in seconds (default `0`; `--cached` / `--fast` forces cache-first reads) |
 | `TEAMS_AUTO_DAEMON` | Auto-start/attach to the background sync daemon (`1` / `true`, or `config.toml`: `auto_daemon = true`, default `false`) |
+| `TEAMS_IMAGE_PROTOCOL` | Terminal image protocol override (`auto`, `kitty`, `iterm2`, `sixel`, `halfblock`) |
 
 ## Troubleshooting
 

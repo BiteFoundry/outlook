@@ -229,6 +229,7 @@ pub enum Action {
     ToggleInlineImages,
     OpenImagePreview,
     LoadPreviewImage,
+    CycleImageProtocol,
     DownloadPreviewImage,
     CheckForUpdates,
     ApplySelfUpdate,
@@ -1129,8 +1130,30 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 }
             });
             if let Some((target, (cols, rows))) = target_and_dims {
-                app.request_preview_image(&target, cols, rows);
+                let key = AppState::preview_image_cache_key(
+                    target.owner_id(),
+                    target.att_id(),
+                    cols,
+                    rows,
+                    ui.graphics_caps.protocol,
+                );
+                app.clear_image_error(&key);
+                app.request_preview_image(
+                    &target,
+                    cols,
+                    rows,
+                    ui.graphics_caps,
+                    theme_bg_rgb(ui.theme.bg_elevated),
+                );
             }
+        }
+        Action::CycleImageProtocol => {
+            ui.graphics_caps.protocol = ui.graphics_caps.protocol.next_manual();
+            ui.info(format!("Image protocol: {}", ui.graphics_caps.protocol.label()));
+            if let Some(Overlay::ImagePreview(preview)) = ui.overlays.last_mut() {
+                preview.error = None;
+            }
+            let _ = dispatch(Action::LoadPreviewImage, app, ui);
         }
         Action::DownloadPreviewImage => {
             let current = ui.overlays.last().and_then(|top| {
@@ -1219,6 +1242,13 @@ fn open_overlay(kind: OverlayKind, app: &mut AppState, ui: &mut UiState) {
     ui.push_overlay(overlay);
 }
 
+fn theme_bg_rgb(color: ratatui::style::Color) -> (u8, u8, u8) {
+    match color {
+        ratatui::style::Color::Rgb(r, g, b) => (r, g, b),
+        _ => (37, 42, 61),
+    }
+}
+
 fn open_image_preview(app: &mut AppState, ui: &mut UiState) {
     let preview_opt = selected_message_scope_and_index(app, ui)
         .and_then(|(scope, idx)| app.message_at(scope, idx))
@@ -1238,9 +1268,21 @@ fn open_image_preview(app: &mut AppState, ui: &mut UiState) {
     ui.close_overlays_of(OverlayKind::ImagePreview);
     if let Some(target) = preview.current().cloned() {
         let (cols, rows) = preview.target_dimensions(ui.term_width, ui.term_height);
-        let key = AppState::image_cache_key(target.owner_id(), target.att_id(), cols, rows);
+        let key = AppState::preview_image_cache_key(
+            target.owner_id(),
+            target.att_id(),
+            cols,
+            rows,
+            ui.graphics_caps.protocol,
+        );
         app.clear_image_error(&key);
-        app.request_preview_image(&target, cols, rows);
+        app.request_preview_image(
+            &target,
+            cols,
+            rows,
+            ui.graphics_caps,
+            theme_bg_rgb(ui.theme.bg_elevated),
+        );
     }
     ui.push_overlay(Overlay::ImagePreview(preview));
 }
@@ -2288,6 +2330,95 @@ mod tests {
         dispatch(Action::SelectNarrowPane(NarrowPane::Thread), &mut app, &mut ui);
         assert_eq!(ui.narrow_pane, NarrowPane::Thread);
         assert_eq!(ui.focus(), Focus::Thread);
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn image_preview_cycle_protocol_dispatch_and_ui_draw_integration() {
+        use crate::img_preview::{RenderedTerminalImage, TerminalImageProtocol};
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let (mut app, mut ui) = test_app_and_ui();
+        ui.term_width = 100;
+        ui.term_height = 30;
+        ui.graphics_caps.protocol = TerminalImageProtocol::Halfblock;
+
+        let msg = crate::models::MessageItem {
+            msg_key: "chat:c1|m-img".to_string(),
+            conv_key: "chat:c1".to_string(),
+            msg_id: "m-img".to_string(),
+            parent_msg_id: None,
+            reply_to_id: None,
+            reply_to_author: None,
+            reply_to_preview: None,
+            subject: None,
+            author_id: None,
+            author_name: "Alice".to_string(),
+            is_me: false,
+            created_at: "2026-11-18T00:00:00Z".to_string(),
+            last_modified_at: None,
+            deleted: false,
+            importance: "normal".to_string(),
+            message_type: "message".to_string(),
+            body_html: String::new(),
+            body_plain: String::new(),
+            attachments: vec![crate::models::AttachmentInfo {
+                id: "att-1".to_string(),
+                content_type: "image/png".to_string(),
+                content_url: None,
+                name: Some("pic.png".to_string()),
+                content_json: None,
+                thumbnail_url: None,
+            }],
+            mentions: Vec::new(),
+            reactions: Vec::new(),
+            reply_count: 0,
+            web_url: None,
+        };
+        let overlay = ImagePreviewOverlay::from_teams_message(&msg, Some(0)).unwrap();
+        let (cols, rows) = overlay.target_dimensions(ui.term_width, ui.term_height);
+        ui.push_overlay(Overlay::ImagePreview(overlay));
+
+        // Pressing 'p' cycles protocol from Halfblock -> next_manual() and queues LoadPreviewImage.
+        let expected_next = TerminalImageProtocol::Halfblock.next_manual();
+        assert!(!dispatch(Action::Input('p'), &mut app, &mut ui));
+        assert_eq!(ui.graphics_caps.protocol, expected_next);
+
+        // Cache a pixel payload for the new protocol and verify ui::draw populates pending_pixel_graphic.
+        let key = AppState::preview_image_cache_key("m-img", "att-1", cols, rows, expected_next);
+        app.insert_image_cache(
+            key.clone(),
+            RenderedTerminalImage {
+                width_px: 100,
+                height_px: 80,
+                cols: 20,
+                rows: 8,
+                format_label: "PNG".to_string(),
+                lines: Vec::new(),
+                protocol: expected_next,
+                pixel_payload: Some("PIXEL_PAYLOAD".to_string()),
+            },
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = crate::ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+        assert_eq!(
+            ui.pending_pixel_graphic.as_ref().map(|p| (&p.cache_key, p.protocol)),
+            Some((&key, expected_next))
+        );
+
+        // Closing overlay resets pending_pixel_graphic to None on the next ui::draw.
+        assert!(!dispatch(Action::CloseOverlay, &mut app, &mut ui));
+        terminal
+            .draw(|frame| {
+                let _ = crate::ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+        assert!(ui.pending_pixel_graphic.is_none());
 
         app.sync_ctrl.request(SyncCommand::Shutdown);
     }

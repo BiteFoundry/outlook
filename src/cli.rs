@@ -44,6 +44,7 @@ Environment Variables:
   TEAMS_CONFIG_DIR / TEAMS_DATA_DIR     Override config and local SQLite cache directories
   TEAMS_CLI_CACHE_SECS=<SECS>           Local cache TTL in seconds for CLI read commands [default: 0; --cached/--fast prefers cache]
   TEAMS_AUTO_DAEMON=1                   Auto-start/connect to background sync daemon (config.toml: auto_daemon = true) [default: false]
+  TEAMS_IMAGE_PROTOCOL=<PROTO>          Terminal image protocol (auto, kitty, iterm2, sixel, halfblock)
 
 Background Sync Daemon:
   teams daemon start | status | stop | restart";
@@ -343,6 +344,9 @@ pub enum Command {
         cols: Option<u16>,
         #[arg(long)]
         rows: Option<u16>,
+        /// Image rendering protocol override (auto, kitty, iterm2, sixel, halfblock)
+        #[arg(long, value_name = "PROTOCOL")]
+        protocol: Option<String>,
     },
     /// Render a local image file in the terminal
     #[command(name = "preview-file")]
@@ -352,6 +356,9 @@ pub enum Command {
         cols: Option<u16>,
         #[arg(long)]
         rows: Option<u16>,
+        /// Image rendering protocol override (auto, kitty, iterm2, sixel, halfblock)
+        #[arg(long, value_name = "PROTOCOL")]
+        protocol: Option<String>,
     },
     /// Check for or apply updates from GitHub Releases
     Update {
@@ -729,6 +736,7 @@ async fn dispatch_command(
             file,
             cols,
             rows,
+            protocol,
         }) => {
             Box::pin(cmd_preview_teams(
                 cfg,
@@ -739,12 +747,16 @@ async fn dispatch_command(
                 file.as_deref(),
                 cols,
                 rows,
+                protocol.as_deref(),
             ))
             .await
         }
-        Some(Command::PreviewFile { path, cols, rows }) => {
-            cmd_preview_local_file(&path, cols, rows)
-        }
+        Some(Command::PreviewFile {
+            path,
+            cols,
+            rows,
+            protocol,
+        }) => cmd_preview_local_file(cfg, &path, cols, rows, protocol.as_deref()),
         Some(Command::Update {
             check,
             force,
@@ -1431,6 +1443,7 @@ async fn cmd_doctor(
     let daemon_status = crate::daemon::query_daemon_status(cfg)
         .await
         .unwrap_or_default();
+    let graphics_caps = img_preview::detect_graphics_caps(cfg.image_protocol);
 
     let mut probe_me: Option<serde_json::Value> = None;
     let mut probe_presence: Option<serde_json::Value> = None;
@@ -1502,6 +1515,9 @@ async fn cmd_doctor(
                     "attached_clients": daemon_status.attached_clients,
                     "auto_daemon": cfg.auto_daemon,
                 },
+                "image_protocol": graphics_caps.protocol.as_str(),
+                "image_protocol_preference": cfg.image_protocol.as_str(),
+                "cell_px": [graphics_caps.cell_px.0, graphics_caps.cell_px.1],
                 "probe": if probe {
                     Some(json!({
                         "ok": probe_error.is_none(),
@@ -1584,6 +1600,19 @@ async fn cmd_doctor(
         println!(
             "token_expires_at: {}",
             token_expires_at.as_deref().unwrap_or("-")
+        );
+        let cell_suffix = if graphics_caps.cell_px_exact {
+            ""
+        } else {
+            " est."
+        };
+        println!(
+            "Image protocol: {} (preference: {}, cell: {}x{}px{})",
+            graphics_caps.protocol.label(),
+            cfg.image_protocol.as_str(),
+            graphics_caps.cell_px.0,
+            graphics_caps.cell_px.1,
+            cell_suffix,
         );
         if probe {
             if let Some(err) = probe_error {
@@ -3562,20 +3591,47 @@ pub(crate) fn default_preview_dimensions(cols: Option<u16>, rows: Option<u16>) -
     (c, r)
 }
 
-fn cmd_preview_local_file(path: &Path, cols: Option<u16>, rows: Option<u16>) -> Result<()> {
-    if !path.exists() || !path.is_file() {
-        bail!("Image file not found: {}", path.display());
+fn resolve_image_protocol_preference(
+    cfg: &AppConfig,
+    protocol: Option<&str>,
+) -> Result<config::ImageProtocolPreference> {
+    match protocol {
+        Some(raw) => match config::ImageProtocolPreference::parse_str(raw) {
+            Some(pref) => Ok(pref),
+            None => bail!(
+                "Invalid image protocol '{}'. Valid values: auto, kitty, iterm2, sixel, halfblock",
+                raw.trim()
+            ),
+        },
+        None => Ok(cfg.image_protocol),
     }
-    let bytes =
-        std::fs::read(path).with_context(|| format!("Failed to read image file: {}", path.display()))?;
-    let (c, r) = default_preview_dimensions(cols, rows);
-    let rendered = img_preview::render_ansi_stdout(&bytes, c, r)?;
+}
+
+fn print_rendered_preview(rendered: &str) -> Result<()> {
     print!("{rendered}");
     if !rendered.ends_with('\n') {
         println!();
     }
     io::stdout().flush()?;
     Ok(())
+}
+
+fn cmd_preview_local_file(
+    cfg: &AppConfig,
+    path: &Path,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    protocol: Option<&str>,
+) -> Result<()> {
+    let effective_pref = resolve_image_protocol_preference(cfg, protocol)?;
+    if !path.exists() || !path.is_file() {
+        bail!("Image file not found: {}", path.display());
+    }
+    let bytes =
+        std::fs::read(path).with_context(|| format!("Failed to read image file: {}", path.display()))?;
+    let (c, r) = default_preview_dimensions(cols, rows);
+    let rendered = img_preview::render_ansi_stdout_with_pref(&bytes, c, r, effective_pref)?;
+    print_rendered_preview(&rendered)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3588,10 +3644,12 @@ async fn cmd_preview_teams(
     file: Option<&Path>,
     cols: Option<u16>,
     rows: Option<u16>,
+    protocol: Option<&str>,
 ) -> Result<()> {
     if let Some(path) = file {
-        return cmd_preview_local_file(path, cols, rows);
+        return cmd_preview_local_file(cfg, path, cols, rows, protocol);
     }
+    let effective_pref = resolve_image_protocol_preference(cfg, protocol)?;
     let target = target.context("Specify a target conversation (<target>) or --file <path>.")?;
     let msg_id = msg_id.context("Specify a message ID (<msg_id>) or --file <path>.")?;
 
@@ -3601,13 +3659,8 @@ async fn cmd_preview_teams(
     let att = select_teams_attachment(&msg, attachment)?;
     let (_name, _ct, bytes) = graph.fetch_attachment_bytes(att).await?;
     let (c, r) = default_preview_dimensions(cols, rows);
-    let rendered = img_preview::render_ansi_stdout(&bytes, c, r)?;
-    print!("{rendered}");
-    if !rendered.ends_with('\n') {
-        println!();
-    }
-    io::stdout().flush()?;
-    Ok(())
+    let rendered = img_preview::render_ansi_stdout_with_pref(&bytes, c, r, effective_pref)?;
+    print_rendered_preview(&rendered)
 }
 
 
@@ -3889,8 +3942,81 @@ mod tests {
         let cli = Cli::try_parse_from(["teams", "preview-file", "shot.png", "--cols", "80"]).unwrap();
         assert!(matches!(
             cli.command.unwrap(),
-            Command::PreviewFile { cols: Some(80), .. }
+            Command::PreviewFile {
+                cols: Some(80),
+                protocol: None,
+                ..
+            }
         ));
+
+        let cli = Cli::try_parse_from([
+            "teams",
+            "preview",
+            "chat:1",
+            "msg-1",
+            "--protocol",
+            "sixel",
+            "--cols",
+            "100",
+            "--rows",
+            "30",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Preview {
+                target,
+                msg_id,
+                cols,
+                rows,
+                protocol,
+                ..
+            } => {
+                assert_eq!(target.as_deref(), Some("chat:1"));
+                assert_eq!(msg_id.as_deref(), Some("msg-1"));
+                assert_eq!(cols, Some(100));
+                assert_eq!(rows, Some(30));
+                assert_eq!(protocol.as_deref(), Some("sixel"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "teams",
+            "preview-file",
+            "shot.png",
+            "--protocol",
+            "iterm2",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::PreviewFile { path, protocol, .. } => {
+                assert_eq!(path, Path::new("shot.png"));
+                assert_eq!(protocol.as_deref(), Some("iterm2"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let mut cfg = AppConfig::default();
+        cfg.image_protocol = config::ImageProtocolPreference::Kitty;
+        assert_eq!(
+            resolve_image_protocol_preference(&cfg, None).unwrap(),
+            config::ImageProtocolPreference::Kitty
+        );
+        assert_eq!(
+            resolve_image_protocol_preference(&cfg, Some("sixel")).unwrap(),
+            config::ImageProtocolPreference::Sixel
+        );
+        assert_eq!(
+            resolve_image_protocol_preference(&cfg, Some("iterm2")).unwrap(),
+            config::ImageProtocolPreference::Iterm2
+        );
+        let invalid_err = resolve_image_protocol_preference(&cfg, Some("invalid-proto"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            invalid_err.contains("auto, kitty, iterm2, sixel, halfblock"),
+            "unexpected error message: {invalid_err}"
+        );
     }
 
     #[test]
@@ -4061,6 +4187,7 @@ mod tests {
             "TEAMS_TOKEN_REFRESH_CMD",
             "TEAMS_ACCESS_TOKEN",
             "TEAMS_DISABLE_KEYRING",
+            "TEAMS_IMAGE_PROTOCOL",
         ];
         let teams_help = <Cli as clap::CommandFactory>::command().render_help().to_string();
         for env_name in required_envs {

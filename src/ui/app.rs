@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use crate::auth::{self, AuthManager};
 use crate::config::{self, AppConfig};
 use crate::graph::GraphClient;
-use crate::img_preview::{self, RenderedTerminalImage};
+use crate::img_preview::{self, RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol};
 use crate::models::{
     AttachmentInfo, ChannelSummary, ConversationKind, ConversationSummary, ConversationTarget,
     CoreEvent, DownloadedFile, MemberInfo, MessageItem, NotificationCandidate, OutgoingMessage,
@@ -236,6 +236,10 @@ pub enum UiMsg {
         cache_key: String,
         rendered: RenderedTerminalImage,
     },
+    ImageBytesFetched {
+        raw_key: String,
+        bytes: Arc<[u8]>,
+    },
     ImageDecodeFailed {
         cache_key: String,
         owner_id: String,
@@ -259,6 +263,16 @@ pub enum UiMsg {
         error: Option<String>,
         toast: Option<(String, ToastKind)>,
     },
+}
+
+pub const MAX_RAW_IMAGE_CACHE_ENTRIES: usize = 8;
+pub const MAX_RAW_IMAGE_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPixelGraphic {
+    pub cache_key: String,
+    pub rect: Rect,
+    pub protocol: TerminalImageProtocol,
 }
 
 pub struct UiState {
@@ -306,6 +320,9 @@ pub struct UiState {
     pub thread_composer_area: Rect,
     pub poll_retrying: bool,
     pub spinner_tick: u8,
+    pub graphics_caps: TerminalGraphicsCaps,
+    pub pending_pixel_graphic: Option<PendingPixelGraphic>,
+    pub active_pixel_graphic: Option<(String, Rect, TerminalImageProtocol)>,
 }
 
 impl Default for UiState {
@@ -371,6 +388,9 @@ impl UiState {
             thread_composer_area: Rect::default(),
             poll_retrying: false,
             spinner_tick: 0,
+            graphics_caps: TerminalGraphicsCaps::default(),
+            pending_pixel_graphic: None,
+            active_pixel_graphic: None,
         }
     }
 
@@ -384,6 +404,7 @@ impl UiState {
         s.theme_preset = config.theme;
         s.theme = Theme::detect(config.theme);
         s.pinned_convs = config.pinned_convs.iter().cloned().collect();
+        s.graphics_caps = img_preview::detect_graphics_caps(config.image_protocol);
         s
     }
 
@@ -487,6 +508,10 @@ pub struct AppState {
     pub image_pending: HashSet<String>,
     pub image_errors: HashMap<String, String>,
     pub image_errors_order: VecDeque<String>,
+    // Bounded raw attachment byte cache (8 entries, 16 MiB) for offline zoom/protocol re-render
+    pub image_raw_cache: HashMap<String, Arc<[u8]>>,
+    pub image_raw_order: VecDeque<String>,
+    pub image_raw_bytes: usize,
     pub ui_tx: mpsc::UnboundedSender<UiMsg>,
 }
 
@@ -548,6 +573,9 @@ impl AppState {
             image_pending: HashSet::new(),
             image_errors: HashMap::new(),
             image_errors_order: VecDeque::new(),
+            image_raw_cache: HashMap::new(),
+            image_raw_order: VecDeque::new(),
+            image_raw_bytes: 0,
             ui_tx,
         }
     }
@@ -2075,6 +2103,59 @@ impl AppState {
         format!("{owner_id}:{att_id}:{cols}x{rows}")
     }
 
+    pub fn preview_image_cache_key(
+        owner_id: &str,
+        att_id: &str,
+        cols: u16,
+        rows: u16,
+        protocol: TerminalImageProtocol,
+    ) -> String {
+        format!("{owner_id}:{att_id}:{cols}x{rows}:{}", protocol.as_str())
+    }
+
+    pub fn raw_image_cache_key(owner_id: &str, att_id: &str) -> String {
+        format!("{owner_id}:{att_id}")
+    }
+
+    pub fn insert_raw_image_cache(&mut self, raw_key: String, bytes: Arc<[u8]>) {
+        let entry_bytes = bytes.len();
+        if entry_bytes > MAX_RAW_IMAGE_CACHE_BYTES {
+            return;
+        }
+        if let Some(prev) = self.image_raw_cache.remove(&raw_key) {
+            self.image_raw_bytes = self.image_raw_bytes.saturating_sub(prev.len());
+            self.image_raw_order.retain(|k| k != &raw_key);
+        }
+        self.image_raw_cache.insert(raw_key.clone(), bytes);
+        self.image_raw_order.push_back(raw_key);
+        self.image_raw_bytes = self.image_raw_bytes.saturating_add(entry_bytes);
+
+        while self.image_raw_order.len() > MAX_RAW_IMAGE_CACHE_ENTRIES {
+            let Some(evicted) = self.image_raw_order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.image_raw_cache.remove(&evicted) {
+                self.image_raw_bytes = self.image_raw_bytes.saturating_sub(removed.len());
+            }
+        }
+
+        while self.image_raw_bytes > MAX_RAW_IMAGE_CACHE_BYTES && self.image_raw_order.len() > 1 {
+            let Some(evicted) = self.image_raw_order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.image_raw_cache.remove(&evicted) {
+                self.image_raw_bytes = self.image_raw_bytes.saturating_sub(removed.len());
+            }
+        }
+    }
+
+    fn touch_raw_image_cache(&mut self, raw_key: &str) -> Option<Arc<[u8]>> {
+        let bytes = self.image_raw_cache.get(raw_key).cloned()?;
+        self.image_raw_order.retain(|k| k != raw_key);
+        self.image_raw_order.push_back(raw_key.to_string());
+        Some(bytes)
+    }
+
     fn rendered_image_bytes(rendered: &RenderedTerminalImage) -> usize {
         rendered.approx_heap_bytes().max(64)
     }
@@ -2156,6 +2237,9 @@ impl AppState {
         self.image_cache_bytes = 0;
         self.image_errors.clear();
         self.image_errors_order.clear();
+        self.image_raw_cache.clear();
+        self.image_raw_order.clear();
+        self.image_raw_bytes = 0;
         self.image_cache_gen = self.image_cache_gen.wrapping_add(1);
     }
 
@@ -2163,14 +2247,16 @@ impl AppState {
         self.clear_image_cache();
     }
 
-    pub fn request_teams_image(
+    fn spawn_attachment_image_decode(
         &mut self,
+        key: String,
         msg_id: String,
         att: AttachmentInfo,
         cols: u16,
         rows: u16,
+        bg: (u8, u8, u8),
+        caps: Option<TerminalGraphicsCaps>,
     ) {
-        let key = Self::image_cache_key(&msg_id, &att.id, cols, rows);
         if self.image_cache.contains_key(&key)
             || self.image_pending.contains(&key)
             || self.image_errors.contains_key(&key)
@@ -2178,17 +2264,32 @@ impl AppState {
             return;
         }
         self.image_pending.insert(key.clone());
+        let raw_key = Self::raw_image_cache_key(&msg_id, &att.id);
+        let cached_raw = self.touch_raw_image_cache(&raw_key);
         let graph = self.graph.clone();
         let tx = self.ui_tx.clone();
-        let bg = (20, 22, 26);
         let att_id = att.id.clone();
 
         tokio::spawn(async move {
-            let fetched = graph.fetch_attachment_bytes(&att).await;
-            match fetched {
-                Ok((_, _, bytes)) => {
-                    let decode_res = tokio::task::spawn_blocking(move || {
-                        img_preview::decode_and_render_halfblocks(&bytes, cols, rows, bg)
+            let raw_bytes = match cached_raw {
+                Some(bytes) => Ok(bytes),
+                None => match graph.fetch_attachment_bytes(&att).await {
+                    Ok((_, _, bytes)) => {
+                        let arc: Arc<[u8]> = Arc::from(bytes);
+                        let _ = tx.send(UiMsg::ImageBytesFetched {
+                            raw_key,
+                            bytes: Arc::clone(&arc),
+                        });
+                        Ok(arc)
+                    }
+                    Err(err) => Err(err),
+                },
+            };
+            match raw_bytes {
+                Ok(bytes) => {
+                    let decode_res = tokio::task::spawn_blocking(move || match caps {
+                        Some(c) => img_preview::decode_and_render_for_protocol(&bytes, cols, rows, bg, c),
+                        None => img_preview::decode_and_render_halfblocks(&bytes, cols, rows, bg),
                     })
                     .await;
                     match decode_res {
@@ -2228,10 +2329,43 @@ impl AppState {
         });
     }
 
-    pub fn request_preview_image(&mut self, target: &PreviewTarget, cols: u16, rows: u16) {
+    pub fn request_teams_image(
+        &mut self,
+        msg_id: String,
+        att: AttachmentInfo,
+        cols: u16,
+        rows: u16,
+    ) {
+        let key = Self::image_cache_key(&msg_id, &att.id, cols, rows);
+        self.spawn_attachment_image_decode(key, msg_id, att, cols, rows, (20, 22, 26), None);
+    }
+
+    pub fn request_preview_image(
+        &mut self,
+        target: &PreviewTarget,
+        cols: u16,
+        rows: u16,
+        caps: TerminalGraphicsCaps,
+        bg_rgb: (u8, u8, u8),
+    ) {
         match target {
             PreviewTarget::Teams { msg_id, attachment } => {
-                self.request_teams_image(msg_id.clone(), attachment.clone(), cols, rows);
+                let key = Self::preview_image_cache_key(
+                    msg_id,
+                    &attachment.id,
+                    cols,
+                    rows,
+                    caps.protocol,
+                );
+                self.spawn_attachment_image_decode(
+                    key,
+                    msg_id.clone(),
+                    attachment.clone(),
+                    cols,
+                    rows,
+                    bg_rgb,
+                    Some(caps),
+                );
             }
         }
     }
@@ -2790,6 +2924,9 @@ impl AppState {
             } => {
                 self.insert_image_cache(cache_key, rendered);
             }
+            UiMsg::ImageBytesFetched { raw_key, bytes } => {
+                self.insert_raw_image_cache(raw_key, bytes);
+            }
             UiMsg::ImageDecodeFailed {
                 cache_key,
                 owner_id,
@@ -3090,6 +3227,8 @@ mod tests {
             rows: 10,
             format_label: "X".repeat(label_bytes),
             lines: vec![],
+            protocol: img_preview::TerminalImageProtocol::Halfblock,
+            pixel_payload: None,
         }
     }
 
@@ -3433,6 +3572,123 @@ mod tests {
             },
         );
         assert_eq!(ui.pending_append_anchor, Some(20));
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn raw_image_cache_hit_skips_fetch_respects_budget_and_clears() {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let sync_ctrl =
+            sync::spawn_sync_engine(cfg.clone(), graph.clone(), storage.clone(), event_tx);
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+
+        // 1. Entry count cap (8 entries) and 16 MiB byte budget enforcement.
+        for i in 0..10 {
+            let key = AppState::raw_image_cache_key("m", &format!("a{i}"));
+            app.insert_raw_image_cache(key, Arc::from(vec![i as u8; 1024]));
+        }
+        assert_eq!(app.image_raw_cache.len(), MAX_RAW_IMAGE_CACHE_ENTRIES);
+        assert_eq!(app.image_raw_bytes, MAX_RAW_IMAGE_CACHE_ENTRIES * 1024);
+        assert!(!app.image_raw_cache.contains_key("m:a0"));
+        assert!(!app.image_raw_cache.contains_key("m:a1"));
+        assert!(app.image_raw_cache.contains_key("m:a9"));
+
+        // Inserting 6 MiB chunks must evict older entries so total stays <= 16 MiB.
+        let six_mib = 6 * 1024 * 1024;
+        for i in 0..3 {
+            let key = AppState::raw_image_cache_key("big", &format!("b{i}"));
+            app.insert_raw_image_cache(key, Arc::from(vec![1u8; six_mib]));
+        }
+        assert!(app.image_raw_bytes <= MAX_RAW_IMAGE_CACHE_BYTES);
+        assert_eq!(app.image_raw_cache.len(), 2);
+        assert!(!app.image_raw_cache.contains_key("big:b0"));
+        assert!(app.image_raw_cache.contains_key("big:b1"));
+        assert!(app.image_raw_cache.contains_key("big:b2"));
+
+        // Oversized single entry (>16 MiB) is not cached.
+        let seventeen_mib = 17 * 1024 * 1024;
+        app.insert_raw_image_cache(
+            AppState::raw_image_cache_key("huge", "h0"),
+            Arc::from(vec![0u8; seventeen_mib]),
+        );
+        assert!(app.image_raw_bytes <= MAX_RAW_IMAGE_CACHE_BYTES);
+        assert!(!app.image_raw_cache.contains_key("huge:h0"));
+
+        // clear_image_caches resets raw cache, order, and byte counter.
+        app.clear_image_caches();
+        assert!(app.image_raw_cache.is_empty());
+        assert!(app.image_raw_order.is_empty());
+        assert_eq!(app.image_raw_bytes, 0);
+
+        // 2. Raw cache hit skips network fetch across zoom & protocol changes.
+        let png = super::super::composer::encode_rgba_to_png(4, 4, vec![200u8; 4 * 4 * 4]).unwrap();
+        let target = PreviewTarget::Teams {
+            msg_id: "msg-offline".to_string(),
+            attachment: AttachmentInfo {
+                id: "att-1".to_string(),
+                content_type: "image/png".to_string(),
+                content_url: None,
+                name: Some("pic.png".to_string()),
+                content_json: None,
+                thumbnail_url: None,
+            },
+        };
+        app.insert_raw_image_cache(
+            AppState::raw_image_cache_key(target.owner_id(), target.att_id()),
+            Arc::from(png),
+        );
+
+        let caps_half = TerminalGraphicsCaps {
+            protocol: TerminalImageProtocol::Halfblock,
+            cell_px: (8, 16),
+            cell_px_exact: false,
+        };
+        app.request_preview_image(&target, 40, 20, caps_half, (37, 42, 61));
+        let msg1 = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+            .await
+            .expect("decode timed out")
+            .expect("channel closed");
+        match msg1 {
+            UiMsg::ImageDecoded { cache_key, rendered } => {
+                assert_eq!(
+                    cache_key,
+                    AppState::preview_image_cache_key("msg-offline", "att-1", 40, 20, TerminalImageProtocol::Halfblock)
+                );
+                assert_eq!(rendered.protocol, TerminalImageProtocol::Halfblock);
+                app.handle_ui_msg(&mut ui, UiMsg::ImageDecoded { cache_key, rendered });
+            }
+            _ => panic!("expected ImageDecoded on raw cache hit"),
+        }
+
+        // Switch protocol to Sixel and zoom to 80x40 offline without any network token!
+        let caps_sixel = TerminalGraphicsCaps {
+            protocol: TerminalImageProtocol::Sixel,
+            cell_px: (8, 16),
+            cell_px_exact: false,
+        };
+        app.request_preview_image(&target, 80, 40, caps_sixel, (37, 42, 61));
+        let msg2 = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+            .await
+            .expect("sixel decode timed out")
+            .expect("channel closed");
+        match msg2 {
+            UiMsg::ImageDecoded { cache_key, rendered } => {
+                assert_eq!(
+                    cache_key,
+                    AppState::preview_image_cache_key("msg-offline", "att-1", 80, 40, TerminalImageProtocol::Sixel)
+                );
+                assert_eq!(rendered.protocol, TerminalImageProtocol::Sixel);
+                assert!(rendered.pixel_payload.is_some());
+            }
+            _ => panic!("expected Sixel ImageDecoded on raw cache hit"),
+        }
 
         app.sync_ctrl.request(SyncCommand::Shutdown);
     }

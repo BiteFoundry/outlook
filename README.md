@@ -43,7 +43,7 @@
 - **Minimal-Chrome Responsive TUI (`ratatui`)**: 3-tier responsive layout (`Wide >= 120`, `Medium 80..119`, `Narrow < 80`), **Composer-First** input workflow, Cozy 5-minute author grouping and Compact gutter density (`Ctrl+D`), `─── N unread messages ───` divider, unified `Ctrl+K` Omni-Switcher, and colorblind-safe multi-depth themes (`NO_COLOR`, `Ansi16`, `Ansi256`, Truecolor Dark/Light).
 - **Deep History Pagination (`@odata.nextLink`)**: Persists Microsoft Graph `$skiptoken` cursors in SQLite `sync_cursors` with deterministic timestamp tie-breaking, automatic recovery on expired tokens, CLI `teams read --before` / `teams sync --depth`, and seamless TUI scroll-up backfill.
 - **Local SQLite WAL + FTS5 Cache & Daemon**: Stores chats, channels, threads, and messages locally in `cache.db` for instant hybrid trigram + `LIKE` offline search (`teams search`) and sub-5ms CLI reads when `teams daemon` is running.
-- **Inline Terminal Image Preview (`v` / `teams preview`)**: Renders PNG, JPEG, GIF, and WebP attachments directly in the terminal via Kitty Graphics Protocol, iTerm2/WezTerm inline images, or 24-bit Truecolor Unicode half-blocks (`▀`).
+- **Inline Terminal Image Preview (`v` / `teams preview`)**: Multi-protocol high-resolution rendering for PNG, JPEG, GIF, and WebP attachments with automatic terminal detection & routing across **Windows, Linux, and macOS** (**Kitty Graphics Protocol**, **iTerm2 `OSC 1337`**, **Sixel `DCS q`**, and **24-bit Unicode Half-Blocks (`▀`)** fallback).
 - **Automatic JWT Scope Diagnostics**: `teams whoami`, `teams doctor`, and `403 Forbidden` handlers inspect JWT `scp`/`roles` claims to flag restricted tokens (such as `Chat.ReadBasic`-only tokens that cannot read message bodies).
 - **AI Agent Automation (`teams serve` & `teams mcp`)**: Local Axum HTTP JSON API (`127.0.0.1:8788`, optional `--token` Bearer auth) and newline-delimited stdio JSON-RPC 2.0 MCP server exposing 17 Microsoft Teams tools.
 - **Cross-Platform & AlmaLinux 8 Ready**: Single static binary (bundled SQLite + `rustls`, zero OpenSSL dev dependencies). Prebuilt Linux binaries target **GLIBC 2.28** (`AlmaLinux 8`, `RHEL 8+`, `Rocky Linux 8+`, `Ubuntu 20.04+`, `Debian 10+`).
@@ -271,7 +271,7 @@ Additional composer, message, and history controls:
 | | `Esc` | Cancel reply/mention popup or return focus to message stream |
 | **Message Stream** | `t` / `Enter` | Open thread drawer for selected channel post |
 | | `r` | Quote-reply / reply to selected message |
-| | `v` | Open inline terminal image preview for attachment |
+| | `v` | Open inline terminal image preview (`+`/`-`/`0`/scroll zoom, `p` cycle protocol, `[`/`]` prev/next, `d` save) |
 | | `e` / `+` / `=` | Open reaction picker (`like`, `heart`, `laugh`, `surprised`, `sad`, `angry`) |
 | | `d` / `[` / `]` | Download attachment / cycle attachments |
 | | `y` | Copy selected message body |
@@ -286,7 +286,13 @@ Additional composer, message, and history controls:
 
 - Scrolling to the top of any chat or channel (`PgUp`, `Up`, or mouse wheel up) automatically fetches older pages via `@odata.nextLink` while anchoring your scroll position. Press `o` to fetch one page on demand or `H` for a 150+ message deep backfill.
 - Scrolling to the bottom of the **Chats** list automatically pages beyond the initial 50 conversations.
-- Pressing `v` on a message with an image attachment opens a crisp inline preview rendered inside your terminal.
+- Pressing `v` on a message with an image attachment opens a high-resolution inline preview with automatic terminal detection and routing across **Windows, Linux, and macOS**:
+  - **Kitty Graphics Protocol** (Kitty, Ghostty)
+  - **iTerm2 Inline Images (`OSC 1337`)** (WezTerm on Windows/Linux/macOS, iTerm2 on macOS, Rio, Mintty)
+  - **Sixel (`DCS q`)** (Windows Terminal v1.22+, foot, Contour, mlterm)
+  - **24-bit Unicode Half-Blocks (`▀`)** universal fallback (tmux/SSH/legacy consoles and fast-scrolling inline chat thumbnails)
+- **TUI Image Preview Controls**: `v` to open, `+` / `-` / `0` or mouse wheel to zoom, `p` to cycle protocol live (`auto` / `kitty` / `iterm2` / `sixel` / `halfblock`), `[` / `]` for previous/next attachment, and `d` to save to disk.
+- Configure the default globally via `image_protocol = "auto"` in `config.toml`, `TEAMS_IMAGE_PROTOCOL`, or per-command via `teams preview --protocol <PROTOCOL>` (and inspect detected capabilities with `teams doctor`).
 
 ---
 
@@ -315,8 +321,8 @@ Most commands accept `<target>` as a canonical `conv_key` (`chat:...`, `chan:<te
 | `teams reply <target> <msg_id> <md>` | - | Reply to a channel thread or quote-reply in a chat | `--mention <user_id:DisplayName>`, `--important`, `--json` |
 | `teams send-file <target> <path>` | `file` | Upload a file to OneDrive/SharePoint and post it | `--caption`, `--thread <root_id>`, `--inline`, `--json` |
 | `teams download <target> <msg_id>` | `dl` | Download an attachment or inline image from a message | `--index <N>`, `--thread <root_id>`, `--out <dir>`, `--json` |
-| `teams preview [target] [msg_id]` | - | Render a message image or local file inline in the terminal | `--file <path>`, `--attachment <id>`, `--thread <root_id>`, `--cols`, `--rows` |
-| `teams preview-file <path>` | - | Render a local image file in the terminal | `--cols`, `--rows` |
+| `teams preview [target] [msg_id]` | - | Render a message image or local file inline in the terminal | `--file <path>`, `--attachment <id>`, `--thread <root_id>`, `--protocol <auto\|kitty\|iterm2\|sixel\|halfblock>`, `--cols`, `--rows` |
+| `teams preview-file <path>` | - | Render a local image file in the terminal | `--protocol <auto\|kitty\|iterm2\|sixel\|halfblock>`, `--cols`, `--rows` |
 | `teams react <target> <msg_id> <type>` | - | Add or remove a reaction (`like`, `heart`, `laugh`, `surprised`, `sad`, `angry`) | `--off`, `--thread <root_id>`, `--json` |
 | `teams edit <target> <msg_id> <md>` | - | Edit a message you sent | `--thread <root_id>`, `--json` |
 | `teams delete <target> <msg_id>` | - | Delete a message you sent (`--yes` required with `--json`) | `--thread <root_id>`, `--yes`, `--json` |
@@ -475,6 +481,7 @@ args = ["mcp"]
 | `TEAMS_DISABLE_KEYRING` | Set to `1` to disable OS keyring and store credentials in `credentials.json` |
 | `TEAMS_CLI_CACHE_SECS` | Local SQLite cache TTL in seconds for CLI reads (default: `0`; `--cached`/`--fast` prefers cache) |
 | `TEAMS_AUTO_DAEMON` | Set to `1`/`true` to auto-start and attach to `teams daemon` for sub-5ms CLI reads (default: `false`) |
+| `TEAMS_IMAGE_PROTOCOL` | Override terminal image rendering protocol (`auto`, `kitty`, `iterm2`, `sixel`, `halfblock`) |
 | `TEAMS_CONFIG_DIR` | Override directory for `config.toml`, `credentials.json`, and `drafts.json` |
 | `TEAMS_DATA_DIR` | Override directory for the SQLite cache (`cache.db`) |
 | `TEAMS_NO_BROWSER` | Set to `1`/`true` to disable automatic browser launch during `teams login` |
@@ -494,6 +501,7 @@ notify = true
 show_nav_rail = true
 auto_thread_pane = true
 inline_images = true
+image_protocol = "auto"    # "auto" | "kitty" | "iterm2" | "sixel" | "halfblock"
 download_dir = ""
 cli_cache_ttl_secs = 0
 auto_daemon = false

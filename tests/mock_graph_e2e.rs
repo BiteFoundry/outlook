@@ -25,9 +25,10 @@ use teams_cli::{
     auth::{
         diagnose_access_token_scopes, explain_graph_permission_error, AuthManager, StoredTokens,
     },
-    config::AppConfig,
+    config::{AppConfig, ImageProtocolPreference},
     graph::GraphClient,
-    img_preview, mcp,
+    img_preview::{self, TerminalGraphicsCaps, TerminalImageProtocol},
+    mcp,
     models::{AttachmentInfo, ConversationTarget, MentionInfo, MessageItem, TeamSummary},
     parser, resolver, serve,
     storage::Storage,
@@ -1752,8 +1753,69 @@ async fn e2e_inline_image_preview_and_self_updater() {
     assert!(
         ansi_stdout.contains('▀')
             || ansi_stdout.starts_with("\x1b]")
-            || ansi_stdout.starts_with("\x1b_G"),
-        "expected valid halfblock, iTerm2, or Kitty escape output"
+            || ansi_stdout.starts_with("\x1b_G")
+            || ansi_stdout.starts_with("\x1bP"),
+        "expected valid halfblock, iTerm2, Kitty, or Sixel escape output"
+    );
+
+    let halfblock_stdout = img_preview::render_ansi_stdout_with_pref(
+        &png_bytes,
+        16,
+        8,
+        ImageProtocolPreference::Halfblock,
+    )
+    .expect("render_ansi_stdout_with_pref(Halfblock)");
+    assert!(halfblock_stdout.contains('▀'));
+    assert!(halfblock_stdout.contains("\x1b[38;2;"));
+
+    let kitty_stdout = img_preview::render_ansi_stdout_with_pref(
+        &png_bytes,
+        16,
+        8,
+        ImageProtocolPreference::Kitty,
+    )
+    .expect("render_ansi_stdout_with_pref(Kitty)");
+    assert!(kitty_stdout.starts_with("\x1b_Gf=100,a=T,"));
+    assert!(kitty_stdout.ends_with("\x1b\\\n"));
+
+    let iterm2_stdout = img_preview::render_ansi_stdout_with_pref(
+        &png_bytes,
+        16,
+        8,
+        ImageProtocolPreference::Iterm2,
+    )
+    .expect("render_ansi_stdout_with_pref(Iterm2)");
+    assert!(iterm2_stdout.starts_with("\x1b]1337;File=inline=1;"));
+    assert!(iterm2_stdout.ends_with("\x07\n"));
+
+    let sixel_stdout = img_preview::render_ansi_stdout_with_pref(
+        &png_bytes,
+        16,
+        8,
+        ImageProtocolPreference::Sixel,
+    )
+    .expect("render_ansi_stdout_with_pref(Sixel)");
+    assert!(sixel_stdout.starts_with("\x1bP0;1;q\"1;1;"));
+    assert!(sixel_stdout.ends_with("\x1b\\\n"));
+
+    let sixel_tui = img_preview::decode_and_render_for_protocol(
+        &png_bytes,
+        16,
+        8,
+        (37, 42, 61),
+        TerminalGraphicsCaps {
+            protocol: TerminalImageProtocol::Sixel,
+            cell_px: (8, 16),
+            cell_px_exact: true,
+        },
+    )
+    .expect("decode_and_render_for_protocol(Sixel)");
+    assert_eq!(sixel_tui.protocol, TerminalImageProtocol::Sixel);
+    assert!(
+        sixel_tui
+            .pixel_payload
+            .as_deref()
+            .is_some_and(|p| p.starts_with("\x1bP0;1;q\"1;1;") && p.ends_with("\x1b\\"))
     );
 
     // 2. Self-Updater E2E against mock GitHub Releases server

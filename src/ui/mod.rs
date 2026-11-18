@@ -293,6 +293,7 @@ pub fn truncate_width(text: &str, max_width: usize) -> String {
 /// Renders one complete frame, rebuilding `ui.hitmap` cleanly from scratch.
 /// Returns the composer terminal cursor position `(x, y)` if focused.
 pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(u16, u16)> {
+    ui.pending_pixel_graphic = None;
     let area = frame.area();
     ui.term_width = area.width;
     ui.term_height = area.height;
@@ -451,9 +452,19 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
     draw_status_bar(frame, plan.status, app, ui, &mut hitmap);
     draw_toasts(frame, area, ui);
 
-    for overlay in &ui.overlays {
-        overlay.draw(frame, area, app, ui, &mut hitmap);
+    let overlays = std::mem::take(&mut ui.overlays);
+    for overlay in &overlays {
+        match overlay {
+            overlays::Overlay::ImagePreview(preview) => {
+                preview.draw_sync(frame, area, app, ui, &mut hitmap);
+            }
+            other => {
+                ui.pending_pixel_graphic = None;
+                other.draw(frame, area, app, ui, &mut hitmap);
+            }
+        }
     }
+    ui.overlays = overlays;
 
     ui.hitmap = hitmap;
     cursor_pos

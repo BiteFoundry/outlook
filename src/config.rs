@@ -84,6 +84,53 @@ impl ThemePreset {
     }
 }
 
+/// Terminal image rendering protocol preference (`auto` detects Kitty / iTerm2 / Sixel / Halfblock).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageProtocolPreference {
+    #[default]
+    Auto,
+    Kitty,
+    #[serde(alias = "iterm")]
+    Iterm2,
+    Sixel,
+    #[serde(alias = "halfblocks", alias = "ansi")]
+    Halfblock,
+}
+
+impl ImageProtocolPreference {
+    pub fn parse_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" | "" => Some(Self::Auto),
+            "kitty" => Some(Self::Kitty),
+            "iterm2" | "iterm" => Some(Self::Iterm2),
+            "sixel" => Some(Self::Sixel),
+            "halfblock" | "halfblocks" | "ansi" => Some(Self::Halfblock),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Kitty => "kitty",
+            Self::Iterm2 => "iterm2",
+            Self::Sixel => "sixel",
+            Self::Halfblock => "halfblock",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Kitty => "Kitty",
+            Self::Iterm2 => "iTerm2",
+            Self::Sixel => "Sixel",
+            Self::Halfblock => "Halfblock",
+        }
+    }
+}
+
 /// Entry persona (`teams`), kept as an enum for stable configuration/caller ergonomics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -128,6 +175,8 @@ pub struct AppConfig {
     pub auto_thread_pane: bool,
     /// Render inline image thumbnails directly inside terminal Chat views.
     pub inline_images: bool,
+    /// Preferred terminal image rendering protocol (`auto`, `kitty`, `iterm2`, `sixel`, `halfblock`).
+    pub image_protocol: ImageProtocolPreference,
     /// Custom download directory. Empty defaults to `Downloads/teams`.
     pub download_dir: String,
     /// Fast poll interval (ms) for active conversation in TUI.
@@ -185,6 +234,10 @@ impl Default for AppConfig {
             show_nav_rail: true,
             auto_thread_pane: true,
             inline_images: true,
+            image_protocol: std::env::var("TEAMS_IMAGE_PROTOCOL")
+                .ok()
+                .and_then(|s| ImageProtocolPreference::parse_str(&s))
+                .unwrap_or_default(),
             download_dir: String::new(),
             active_poll_ms: 2_500,
             chat_poll_ms: 8_000,
@@ -270,6 +323,13 @@ impl AppConfig {
         if let Ok(ad) = std::env::var("TEAMS_AUTO_DAEMON") {
             if let Some(parsed) = parse_env_bool(&ad) {
                 cfg.auto_daemon = parsed;
+            }
+        }
+        if let Ok(proto) = std::env::var("TEAMS_IMAGE_PROTOCOL") {
+            if !proto.trim().is_empty() {
+                if let Some(parsed) = ImageProtocolPreference::parse_str(&proto) {
+                    cfg.image_protocol = parsed;
+                }
             }
         }
         cfg
@@ -667,5 +727,103 @@ mod tests {
         ]);
         let cfg = AppConfig::load();
         assert_eq!(cfg.cli_cache_ttl_secs, 77);
+    }
+
+    #[test]
+    fn test_image_protocol_preference_parse_aliases_and_toml_roundtrip() {
+        assert_eq!(
+            ImageProtocolPreference::parse_str("auto"),
+            Some(ImageProtocolPreference::Auto)
+        );
+        assert_eq!(
+            ImageProtocolPreference::parse_str(""),
+            Some(ImageProtocolPreference::Auto)
+        );
+        assert_eq!(
+            ImageProtocolPreference::parse_str("KITTY"),
+            Some(ImageProtocolPreference::Kitty)
+        );
+        assert_eq!(
+            ImageProtocolPreference::parse_str("iterm2"),
+            Some(ImageProtocolPreference::Iterm2)
+        );
+        assert_eq!(
+            ImageProtocolPreference::parse_str("iterm"),
+            Some(ImageProtocolPreference::Iterm2)
+        );
+        assert_eq!(
+            ImageProtocolPreference::parse_str("sixel"),
+            Some(ImageProtocolPreference::Sixel)
+        );
+        assert_eq!(
+            ImageProtocolPreference::parse_str("halfblock"),
+            Some(ImageProtocolPreference::Halfblock)
+        );
+        assert_eq!(
+            ImageProtocolPreference::parse_str("halfblocks"),
+            Some(ImageProtocolPreference::Halfblock)
+        );
+        assert_eq!(
+            ImageProtocolPreference::parse_str("ansi"),
+            Some(ImageProtocolPreference::Halfblock)
+        );
+        assert_eq!(ImageProtocolPreference::parse_str("unknown"), None);
+
+        assert_eq!(ImageProtocolPreference::Auto.as_str(), "auto");
+        assert_eq!(ImageProtocolPreference::Kitty.as_str(), "kitty");
+        assert_eq!(ImageProtocolPreference::Iterm2.as_str(), "iterm2");
+        assert_eq!(ImageProtocolPreference::Sixel.as_str(), "sixel");
+        assert_eq!(ImageProtocolPreference::Halfblock.as_str(), "halfblock");
+        assert_eq!(ImageProtocolPreference::Auto.label(), "Auto");
+        assert_eq!(ImageProtocolPreference::Kitty.label(), "Kitty");
+        assert_eq!(ImageProtocolPreference::Iterm2.label(), "iTerm2");
+        assert_eq!(ImageProtocolPreference::Sixel.label(), "Sixel");
+        assert_eq!(ImageProtocolPreference::Halfblock.label(), "Halfblock");
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        {
+            let _guard = EnvVarGuard::set(&[("TEAMS_IMAGE_PROTOCOL", None)]);
+            let mut cfg = AppConfig::default();
+            assert_eq!(cfg.image_protocol, ImageProtocolPreference::Auto);
+            cfg.image_protocol = ImageProtocolPreference::Sixel;
+            cfg.save_to(&cfg_path).unwrap();
+
+            let reloaded = AppConfig::load_from(&cfg_path).unwrap();
+            assert_eq!(reloaded.image_protocol, ImageProtocolPreference::Sixel);
+        }
+
+        // Verify serde aliases (`iterm`, `halfblocks`, `ansi`) deserialize cleanly
+        for (raw, expected) in [
+            ("image_protocol = \"iterm\"\n", ImageProtocolPreference::Iterm2),
+            (
+                "image_protocol = \"halfblocks\"\n",
+                ImageProtocolPreference::Halfblock,
+            ),
+            (
+                "image_protocol = \"ansi\"\n",
+                ImageProtocolPreference::Halfblock,
+            ),
+            (
+                "image_protocol = \"kitty\"\n",
+                ImageProtocolPreference::Kitty,
+            ),
+        ] {
+            let parsed: AppConfig = toml::from_str(raw).unwrap();
+            assert_eq!(parsed.image_protocol, expected);
+        }
+
+        // Verify TEAMS_IMAGE_PROTOCOL env override in AppConfig::load()
+        let dir_str = dir.path().to_string_lossy().into_owned();
+        {
+            let _guard = EnvVarGuard::set(&[
+                ("TEAMS_CONFIG_DIR", Some(&dir_str)),
+                ("TEAMS_IMAGE_PROTOCOL", Some("iterm")),
+            ]);
+            let cfg = AppConfig::load();
+            assert_eq!(cfg.image_protocol, ImageProtocolPreference::Iterm2);
+        }
     }
 }

@@ -35,6 +35,7 @@ use crate::ui::{
 
 struct TerminalGuard {
     keyboard_enhanced: bool,
+    kitty_used: bool,
 }
 
 impl TerminalGuard {
@@ -65,11 +66,22 @@ impl TerminalGuard {
         terminal.hide_cursor()?;
         terminal.clear()?;
 
-        Ok((Self { keyboard_enhanced }, terminal))
+        Ok((
+            Self {
+                keyboard_enhanced,
+                kitty_used: false,
+            },
+            terminal,
+        ))
     }
 
     fn restore(&self) {
+        use std::io::Write;
         let mut stdout = io::stdout();
+        if self.kitty_used {
+            let _ = stdout.write_all(crate::img_preview::kitty_delete_preview_sequence().as_bytes());
+            let _ = stdout.flush();
+        }
         if self.keyboard_enhanced {
             let _ = execute!(stdout, PopKeyboardEnhancementFlags);
         }
@@ -287,24 +299,85 @@ fn draw_frame(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut AppState,
     ui: &mut UiState,
+    guard: &mut TerminalGuard,
 ) -> Result<()> {
+    use std::io::Write;
+    use crate::img_preview::{self, TerminalImageProtocol};
+
     let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
-    let mut cursor_pos = None;
-    let draw_res = terminal
-        .draw(|frame| {
+    let prev_graphic = ui.active_pixel_graphic.clone();
+
+    let draw_res: Result<()> = (|| {
+        let mut cursor_pos = None;
+        terminal.draw(|frame| {
             cursor_pos = ui::draw(frame, app, ui);
-        })
-        .map(|_| ());
-    if draw_res.is_ok() {
+        })?;
+
+        let pending_matches_prev = match (&prev_graphic, &ui.pending_pixel_graphic) {
+            (None, None) => true,
+            (Some((pk, pr, pp)), Some(pg)) => {
+                pk == &pg.cache_key && pr == &pg.rect && pp == &pg.protocol
+            }
+            _ => false,
+        };
+
+        if !pending_matches_prev {
+            if let Some((_, _, prev_proto)) = &prev_graphic {
+                if *prev_proto == TerminalImageProtocol::Kitty {
+                    terminal
+                        .backend_mut()
+                        .write_all(img_preview::kitty_delete_preview_sequence().as_bytes())?;
+                }
+                terminal.clear()?;
+                ui.active_pixel_graphic = None;
+                terminal.draw(|frame| {
+                    cursor_pos = ui::draw(frame, app, ui);
+                })?;
+            }
+
+            if let Some(pg) = ui.pending_pixel_graphic.clone() {
+                let already_active = ui.active_pixel_graphic.as_ref().is_some_and(
+                    |(ak, ar, ap)| ak == &pg.cache_key && *ar == pg.rect && *ap == pg.protocol,
+                );
+                if !already_active {
+                    if let Some(payload) = app
+                        .image_cache
+                        .get(&pg.cache_key)
+                        .and_then(|r| r.pixel_payload.as_deref())
+                    {
+                        if pg.protocol == TerminalImageProtocol::Kitty {
+                            terminal
+                                .backend_mut()
+                                .write_all(img_preview::kitty_delete_preview_sequence().as_bytes())?;
+                            guard.kitty_used = true;
+                        }
+                        crossterm::queue!(
+                            terminal.backend_mut(),
+                            crossterm::cursor::MoveTo(pg.rect.x, pg.rect.y)
+                        )?;
+                        terminal.backend_mut().write_all(payload.as_bytes())?;
+                        terminal.backend_mut().flush()?;
+                        ui.active_pixel_graphic = Some((pg.cache_key, pg.rect, pg.protocol));
+                    } else {
+                        ui.active_pixel_graphic = None;
+                    }
+                }
+            } else {
+                ui.active_pixel_graphic = None;
+            }
+        }
+
         if let Some((cx, cy)) = cursor_pos {
             let _ = terminal.show_cursor();
             let _ = terminal.set_cursor_position((cx, cy));
         } else {
             let _ = terminal.hide_cursor();
         }
-    }
+        Ok(())
+    })();
+
     let _ = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
-    Ok(draw_res?)
+    draw_res
 }
 
 fn handle_terminal_event(
@@ -388,6 +461,12 @@ fn handle_terminal_event(
             ui.term_width = w;
             ui.term_height = h;
             *dirty = true;
+            if matches!(
+                ui.overlays.last(),
+                Some(ui::overlays::Overlay::ImagePreview(_))
+            ) {
+                let _ = action::dispatch(Action::LoadPreviewImage, app, ui);
+            }
         }
         _ => {}
     }
@@ -527,7 +606,7 @@ pub async fn run_with_persona(
     storage: Storage,
 ) -> Result<()> {
     // Enter alternate screen and raw mode first so the terminal responds in <5ms.
-    let (guard, mut terminal) = TerminalGuard::enter()?;
+    let (mut guard, mut terminal) = TerminalGuard::enter()?;
     install_panic_hook(guard.keyboard_enhanced);
 
     let (core_tx, mut core_rx) = mpsc::unbounded_channel::<CoreEvent>();
@@ -548,7 +627,7 @@ pub async fn run_with_persona(
         ui_tx.clone(),
     );
     app.load_cached_teams();
-    draw_frame(&mut terminal, &mut app, &mut ui)?;
+    draw_frame(&mut terminal, &mut app, &mut ui, &mut guard)?;
 
     spawn_sync_supervisor(
         config,
@@ -570,6 +649,18 @@ pub async fn run_with_persona(
     loop {
         if ui.editor_requested {
             ui.editor_requested = false;
+            if ui
+                .active_pixel_graphic
+                .as_ref()
+                .is_some_and(|(_, _, p)| *p == crate::img_preview::TerminalImageProtocol::Kitty)
+            {
+                use std::io::Write;
+                let _ = terminal
+                    .backend_mut()
+                    .write_all(crate::img_preview::kitty_delete_preview_sequence().as_bytes());
+                let _ = terminal.backend_mut().flush();
+            }
+            ui.active_pixel_graphic = None;
             guard.restore();
             let result = composer::external_edit(ui.composer.text());
             let mut stdout = io::stdout();
@@ -604,7 +695,7 @@ pub async fn run_with_persona(
         }
 
         if dirty {
-            draw_frame(&mut terminal, &mut app, &mut ui)?;
+            draw_frame(&mut terminal, &mut app, &mut ui, &mut guard)?;
             dirty = false;
         }
 
