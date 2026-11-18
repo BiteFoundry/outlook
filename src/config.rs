@@ -5,7 +5,9 @@
 use std::{
     collections::HashMap,
     fs,
+    io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use anyhow::{Context, Result};
@@ -216,7 +218,9 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn load() -> Self {
-        let mut cfg = Self::load_from(&config_file_path()).unwrap_or_default();
+        let Ok(mut cfg) = Self::load_from(&config_file_path()) else {
+            return Self::default();
+        };
         // Environment variables take precedence over file values when set.
         if let Ok(cid) = std::env::var("TEAMS_CLIENT_ID").or_else(|_| std::env::var("AZURE_CLIENT_ID")) {
             if !cid.trim().is_empty() {
@@ -384,23 +388,101 @@ pub fn ensure_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
+static ATOMIC_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Atomically writes `data` to `path` using a unique temp file (`create_new(true)`),
+/// flushing before rename and avoiding naked deletion of the destination before the
+/// replacement is ready. Files whose name contains `"credentials"` default to `0o600` on Unix.
 pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    let is_secret = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_ascii_lowercase().contains("credentials"))
+        .unwrap_or(false);
+    write_atomic_with_mode(path, data, is_secret)
+}
+
+/// Atomically writes `data` to `path` with `0o600` permissions at creation time on Unix.
+pub fn write_atomic_0600(path: &Path, data: &[u8]) -> Result<()> {
+    write_atomic_with_mode(path, data, true)
+}
+
+fn write_atomic_with_mode(path: &Path, data: &[u8], mode_0600: bool) -> Result<()> {
     ensure_parent(path)?;
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, data)
-        .with_context(|| format!("Failed to write temp file: {}", tmp.display()))?;
-    if let Err(err) = fs::rename(&tmp, path) {
-        if path.exists() {
-            fs::remove_file(path)
-                .with_context(|| format!("Failed to replace existing file: {}", path.display()))?;
-            fs::rename(&tmp, path)
-                .with_context(|| format!("Atomic file save failed: {}", path.display()))?;
-        } else {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    let pid = std::process::id();
+    let seq = ATOMIC_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{name}.{pid}.{seq}.tmp"));
+
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    if mode_0600 {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = mode_0600;
+
+    let write_res = (|| -> Result<()> {
+        let mut file = opts
+            .open(&tmp)
+            .with_context(|| format!("Failed to create temp file: {}", tmp.display()))?;
+        file.write_all(data)
+            .with_context(|| format!("Failed to write temp file: {}", tmp.display()))?;
+        file.flush()
+            .with_context(|| format!("Failed to flush temp file: {}", tmp.display()))?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+
+    if let Err(rename_err) = fs::rename(&tmp, path) {
+        if let Err(replace_err) =
+            replace_existing_with_backup(&tmp, path, parent, name, pid, seq, rename_err)
+        {
             let _ = fs::remove_file(&tmp);
-            return Err(err).with_context(|| format!("Failed to save file: {}", path.display()));
+            return Err(replace_err);
         }
     }
     Ok(())
+}
+
+fn replace_existing_with_backup(
+    tmp: &Path,
+    path: &Path,
+    parent: &Path,
+    name: &str,
+    pid: u32,
+    seq: u64,
+    original_err: std::io::Error,
+) -> Result<()> {
+    if path.symlink_metadata().is_err() {
+        return Err(original_err).with_context(|| format!("Failed to save file: {}", path.display()));
+    }
+    let backup = parent.join(format!(".{name}.{pid}.{seq}.bak"));
+    fs::rename(path, &backup)
+        .with_context(|| format!("Failed to back up existing file: {}", path.display()))?;
+    match fs::rename(tmp, path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&backup);
+            Ok(())
+        }
+        Err(err) => {
+            let _ = fs::rename(&backup, path);
+            Err(err).with_context(|| format!("Atomic file save failed: {}", path.display()))
+        }
+    }
 }
 
 /// Draft key format: `"{conv_key}"` for conversation root or `"{conv_key}#thread:{root_msg_id}"` for thread replies.
@@ -549,5 +631,41 @@ mod tests {
         assert_eq!(parse_env_bool("0"), Some(false));
         assert_eq!(parse_env_bool("false"), Some(false));
         assert_eq!(parse_env_bool("invalid"), None);
+    }
+
+    #[test]
+    fn test_write_atomic_and_0600_and_missing_config_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("sub/settings.toml");
+        write_atomic(&target, b"first = 1\n").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"first = 1\n");
+
+        write_atomic(&target, b"second = 2\n").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"second = 2\n");
+
+        let secret = dir.path().join("sub/credentials.json");
+        write_atomic_0600(&secret, b"{\"token\":\"abc\"}").unwrap();
+        assert_eq!(fs::read(&secret).unwrap(), b"{\"token\":\"abc\"}");
+
+        let leftovers: Vec<_> = fs::read_dir(dir.path().join("sub"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name();
+                let s = n.to_string_lossy();
+                s.ends_with(".tmp") || s.ends_with(".bak")
+            })
+            .collect();
+        assert!(leftovers.is_empty());
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let missing_dir = dir.path().join("no-config-here");
+        let missing_str = missing_dir.to_string_lossy().into_owned();
+        let _guard = EnvVarGuard::set(&[
+            ("TEAMS_CONFIG_DIR", Some(&missing_str)),
+            ("TEAMS_CLI_CACHE_SECS", Some("77")),
+        ]);
+        let cfg = AppConfig::load();
+        assert_eq!(cfg.cli_cache_ttl_secs, 77);
     }
 }

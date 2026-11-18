@@ -17,6 +17,7 @@ use crate::models::{
 
 const SMALL_UPLOAD_LIMIT: u64 = 4 * 1024 * 1024; // 4 MiB
 const UPLOAD_CHUNK_SIZE: usize = 3_276_800; // 3.2 MiB (10 * 320 KiB)
+const MAX_IN_MEMORY_ATTACHMENT_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 
 #[derive(Debug, Deserialize)]
 struct DriveParentReference {
@@ -207,9 +208,9 @@ impl GraphClient {
             .await
             .with_context(|| format!("Failed to open large file: {}", local_path.display()))?;
         let mut offset: u64 = 0;
+        let mut buf = vec![0u8; UPLOAD_CHUNK_SIZE];
 
         loop {
-            let mut buf = vec![0u8; UPLOAD_CHUNK_SIZE];
             let mut filled = 0usize;
             while filled < UPLOAD_CHUNK_SIZE {
                 let n = file.read(&mut buf[filled..]).await?;
@@ -221,11 +222,10 @@ impl GraphClient {
             if filled == 0 {
                 bail!("Upload session reached EOF without a completion response.");
             }
-            buf.truncate(filled);
 
             let end_inclusive = offset + (filled as u64) - 1;
             let (_status, val) = self
-                .put_upload_chunk(&session.upload_url, buf, offset, end_inclusive, size)
+                .put_upload_chunk(&session.upload_url, &buf[..filled], offset, end_inclusive, size)
                 .await?;
             offset += filled as u64;
 
@@ -301,31 +301,35 @@ impl GraphClient {
 
         let is_hosted = content_url.contains("/hostedContents/")
             || attachment.content_type.eq_ignore_ascii_case("hostedContent");
+        let fallback_bearer = should_send_bearer(&self.config.graph_base_url, content_url);
 
-        let bytes = if is_hosted {
-            self.get_bytes(content_url).await?
+        let bytes_written = if is_hosted {
+            self.get_to_file(content_url, &dest_path, fallback_bearer)
+                .await?
         } else {
             let share_token = encode_graph_share_token(content_url);
             let share_path = format!("/shares/{share_token}/driveItem/content");
-            match self.get_bytes(&share_path).await {
-                Ok(b) => b,
-                Err(_) => self.get_bytes(content_url).await?,
+            match self.get_to_file(&share_path, &dest_path, true).await {
+                Ok(n) => n,
+                Err(err) if is_auth_or_forbidden_error(&err) => return Err(err),
+                Err(_) => {
+                    self.get_to_file(content_url, &dest_path, fallback_bearer)
+                        .await?
+                }
             }
         };
-
-        tokio::fs::write(&dest_path, &bytes)
-            .await
-            .with_context(|| format!("Failed to save file: {}", dest_path.display()))?;
 
         Ok(DownloadedFile {
             path: dest_path,
             file_name: final_name,
-            bytes_written: bytes.len() as u64,
+            bytes_written,
         })
     }
 
     pub async fn download_hosted_bytes(&self, hosted_url: &str) -> Result<Vec<u8>> {
-        self.get_bytes(hosted_url).await
+        let use_bearer = should_send_bearer(&self.config.graph_base_url, hosted_url);
+        self.get_bytes_with_limit(hosted_url, use_bearer, MAX_IN_MEMORY_ATTACHMENT_BYTES)
+            .await
     }
 
     /// Downloads raw attachment bytes in memory (for inline terminal image preview) along with `(file_name, content_type, bytes)`.
@@ -347,18 +351,83 @@ impl GraphClient {
             .unwrap_or_else(|| format!("attachment_{}", attachment.id));
         let is_hosted = content_url.contains("/hostedContents/")
             || attachment.content_type.eq_ignore_ascii_case("hostedContent");
+        let fallback_bearer = should_send_bearer(&self.config.graph_base_url, content_url);
         let bytes = if is_hosted {
-            self.get_bytes(content_url).await?
+            self.get_bytes_with_limit(content_url, fallback_bearer, MAX_IN_MEMORY_ATTACHMENT_BYTES)
+                .await?
         } else {
             let share_token = encode_graph_share_token(content_url);
             let share_path = format!("/shares/{share_token}/driveItem/content");
-            match self.get_bytes(&share_path).await {
+            match self
+                .get_bytes_with_limit(&share_path, true, MAX_IN_MEMORY_ATTACHMENT_BYTES)
+                .await
+            {
                 Ok(b) => b,
-                Err(_) => self.get_bytes(content_url).await?,
+                Err(err) if is_auth_or_forbidden_error(&err) => return Err(err),
+                Err(_) => {
+                    self.get_bytes_with_limit(
+                        content_url,
+                        fallback_bearer,
+                        MAX_IN_MEMORY_ATTACHMENT_BYTES,
+                    )
+                    .await?
+                }
             }
         };
         Ok((raw_name, attachment.content_type.clone(), bytes))
     }
+}
+
+pub(crate) fn should_send_bearer(graph_base_url: &str, target_url: &str) -> bool {
+    let trimmed = target_url.trim();
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return true;
+    }
+    let Ok(target) = url::Url::parse(trimmed) else {
+        return false;
+    };
+    let Some(target_host) = target.host_str() else {
+        return false;
+    };
+    if let Ok(base) = url::Url::parse(graph_base_url.trim()) {
+        if let Some(base_host) = base.host_str() {
+            if target.scheme() == base.scheme()
+                && target.port_or_known_default() == base.port_or_known_default()
+            {
+                if target_host.eq_ignore_ascii_case(base_host) {
+                    return true;
+                }
+                let is_loopback = |h: &str| {
+                    h.eq_ignore_ascii_case("127.0.0.1") || h.eq_ignore_ascii_case("localhost")
+                };
+                if is_loopback(base_host) && is_loopback(target_host) {
+                    return true;
+                }
+            }
+        }
+    }
+    if target.scheme() == "https" {
+        let lower = target_host.to_ascii_lowercase();
+        if lower == "microsoft.com" || lower.ends_with(".microsoft.com") {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_auth_or_forbidden_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    let detail = msg
+        .strip_prefix(crate::graph::GRAPH_API_ERROR_PREFIX)
+        .and_then(|rest| rest.split_once("): ").map(|(_, d)| d))
+        .unwrap_or(&msg);
+    let lower = detail.to_ascii_lowercase();
+    detail.starts_with("401 ")
+        || detail.starts_with("403 ")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("authorization_requestdenied")
+        || lower.contains("insufficient privileges")
 }
 
 /// Extracts a lowercase GUID from a DriveItem `eTag` (e.g. `"{153FA47D-18C9-4179-BE08-9879815A9F90},1"`),
@@ -496,5 +565,163 @@ mod tests {
 
         let third = deduplicate_dest_path(dir.path(), "report.pdf");
         assert_eq!(third.file_name().unwrap(), "report (2).pdf");
+    }
+
+    #[test]
+    fn test_should_send_bearer_origin_guard() {
+        let base = "https://graph.microsoft.com/v1.0";
+        assert!(should_send_bearer(base, "/me/drive/items/1/content"));
+        assert!(should_send_bearer(base, "https://graph.microsoft.com/v1.0/shares/123"));
+        assert!(should_send_bearer(base, "https://cdn.microsoft.com/file.bin"));
+        assert!(!should_send_bearer(base, "https://evil.example.com/steal"));
+        assert!(!should_send_bearer(base, "https://contoso.sharepoint.com/sites/a/doc.pdf"));
+        assert!(!should_send_bearer(base, "http://graph.microsoft.com/v1.0/me"));
+
+        let mock_base = "http://127.0.0.1:4567/v1.0";
+        assert!(should_send_bearer(mock_base, "http://127.0.0.1:4567/files/a.bin"));
+        assert!(should_send_bearer(mock_base, "http://localhost:4567/files/a.bin"));
+        assert!(!should_send_bearer(mock_base, "http://127.0.0.1:9999/files/a.bin"));
+    }
+
+    #[tokio::test]
+    async fn test_download_attachment_streams_and_protects_bearer_and_403() {
+        use axum::{
+            http::{header, HeaderMap, StatusCode},
+            routing::get,
+            Router,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let saw_ext_auth = Arc::new(Mutex::new(Option::<String>::None));
+        let saw_ext_clone = saw_ext_auth.clone();
+
+        let ext_app = Router::new().route(
+            "/external/file.txt",
+            get(move |headers: HeaderMap| {
+                let saw = saw_ext_clone.clone();
+                async move {
+                    *saw.lock().unwrap() = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    (StatusCode::OK, b"external-payload-ok".to_vec())
+                }
+            }),
+        );
+        let ext_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ext_addr = ext_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(ext_listener, ext_app).await;
+        });
+
+        let forbidden_url = format!(
+            "http://127.0.0.1:{}/external/file.txt?forbidden=1",
+            ext_addr.port()
+        );
+        let forbidden_share_tok = encode_graph_share_token(&forbidden_url);
+        let graph_app = Router::new().route(
+            "/v1.0/shares/{token}/driveItem/content",
+            get(move |axum::extract::Path(token): axum::extract::Path<String>| {
+                let forbidden_tok = forbidden_share_tok.clone();
+                async move {
+                    if token == forbidden_tok {
+                        (StatusCode::FORBIDDEN, "forbidden")
+                    } else {
+                        (StatusCode::NOT_FOUND, "not found")
+                    }
+                }
+            }),
+        );
+        let graph_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let graph_addr = graph_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(graph_listener, graph_app).await;
+        });
+
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.graph_base_url = format!("http://{graph_addr}/v1.0");
+        let tok = crate::auth::StoredTokens {
+            access_token: "secret-graph-bearer".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("u1".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = crate::auth::AuthManager::from_tokens(cfg.clone(), tok);
+        let client = GraphClient::new(cfg, auth).unwrap();
+
+        let dir = tempdir().unwrap();
+
+        // 1. 404 on /shares falls back to external content_url WITHOUT leaking Bearer token
+        let ext_url = format!("http://127.0.0.1:{}/external/file.txt", ext_addr.port());
+        let att = AttachmentInfo {
+            id: "a1".into(),
+            content_type: "reference".into(),
+            content_url: Some(ext_url),
+            name: Some("ext.txt".into()),
+            content_json: None,
+            thumbnail_url: None,
+        };
+        let dl = client.download_attachment(&att, dir.path()).await.unwrap();
+        assert_eq!(std::fs::read(&dl.path).unwrap(), b"external-payload-ok");
+        assert_eq!(dl.bytes_written, 19);
+        assert_eq!(*saw_ext_auth.lock().unwrap(), None);
+
+        // 2. 403 on /shares must NOT be swallowed or fall back to content_url
+        let forbidden_att = AttachmentInfo {
+            id: "a2".into(),
+            content_type: "reference".into(),
+            content_url: Some(forbidden_url),
+            name: Some("forbidden.txt".into()),
+            content_json: None,
+            thumbnail_url: None,
+        };
+        let err = client
+            .download_attachment(&forbidden_att, dir.path())
+            .await
+            .unwrap_err();
+        assert!(is_auth_or_forbidden_error(&err));
+        assert!(!dir.path().join("forbidden.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_get_bytes_with_limit_rejects_oversized_response() {
+        use axum::{routing::get, Router};
+
+        let app = Router::new().route(
+            "/v1.0/big",
+            get(|| async { vec![b'x'; 2048] }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tok = crate::auth::StoredTokens {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("u1".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = crate::auth::AuthManager::from_tokens(cfg.clone(), tok);
+        let client = GraphClient::new(cfg, auth).unwrap();
+
+        let err = client
+            .get_bytes_with_limit("/big", true, 1024)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds in-memory limit"));
     }
 }

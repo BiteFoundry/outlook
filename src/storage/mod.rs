@@ -90,6 +90,28 @@ impl Storage {
         })
     }
 
+    /// Opens an existing database with a single read-only connection without creating an empty DB file.
+    pub fn open_readonly(path: &Path) -> Result<Self> {
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = rusqlite::Connection::open_with_flags(path, flags)?;
+        db::init_reader_connection(&conn)?;
+        let trigram_enabled: bool = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|s| s.to_ascii_lowercase().contains("trigram"))
+            .unwrap_or(false);
+        Ok(Self {
+            path: path.to_path_buf(),
+            conn: Arc::new(Mutex::new(conn)),
+            readers: None,
+            trigram_enabled,
+        })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -102,9 +124,10 @@ impl Storage {
         self.trigram_enabled
     }
 
-    /// Releases unused SQLite page-cache memory back to the OS (`PRAGMA shrink_memory`).
+    /// Releases unused SQLite page-cache memory back to the OS (`PRAGMA shrink_memory`) and runs `PRAGMA optimize`.
     pub fn shrink_memory(&self) {
         if let Ok(conn) = self.conn.lock() {
+            let _ = conn.execute_batch("PRAGMA optimize;");
             db::shrink_connection_memory(&conn);
         }
         if let Some(pool) = &self.readers {
@@ -761,7 +784,7 @@ mod tests {
 
         // 1) Identical re-upsert must skip both messages and messages_fts writes (0 SQLite changes).
         let changes_before_noop = storage.conn().lock().unwrap().total_changes();
-        assert_eq!(storage.upsert_messages(&[m1.clone()]).unwrap(), 1);
+        assert_eq!(storage.upsert_messages(&[m1.clone()]).unwrap(), 0);
         let changes_after_noop = storage.conn().lock().unwrap().total_changes();
         assert_eq!(changes_after_noop - changes_before_noop, 0);
         assert_eq!(
@@ -910,5 +933,67 @@ mod tests {
             .unwrap();
         let without_ids: Vec<&str> = without_id.iter().map(|m| m.msg_id.as_str()).collect();
         assert_eq!(without_ids, vec!["m0"]);
+    }
+
+    #[test]
+    fn test_open_readonly_does_not_create_file_and_reads_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_db = dir.path().join("nonexistent/cache.db");
+        assert!(Storage::open_readonly(&missing_db).is_err());
+        assert!(!missing_db.exists());
+
+        let db_file = dir.path().join("existing.db");
+        {
+            let rw = Storage::open(&db_file).unwrap();
+            let chat = sample_chat("c-ro", "Readonly Room", false, Some("2026-11-15T12:00:00Z"));
+            rw.upsert_conversations(&[chat]).unwrap();
+        }
+        let ro = Storage::open_readonly(&db_file).unwrap();
+        let convs = ro.list_conversations().unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].title, "Readonly Room");
+    }
+
+    #[test]
+    fn test_upsert_attachment_mention_edit_and_soft_delete_reply_count() {
+        use crate::models::AttachmentInfo;
+
+        let storage = Storage::open_in_memory().unwrap();
+        let chat = sample_chat("c-att", "Mentions & Replies", false, None);
+        let conv_key = chat.conv_key.clone();
+        storage.upsert_conversations(&[chat]).unwrap();
+
+        let mut root = sample_msg(&conv_key, "root1", None, "Alice", "Root", None, "2026-11-15T09:00:00Z");
+        let rep1 = sample_msg(&conv_key, "r1", Some("root1"), "Bob", "Reply 1", None, "2026-11-15T09:01:00Z");
+        let mut rep2 = sample_msg(&conv_key, "r2", Some("root1"), "Carol", "Reply 2", None, "2026-11-15T09:02:00Z");
+        assert_eq!(storage.upsert_messages(&[root.clone(), rep1, rep2.clone()]).unwrap(), 3);
+        assert_eq!(storage.get_message(&conv_key, "root1").unwrap().unwrap().reply_count, 2);
+
+        // Soft-deleting rep2 updates root reply_count accurately from 2 -> 1
+        rep2.deleted = true;
+        assert_eq!(storage.upsert_messages(&[rep2]).unwrap(), 1);
+        assert_eq!(storage.get_message(&conv_key, "root1").unwrap().unwrap().reply_count, 1);
+
+        // Editing attachments & mentions without changing last_modified_at is NOT skipped
+        root.attachments.push(AttachmentInfo {
+            id: "att1".to_string(),
+            content_type: "reference".to_string(),
+            content_url: None,
+            name: Some("doc.pdf".to_string()),
+            content_json: None,
+            thumbnail_url: None,
+        });
+        assert_eq!(storage.upsert_messages(&[root.clone()]).unwrap(), 1);
+        assert_eq!(storage.get_message(&conv_key, "root1").unwrap().unwrap().attachments.len(), 1);
+
+        root.mentions.push(MentionInfo {
+            id: 0,
+            user_id: "u-target".to_string(),
+            display_name: "Target".to_string(),
+        });
+        assert_eq!(storage.upsert_messages(&[root]).unwrap(), 1);
+        let mentioned = storage.list_mentions_for_user("u-target", 10).unwrap();
+        assert_eq!(mentioned.len(), 1);
+        assert_eq!(mentioned[0].msg_id, "root1");
     }
 }

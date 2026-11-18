@@ -55,7 +55,7 @@ struct Snapshot {
     mentions: Vec<MentionRef>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ComposerState {
     text: String,
     cursor: usize,
@@ -66,10 +66,32 @@ pub struct ComposerState {
     mentions: Vec<MentionRef>,
     pub pending_images: Vec<InlineImageUpload>,
     pub pending_preview: Option<RenderedTerminalImage>,
+    pub last_inner_width: u16,
     anchor: Option<usize>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     pub popup: MentionPopup,
+}
+
+impl Default for ComposerState {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            cursor: 0,
+            subject: String::new(),
+            subject_cursor: 0,
+            subject_focused: false,
+            reply: None,
+            mentions: Vec::new(),
+            pending_images: Vec::new(),
+            pending_preview: None,
+            last_inner_width: 72,
+            anchor: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            popup: MentionPopup::default(),
+        }
+    }
 }
 
 impl ComposerState {
@@ -295,7 +317,18 @@ impl ComposerState {
     }
 
     pub fn stage_inline_image(&mut self, bytes: Vec<u8>, mime_type: &str, file_name: Option<String>) {
-        self.pending_preview = img_preview::decode_and_render_halfblocks(&bytes, 24, 5, (20, 22, 26)).ok();
+        let preview = img_preview::decode_and_render_halfblocks(&bytes, 24, 5, (20, 22, 26)).ok();
+        self.stage_inline_image_with_preview(bytes, mime_type, file_name, preview);
+    }
+
+    pub fn stage_inline_image_with_preview(
+        &mut self,
+        bytes: Vec<u8>,
+        mime_type: &str,
+        file_name: Option<String>,
+        preview: Option<RenderedTerminalImage>,
+    ) {
+        self.pending_preview = preview;
         let temp_id = (self.pending_images.len() + 1).to_string();
         self.pending_images.push(InlineImageUpload {
             temp_id,
@@ -542,10 +575,18 @@ impl ComposerState {
     }
 
     pub fn move_doc_start(&mut self, extend: bool) {
+        if self.subject_focused {
+            self.subject_cursor = 0;
+            return;
+        }
         self.move_to(0, extend);
     }
 
     pub fn move_doc_end(&mut self, extend: bool) {
+        if self.subject_focused {
+            self.subject_cursor = self.subject.len();
+            return;
+        }
         self.move_to(self.text.len(), extend);
     }
 
@@ -725,7 +766,9 @@ impl ComposerState {
                 }
             }
         }
-        let body_lines = (self.line_count() as u16).clamp(1, 8);
+        let wrap_width = self.last_inner_width.max(1) as usize;
+        let (visual_lines, _, _) = text_layout(&self.text, wrap_width, self.cursor);
+        let body_lines = (visual_lines.len() as u16).clamp(1, 8);
         (1 + extra + body_lines).clamp(2, 13)
     }
 }
@@ -768,9 +811,16 @@ pub fn draw(
         Style::default().bg(theme.bg_composer).fg(theme.fg_primary)
     };
     frame.render_widget(Paragraph::new("").style(surface_style), area);
-    hitmap.add(area, HitTarget::Composer);
-    if ui.thread_drawer_open && ui.composer_target_thread && app.active_thread.is_some() {
-        hitmap.add_line(area.x, area.y, area.width, HitTarget::ThreadComposer);
+    let is_thread_composer = ui.thread_drawer_open
+        && ui.composer_target_thread
+        && app.active_thread.is_some()
+        && ui.term_width >= 120
+        && ui.thread_composer_area == area
+        && ui.thread_composer_area.width > 0;
+    if is_thread_composer {
+        hitmap.add(area, HitTarget::ThreadComposer);
+    } else {
+        hitmap.add(area, HitTarget::Composer);
     }
 
     let is_channel_root = is_composing_channel_root(app, ui);
@@ -796,6 +846,7 @@ pub fn draw(
 
     let mut y = area.y.saturating_add(1);
     let mut subject_y: Option<u16> = None;
+    let mut subject_cursor_col: u16 = 0;
 
     if show_subject && y < area.bottom() {
         subject_y = Some(y);
@@ -805,21 +856,25 @@ pub fn draw(
         } else {
             theme.accent_style()
         };
-        let body_text = if ui.composer.subject.is_empty() {
-            "(Post subject · Ctrl+S to hide)".to_string()
+        let max_body = (area.width as usize).saturating_sub(prefix_w);
+        let (visible_body, cursor_col) = if ui.composer.subject.is_empty() {
+            (
+                truncate_display("(Post subject · Ctrl+S to hide)", max_body),
+                0usize,
+            )
         } else {
-            ui.composer.subject.clone()
+            slice_display_window(&ui.composer.subject, ui.composer.subject_cursor, max_body)
         };
+        subject_cursor_col = cursor_col as u16;
         let body_style = if ui.composer.subject.is_empty() {
             theme.muted_style().add_modifier(Modifier::ITALIC)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };
-        let max_body = (area.width as usize).saturating_sub(prefix_w);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(SUBJECT_PREFIX, subj_style),
-                Span::styled(truncate_display(&body_text, max_body), body_style),
+                Span::styled(visible_body, body_style),
             ]))
             .style(surface_style),
             Rect::new(area.x, y, area.width, 1),
@@ -904,6 +959,7 @@ pub fn draw(
 
     let gutter_w = if text_area.width > 4 { 2usize } else { 0usize };
     let body_width = (text_area.width as usize).saturating_sub(gutter_w).max(1);
+    ui.composer.last_inner_width = body_width.min(u16::MAX as usize) as u16;
     let text = ui.composer.text();
     let selection = ui.composer.selection_range();
     let (visual, cursor_row, cursor_col) = text_layout(text, body_width, ui.composer.cursor());
@@ -972,7 +1028,7 @@ pub fn draw(
     frame.render_widget(Paragraph::new(lines).style(surface_style), text_area);
 
     if focused && !ui.composer.subject_focused {
-        ui.composer.popup.draw(frame, area, &theme);
+        ui.composer.popup.draw(frame, area, &theme, hitmap);
     }
     if !focused {
         return None;
@@ -980,13 +1036,10 @@ pub fn draw(
 
     if let Some(subj_y) = subject_y.filter(|_| ui.composer.subject_focused) {
         let prefix_w = UnicodeWidthStr::width(SUBJECT_PREFIX) as u16;
-        let subj_col = UnicodeWidthStr::width(
-            &ui.composer.subject[..ui.composer.subject_cursor.min(ui.composer.subject.len())],
-        ) as u16;
         let cx = area
             .x
             .saturating_add(prefix_w)
-            .saturating_add(subj_col)
+            .saturating_add(subject_cursor_col)
             .min(area.right().saturating_sub(1));
         return Some((cx, subj_y));
     }
@@ -1094,7 +1147,11 @@ fn push_line_spans(
             spans.push(Span::styled(std::mem::take(&mut run), style));
         }
         run_selected = selected;
-        run.push(ch);
+        if ch == '\t' {
+            run.push_str("    ");
+        } else {
+            run.push(ch);
+        }
     }
     if !run.is_empty() {
         let style = if run_selected {
@@ -1124,22 +1181,29 @@ pub fn text_layout(text: &str, width: usize, cursor: usize) -> (Vec<(usize, usiz
     let mut cursor_pos: Option<(usize, usize)> = None;
 
     for (index, ch) in text.char_indices() {
-        if index == cursor {
-            cursor_pos = Some((row, col));
-        }
         if ch == '\n' {
+            if index == cursor {
+                cursor_pos = Some((row, col));
+            }
             lines.push((line_start, index));
             row += 1;
             col = 0;
             line_start = index + 1;
             continue;
         }
-        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        let char_width = if ch == '\t' {
+            4
+        } else {
+            UnicodeWidthChar::width(ch).unwrap_or(0)
+        };
         if col > 0 && col + char_width > width {
             lines.push((line_start, index));
             row += 1;
             col = 0;
             line_start = index;
+        }
+        if index == cursor {
+            cursor_pos = Some((row, col));
         }
         col += char_width;
     }
@@ -1220,14 +1284,74 @@ fn truncate_display(text: &str, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0usize;
     for ch in text.chars() {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        let w = if ch == '\t' {
+            4
+        } else {
+            UnicodeWidthChar::width(ch).unwrap_or(0)
+        };
         if used + w > width {
             break;
         }
-        out.push(ch);
+        if ch == '\t' {
+            out.push_str("    ");
+        } else {
+            out.push(ch);
+        }
         used += w;
     }
     out
+}
+
+fn slice_display_window(text: &str, cursor: usize, max_width: usize) -> (String, usize) {
+    if max_width == 0 {
+        return (String::new(), 0);
+    }
+    let mut safe_cursor = cursor.min(text.len());
+    while safe_cursor > 0 && !text.is_char_boundary(safe_cursor) {
+        safe_cursor -= 1;
+    }
+    let cursor_total_col: usize = text[..safe_cursor]
+        .chars()
+        .map(|ch| {
+            if ch == '\t' {
+                1
+            } else {
+                UnicodeWidthChar::width(ch).unwrap_or(0)
+            }
+        })
+        .sum();
+    let scroll_col = if cursor_total_col < max_width {
+        0
+    } else {
+        cursor_total_col.saturating_sub(max_width.saturating_sub(1))
+    };
+
+    let mut out = String::new();
+    let mut col = 0usize;
+    let mut start_col: Option<usize> = None;
+    let mut vis_w = 0usize;
+    for ch in text.chars() {
+        let display_ch = if ch == '\t' { ' ' } else { ch };
+        let cw = UnicodeWidthChar::width(display_ch).unwrap_or(0);
+        if col < scroll_col {
+            col += cw;
+            continue;
+        }
+        if start_col.is_none() {
+            start_col = Some(col);
+        }
+        if vis_w + cw > max_width {
+            break;
+        }
+        out.push(display_ch);
+        vis_w += cw;
+        col += cw;
+    }
+    let origin = start_col.unwrap_or(col);
+    let cursor_col = cursor_total_col
+        .saturating_sub(origin)
+        .min(max_width.saturating_sub(1));
+    (out, cursor_col)
 }
 
 // ---------------------------------------------------------------------------
@@ -1253,16 +1377,54 @@ pub fn external_edit(current: &str) -> std::io::Result<String> {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(default_editor);
 
-    let mut parts = editor.split_whitespace();
-    let program = parts.next().unwrap_or("vi");
+    let parts = parse_editor_command(&editor);
+    let program = parts.first().map(String::as_str).unwrap_or("vi");
+    let args = parts.get(1..).unwrap_or(&[]);
 
-    let status = Command::new(program).args(parts).arg(&path).status();
+    let status = Command::new(program).args(args).arg(&path).status();
 
     let contents = std::fs::read_to_string(&path);
     let _ = std::fs::remove_file(&path);
 
     let _ = status?;
     Ok(normalize(&contents?).trim_end().to_string())
+}
+
+fn parse_editor_command(raw: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut in_token = false;
+
+    for ch in raw.chars() {
+        match quote {
+            Some(q) => {
+                if ch == q {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            None => {
+                if ch == '"' || ch == '\'' {
+                    quote = Some(ch);
+                    in_token = true;
+                } else if ch.is_whitespace() {
+                    if in_token {
+                        args.push(std::mem::take(&mut current));
+                        in_token = false;
+                    }
+                } else {
+                    current.push(ch);
+                    in_token = true;
+                }
+            }
+        }
+    }
+    if in_token {
+        args.push(current);
+    }
+    args
 }
 
 fn default_editor() -> String {
@@ -1391,5 +1553,42 @@ mod tests {
         let png = encode_rgba_to_png(2, 2, vec![255; 16]).unwrap();
         composer.stage_inline_image(png, "image/png", None);
         assert!(composer.desired_height(false, false) < composer.desired_height(false, true));
+    }
+
+    #[test]
+    fn text_layout_wrap_boundary_places_cursor_on_next_row_and_soft_wrap_expands_height() {
+        // Cursor at byte 5 in "abcdeX" with width 5 wraps 'X' to row 1 col 0.
+        let (lines, row, col) = text_layout("abcdeX", 5, 5);
+        assert_eq!(lines, vec![(0, 5), (5, 6)]);
+        assert_eq!((row, col), (1, 0));
+
+        // Tab has deterministic width 4.
+        let (_, tab_row, tab_col) = text_layout("\ta", 10, 1);
+        assert_eq!((tab_row, tab_col), (0, 4));
+
+        // Long paragraph without '\n' soft-wraps and grows desired_height.
+        let mut composer = ComposerState::new();
+        composer.last_inner_width = 72;
+        composer.insert_str(&"x".repeat(250));
+        let h = composer.desired_height(false, false);
+        assert!(h > 2 && h <= 9);
+
+        // Subject-focused Ctrl+Home / Ctrl+End and horizontal window scrolling.
+        composer.subject = "0123456789ABCDEF".to_string();
+        composer.subject_cursor = 5;
+        composer.subject_focused = true;
+        composer.move_doc_end(false);
+        assert_eq!(composer.subject_cursor, composer.subject.len());
+        let (win, ccol) = slice_display_window(&composer.subject, composer.subject_cursor, 8);
+        assert_eq!(win.len(), 7);
+        assert!(ccol < 8);
+        composer.move_doc_start(false);
+        assert_eq!(composer.subject_cursor, 0);
+
+        // Quoted Windows $EDITOR paths stay intact.
+        assert_eq!(
+            parse_editor_command(r#""C:\Program Files\Sublime Text\subl.exe" -w"#),
+            vec![r"C:\Program Files\Sublime Text\subl.exe", "-w"]
+        );
     }
 }

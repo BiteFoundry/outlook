@@ -109,7 +109,7 @@ fn install_panic_hook(keyboard_enhanced: bool) {
 
 const MAX_COALESCED_EVENTS: usize = 64;
 const ACTIVITY_THROTTLE: Duration = Duration::from_secs(5);
-const PASTE_BURST_POLL: Duration = Duration::from_millis(4);
+const PASTE_BURST_POLL: Duration = Duration::from_millis(2);
 const MAX_PASTE_BURST_EVENTS: usize = 4096;
 
 #[derive(Debug, Default)]
@@ -199,12 +199,22 @@ async fn process_terminal_event_with_burst(
     let mut stream_ended = false;
 
     while detector.len() < MAX_PASTE_BURST_EVENTS {
+        let has_enter = detector
+            .keys
+            .iter()
+            .any(|k| k.code == KeyCode::Enter && k.modifiers == KeyModifiers::NONE);
         let next_ev = match events.next().now_or_never() {
             Some(item) => item,
-            None => match tokio::time::timeout(PASTE_BURST_POLL, events.next()).await {
-                Ok(item) => item,
-                Err(_) => break,
-            },
+            None => {
+                let buffered = crossterm::event::poll(Duration::ZERO).unwrap_or(false);
+                if !has_enter && !buffered {
+                    break;
+                }
+                match tokio::time::timeout(PASTE_BURST_POLL, events.next()).await {
+                    Ok(item) => item,
+                    Err(_) => break,
+                }
+            }
         };
         match next_ev {
             Some(Ok(CrosstermEvent::Key(k))) if k.kind == KeyEventKind::Release => {
@@ -306,13 +316,19 @@ fn handle_terminal_event(
 ) -> LoopStep {
     match ev {
         CrosstermEvent::Key(key) => {
-            if let Some(act) = event::key_to_action_for_tab(
+            let act = event::key_to_action_for_tab(
                 key,
                 ui.focus(),
                 ui.active_nav_tab,
                 &ui.keymap,
                 ui.accepts_text_input(),
-            ) {
+            )
+            .or_else(|| {
+                (key.kind == crossterm::event::KeyEventKind::Press
+                    && key.code == KeyCode::BackTab)
+                    .then_some(Action::PrevFocus)
+            });
+            if let Some(act) = act {
                 notify_activity_throttled(app, last_activity_sent);
                 *dirty = true;
                 if action::dispatch(act, app, ui) {
@@ -547,6 +563,7 @@ pub async fn run_with_persona(
 
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(200));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
     let mut last_activity_sent: Option<Instant> = None;
 
@@ -597,6 +614,10 @@ pub async fn run_with_persona(
                 let before = ui.toasts.len();
                 ui.toasts.tick(std::time::Instant::now());
                 if ui.toasts.len() != before {
+                    dirty = true;
+                }
+                if ui.poll_retrying || app.syncing || ui.tasks.first_running().is_some() {
+                    ui.spinner_tick = ui.spinner_tick.wrapping_add(1);
                     dirty = true;
                 }
             }

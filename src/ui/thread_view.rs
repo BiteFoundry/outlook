@@ -23,9 +23,10 @@ use crate::{
     ui::{
         app::{AppState, Focus, UiState},
         chat_view::{
-            hash_message_sig, hash_theme_sig, messages_groupable, render_message_item_with_ctx,
-            render_scrolled_lines, truncate, CachedStream, DualHasher, LineSliceCache,
-            MessageRenderCtx, RenderedLine,
+            apply_selection_to_lines, hash_message_sig, hash_theme_sig, messages_groupable,
+            render_message_item_with_ctx, render_scrolled_lines_with_selection, truncate,
+            CachedStream, DualHasher, LineSliceCache, MessageRenderCtx, RenderedLine,
+            VisibleSelection,
         },
         hitmap::{ButtonId, HitMap, HitTarget, MessageScope},
         theme::Theme,
@@ -39,13 +40,12 @@ thread_local! {
 #[allow(clippy::too_many_arguments)]
 fn compute_thread_sig(
     thread: &ThreadView,
-    selected_idx: Option<usize>,
     density: DensityMode,
     my_user_id: &str,
     my_display_name: Option<&str>,
     presences: Option<&HashMap<String, PresenceStatus>>,
     my_presence: Option<&PresenceStatus>,
-    image_cache_len: usize,
+    image_cache_gen: u64,
     inline_images: bool,
     theme: &Theme,
     width: usize,
@@ -79,7 +79,6 @@ fn compute_thread_sig(
     } else {
         h.write_hash(&0u8);
     }
-    h.write_hash(&selected_idx);
     h.write_hash(&density);
     h.write_str(my_user_id);
     if let Some(dn) = my_display_name {
@@ -89,7 +88,7 @@ fn compute_thread_sig(
         h.write_hash(&0u8);
     }
     h.write_hash(&inline_images);
-    h.write_hash(&image_cache_len);
+    h.write_hash(&image_cache_gen);
     h.write_hash(&width);
     hash_theme_sig(&mut h, theme);
     h.finish()
@@ -123,7 +122,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hit
     }
 
     let Some(thread) = &app.active_thread else {
-        ui.thread_scroll.message_ranges.clear();
+        ui.thread_scroll.message_ranges = Arc::from([]);
         ui.thread_scroll.total_lines = 0;
         let msg = if app.loading_thread {
             "Loading thread…"
@@ -149,19 +148,19 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hit
 
     let cached = build_thread_stream_cached(
         thread,
-        ui.thread_scroll.selected_idx,
         ui.density,
         &app.my_user_id,
         my_display_name,
         Some(&app.presences),
         app.my_presence.as_ref(),
         thumbs,
+        app.image_cache_gen,
         (thumb_cols, thumb_rows),
         &ui.theme,
         width,
     );
 
-    ui.thread_scroll.message_ranges = cached.ranges.to_vec();
+    ui.thread_scroll.message_ranges = Arc::clone(&cached.ranges);
     if cached.lines.is_empty() {
         ui.thread_scroll.total_lines = 0;
         return;
@@ -172,7 +171,31 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hit
     let offset = ui.thread_scroll.offset(height);
     ui.thread_scroll.offset = offset;
 
-    render_scrolled_lines(frame, body_area, &cached.lines, offset, height, hitmap);
+    let selection = ui.thread_scroll.selected_idx.and_then(|sel_idx| {
+        let range = *cached.ranges.get(sel_idx)?;
+        let (scope, msg_index) = if sel_idx == 0 {
+            (MessageScope::ThreadRoot, 0)
+        } else {
+            (MessageScope::ThreadReply, sel_idx - 1)
+        };
+        Some(VisibleSelection {
+            range,
+            scope,
+            msg_index,
+            show_thread_action: false,
+            theme: &ui.theme,
+        })
+    });
+
+    render_scrolled_lines_with_selection(
+        frame,
+        body_area,
+        &cached.lines,
+        offset,
+        height,
+        selection,
+        hitmap,
+    );
 }
 
 fn draw_header(
@@ -304,33 +327,44 @@ pub fn build_thread_lines(
     width: usize,
     _hyperlinks: bool,
 ) -> Vec<RenderedLine> {
-    build_thread_stream_cached(
+    let width = width.max(12);
+    let cached = build_thread_stream_cached(
         thread,
-        selected_idx,
         DensityMode::Cozy,
         "",
         None,
         None,
         None,
         None,
+        0,
         (0, 0),
         theme,
         width,
-    )
-    .lines
-    .to_vec()
+    );
+    let mut lines = cached.lines.to_vec();
+    if let Some(sel_idx) = selected_idx {
+        if let Some(&(start, end)) = cached.ranges.get(sel_idx) {
+            let (scope, msg_index) = if sel_idx == 0 {
+                (MessageScope::ThreadRoot, 0)
+            } else {
+                (MessageScope::ThreadReply, sel_idx - 1)
+            };
+            apply_selection_to_lines(&mut lines[start..end], scope, msg_index, width, theme, false);
+        }
+    }
+    lines
 }
 
 #[allow(clippy::too_many_arguments)]
 fn build_thread_stream_cached(
     thread: &ThreadView,
-    selected_idx: Option<usize>,
     density: DensityMode,
     my_user_id: &str,
     my_display_name: Option<&str>,
     presences: Option<&HashMap<String, PresenceStatus>>,
     my_presence: Option<&PresenceStatus>,
     image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
+    image_cache_gen: u64,
     thumb_dims: (u16, u16),
     theme: &Theme,
     width: usize,
@@ -338,13 +372,12 @@ fn build_thread_stream_cached(
     let width = width.max(12);
     let sig = compute_thread_sig(
         thread,
-        selected_idx,
         density,
         my_user_id,
         my_display_name,
         presences,
         my_presence,
-        image_cache.map_or(0, HashMap::len),
+        image_cache_gen,
         image_cache.is_some(),
         theme,
         width,
@@ -355,7 +388,7 @@ fn build_thread_stream_cached(
 
     let (out, ranges) = build_thread_lines_uncached(
         thread,
-        selected_idx,
+        None,
         density,
         my_user_id,
         my_display_name,

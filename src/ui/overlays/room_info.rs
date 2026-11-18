@@ -39,11 +39,11 @@ impl RoomInfoState {
 
     pub fn handle(&mut self, action: &Action) -> OverlayOutcome {
         match action {
-            Action::MoveUp => {
+            Action::MoveUp | Action::CursorLeft | Action::PrevFocus => {
                 self.move_up();
                 OverlayOutcome::Handled
             }
-            Action::MoveDown => {
+            Action::MoveDown | Action::CursorRight | Action::Tab => {
                 self.move_down();
                 OverlayOutcome::Handled
             }
@@ -159,10 +159,16 @@ impl RoomInfoState {
                     .map(|e| format!(" · {e}"))
                     .unwrap_or_default();
                 let avail_str = avail.unwrap_or("Offline");
+                let avail_badge = format!(" [{avail_str}]");
+                let prefix_str = format!("  {dot} ");
+                let prefix_w = unicode_width::UnicodeWidthStr::width(prefix_str.as_str());
+                let avail_w = unicode_width::UnicodeWidthStr::width(avail_badge.as_str());
+                let name_budget = (inner.width as usize).saturating_sub(prefix_w + avail_w);
+                let raw_member = format!("{}{me_tag}{email}", member.display_name);
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  {dot} "), Style::default().fg(dot_color)),
-                    Span::raw(format!("{}{me_tag}{email}", member.display_name)),
-                    Span::styled(format!(" [{avail_str}]"), theme.muted_style()),
+                    Span::styled(prefix_str, Style::default().fg(dot_color)),
+                    Span::raw(crate::ui::truncate_width(&raw_member, name_budget)),
+                    Span::styled(avail_badge, theme.muted_style()),
                 ]));
             }
             if app.members.len() > member_space && member_space > 0 {

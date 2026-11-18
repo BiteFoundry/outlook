@@ -12,7 +12,7 @@ teams serve --token secret123   # require Authorization: Bearer secret123
 teams api                       # alias for `serve`
 ```
 
-- `--bind` defaults to `127.0.0.1` (loopback only).
+- `--bind` defaults to `127.0.0.1` (loopback only). Binding to a non-loopback address (e.g. `0.0.0.0`) requires `--token <SECRET>` unless `TEAMS_ALLOW_INSECURE_SERVE=1` is explicitly set.
 - `--port` defaults to `8788`.
 - `--token` is optional; when set, every endpoint except `GET /health` requires `Authorization: Bearer <token>`.
 - Requires an existing login (`teams login`) or `TEAMS_ACCESS_TOKEN`.
@@ -21,14 +21,14 @@ teams api                       # alias for `serve`
 ## Conventions
 
 - All responses are JSON (`Content-Type: application/json`).
-- Errors use `{"error": "<message>"}` with HTTP `400`, `401`, `404`, or `500`.
+- Errors use `{"error": "<message>"}` with HTTP `400`, `401`, `403`, `404`, or `500`.
 - `limit` defaults to `50` and is clamped to `1..=1000`.
 - `{key}` path parameters accept:
   - URL-encoded `conv_key` (e.g. `chat%3A19%3A...` or `chan%3A<team_id>%3A<channel_id>`),
   - raw `chat_id`,
   - `"<team>/<channel>"` (URL-encoded as needed), or
   - a unique case-insensitive title substring.
-- Permissive CORS is enabled for local browser-based agent UIs.
+- CORS is restricted to loopback (`localhost` / `127.0.0.1` / `[::1]`) origins when `--token` is unset, and permissive when `--token` is configured.
 
 ## Endpoints
 
@@ -44,13 +44,13 @@ curl http://127.0.0.1:8788/health
 {
   "ok": true,
   "user_id": "00000000-0000-0000-0000-000000000000",
-  "version": "0.6.0"
+  "version": "0.7.1"
 }
 ```
 
-### `GET /conversations?refresh=false&kind=`
+### `GET /conversations?refresh=false&kind=&limit=`
 
-Lists both chats (`oneOnOne`, `group`, `meeting`) and team channels (`channel`) from the local cache, or syncs from Microsoft Graph first when `refresh=true`.
+Lists both chats (`oneOnOne`, `group`, `meeting`) and team channels (`channel`) from the local cache, or syncs from Microsoft Graph first when `refresh=true`. Optional `limit` (`1..=1000`) caps the returned list (and limits `list_chats` when `refresh=true`).
 
 ```bash
 curl "http://127.0.0.1:8788/conversations?refresh=true&kind=oneOnOne" \
@@ -212,10 +212,15 @@ curl "http://127.0.0.1:8788/conversations/chan%3Ateam1%3Achan1/threads/170000000
 
 Posts a thread reply when `{key}` is a team channel, or sends a quote-reply when `{key}` is a 1:1/group chat.
 
+Body (`ReplyBody`):
+- `markdown` (required, non-empty string)
+- `mentions` (optional array of `"user_id:DisplayName"` strings or `{ "id"?: 0, "user_id": "...", "display_name": "..." }` objects)
+- `important` (optional boolean, default `false`)
+
 ```bash
 curl -X POST http://127.0.0.1:8788/conversations/chan%3Ateam1%3Achan1/messages/1700000000000/replies \
   -H "Content-Type: application/json" \
-  -d '{"markdown":"Looks good to me!"}'
+  -d '{"markdown":"Looks good to me! @Alice","mentions":["u1:Alice"],"important":false}'
 ```
 
 ### `POST /conversations/{key}/files`
@@ -322,13 +327,23 @@ Searches local SQLite FTS5 message cache. `target` is optional (conv_key or fuzz
 }
 ```
 
+### `GET /openapi.json`
+
+Returns the runtime OpenAPI 3.0.3 JSON document describing all available HTTP endpoints and bearer security scheme.
+
+```bash
+curl http://127.0.0.1:8788/openapi.json \
+  -H "Authorization: Bearer secret123"
+```
+
 ## Errors
 
 All failing endpoints return `{"error": "<message>"}`:
 
 | HTTP Status | Meaning |
 | --- | --- |
-| `400` | Validation error (empty body, invalid reaction/kind/presence, missing local file, etc.) |
+| `400` | Validation error (empty body, invalid `before` cursor, invalid reaction/kind/presence, missing local file, out-of-range attachment index, etc.) |
 | `401` | `--token` is enabled and `Authorization: Bearer <token>` is missing or invalid |
-| `404` | Target conversation or cached thread not found |
-| `500` | Microsoft Graph or SQLite error |
+| `403` | Insufficient Microsoft Graph permissions / missing token scopes (includes JWT `scp`/`roles` diagnostics) |
+| `404` | Target conversation, message, or cached thread not found |
+| `500` | Unexpected Microsoft Graph, IO, or SQLite error |

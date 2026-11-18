@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
     extract::{Path, Query, Request, State},
-    http::{header, StatusCode},
+    http::{header, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, patch, post},
@@ -15,7 +15,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{net::TcpListener, sync::mpsc};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::{
     cli,
@@ -254,12 +254,30 @@ pub fn build_router(
     storage: Storage,
     token: Option<String>,
 ) -> axum::Router {
+    let has_token = token.as_deref().is_some_and(|t| !t.trim().is_empty());
     let state = Arc::new(AppState {
         config,
         graph,
         storage,
         token,
     });
+
+    let cors = if has_token {
+        CorsLayer::permissive()
+    } else {
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::predicate(|origin, _| {
+                origin.to_str().ok().is_some_and(is_loopback_origin)
+            }))
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PATCH,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
+            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+    };
 
     Router::new()
         .route("/health", get(health))
@@ -294,7 +312,7 @@ pub fn build_router(
         .route("/presence", get(get_presence).post(set_presence))
         .route("/openapi.json", get(openapi_spec))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
-        .layer(CorsLayer::permissive())
+        .layer(cors)
         .with_state(state)
 }
 
@@ -305,6 +323,12 @@ pub async fn run(
     storage: Storage,
     opts: ServeOptions,
 ) -> Result<()> {
+    let addr: SocketAddr = format!("{}:{}", opts.bind, opts.port)
+        .parse()
+        .with_context(|| format!("Invalid bind address: {}:{}", opts.bind, opts.port))?;
+    let allow_insecure = std::env::var("TEAMS_ALLOW_INSECURE_SERVE").ok();
+    check_bind_security(addr, opts.token.as_deref(), allow_insecure.as_deref())?;
+
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
 
@@ -314,9 +338,6 @@ pub async fn run(
 
     let app = build_router(config, graph, storage, opts.token);
 
-    let addr: SocketAddr = format!("{}:{}", opts.bind, opts.port)
-        .parse()
-        .with_context(|| format!("Invalid bind address: {}:{}", opts.bind, opts.port))?;
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("Failed to bind listener: {addr}"))?;
@@ -328,6 +349,130 @@ pub async fn run(
         .context("HTTP server error")?;
 
     Ok(())
+}
+
+fn check_bind_security(
+    addr: SocketAddr,
+    token: Option<&str>,
+    allow_insecure_env: Option<&str>,
+) -> Result<()> {
+    let has_token = token.is_some_and(|t| !t.trim().is_empty());
+    let allow_insecure = allow_insecure_env.map(str::trim) == Some("1");
+    if !addr.ip().is_loopback() && !has_token && !allow_insecure {
+        anyhow::bail!(
+            "Refusing to bind HTTP API on non-loopback address {addr} without `--token <SECRET>`. \
+             Pass `--token <SECRET>` to require Bearer authentication before exposing Teams and host file endpoints, \
+             or set `TEAMS_ALLOW_INSECURE_SERVE=1` to override."
+        );
+    }
+    Ok(())
+}
+
+fn is_loopback_origin(origin: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(origin) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    match parsed.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+async fn with_storage<T, F>(storage: &Storage, f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Storage) -> Result<T> + Send + 'static,
+{
+    let storage = storage.clone();
+    tokio::task::spawn_blocking(move || f(&storage))
+        .await
+        .map_err(|err| anyhow::anyhow!("storage task panicked: {err}"))?
+}
+
+async fn map_graph_error(graph: &GraphClient, err: anyhow::Error) -> ApiError {
+    if cli::is_forbidden_error(&err) {
+        let wrapped = cli::wrap_graph_permission_error(graph, err).await;
+        return ApiError::new(StatusCode::FORBIDDEN, format!("{wrapped:#}"));
+    }
+    ApiError::from(err)
+}
+
+async fn map_target_error(graph: &GraphClient, err: anyhow::Error) -> ApiError {
+    if cli::is_forbidden_error(&err) {
+        let wrapped = cli::wrap_graph_permission_error(graph, err).await;
+        return ApiError::new(StatusCode::FORBIDDEN, format!("{wrapped:#}"));
+    }
+    let msg = format!("{err:#}");
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("target conversation/channel name is empty") {
+        ApiError::bad_request(msg)
+    } else if lower.contains("conversation/channel not found")
+        || lower.contains("ambiguous target")
+        || lower.starts_with("multiple ")
+    {
+        ApiError::not_found(msg)
+    } else {
+        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, msg)
+    }
+}
+
+async fn map_download_error(graph: &GraphClient, err: anyhow::Error) -> ApiError {
+    if cli::is_forbidden_error(&err) {
+        let wrapped = cli::wrap_graph_permission_error(graph, err).await;
+        return ApiError::new(StatusCode::FORBIDDEN, format!("{wrapped:#}"));
+    }
+    let msg = format!("{err:#}");
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("message not found") {
+        ApiError::not_found(msg)
+    } else if lower.contains("has no attachments") || lower.contains("is out of range") {
+        ApiError::bad_request(msg)
+    } else {
+        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, msg)
+    }
+}
+
+async fn resolve_target_for_api(
+    state: &AppState,
+    key: &str,
+    offline: bool,
+) -> Result<crate::models::ConversationSummary, ApiError> {
+    if offline {
+        let key_owned = key.to_string();
+        return with_storage(&state.storage, move |s| {
+            let cached = s.list_conversations()?;
+            resolver::resolve_from_slice(&cached, &key_owned)
+        })
+        .await
+        .map_err(|err| {
+            let msg = format!("{err:#}");
+            if msg
+                .to_ascii_lowercase()
+                .contains("target conversation/channel name is empty")
+            {
+                ApiError::bad_request(msg)
+            } else if msg
+                .to_ascii_lowercase()
+                .contains("conversation/channel not found")
+                || msg.to_ascii_lowercase().contains("ambiguous target")
+                || msg.to_ascii_lowercase().starts_with("multiple ")
+            {
+                ApiError::not_found(msg)
+            } else {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, msg)
+            }
+        });
+    }
+
+    match cli::resolve_target(&state.storage, &state.graph, key, false).await {
+        Ok(conv) => Ok(conv),
+        Err(err) => Err(map_target_error(&state.graph, err).await),
+    }
 }
 
 async fn auth_middleware(
@@ -375,13 +520,20 @@ async fn list_conversations(
                 state.graph.list_chats(chat_limit),
                 state.graph.list_joined_teams_with_channels(),
             );
-            let chats = chats_res?;
-            state.storage.upsert_conversations(&chats)?;
-            if let Ok(teams) = teams_res {
-                state.storage.upsert_teams(&teams)?;
-            }
-        } else {
-            sync::bootstrap_conversations(&state.graph, &state.storage).await?;
+            let chats = match chats_res {
+                Ok(c) => c,
+                Err(err) => return Err(map_graph_error(&state.graph, err).await),
+            };
+            with_storage(&state.storage, move |s| {
+                s.upsert_conversations(&chats)?;
+                if let Ok(teams) = teams_res {
+                    s.upsert_teams(&teams)?;
+                }
+                Ok(())
+            })
+            .await?;
+        } else if let Err(err) = sync::bootstrap_conversations(&state.graph, &state.storage).await {
+            return Err(map_graph_error(&state.graph, err).await);
         }
     }
 
@@ -390,13 +542,17 @@ async fn list_conversations(
         Some(raw) => Some(parse_kind_filter(raw)?),
     };
 
-    let mut conversations = state.storage.list_conversations()?;
-    if let Some(kind) = kind_filter {
-        conversations.retain(|c| c.kind == kind);
-    }
-    if let Some(max_items) = limit {
-        conversations.truncate(max_items);
-    }
+    let conversations = with_storage(&state.storage, move |s| {
+        let mut items = s.list_conversations()?;
+        if let Some(kind) = kind_filter {
+            items.retain(|c| c.kind == kind);
+        }
+        if let Some(max_items) = limit {
+            items.truncate(max_items);
+        }
+        Ok(items)
+    })
+    .await?;
 
     Ok(Json(json!({ "conversations": conversations })))
 }
@@ -415,13 +571,20 @@ async fn create_chat(
         return Err(ApiError::bad_request("members must not be empty"));
     }
 
-    let chat = state
+    let chat = match state
         .graph
         .create_chat(&members, body.topic.as_deref())
-        .await?;
-    state
-        .storage
-        .upsert_conversations(std::slice::from_ref(&chat))?;
+        .await
+    {
+        Ok(c) => c,
+        Err(err) => return Err(map_graph_error(&state.graph, err).await),
+    };
+    let chat_to_store = chat.clone();
+    with_storage(&state.storage, move |s| {
+        s.upsert_conversations(std::slice::from_ref(&chat_to_store))?;
+        Ok(())
+    })
+    .await?;
 
     Ok(Json(json!({ "ok": true, "conversation": chat })))
 }
@@ -431,16 +594,18 @@ async fn list_teams(
     Query(query): Query<TeamsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let teams = if query.refresh {
-        let fetched = state.graph.list_joined_teams_with_channels().await?;
-        state.storage.upsert_teams(&fetched)?;
-        let stored = state.storage.list_teams()?;
-        if stored.is_empty() {
-            fetched
-        } else {
-            stored
-        }
+        let fetched = match state.graph.list_joined_teams_with_channels().await {
+            Ok(t) => t,
+            Err(err) => return Err(map_graph_error(&state.graph, err).await),
+        };
+        with_storage(&state.storage, move |s| {
+            s.upsert_teams(&fetched)?;
+            let stored = s.list_teams()?;
+            Ok(if stored.is_empty() { fetched } else { stored })
+        })
+        .await?
     } else {
-        state.storage.list_teams()?
+        with_storage(&state.storage, |s| s.list_teams()).await?
     };
 
     Ok(Json(json!({ "teams": teams })))
@@ -452,31 +617,53 @@ async fn get_messages(
     Query(query): Query<MessagesQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let limit = cli::clamp_limit(query.limit.unwrap_or(50));
-    let conv = cli::resolve_target(&state.storage, &state.graph, &key, query.offline)
-        .await
-        .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
+    let conv = resolve_target_for_api(&state, &key, query.offline).await?;
 
-    let before = query
+    let before_owned = query
         .before
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty());
-    if let Some(raw_before) = before {
-        cli::resolve_before_cursor(&state.storage, &conv.conv_key, raw_before)
-            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if let Some(ref raw_before) = before_owned {
+        let conv_key = conv.conv_key.clone();
+        let before_val = raw_before.clone();
+        with_storage(&state.storage, move |s| {
+            cli::resolve_before_cursor(s, &conv_key, &before_val)
+        })
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     }
-    let fetch_older = query.fetch_older.unwrap_or(before.is_some());
 
-    let res = cli::read_conversation_messages(
+    if query.offline {
+        let conv_clone = conv.clone();
+        let res = with_storage(&state.storage, move |s| {
+            cli::read_conversation_messages_offline(s, &conv_clone, limit, before_owned.as_deref())
+        })
+        .await?;
+        return Ok(Json(json!({
+            "conversation": conv,
+            "messages": res.messages,
+            "has_more": res.has_more,
+            "next_before": res.next_before,
+        })));
+    }
+
+    let fetch_older = query.fetch_older.unwrap_or(before_owned.is_some());
+    let res = match cli::read_conversation_messages(
         &state.storage,
         &state.graph,
         &conv,
         limit,
-        before,
-        query.offline,
+        before_owned.as_deref(),
+        false,
         fetch_older,
     )
-    .await?;
+    .await
+    {
+        Ok(r) => r,
+        Err(err) => return Err(map_graph_error(&state.graph, err).await),
+    };
 
     Ok(Json(json!({
         "conversation": conv,
@@ -496,9 +683,7 @@ async fn send_message(
     }
 
     let mentions = parse_mention_inputs(&body.mentions)?;
-    let conv = cli::resolve_target(&state.storage, &state.graph, &key, false)
-        .await
-        .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
+    let conv = resolve_target_for_api(&state, &key, false).await?;
 
     let mut outgoing = parser::compile_outgoing_markdown(
         &body.markdown,
@@ -512,8 +697,15 @@ async fn send_message(
         outgoing.importance = Some("high".to_string());
     }
 
-    let sent = state.graph.send_message(&conv.target, &outgoing).await?;
-    let _ = state.storage.upsert_messages(std::slice::from_ref(&sent));
+    let sent = match state.graph.send_message(&conv.target, &outgoing).await {
+        Ok(m) => m,
+        Err(err) => return Err(map_graph_error(&state.graph, err).await),
+    };
+    let sent_clone = sent.clone();
+    let _ = with_storage(&state.storage, move |s| {
+        s.upsert_messages(std::slice::from_ref(&sent_clone))
+    })
+    .await;
 
     Ok(Json(json!({
         "ok": true,
@@ -528,9 +720,7 @@ async fn get_thread(
     Query(query): Query<ThreadQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let limit = cli::clamp_limit(query.limit.unwrap_or(50));
-    let conv = cli::resolve_target(&state.storage, &state.graph, &key, query.offline)
-        .await
-        .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
+    let conv = resolve_target_for_api(&state, &key, query.offline).await?;
 
     let ConversationTarget::Channel {
         ref team_id,
@@ -544,19 +734,28 @@ async fn get_thread(
     };
 
     let thread = if query.offline {
-        state
-            .storage
-            .get_thread(&conv.conv_key, &root_id, limit)?
+        let conv_key = conv.conv_key.clone();
+        let root_id_clone = root_id.clone();
+        with_storage(&state.storage, move |s| s.get_thread(&conv_key, &root_id_clone, limit))
+            .await?
             .ok_or_else(|| ApiError::not_found(format!("thread not found in cache: {root_id}")))?
     } else {
-        let view = state
+        let view = match state
             .graph
             .get_thread(team_id, channel_id, &root_id, limit)
-            .await?;
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => return Err(map_graph_error(&state.graph, err).await),
+        };
         let mut all = Vec::with_capacity(1 + view.replies.len());
         all.push(view.root.clone());
         all.extend(view.replies.iter().cloned());
-        state.storage.upsert_messages(&all)?;
+        with_storage(&state.storage, move |s| {
+            s.upsert_messages(&all)?;
+            Ok(())
+        })
+        .await?;
         view
     };
 
@@ -573,9 +772,7 @@ async fn reply_message(
     }
 
     let mentions = parse_mention_inputs(&body.mentions)?;
-    let conv = cli::resolve_target(&state.storage, &state.graph, &key, false)
-        .await
-        .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
+    let conv = resolve_target_for_api(&state, &key, false).await?;
 
     let quote = cli::build_quote_reply(&state.storage, &state.graph, &conv, &msg_id).await;
     let mut outgoing =
@@ -584,11 +781,19 @@ async fn reply_message(
         outgoing.importance = Some("high".to_string());
     }
 
-    let sent = state
+    let sent = match state
         .graph
         .reply_message(&conv.target, &msg_id, &outgoing)
-        .await?;
-    let _ = state.storage.upsert_messages(std::slice::from_ref(&sent));
+        .await
+    {
+        Ok(m) => m,
+        Err(err) => return Err(map_graph_error(&state.graph, err).await),
+    };
+    let sent_clone = sent.clone();
+    let _ = with_storage(&state.storage, move |s| {
+        s.upsert_messages(std::slice::from_ref(&sent_clone))
+    })
+    .await;
 
     Ok(Json(json!({
         "ok": true,
@@ -620,11 +825,9 @@ async fn send_file(
         ));
     }
 
-    let conv = cli::resolve_target(&state.storage, &state.graph, &key, false)
-        .await
-        .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
+    let conv = resolve_target_for_api(&state, &key, false).await?;
 
-    let sent = cli::send_file_or_inline(
+    let sent = match cli::send_file_or_inline(
         &state.graph,
         &state.storage,
         &conv,
@@ -633,7 +836,11 @@ async fn send_file(
         body.thread_root_id.as_deref(),
         body.inline,
     )
-    .await?;
+    .await
+    {
+        Ok(m) => m,
+        Err(err) => return Err(map_graph_error(&state.graph, err).await),
+    };
 
     Ok(Json(json!({
         "ok": true,
@@ -654,9 +861,7 @@ async fn download_attachment(
             .map_err(|e| ApiError::bad_request(format!("invalid JSON body: {e}")))?
     };
 
-    let conv = cli::resolve_target(&state.storage, &state.graph, &key, false)
-        .await
-        .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
+    let conv = resolve_target_for_api(&state, &key, false).await?;
 
     let dest_dir = parsed
         .out_dir
@@ -666,7 +871,7 @@ async fn download_attachment(
         .map(PathBuf::from)
         .unwrap_or_else(|| state.config.resolved_download_dir());
 
-    let downloaded = cli::download_message_attachment(
+    let downloaded = match cli::download_message_attachment(
         &state.graph,
         &state.storage,
         &conv,
@@ -676,7 +881,10 @@ async fn download_attachment(
         &dest_dir,
     )
     .await
-    .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    {
+        Ok(d) => d,
+        Err(err) => return Err(map_download_error(&state.graph, err).await),
+    };
 
     Ok(Json(json!({
         "ok": true,
@@ -693,11 +901,9 @@ async fn react_message(
 ) -> Result<Json<Value>, ApiError> {
     let normalized = cli::normalize_reaction(&body.reaction)
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
-    let conv = cli::resolve_target(&state.storage, &state.graph, &key, false)
-        .await
-        .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
+    let conv = resolve_target_for_api(&state, &key, false).await?;
 
-    state
+    if let Err(err) = state
         .graph
         .set_reaction(
             &conv.target,
@@ -706,7 +912,10 @@ async fn react_message(
             &normalized,
             body.enable,
         )
-        .await?;
+        .await
+    {
+        return Err(map_graph_error(&state.graph, err).await);
+    }
 
     Ok(Json(json!({
         "ok": true,
@@ -726,13 +935,11 @@ async fn edit_message(
         return Err(ApiError::bad_request("markdown must not be empty"));
     }
 
-    let conv = cli::resolve_target(&state.storage, &state.graph, &key, false)
-        .await
-        .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
+    let conv = resolve_target_for_api(&state, &key, false).await?;
     let compiled =
         parser::compile_outgoing_markdown(&body.markdown, None, vec![], vec![], vec![], None);
 
-    state
+    if let Err(err) = state
         .graph
         .edit_message(
             &conv.target,
@@ -740,7 +947,10 @@ async fn edit_message(
             body.thread_root_id.as_deref(),
             &compiled.body_html,
         )
-        .await?;
+        .await
+    {
+        return Err(map_graph_error(&state.graph, err).await);
+    }
 
     Ok(Json(json!({
         "ok": true,
@@ -767,14 +977,15 @@ async fn delete_message(
         .or(query.thread_root_id)
         .filter(|s| !s.trim().is_empty());
 
-    let conv = cli::resolve_target(&state.storage, &state.graph, &key, false)
-        .await
-        .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
+    let conv = resolve_target_for_api(&state, &key, false).await?;
 
-    state
+    if let Err(err) = state
         .graph
         .delete_message(&conv.target, &msg_id, thread_root_id.as_deref())
-        .await?;
+        .await
+    {
+        return Err(map_graph_error(&state.graph, err).await);
+    }
 
     Ok(Json(json!({
         "ok": true,
@@ -787,15 +998,19 @@ async fn mark_read(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let conv = cli::resolve_target(&state.storage, &state.graph, &key, false)
-        .await
-        .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
+    let conv = resolve_target_for_api(&state, &key, false).await?;
 
     if let ConversationTarget::Chat { ref chat_id } = conv.target {
-        state.graph.mark_chat_read(chat_id).await?;
+        if let Err(err) = state.graph.mark_chat_read(chat_id).await {
+            return Err(map_graph_error(&state.graph, err).await);
+        }
     }
     let now = chrono::Utc::now().to_rfc3339();
-    state.storage.mark_conversation_read(&conv.conv_key, &now)?;
+    let conv_key = conv.conv_key.clone();
+    with_storage(&state.storage, move |s| {
+        s.mark_conversation_read(&conv_key, &now)
+    })
+    .await?;
 
     Ok(Json(json!({
         "ok": true,
@@ -807,12 +1022,18 @@ async fn list_members(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let conv = cli::resolve_target(&state.storage, &state.graph, &key, false)
-        .await
-        .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
+    let conv = resolve_target_for_api(&state, &key, false).await?;
 
-    let members = state.graph.list_members(&conv.target).await?;
-    let _ = state.storage.upsert_members(&conv.conv_key, &members);
+    let members = match state.graph.list_members(&conv.target).await {
+        Ok(m) => m,
+        Err(err) => return Err(map_graph_error(&state.graph, err).await),
+    };
+    let conv_key = conv.conv_key.clone();
+    let members_clone = members.clone();
+    let _ = with_storage(&state.storage, move |s| {
+        s.upsert_members(&conv_key, &members_clone)
+    })
+    .await;
 
     Ok(Json(json!({
         "conv_key": conv.conv_key,
@@ -825,25 +1046,42 @@ async fn search(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let q = query.q.trim();
+    let q = query.q.trim().to_string();
     if q.is_empty() {
         return Err(ApiError::bad_request("q must not be empty"));
     }
     let limit = cli::clamp_limit(query.limit.unwrap_or(50));
+    let target_opt = query
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
-    let conv_key_filter = match query.target.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(target) => {
-            let cached = state.storage.list_conversations()?;
-            let resolved = resolver::resolve_from_slice(&cached, target)
-                .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
-            Some(resolved.conv_key)
+    let q_clone = q.clone();
+    let hits = with_storage(&state.storage, move |s| {
+        let conv_key_filter = match target_opt {
+            Some(ref target) => {
+                let cached = s.list_conversations()?;
+                Some(resolver::resolve_from_slice(&cached, target)?.conv_key)
+            }
+            None => None,
+        };
+        s.search_messages(&q_clone, conv_key_filter.as_deref(), limit)
+    })
+    .await
+    .map_err(|err| {
+        let msg = format!("{err:#}");
+        let lower = msg.to_ascii_lowercase();
+        if lower.contains("conversation/channel not found")
+            || lower.contains("ambiguous target")
+            || lower.starts_with("multiple ")
+        {
+            ApiError::not_found(msg)
+        } else {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, msg)
         }
-        None => None,
-    };
-
-    let hits = state
-        .storage
-        .search_messages(q, conv_key_filter.as_deref(), limit)?;
+    })?;
 
     Ok(Json(json!({
         "query": q,
@@ -865,10 +1103,16 @@ async fn get_presence(
         if ids.is_empty() {
             return Err(ApiError::bad_request("user_ids must contain at least one ID"));
         }
-        let presences = state.graph.get_presences_by_user_ids(&ids).await?;
+        let presences = match state.graph.get_presences_by_user_ids(&ids).await {
+            Ok(p) => p,
+            Err(err) => return Err(map_graph_error(&state.graph, err).await),
+        };
         Ok(Json(json!({ "presences": presences })))
     } else {
-        let presence = state.graph.get_my_presence().await?;
+        let presence = match state.graph.get_my_presence().await {
+            Ok(p) => p,
+            Err(err) => return Err(map_graph_error(&state.graph, err).await),
+        };
         Ok(Json(json!({ "presence": presence })))
     }
 }
@@ -886,10 +1130,13 @@ async fn set_presence(
         .filter(|s| !s.is_empty())
         .unwrap_or(&availability);
 
-    state
+    if let Err(err) = state
         .graph
         .set_my_presence(&availability, activity, body.expiration_mins)
-        .await?;
+        .await
+    {
+        return Err(map_graph_error(&state.graph, err).await);
+    }
 
     Ok(Json(json!({
         "ok": true,
@@ -1351,5 +1598,181 @@ mod tests {
                 "unexpected non-Teams route in openapi: {p}"
             );
         }
+    }
+
+    #[test]
+    fn non_loopback_bind_requires_token_or_env_override() {
+        let loopback: SocketAddr = "127.0.0.1:8788".parse().unwrap();
+        let any_v4: SocketAddr = "0.0.0.0:8788".parse().unwrap();
+        let lan_v4: SocketAddr = "192.168.1.10:8788".parse().unwrap();
+
+        assert!(check_bind_security(loopback, None, None).is_ok());
+        assert!(check_bind_security(any_v4, None, None).is_err());
+        assert!(check_bind_security(lan_v4, None, Some("0")).is_err());
+        assert!(check_bind_security(any_v4, Some("   "), None).is_err());
+        assert!(check_bind_security(any_v4, Some("secret"), None).is_ok());
+        assert!(check_bind_security(any_v4, None, Some("1")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cors_restricts_unauthenticated_remote_origins_and_allows_loopback() {
+        let base_no_tok = spawn_test_server(None).await;
+        let client = reqwest::Client::new();
+
+        // Remote origin must not receive Access-Control-Allow-Origin when --token is None
+        let res = client
+            .get(format!("{base_no_tok}/conversations"))
+            .header(header::ORIGIN, "https://evil.example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(
+            res.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none(),
+            "unexpected ACAO header for remote origin without token"
+        );
+
+        // Localhost origin IS allowed when --token is None
+        let res = client
+            .get(format!("{base_no_tok}/conversations"))
+            .header(header::ORIGIN, "http://localhost:3000")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("http://localhost:3000")
+        );
+
+        // Loopback IPv6 origin IS allowed
+        assert!(is_loopback_origin("http://[::1]:5173"));
+        assert!(!is_loopback_origin("https://localhost.evil.com"));
+    }
+
+    #[tokio::test]
+    async fn download_and_target_resolution_preserve_403_and_500_status_codes() {
+        use crate::auth::StoredTokens;
+
+        let mock_app = Router::new()
+            .route(
+                "/v1.0/me/chats",
+                get(|| async {
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "error": {
+                                "code": "Authorization_RequestDenied",
+                                "message": "Insufficient privileges"
+                            }
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/joinedTeams",
+                get(|| async {
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "error": {
+                                "code": "Authorization_RequestDenied",
+                                "message": "Insufficient privileges"
+                            }
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/chats/{chat_id}/messages",
+                get(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": { "code": "InternalServerError", "message": "boom" } })),
+                    )
+                }),
+            );
+        let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        let mock_server = tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app).await.unwrap();
+        });
+
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{mock_addr}/v1.0"),
+            ..AppConfig::default()
+        };
+        let tokens = StoredTokens {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: cfg.client_id.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            user_id: Some("me-1".to_string()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "pkce".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg.clone(), auth)
+            .unwrap()
+            .with_my_user_id("me-1");
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_conversations(&[crate::models::ConversationSummary {
+                conv_key: "chat:c-err".to_string(),
+                target: ConversationTarget::Chat {
+                    chat_id: "c-err".to_string(),
+                },
+                kind: ConversationKind::OneOnOne,
+                team_id: None,
+                team_name: None,
+                title: "ErrRoom".to_string(),
+                topic: None,
+                unread_count: 0,
+                last_read_at: None,
+                last_msg_id: None,
+                last_msg_author: None,
+                last_msg_preview: None,
+                last_updated_at: None,
+                pinned: false,
+                peer_user_id: None,
+                web_url: None,
+            }])
+            .unwrap();
+
+        let router = build_router(cfg, graph, storage, None);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let api_server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        // Target resolution encountering 403 from Graph returns 403 Forbidden (not 404)
+        let res = client
+            .get(format!("{base}/conversations/UnknownChat/messages"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // download_attachment encountering Graph 500 returns 500 (not 400)
+        let res = client
+            .post(format!(
+                "{base}/conversations/chat%3Ac-err/messages/m999/attachments/download"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        api_server.abort();
+        mock_server.abort();
     }
 }

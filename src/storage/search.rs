@@ -8,6 +8,25 @@ use crate::{
     storage::repo::escape_like,
 };
 
+struct SearchQueryContext {
+    query_lower: String,
+    tokens_lower: Vec<String>,
+}
+
+impl SearchQueryContext {
+    fn new(trimmed_query: &str) -> Self {
+        let query_lower = trimmed_query.to_lowercase();
+        let tokens_lower = query_lower
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        Self {
+            query_lower,
+            tokens_lower,
+        }
+    }
+}
+
 pub fn search_messages(
     conn: &Connection,
     query: &str,
@@ -19,28 +38,42 @@ pub fn search_messages(
         return Ok(Vec::new());
     }
 
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let query_ctx = SearchQueryContext::new(trimmed);
+    let all_tokens_at_least_3 = tokens.iter().all(|t| t.chars().count() >= 3);
     let char_count = trimmed.chars().count();
     if char_count >= 3 {
-        if let Some(fts_query) = build_fts_query(trimmed) {
-            if let Ok(hits) = run_fts_search(conn, &fts_query, trimmed, conv_key_filter, limit) {
-                if !hits.is_empty() {
+        if let Some(fts_query) =
+            build_fts_query_from_tokens(trimmed, &tokens, all_tokens_at_least_3)
+        {
+            if let Ok(hits) =
+                run_fts_search(conn, &fts_query, &query_ctx, conv_key_filter, limit)
+            {
+                if all_tokens_at_least_3 || !hits.is_empty() {
                     return Ok(hits);
                 }
             }
         }
     }
 
-    run_like_search(conn, trimmed, conv_key_filter, limit)
+    run_like_search(conn, &query_ctx, conv_key_filter, limit)
 }
 
-fn build_fts_query(trimmed: &str) -> Option<String> {
-    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+fn build_fts_query_from_tokens(
+    trimmed: &str,
+    tokens: &[&str],
+    all_tokens_at_least_3: bool,
+) -> Option<String> {
     if tokens.is_empty() {
         return None;
     }
     // In FTS5 trigram mode, every token in an AND query needs >= 3 chars to match.
     // If any token is < 3 chars, try exact phrase if overall >= 3 chars; if 0 hits, LIKE handles it.
-    if tokens.len() > 1 && tokens.iter().all(|t| t.chars().count() >= 3) {
+    if tokens.len() > 1 && all_tokens_at_least_3 {
         let quoted: Vec<String> = tokens
             .iter()
             .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
@@ -54,7 +87,7 @@ fn build_fts_query(trimmed: &str) -> Option<String> {
 fn run_fts_search(
     conn: &Connection,
     fts_query: &str,
-    raw_query: &str,
+    query_ctx: &SearchQueryContext,
     conv_key_filter: Option<&str>,
     limit: usize,
 ) -> Result<Vec<SearchHit>> {
@@ -82,7 +115,7 @@ fn run_fts_search(
             ",
         )?;
         let rows = stmt.query_map(params![fts_query, conv_key, limit as i64], |row| {
-            map_search_hit_row(row, raw_query)
+            map_search_hit_row(row, query_ctx)
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     } else {
@@ -108,7 +141,7 @@ fn run_fts_search(
             ",
         )?;
         let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
-            map_search_hit_row(row, raw_query)
+            map_search_hit_row(row, query_ctx)
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
@@ -118,11 +151,11 @@ fn run_fts_search(
 
 fn run_like_search(
     conn: &Connection,
-    raw_query: &str,
+    query_ctx: &SearchQueryContext,
     conv_key_filter: Option<&str>,
     limit: usize,
 ) -> Result<Vec<SearchHit>> {
-    let pattern = format!("%{}%", escape_like(&raw_query.to_lowercase()));
+    let pattern = format!("%{}%", escape_like(&query_ctx.query_lower));
     let hits = if let Some(conv_key) = conv_key_filter {
         let mut stmt = conn.prepare_cached(
             "
@@ -150,7 +183,7 @@ fn run_like_search(
             ",
         )?;
         let rows = stmt.query_map(params![conv_key, pattern, limit as i64], |row| {
-            map_search_hit_row(row, raw_query)
+            map_search_hit_row(row, query_ctx)
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     } else {
@@ -179,7 +212,7 @@ fn run_like_search(
             ",
         )?;
         let rows = stmt.query_map(params![pattern, limit as i64], |row| {
-            map_search_hit_row(row, raw_query)
+            map_search_hit_row(row, query_ctx)
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
@@ -187,7 +220,7 @@ fn run_like_search(
     Ok(hits)
 }
 
-fn map_search_hit_row(row: &Row<'_>, query: &str) -> rusqlite::Result<SearchHit> {
+fn map_search_hit_row(row: &Row<'_>, query_ctx: &SearchQueryContext) -> rusqlite::Result<SearchHit> {
     let conv_key: String = row.get(0)?;
     let conv_title: String = row.get(1)?;
     let kind_opt: Option<String> = row.get(2)?;
@@ -207,7 +240,7 @@ fn map_search_hit_row(row: &Row<'_>, query: &str) -> rusqlite::Result<SearchHit>
         subject.as_deref(),
         &body_plain,
         &author_name,
-        query,
+        query_ctx,
         120,
     );
 
@@ -223,14 +256,25 @@ fn map_search_hit_row(row: &Row<'_>, query: &str) -> rusqlite::Result<SearchHit>
     })
 }
 
+fn normalize_whitespace(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for word in input.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
+}
+
 fn build_contextual_snippet(
     subject: Option<&str>,
     body_plain: &str,
     author_name: &str,
-    query: &str,
+    query_ctx: &SearchQueryContext,
     max_chars: usize,
 ) -> String {
-    let clean_body = body_plain.split_whitespace().collect::<Vec<_>>().join(" ");
+    let clean_body = normalize_whitespace(body_plain);
     let source = match subject.map(str::trim).filter(|s| !s.is_empty()) {
         Some(subj) if !clean_body.is_empty() => format!("[{subj}] {clean_body}"),
         Some(subj) => format!("[{subj}]"),
@@ -238,45 +282,55 @@ fn build_contextual_snippet(
         None => author_name.to_string(),
     };
 
-    let chars: Vec<char> = source.chars().collect();
-    if chars.len() <= max_chars {
+    let total_chars = source.chars().count();
+    if total_chars <= max_chars {
         return source;
     }
 
-    let query_lower = query.trim().to_lowercase();
-    let match_char_idx = find_case_insensitive_char_pos(&source, &query_lower)
+    let source_lower = source.to_lowercase();
+    let match_char_idx = find_lower_char_pos(&source_lower, &query_ctx.query_lower)
         .or_else(|| {
-            query_lower
-                .split_whitespace()
-                .filter_map(|tok| find_case_insensitive_char_pos(&source, tok))
+            query_ctx
+                .tokens_lower
+                .iter()
+                .filter_map(|tok| find_lower_char_pos(&source_lower, tok))
                 .min()
         })
         .unwrap_or(0);
 
     let half = max_chars / 2;
     let mut start = match_char_idx.saturating_sub(half);
-    let end = (start + max_chars).min(chars.len());
+    let end = (start + max_chars).min(total_chars);
     if end - start < max_chars {
         start = end.saturating_sub(max_chars);
     }
 
-    let mut out = String::new();
+    let start_byte = source
+        .char_indices()
+        .nth(start)
+        .map(|(b, _)| b)
+        .unwrap_or(source.len());
+    let end_byte = source
+        .char_indices()
+        .nth(end)
+        .map(|(b, _)| b)
+        .unwrap_or(source.len());
+
+    let mut out = String::with_capacity(end_byte.saturating_sub(start_byte) + 8);
     if start > 0 {
         out.push('…');
     }
-    let slice: String = chars[start..end].iter().collect();
-    out.push_str(slice.trim());
-    if end < chars.len() {
+    out.push_str(source[start_byte..end_byte].trim());
+    if end < total_chars {
         out.push('…');
     }
     out
 }
 
-fn find_case_insensitive_char_pos(haystack: &str, needle_lower: &str) -> Option<usize> {
+fn find_lower_char_pos(haystack_lower: &str, needle_lower: &str) -> Option<usize> {
     if needle_lower.is_empty() {
         return None;
     }
-    let haystack_lower = haystack.to_lowercase();
     let byte_idx = haystack_lower.find(needle_lower)?;
     Some(haystack_lower[..byte_idx].chars().count())
 }

@@ -127,7 +127,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut AppState, ui: &mut UiState,
     }
 
     if app.active_conv_key.is_none() {
-        ui.chat_scroll.message_ranges.clear();
+        ui.chat_scroll.message_ranges = Arc::from([]);
         ui.chat_scroll.total_lines = 0;
         frame.render_widget(
             Paragraph::new("Select a conversation from the sidebar (or press Ctrl+K)")
@@ -138,7 +138,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut AppState, ui: &mut UiState,
     }
 
     if app.loading_messages && app.messages.is_empty() {
-        ui.chat_scroll.message_ranges.clear();
+        ui.chat_scroll.message_ranges = Arc::from([]);
         ui.chat_scroll.total_lines = 0;
         frame.render_widget(
             Paragraph::new("Loading messages…").style(ui.theme.muted_style()),
@@ -148,7 +148,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut AppState, ui: &mut UiState,
     }
 
     if app.messages.is_empty() {
-        ui.chat_scroll.message_ranges.clear();
+        ui.chat_scroll.message_ranges = Arc::from([]);
         let mut empty_lines = Vec::new();
         if let Some(banner) = build_history_banner_line(
             app.loading_older,
@@ -168,12 +168,13 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut AppState, ui: &mut UiState,
         ui.chat_scroll.total_lines = empty_lines.len();
         ui.chat_scroll.offset = 0;
         ui.pending_prepend_anchor = None;
+        ui.pending_append_anchor = None;
         render_scrolled_lines(frame, message_area, &empty_lines, 0, height, hitmap);
         return;
     }
 
     let cached = build_stream_cached(app, ui, message_area.width as usize);
-    ui.chat_scroll.message_ranges = cached.ranges.to_vec();
+    ui.chat_scroll.message_ranges = Arc::clone(&cached.ranges);
     if cached.lines.is_empty() {
         ui.chat_scroll.total_lines = 0;
         return;
@@ -181,11 +182,36 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut AppState, ui: &mut UiState,
 
     let height = message_area.height as usize;
     apply_prepend_anchor(ui, cached.lines.len(), height);
+    apply_append_anchor(ui, cached.lines.len(), height);
     ui.chat_scroll.total_lines = cached.lines.len();
     let offset = ui.chat_scroll.offset(height);
     ui.chat_scroll.offset = offset;
 
-    render_scrolled_lines(frame, message_area, &cached.lines, offset, height, hitmap);
+    let is_channel = app
+        .active_conversation()
+        .is_some_and(|c| c.kind == ConversationKind::Channel)
+        || app.active_channel().is_some();
+    let selection = ui.chat_scroll.selected_idx.and_then(|sel_idx| {
+        let range = *cached.ranges.get(sel_idx)?;
+        let msg = app.messages.get(sel_idx)?;
+        Some(VisibleSelection {
+            range,
+            scope: MessageScope::Chat,
+            msg_index: sel_idx,
+            show_thread_action: is_channel && msg.parent_msg_id.is_none(),
+            theme: &ui.theme,
+        })
+    });
+
+    render_scrolled_lines_with_selection(
+        frame,
+        message_area,
+        &cached.lines,
+        offset,
+        height,
+        selection,
+        hitmap,
+    );
 }
 
 pub(crate) fn apply_prepend_anchor(ui: &mut UiState, new_total_lines: usize, height: usize) {
@@ -195,6 +221,21 @@ pub(crate) fn apply_prepend_anchor(ui: &mut UiState, new_total_lines: usize, hei
             let delta = new_total_lines - old_total_lines;
             let new_max_off = new_total_lines.saturating_sub(height);
             let anchored_offset = old_offset.saturating_add(delta).min(new_max_off);
+            ui.chat_scroll.scroll_up = new_max_off
+                .saturating_sub(anchored_offset)
+                .min(u16::MAX as usize) as u16;
+        }
+    }
+}
+
+pub(crate) fn apply_append_anchor(ui: &mut UiState, new_total_lines: usize, height: usize) {
+    if let Some(old_offset) = ui.pending_append_anchor.take() {
+        if !ui.chat_scroll.follow_tail
+            && ui.chat_scroll.scroll_up > 0
+            && new_total_lines > height
+        {
+            let new_max_off = new_total_lines.saturating_sub(height);
+            let anchored_offset = old_offset.min(new_max_off);
             ui.chat_scroll.scroll_up = new_max_off
                 .saturating_sub(anchored_offset)
                 .min(u16::MAX as usize) as u16;
@@ -249,6 +290,14 @@ pub(crate) fn build_history_banner_line(
     ))
 }
 
+pub(crate) struct VisibleSelection<'a> {
+    pub range: (usize, usize),
+    pub scope: MessageScope,
+    pub msg_index: usize,
+    pub show_thread_action: bool,
+    pub theme: &'a Theme,
+}
+
 pub fn render_scrolled_lines(
     frame: &mut Frame,
     area: Rect,
@@ -257,24 +306,67 @@ pub fn render_scrolled_lines(
     height: usize,
     hitmap: &mut HitMap,
 ) {
+    render_scrolled_lines_with_selection(frame, area, lines, offset, height, None, hitmap);
+}
+
+pub(crate) fn render_scrolled_lines_with_selection(
+    frame: &mut Frame,
+    area: Rect,
+    lines: &[RenderedLine],
+    offset: usize,
+    height: usize,
+    selection: Option<VisibleSelection<'_>>,
+    hitmap: &mut HitMap,
+) {
     let end = offset.saturating_add(height).min(lines.len());
     let slice = lines.get(offset..end).unwrap_or(&[]);
-    let visible: Vec<Line> = slice.iter().map(|r| r.line.clone()).collect();
-    frame.render_widget(Paragraph::new(visible), area);
+    let width = area.width as usize;
 
+    let mut visible: Vec<Line> = Vec::with_capacity(slice.len());
     for (row, rendered) in slice.iter().enumerate() {
+        let global_idx = offset + row;
         let y = area.y + row as u16;
-        if let Some(target) = rendered.target {
-            hitmap.add_line(area.x, y, area.width, target);
-        }
-        for &(col_off, width, target) in &rendered.inline_targets {
-            let x = area.x.saturating_add(col_off);
-            if x < area.x + area.width {
-                let clamped = width.min((area.x + area.width).saturating_sub(x));
-                hitmap.add_line(x, y, clamped, target);
+        let is_selected = selection
+            .as_ref()
+            .is_some_and(|sel| global_idx >= sel.range.0 && global_idx < sel.range.1);
+        if is_selected {
+            let sel = selection.as_ref().unwrap();
+            let mut decorated = rendered.clone();
+            apply_selection_to_line(
+                &mut decorated,
+                global_idx == sel.range.0,
+                sel.scope,
+                sel.msg_index,
+                width,
+                sel.theme,
+                sel.show_thread_action,
+            );
+            visible.push(decorated.line);
+            if let Some(target) = decorated.target {
+                hitmap.add_line(area.x, y, area.width, target);
+            }
+            for &(col_off, w, target) in &decorated.inline_targets {
+                let x = area.x.saturating_add(col_off);
+                if x < area.x + area.width {
+                    let clamped = w.min((area.x + area.width).saturating_sub(x));
+                    hitmap.add_line(x, y, clamped, target);
+                }
+            }
+        } else {
+            visible.push(rendered.line.clone());
+            if let Some(target) = rendered.target {
+                hitmap.add_line(area.x, y, area.width, target);
+            }
+            for &(col_off, w, target) in &rendered.inline_targets {
+                let x = area.x.saturating_add(col_off);
+                if x < area.x + area.width {
+                    let clamped = w.min((area.x + area.width).saturating_sub(x));
+                    hitmap.add_line(x, y, clamped, target);
+                }
             }
         }
     }
+    frame.render_widget(Paragraph::new(visible), area);
 }
 
 pub fn pane_title(follow_tail: bool) -> &'static str {
@@ -592,9 +684,26 @@ pub(crate) fn hash_message_sig(h: &mut DualHasher, msg: &MessageItem) {
         h.write_str(&m.display_name);
     }
     h.write_hash(&msg.attachments.len());
-    h.write_hash(&msg.body_html.len());
-    h.write_hash(&msg.body_plain.len());
-    h.write_hash(&msg.subject.as_deref().map(str::len));
+    for att in &msg.attachments {
+        h.write_str(&att.id);
+        match &att.name {
+            Some(name) => {
+                h.write_hash(&1u8);
+                h.write_str(name);
+            }
+            None => h.write_hash(&0u8),
+        }
+        h.write_str(&att.content_type);
+    }
+    h.write_str(&msg.body_html);
+    h.write_str(&msg.body_plain);
+    match &msg.subject {
+        Some(subj) => {
+            h.write_hash(&1u8);
+            h.write_str(subj);
+        }
+        None => h.write_hash(&0u8),
+    }
     h.write_str(&msg.importance);
 }
 
@@ -611,7 +720,7 @@ fn compute_chat_lines_sig(
     width: usize,
     hyperlinks: bool,
     inline_images: bool,
-    image_cache_len: usize,
+    image_cache_gen: u64,
     loading_older: bool,
     oldest_reached: bool,
     history_error: Option<&str>,
@@ -626,7 +735,6 @@ fn compute_chat_lines_sig(
         None => h.write_hash(&0u8),
     }
     h.write_hash(&view.is_channel);
-    h.write_hash(&view.selected_index);
     h.write_hash(&density);
     match unread_anchor_ts {
         Some(ts) => {
@@ -646,7 +754,7 @@ fn compute_chat_lines_sig(
     h.write_hash(&width);
     h.write_hash(&hyperlinks);
     h.write_hash(&inline_images);
-    h.write_hash(&image_cache_len);
+    h.write_hash(&image_cache_gen);
     h.write_hash(&loading_older);
     h.write_hash(&oldest_reached);
     match history_error {
@@ -714,7 +822,8 @@ pub(crate) fn build_stream_cached(
 ) -> CachedStream {
     let hyperlinks = hyperlinks_enabled();
     let width = width.max(12);
-    let view = ChatRender::from_app(app, ui);
+    let mut view = ChatRender::from_app(app, ui);
+    view.selected_index = None;
     let active_unread_ts = match (&ui.unread_anchor, app.active_conv_key.as_deref()) {
         (Some((conv, ts)), Some(active)) if conv == active => Some(ts.as_str()),
         _ => None,
@@ -734,7 +843,7 @@ pub(crate) fn build_stream_cached(
             width,
             hyperlinks,
             ui.inline_images,
-            app.image_cache.len(),
+            app.image_cache_gen,
             app.loading_older,
             app.oldest_reached,
             app.history_error.as_deref(),
@@ -767,7 +876,8 @@ pub(crate) fn build_stream_cached(
         }
     }
 
-    let view = ChatRender::from_app(app, ui);
+    let mut view = ChatRender::from_app(app, ui);
+    view.selected_index = None;
     let my_display_name = app.my_profile.as_ref().map(|p| p.display_name.as_str());
     let mut out = Vec::new();
     if app.active_conv_key.is_some() {
@@ -1574,16 +1684,21 @@ fn render_message_body_and_attachments(
     msg: &MessageItem,
     bctx: &BodyBlockCtx<'_>,
 ) -> bool {
-    let mut blocks = parser::parse_message_blocks(&msg.body_html, &msg.attachments, &msg.mentions);
-    if blocks.is_empty() && !msg.body_plain.trim().is_empty() {
-        blocks.push(RichBlock::Paragraph(vec![RichSpan::plain(&msg.body_plain)]));
-    }
+    let parsed_blocks =
+        parser::parse_message_blocks_arc(&msg.body_html, &msg.attachments, &msg.mentions);
+    let fallback_blocks;
+    let blocks: &[RichBlock] = if parsed_blocks.is_empty() && !msg.body_plain.trim().is_empty() {
+        fallback_blocks = [RichBlock::Paragraph(vec![RichSpan::plain(&msg.body_plain)])];
+        &fallback_blocks
+    } else {
+        &parsed_blocks
+    };
 
     let mut emitted_attach_indices: Vec<usize> = Vec::new();
     let mut emitted_thumb_ids: Vec<String> = Vec::new();
     let mut ended_with_text = false;
 
-    for block in &blocks {
+    for block in blocks {
         match block {
             RichBlock::AttachmentChip { id, name } => {
                 ended_with_text = false;
@@ -1815,8 +1930,9 @@ fn line_display_width(line: &Line<'_>) -> usize {
         .sum()
 }
 
-pub(crate) fn apply_selection_to_lines(
-    slice: &mut [RenderedLine],
+pub(crate) fn apply_selection_to_line(
+    rendered: &mut RenderedLine,
+    is_first_line: bool,
     scope: MessageScope,
     msg_index: usize,
     width: usize,
@@ -1836,115 +1952,134 @@ pub(crate) fn apply_selection_to_lines(
         None => Style::default().add_modifier(Modifier::BOLD),
     };
 
-    for (line_idx, rendered) in slice.iter_mut().enumerate() {
-        // Replace leading 2-col gutter with `▎ `
-        let mut new_spans: Vec<Span<'static>> = Vec::with_capacity(rendered.line.spans.len() + 2);
-        let mut replaced_gutter = false;
-        for (si, span) in rendered.line.spans.drain(..).enumerate() {
-            if si == 0 && !replaced_gutter {
-                if let Some(rest) = span.content.strip_prefix("  ") {
-                    new_spans.push(Span::styled("▎ ", gutter_style));
-                    if !rest.is_empty() {
-                        new_spans.push(Span::styled(rest.to_string(), span.style));
-                    }
-                    replaced_gutter = true;
-                    continue;
+    // Replace leading 2-col gutter with `▎ `
+    let mut new_spans: Vec<Span<'static>> = Vec::with_capacity(rendered.line.spans.len() + 2);
+    let mut replaced_gutter = false;
+    for (si, span) in rendered.line.spans.drain(..).enumerate() {
+        if si == 0 && !replaced_gutter {
+            if let Some(rest) = span.content.strip_prefix("  ") {
+                new_spans.push(Span::styled("▎ ", gutter_style));
+                if !rest.is_empty() {
+                    new_spans.push(Span::styled(rest.to_string(), span.style));
                 }
-            }
-            new_spans.push(span);
-        }
-        if !replaced_gutter {
-            new_spans.insert(0, Span::styled("▎ ", gutter_style));
-        }
-
-        // Non-destructive bg_selected tint on all non-gutter spans without clobbering `.fg`
-        if let Some(bg) = sel_bg {
-            for span in new_spans.iter_mut().skip(1) {
-                if span.style.bg.is_none() || span.style.bg == Some(Color::Reset) {
-                    span.style = span.style.bg(bg);
-                }
+                replaced_gutter = true;
+                continue;
             }
         }
+        new_spans.push(span);
+    }
+    if !replaced_gutter {
+        new_spans.insert(0, Span::styled("▎ ", gutter_style));
+    }
 
-        rendered.line = Line::from(new_spans);
-        let cur_w = line_display_width(&rendered.line);
+    // Non-destructive bg_selected tint on all non-gutter spans without clobbering `.fg`
+    if let Some(bg) = sel_bg {
+        for span in new_spans.iter_mut().skip(1) {
+            if span.style.bg.is_none() || span.style.bg == Some(Color::Reset) {
+                span.style = span.style.bg(bg);
+            }
+        }
+    }
 
-        let pad_style = match sel_bg {
-            Some(bg) => Style::default().bg(bg),
-            None => Style::default(),
+    rendered.line = Line::from(new_spans);
+    let cur_w = line_display_width(&rendered.line);
+
+    let pad_style = match sel_bg {
+        Some(bg) => Style::default().bg(bg),
+        None => Style::default(),
+    };
+
+    let mut added_chips = false;
+    if is_first_line {
+        let chips: &[(&str, InlineActionKind)] = if show_thread_action {
+            &[
+                ("r reply", InlineActionKind::Reply),
+                ("t thread", InlineActionKind::Thread),
+                ("+ react", InlineActionKind::React),
+            ]
+        } else {
+            &[
+                ("r reply", InlineActionKind::Reply),
+                ("+ react", InlineActionKind::React),
+            ]
         };
+        let sep = " · ";
+        let sep_w = UnicodeWidthStr::width(sep);
+        let chips_w: usize = chips
+            .iter()
+            .map(|(l, _)| UnicodeWidthStr::width(*l))
+            .sum::<usize>()
+            + sep_w * chips.len().saturating_sub(1);
 
-        let mut added_chips = false;
-        if line_idx == 0 {
-            let chips: &[(&str, InlineActionKind)] = if show_thread_action {
-                &[
-                    ("r reply", InlineActionKind::Reply),
-                    ("t thread", InlineActionKind::Thread),
-                    ("+ react", InlineActionKind::React),
-                ]
-            } else {
-                &[
-                    ("r reply", InlineActionKind::Reply),
-                    ("+ react", InlineActionKind::React),
-                ]
-            };
-            let sep = " · ";
-            let sep_w = UnicodeWidthStr::width(sep);
-            let chips_w: usize = chips
-                .iter()
-                .map(|(l, _)| UnicodeWidthStr::width(*l))
-                .sum::<usize>()
-                + sep_w * chips.len().saturating_sub(1);
-
-            if cur_w + 2 + chips_w <= width {
-                let trail = usize::from(cur_w + 2 + chips_w + 1 <= width);
-                let pad = width.saturating_sub(cur_w + chips_w + trail);
-                if pad > 0 {
-                    rendered
-                        .line
-                        .spans
-                        .push(Span::styled(" ".repeat(pad), pad_style));
-                }
-                let chip_style = match sel_bg {
-                    Some(bg) => Style::default().fg(theme.accent).bg(bg),
-                    None => Style::default().add_modifier(Modifier::BOLD),
-                };
-                let sep_style = match sel_bg {
-                    Some(bg) => Style::default().fg(theme.fg_muted).bg(bg),
-                    None => theme.muted_style(),
-                };
-                let mut col = (cur_w + pad) as u16;
-                for (ci, &(label, action)) in chips.iter().enumerate() {
-                    if ci > 0 {
-                        rendered.line.spans.push(Span::styled(sep, sep_style));
-                        col += sep_w as u16;
-                    }
-                    let cw = UnicodeWidthStr::width(label) as u16;
-                    rendered.line.spans.push(Span::styled(label, chip_style));
-                    rendered.inline_targets.push((
-                        col,
-                        cw,
-                        HitTarget::InlineAction {
-                            scope,
-                            msg_index,
-                            action,
-                        },
-                    ));
-                    col += cw;
-                }
-                if trail > 0 {
-                    rendered.line.spans.push(Span::styled(" ", pad_style));
-                }
-                added_chips = true;
+        if cur_w + 2 + chips_w <= width {
+            let trail = usize::from(cur_w + 2 + chips_w + 1 <= width);
+            let pad = width.saturating_sub(cur_w + chips_w + trail);
+            if pad > 0 {
+                rendered
+                    .line
+                    .spans
+                    .push(Span::styled(" ".repeat(pad), pad_style));
             }
+            let chip_style = match sel_bg {
+                Some(bg) => Style::default().fg(theme.accent).bg(bg),
+                None => Style::default().add_modifier(Modifier::BOLD),
+            };
+            let sep_style = match sel_bg {
+                Some(bg) => Style::default().fg(theme.fg_muted).bg(bg),
+                None => theme.muted_style(),
+            };
+            let mut col = (cur_w + pad) as u16;
+            for (ci, &(label, action)) in chips.iter().enumerate() {
+                if ci > 0 {
+                    rendered.line.spans.push(Span::styled(sep, sep_style));
+                    col += sep_w as u16;
+                }
+                let cw = UnicodeWidthStr::width(label) as u16;
+                rendered.line.spans.push(Span::styled(label, chip_style));
+                rendered.inline_targets.push((
+                    col,
+                    cw,
+                    HitTarget::InlineAction {
+                        scope,
+                        msg_index,
+                        action,
+                    },
+                ));
+                col += cw;
+            }
+            if trail > 0 {
+                rendered.line.spans.push(Span::styled(" ", pad_style));
+            }
+            added_chips = true;
         }
+    }
 
-        if !added_chips && cur_w < width && sel_bg.is_some() {
-            rendered
-                .line
-                .spans
-                .push(Span::styled(" ".repeat(width - cur_w), pad_style));
-        }
+    if !added_chips && cur_w < width && sel_bg.is_some() {
+        rendered
+            .line
+            .spans
+            .push(Span::styled(" ".repeat(width - cur_w), pad_style));
+    }
+}
+
+pub(crate) fn apply_selection_to_lines(
+    slice: &mut [RenderedLine],
+    scope: MessageScope,
+    msg_index: usize,
+    width: usize,
+    theme: &Theme,
+    show_thread_action: bool,
+) {
+    for (line_idx, rendered) in slice.iter_mut().enumerate() {
+        apply_selection_to_line(
+            rendered,
+            line_idx == 0,
+            scope,
+            msg_index,
+            width,
+            theme,
+            show_thread_action,
+        );
     }
 }
 
@@ -2099,7 +2234,8 @@ fn render_rich_blocks_inner(
                 push_line(Line::from(top_spans));
 
                 for raw_line in code.lines() {
-                    let content = truncate(raw_line, body_w.saturating_sub(2));
+                    let expanded = raw_line.replace('\t', "    ");
+                    let content = truncate(&expanded, body_w.saturating_sub(2));
                     let content_w = UnicodeWidthStr::width(content.as_str());
                     let mut code_spans = Vec::new();
                     if !indent.is_empty() {
@@ -2382,6 +2518,20 @@ fn wrap_rich_spans(
                 }
                 lines.push(std::mem::take(&mut current));
                 used = 0;
+                continue;
+            }
+            if ch == '\t' {
+                for _ in 0..4 {
+                    if used + 1 > limit && (used > 0 || !buf.is_empty()) {
+                        if !buf.is_empty() {
+                            current.push(Span::styled(std::mem::take(&mut buf), style));
+                        }
+                        lines.push(std::mem::take(&mut current));
+                        used = 0;
+                    }
+                    buf.push(' ');
+                    used += 1;
+                }
                 continue;
             }
             let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
@@ -2786,7 +2936,8 @@ mod tests {
             None,
             &theme,
         );
-        assert_ne!(sig_base, sig_sel);
+        // Selection is applied at render time on the visible slice, so sig_base == sig_sel.
+        assert_eq!(sig_base, sig_sel);
 
         let sig_compact = compute_chat_lines_sig(
             Some("chan:t1:c1"),
@@ -2861,10 +3012,38 @@ mod tests {
         );
         assert_ne!(sig_base, sig_react);
 
-        cache.insert(sig_sel, cached_val.clone());
+        cache.insert(sig_compact, cached_val.clone());
         cache.insert(sig_width, cached_val);
         assert!(cache.get(sig_base).is_none());
         assert!(cache.get(sig_width).is_some());
+
+        // Changing body_plain or attachment names invalidates the message hash.
+        let orig_msg = msgs[0].clone();
+        msgs[0].body_plain.push('!');
+        let sig_body = compute_chat_lines_sig(
+            Some("chan:t1:c1"),
+            &ChatRender {
+                messages: &msgs,
+                is_channel: true,
+                selected_index: None,
+            },
+            DensityMode::Cozy,
+            None,
+            "",
+            None,
+            None,
+            None,
+            80,
+            false,
+            true,
+            0,
+            false,
+            false,
+            None,
+            &theme,
+        );
+        assert_ne!(sig_base, sig_body);
+        msgs[0] = orig_msg;
     }
 
     #[test]

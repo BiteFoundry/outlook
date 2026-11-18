@@ -331,6 +331,10 @@ impl SyncCursor {
     }
 }
 
+/// Sentinel summary emitted via `CoreEvent::SyncStateChanged { busy: false, summary }`
+/// while background polling is silently retrying transient errors.
+pub const POLL_RETRY_SUMMARY: &str = "__poll_retrying__";
+
 /// Asynchronous events pushed from `SyncEngine` to TUI or live subscribers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CoreEvent {

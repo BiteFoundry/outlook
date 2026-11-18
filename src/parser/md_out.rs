@@ -52,7 +52,11 @@ pub fn compile_outgoing_markdown(
 }
 
 fn render_markdown_to_html(markdown: &str, mentions: &[MentionInfo]) -> String {
-    let normalized = markdown.replace("\r\n", "\n");
+    let normalized: std::borrow::Cow<'_, str> = if markdown.contains('\r') {
+        std::borrow::Cow::Owned(markdown.replace("\r\n", "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(markdown)
+    };
     let lines: Vec<&str> = normalized.split('\n').collect();
     let mut blocks: Vec<String> = Vec::new();
     let mut i = 0;
@@ -134,19 +138,28 @@ fn render_markdown_to_html(markdown: &str, mentions: &[MentionInfo]) -> String {
 fn render_inline(input: &str, mentions: &[&MentionInfo]) -> String {
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
+    let mut no_closing_backtick = false;
+    let mut no_closing_bracket = false;
+    let mut no_closing_double_star = false;
+    let mut no_closing_tilde = false;
+    let mut no_closing_star = false;
 
     while i < input.len() {
         let rest = &input[i..];
 
         // Inline code: `...`
-        if let Some(after_tick) = rest.strip_prefix('`') {
-            if let Some(end_idx) = after_tick.find('`') {
-                let code = &after_tick[..end_idx];
-                out.push_str("<code>");
-                out.push_str(&escape_html(code));
-                out.push_str("</code>");
-                i += 1 + end_idx + 1;
-                continue;
+        if !no_closing_backtick {
+            if let Some(after_tick) = rest.strip_prefix('`') {
+                if let Some(end_idx) = after_tick.find('`') {
+                    let code = &after_tick[..end_idx];
+                    out.push_str("<code>");
+                    out.push_str(&escape_html(code));
+                    out.push_str("</code>");
+                    i += 1 + end_idx + 1;
+                    continue;
+                } else {
+                    no_closing_backtick = true;
+                }
             }
         }
 
@@ -168,58 +181,82 @@ fn render_inline(input: &str, mentions: &[&MentionInfo]) -> String {
         }
 
         // Markdown link: [label](url)
-        if rest.starts_with('[') {
-            if let Some((label, url, consumed)) = parse_markdown_link(rest) {
-                if is_safe_url(url) {
-                    out.push_str(&format!(
-                        "<a href=\"{}\">{}</a>",
-                        escape_html_attr(url),
-                        render_inline(label, mentions)
-                    ));
-                    i += consumed;
-                    continue;
+        if !no_closing_bracket && rest.starts_with('[') {
+            match parse_markdown_link(rest) {
+                Some((label, url, consumed)) => {
+                    if is_safe_url(url) {
+                        out.push_str(&format!(
+                            "<a href=\"{}\">{}</a>",
+                            escape_html_attr(url),
+                            render_inline(label, mentions)
+                        ));
+                        i += consumed;
+                        continue;
+                    }
+                }
+                None => {
+                    no_closing_bracket = true;
                 }
             }
         }
 
         // Bold: **...**
-        if let Some(after_stars) = rest.strip_prefix("**") {
-            if let Some(end_idx) = after_stars.find("**") {
-                if end_idx > 0 {
-                    let inner = &after_stars[..end_idx];
-                    out.push_str("<strong>");
-                    out.push_str(&render_inline(inner, mentions));
-                    out.push_str("</strong>");
-                    i += 2 + end_idx + 2;
-                    continue;
+        if !no_closing_double_star {
+            if let Some(after_stars) = rest.strip_prefix("**") {
+                match after_stars.find("**") {
+                    Some(end_idx) => {
+                        if end_idx > 0 {
+                            let inner = &after_stars[..end_idx];
+                            out.push_str("<strong>");
+                            out.push_str(&render_inline(inner, mentions));
+                            out.push_str("</strong>");
+                            i += 2 + end_idx + 2;
+                            continue;
+                        }
+                    }
+                    None => {
+                        no_closing_double_star = true;
+                    }
                 }
             }
         }
 
         // Strikethrough: ~~...~~
-        if let Some(after_tilde) = rest.strip_prefix("~~") {
-            if let Some(end_idx) = after_tilde.find("~~") {
-                if end_idx > 0 {
-                    let inner = &after_tilde[..end_idx];
-                    out.push_str("<s>");
-                    out.push_str(&render_inline(inner, mentions));
-                    out.push_str("</s>");
-                    i += 2 + end_idx + 2;
-                    continue;
+        if !no_closing_tilde {
+            if let Some(after_tilde) = rest.strip_prefix("~~") {
+                match after_tilde.find("~~") {
+                    Some(end_idx) => {
+                        if end_idx > 0 {
+                            let inner = &after_tilde[..end_idx];
+                            out.push_str("<s>");
+                            out.push_str(&render_inline(inner, mentions));
+                            out.push_str("</s>");
+                            i += 2 + end_idx + 2;
+                            continue;
+                        }
+                    }
+                    None => {
+                        no_closing_tilde = true;
+                    }
                 }
             }
         }
 
         // Italic: *...* (single asterisk, not **)
-        if rest.starts_with('*') && !rest.starts_with("**") {
-            if let Some(end_idx) = find_closing_single_asterisk(&rest[1..]) {
-                if end_idx > 0 {
-                    let inner = &rest[1..1 + end_idx];
-                    out.push_str("<em>");
-                    out.push_str(&render_inline(inner, mentions));
-                    out.push_str("</em>");
-                    i += 1 + end_idx + 1;
-                    continue;
+        if !no_closing_star && rest.starts_with('*') && !rest.starts_with("**") {
+            match find_closing_single_asterisk(&rest[1..]) {
+                Some(end_idx) => {
+                    if end_idx > 0 {
+                        let inner = &rest[1..1 + end_idx];
+                        out.push_str("<em>");
+                        out.push_str(&render_inline(inner, mentions));
+                        out.push_str("</em>");
+                        i += 1 + end_idx + 1;
+                        continue;
+                    }
+                }
+                None => {
+                    no_closing_star = true;
                 }
             }
         }
@@ -310,4 +347,25 @@ pub fn escape_html(input: &str) -> String {
 
 pub fn escape_html_attr(input: &str) -> String {
     escape_html(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_render_inline_linear_on_unmatched_delimiters_and_unsafe_links() {
+        let many_ticks = "` ".repeat(2000);
+        let many_stars = "* ".repeat(2000);
+        let many_double = "** ".repeat(2000);
+        let many_tilde = "~~ ".repeat(2000);
+        let many_brackets = "[ ".repeat(2000);
+
+        let payload = format!(
+            "{many_ticks}\n\n{many_stars}\n\n{many_double}\n\n{many_tilde}\n\n{many_brackets}\n\n[bad](javascript:alert(1)) [ok](https://example.com)"
+        );
+        let html = render_markdown_to_html(&payload, &[]);
+        assert!(html.contains("<a href=\"https://example.com\">ok</a>"));
+        assert!(!html.contains("<a href=\"javascript:"));
+    }
 }

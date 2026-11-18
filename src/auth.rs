@@ -39,8 +39,11 @@ static EXPIRY_SOON_WARNED: AtomicBool = AtomicBool::new(false);
 /// Emits the external refresh-command fallback warning at most once per process.
 static REFRESH_CMD_WARNED: AtomicBool = AtomicBool::new(false);
 const EXTERNAL_REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
+const REFRESH_CMD_FAILURE_COOLDOWN: Duration = Duration::from_secs(15);
+#[cfg(target_os = "windows")]
+const WINDOWS_CRED_MAX_BYTES: usize = 2500;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredTokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
@@ -52,6 +55,25 @@ pub struct StoredTokens {
     pub user_display_name: Option<String>,
     pub user_email: Option<String>,
     pub auth_mode: String,
+}
+
+impl std::fmt::Debug for StoredTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredTokens")
+            .field("access_token", &"[REDACTED]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("expires_at", &self.expires_at)
+            .field("client_id", &self.client_id)
+            .field("tenant_id", &self.tenant_id)
+            .field("user_id", &self.user_id)
+            .field("user_display_name", &self.user_display_name)
+            .field("user_email", &self.user_email)
+            .field("auth_mode", &self.auth_mode)
+            .finish()
+    }
 }
 
 impl StoredTokens {
@@ -71,12 +93,25 @@ pub struct LoginOptions {
     pub port: Option<u16>,
 }
 
+#[derive(Clone, Default)]
+struct ExternalTokenCache {
+    env_token: Option<(String, StoredTokens)>,
+    file_token: Option<(
+        std::path::PathBuf,
+        Option<std::time::SystemTime>,
+        u64,
+        StoredTokens,
+    )>,
+}
+
 #[derive(Clone)]
 pub struct AuthManager {
     config: AppConfig,
     http: reqwest::Client,
     tokens: Arc<RwLock<Option<StoredTokens>>>,
     refresh_mutex: Arc<tokio::sync::Mutex<()>>,
+    external_cache: Arc<std::sync::Mutex<Option<ExternalTokenCache>>>,
+    refresh_cmd_cooldown_until: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     #[cfg(test)]
     token_path_override: Option<std::path::PathBuf>,
 }
@@ -94,6 +129,8 @@ impl AuthManager {
             http,
             tokens: Arc::new(RwLock::new(loaded)),
             refresh_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            external_cache: Arc::new(std::sync::Mutex::new(None)),
+            refresh_cmd_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             token_path_override: None,
         })
@@ -106,6 +143,8 @@ impl AuthManager {
             http,
             tokens: Arc::new(RwLock::new(Some(tokens))),
             refresh_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            external_cache: Arc::new(std::sync::Mutex::new(None)),
+            refresh_cmd_cooldown_until: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             token_path_override: None,
         }
@@ -137,6 +176,10 @@ impl AuthManager {
         &self.config
     }
 
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.http
+    }
+
     fn has_refresh_cmd(&self) -> bool {
         !self.config.token_refresh_cmd.trim().is_empty()
     }
@@ -145,13 +188,84 @@ impl AuthManager {
         (self.config.token_refresh_mins.min(1440) * 60) as i64
     }
 
+    fn cached_env_access_token(&self) -> Option<StoredTokens> {
+        let Ok(raw) = std::env::var("TEAMS_ACCESS_TOKEN") else {
+            if let Ok(mut guard) = self.external_cache.lock() {
+                if let Some(ref mut cache) = *guard {
+                    cache.env_token = None;
+                }
+            }
+            return None;
+        };
+        if let Ok(guard) = self.external_cache.lock() {
+            if let Some(ref cache) = *guard {
+                if let Some((ref cached_raw, ref cached_tok)) = cache.env_token {
+                    if *cached_raw == raw {
+                        return Some(cached_tok.clone());
+                    }
+                }
+            }
+        }
+        let parsed = env_access_token_from_str(&raw, &self.config);
+        if let Ok(mut guard) = self.external_cache.lock() {
+            let cache = guard.get_or_insert_with(ExternalTokenCache::default);
+            cache.env_token = parsed.as_ref().map(|tok| (raw, tok.clone()));
+        }
+        parsed
+    }
+
+    fn cached_external_token_file(&self, path: &Path) -> Result<StoredTokens> {
+        let meta = std::fs::metadata(path)
+            .with_context(|| format!("Failed to read external token file: {}", path.display()))?;
+        let modified = meta.modified().ok();
+        let len = meta.len();
+
+        if modified.is_some() {
+            if let Ok(guard) = self.external_cache.lock() {
+                if let Some(ref cache) = *guard {
+                    if let Some((ref p, m, l, ref tok)) = cache.file_token {
+                        if p == path && m == modified && l == len {
+                            return Ok(tok.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        match read_external_token_file(path, &self.config) {
+            Ok(tok) => {
+                if let Ok(mut guard) = self.external_cache.lock() {
+                    let cache = guard.get_or_insert_with(ExternalTokenCache::default);
+                    cache.file_token = Some((path.to_path_buf(), modified, len, tok.clone()));
+                }
+                Ok(tok)
+            }
+            Err(err) => {
+                if let Ok(mut guard) = self.external_cache.lock() {
+                    if let Some(ref mut cache) = *guard {
+                        cache.file_token = None;
+                    }
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn invalidate_file_token_cache(&self) {
+        if let Ok(mut guard) = self.external_cache.lock() {
+            if let Some(ref mut cache) = *guard {
+                cache.file_token = None;
+            }
+        }
+    }
+
     async fn resolve_current_tokens_raw(&self) -> Option<StoredTokens> {
         let mem_tok = self.tokens.read().await.clone();
-        let env_tok = env_access_token(&self.config);
+        let env_tok = self.cached_env_access_token();
         let file_tok = self
             .config
             .resolved_token_file()
-            .and_then(|path| read_external_token_file(&path, &self.config).ok());
+            .and_then(|path| self.cached_external_token_file(&path).ok());
 
         if let Some(ref mem) = mem_tok {
             if mem.auth_mode == "refresh_cmd" {
@@ -191,7 +305,7 @@ impl AuthManager {
             return Some(tok);
         }
         if self.has_refresh_cmd() {
-            return self.run_external_refresh_cmd(None).await.ok();
+            return self.run_external_refresh_cmd(None, true).await.ok();
         }
         None
     }
@@ -212,7 +326,7 @@ impl AuthManager {
                     if !tok.is_expired_soon(skew_secs) {
                         return Ok(tok.access_token);
                     }
-                    let refreshed = self.run_external_refresh_cmd(Some(&tok)).await?;
+                    let refreshed = self.run_external_refresh_cmd(Some(&tok), true).await?;
                     return Ok(refreshed.access_token);
                 }
 
@@ -236,7 +350,7 @@ impl AuthManager {
                 return Ok(tok.access_token);
             }
             if has_refresh_cmd {
-                let refreshed = self.run_external_refresh_cmd(Some(&tok)).await?;
+                let refreshed = self.run_external_refresh_cmd(Some(&tok), true).await?;
                 return Ok(refreshed.access_token);
             }
             if let Some(reloaded) = self
@@ -248,19 +362,19 @@ impl AuthManager {
                 }
             }
             if self.can_refresh_token(&tok) {
-                let refreshed = self.refresh_now().await?;
+                let refreshed = self.refresh_oauth_serialized(None, Some(90)).await?;
                 return Ok(refreshed.access_token);
             }
             return Ok(tok.access_token);
         }
 
         if has_refresh_cmd {
-            let refreshed = self.run_external_refresh_cmd(None).await?;
+            let refreshed = self.run_external_refresh_cmd(None, true).await?;
             return Ok(refreshed.access_token);
         }
 
         if let Some(token_path) = self.config.resolved_token_file() {
-            let tok = read_external_token_file(&token_path, &self.config)?;
+            let tok = self.cached_external_token_file(&token_path)?;
             if tok.is_expired_soon(0) {
                 bail!(
                     "Token expired (exp: {}, auth_mode={}) — refresh your token and retry. (Auto-refresh supported via TEAMS_TOKEN_FILE + TEAMS_TOKEN_REFRESH_CMD)",
@@ -300,7 +414,7 @@ impl AuthManager {
         if self.has_refresh_cmd() {
             return true;
         }
-        if env_access_token(&self.config).is_some() || self.config.resolved_token_file().is_some() {
+        if self.cached_env_access_token().is_some() || self.config.resolved_token_file().is_some() {
             return false;
         }
         let guard = self.tokens.read().await;
@@ -412,16 +526,15 @@ impl AuthManager {
     pub async fn refresh_now(&self) -> Result<StoredTokens> {
         if self.has_refresh_cmd() {
             let current = self.resolve_current_tokens_raw().await;
-            return self.run_external_refresh_cmd(current.as_ref()).await;
+            return self.run_external_refresh_cmd(current.as_ref(), true).await;
         }
-        if env_access_token(&self.config).is_some() {
+        if self.cached_env_access_token().is_some() {
             bail!("TEAMS_ACCESS_TOKEN environment variable token cannot be auto-refreshed (TEAMS_TOKEN_REFRESH_CMD is not set).");
         }
         if let Some(path) = self.config.resolved_token_file() {
-            return read_external_token_file(&path, &self.config);
+            return self.cached_external_token_file(&path);
         }
-        let mut guard = self.tokens.write().await;
-        self.refresh_locked(&mut guard).await
+        self.refresh_oauth_serialized(None, None).await
     }
 
     /// Refreshes or hot-reloads the token only if it still matches `failed_access_token` (prevents thundering herd on 401).
@@ -436,41 +549,30 @@ impl AuthManager {
                     return Ok(cur.clone());
                 }
             }
-            let refreshed = self.run_external_refresh_cmd(current.as_ref()).await?;
+            let refreshed = self.run_external_refresh_cmd(current.as_ref(), false).await?;
             if refreshed.access_token == failed_access_token {
                 bail!("External token refresh returned the same rejected token.");
             }
             return Ok(refreshed);
         }
-        if env_access_token(&self.config).is_some() {
+        if self.cached_env_access_token().is_some() {
             bail!("TEAMS_ACCESS_TOKEN environment variable token cannot be auto-refreshed.");
         }
         if let Some(path) = self.config.resolved_token_file() {
-            if let Ok(disk_tok) = read_external_token_file(&path, &self.config) {
+            if let Ok(disk_tok) = self.cached_external_token_file(&path) {
                 if disk_tok.access_token != failed_access_token && !disk_tok.is_expired_soon(0) {
                     return Ok(disk_tok);
                 }
             }
             bail!("External token file is expired or was rejected. Refresh your token or set TEAMS_TOKEN_REFRESH_CMD.");
         }
-        let mut guard = self.tokens.write().await;
-        if let Some(current) = guard.as_ref() {
-            if current.access_token != failed_access_token && !current.is_expired_soon(30) {
-                return Ok(current.clone());
-            }
-        }
-        if let Ok(Some(disk_tok)) = self.load_from_configured_source() {
-            if disk_tok.access_token != failed_access_token && !disk_tok.is_expired_soon(10) {
-                *guard = Some(disk_tok.clone());
-                return Ok(disk_tok);
-            }
-        }
-        self.refresh_locked(&mut guard).await
+        self.refresh_oauth_serialized(Some(failed_access_token), None).await
     }
 
     async fn run_external_refresh_cmd(
         &self,
         current: Option<&StoredTokens>,
+        allow_cooldown: bool,
     ) -> Result<StoredTokens> {
         let _lock = self.refresh_mutex.lock().await;
         let skew_secs = self.external_refresh_skew_secs();
@@ -479,7 +581,7 @@ impl AuthManager {
 
         // Double-check if another concurrent task/process already refreshed `token_file`.
         if let Some(ref path) = token_file {
-            if let Ok(reloaded) = read_external_token_file(path, &self.config) {
+            if let Ok(reloaded) = self.cached_external_token_file(path) {
                 if !reloaded.is_expired_soon(skew_secs.min(60))
                     && Some(reloaded.access_token.as_str()) != old_token
                 {
@@ -495,14 +597,29 @@ impl AuthManager {
             }
         }
 
+        if allow_cooldown {
+            if let Some(cur) = current {
+                if !cur.is_expired_soon(0) {
+                    if let Ok(guard) = self.refresh_cmd_cooldown_until.lock() {
+                        if let Some(until) = *guard {
+                            if std::time::Instant::now() < until {
+                                return Ok(cur.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let cmd_str = self.config.token_refresh_cmd.trim();
         let exec_res = execute_external_refresh_shell(cmd_str, token_file.as_deref()).await;
 
         match exec_res {
             Ok(stdout) => {
+                self.invalidate_file_token_cache();
                 let parsed = if let Some(ref path) = token_file {
                     if path.exists() {
-                        match read_external_token_file(path, &self.config) {
+                        match self.cached_external_token_file(path) {
                             Ok(file_tok)
                                 if Some(file_tok.access_token.as_str()) != old_token
                                     || stdout.trim().is_empty() =>
@@ -553,7 +670,11 @@ impl AuthManager {
                 let new_tok = match parsed {
                     Ok(t) => t,
                     Err(err) => {
-                        return fallback_or_bail_refresh_error(current, &err.to_string());
+                        let res = fallback_or_bail_refresh_error(current, &err.to_string());
+                        if res.is_ok() {
+                            self.record_refresh_cmd_cooldown();
+                        }
+                        return res;
                     }
                 };
 
@@ -563,16 +684,62 @@ impl AuthManager {
                         format_local_exp(new_tok.expires_at)
                     );
                 }
+                self.clear_refresh_cmd_cooldown();
                 Ok(new_tok)
             }
-            Err(err) => fallback_or_bail_refresh_error(current, &err.to_string()),
+            Err(err) => {
+                let res = fallback_or_bail_refresh_error(current, &err.to_string());
+                if res.is_ok() {
+                    self.record_refresh_cmd_cooldown();
+                }
+                res
+            }
         }
     }
 
-    async fn refresh_locked(&self, guard: &mut Option<StoredTokens>) -> Result<StoredTokens> {
-        let current = guard
-            .as_ref()
-            .cloned()
+    fn record_refresh_cmd_cooldown(&self) {
+        if let Ok(mut guard) = self.refresh_cmd_cooldown_until.lock() {
+            *guard = Some(std::time::Instant::now() + REFRESH_CMD_FAILURE_COOLDOWN);
+        }
+    }
+
+    fn clear_refresh_cmd_cooldown(&self) {
+        if let Ok(mut guard) = self.refresh_cmd_cooldown_until.lock() {
+            *guard = None;
+        }
+    }
+
+    /// Serializes OAuth refreshes via `refresh_mutex` and releases `self.tokens` across the network call.
+    async fn refresh_oauth_serialized(
+        &self,
+        expected_failed_token: Option<&str>,
+        min_valid_skew_secs: Option<i64>,
+    ) -> Result<StoredTokens> {
+        let _refresh_guard = self.refresh_mutex.lock().await;
+
+        let current_opt = { self.tokens.read().await.clone() };
+        if let Some(failed_tok) = expected_failed_token {
+            if let Some(ref cur) = current_opt {
+                if cur.access_token != failed_tok && !cur.is_expired_soon(30) {
+                    return Ok(cur.clone());
+                }
+            }
+            if let Ok(Some(disk_tok)) = self.load_from_configured_source() {
+                if disk_tok.access_token != failed_tok && !disk_tok.is_expired_soon(10) {
+                    let mut guard = self.tokens.write().await;
+                    *guard = Some(disk_tok.clone());
+                    return Ok(disk_tok);
+                }
+            }
+        } else if let Some(skew_secs) = min_valid_skew_secs {
+            if let Some(ref cur) = current_opt {
+                if !cur.is_expired_soon(skew_secs) {
+                    return Ok(cur.clone());
+                }
+            }
+        }
+
+        let current = current_opt
             .ok_or_else(|| anyhow!("No stored token found. Run 'teams login' first."))?;
 
         let token_url = self.token_endpoint(&current.tenant_id);
@@ -607,18 +774,20 @@ impl AuthManager {
         };
 
         let expires_in = token_resp.expires_in.unwrap_or(3600).max(60);
+        let claims = parse_jwt_claims(&token_resp.access_token).unwrap_or_default();
         let updated = StoredTokens {
             access_token: token_resp.access_token,
             refresh_token: token_resp.refresh_token.or(current.refresh_token),
             expires_at: chrono::Utc::now().timestamp() + expires_in,
             client_id: current.client_id,
             tenant_id: current.tenant_id,
-            user_id: current.user_id,
-            user_display_name: current.user_display_name,
-            user_email: current.user_email,
+            user_id: current.user_id.or(claims.user_id),
+            user_display_name: current.user_display_name.or(claims.user_display_name),
+            user_email: current.user_email.or(claims.user_email),
             auth_mode: current.auth_mode,
         };
 
+        let mut guard = self.tokens.write().await;
         self.persist_tokens(&updated)?;
         *guard = Some(updated.clone());
         Ok(updated)
@@ -723,15 +892,16 @@ impl AuthManager {
                 let tok: TokenResponse =
                     serde_json::from_str(&poll_text).context("Failed to parse token response")?;
                 let expires_in = tok.expires_in.unwrap_or(3600).max(60);
+                let claims = parse_jwt_claims(&tok.access_token).unwrap_or_default();
                 return Ok(StoredTokens {
                     access_token: tok.access_token,
                     refresh_token: tok.refresh_token,
                     expires_at: chrono::Utc::now().timestamp() + expires_in,
                     client_id: client_id.to_string(),
                     tenant_id: tenant_id.to_string(),
-                    user_id: None,
-                    user_display_name: None,
-                    user_email: None,
+                    user_id: claims.user_id,
+                    user_display_name: claims.user_display_name,
+                    user_email: claims.user_email,
                     auth_mode: "device_code".to_string(),
                 });
             }
@@ -819,6 +989,7 @@ impl AuthManager {
         ];
         let tok = self.post_token_form(&token_url, &params).await?;
         let expires_in = tok.expires_in.unwrap_or(3600).max(60);
+        let claims = parse_jwt_claims(&tok.access_token).unwrap_or_default();
 
         Ok(StoredTokens {
             access_token: tok.access_token,
@@ -826,9 +997,9 @@ impl AuthManager {
             expires_at: chrono::Utc::now().timestamp() + expires_in,
             client_id: client_id.to_string(),
             tenant_id: tenant_id.to_string(),
-            user_id: None,
-            user_display_name: None,
-            user_email: None,
+            user_id: claims.user_id,
+            user_display_name: claims.user_display_name,
+            user_email: claims.user_email,
             auth_mode: "pkce".to_string(),
         })
     }
@@ -976,6 +1147,10 @@ pub fn save_stored_tokens(tokens: &StoredTokens) -> Result<()> {
     }
     #[cfg(not(target_os = "linux"))]
     {
+        #[cfg(target_os = "windows")]
+        if json.len() > WINDOWS_CRED_MAX_BYTES {
+            return save_tokens_to_path(tokens, &fallback);
+        }
         match keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
             Ok(entry) => {
                 if entry.set_password(&json).is_ok() {
@@ -1457,16 +1632,15 @@ fn parse_jwt_claims(token: &str) -> Option<JwtClaims> {
     })
 }
 
-fn stored_tokens_from_jwt(
-    raw_token: &str,
+fn stored_tokens_from_jwt_with_claims(
+    token: String,
+    claims: JwtClaims,
     refresh_token: Option<String>,
     expires_at_override: Option<i64>,
     fallback_client_id: &str,
     fallback_tenant_id: &str,
     auth_mode: &str,
 ) -> StoredTokens {
-    let token = strip_bearer_prefix(raw_token).to_string();
-    let claims = parse_jwt_claims(&token).unwrap_or_default();
     let expires_at = expires_at_override
         .or(claims.exp)
         .unwrap_or_else(|| chrono::Utc::now().timestamp() + 3600);
@@ -1485,6 +1659,27 @@ fn stored_tokens_from_jwt(
         user_email: claims.user_email,
         auth_mode: auth_mode.to_string(),
     }
+}
+
+fn stored_tokens_from_jwt(
+    raw_token: &str,
+    refresh_token: Option<String>,
+    expires_at_override: Option<i64>,
+    fallback_client_id: &str,
+    fallback_tenant_id: &str,
+    auth_mode: &str,
+) -> StoredTokens {
+    let token = strip_bearer_prefix(raw_token).to_string();
+    let claims = parse_jwt_claims(&token).unwrap_or_default();
+    stored_tokens_from_jwt_with_claims(
+        token,
+        claims,
+        refresh_token,
+        expires_at_override,
+        fallback_client_id,
+        fallback_tenant_id,
+        auth_mode,
+    )
 }
 
 fn json_non_empty_str(val: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -1559,19 +1754,21 @@ fn parse_external_token_str(
                 anyhow!("External token JSON is missing access_token/accessToken/token field: {source_label}")
             })?;
         let refresh_token = json_non_empty_str(&val, &["refresh_token", "refreshToken"]);
-        let claims_exp = parse_jwt_claims(&raw_token).and_then(|c| c.exp);
+        let token = strip_bearer_prefix(&raw_token).to_string();
+        let claims = parse_jwt_claims(&token).unwrap_or_default();
         let exp_override = ["expires_at", "expires_on", "expiresOn"]
             .iter()
             .find_map(|k| val.get(*k).and_then(parse_expiry_value))
-            .or(claims_exp)
+            .or(claims.exp)
             .or_else(|| {
                 val.get("expires_in")
                     .and_then(|v| v.as_i64())
                     .map(|secs| chrono::Utc::now().timestamp() + secs)
             });
 
-        let mut tok = stored_tokens_from_jwt(
-            &raw_token,
+        let mut tok = stored_tokens_from_jwt_with_claims(
+            token,
+            claims,
             refresh_token,
             exp_override,
             &config.client_id,
@@ -1709,16 +1906,29 @@ async fn accept_pkce_callback(listener: &TcpListener, expected_state: &str) -> R
         let (mut socket, _) = listener.accept().await.context("Failed to accept callback connection")?;
 
         let mut buf = Vec::with_capacity(4096);
-        let mut chunk = [0u8; 2048];
-        loop {
-            let n = socket.read(&mut chunk).await?;
-            if n == 0 {
-                break;
+        let read_res = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut chunk = [0u8; 2048];
+            loop {
+                let n = socket.read(&mut chunk).await?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() >= 16384 {
+                    break;
+                }
             }
-            buf.extend_from_slice(&chunk[..n]);
-            if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() >= 16384 {
-                break;
-            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+        if !matches!(read_res, Ok(Ok(()))) {
+            let _ = write_http_response(
+                &mut socket,
+                "408 Request Timeout",
+                "<h1>Request Timeout</h1>",
+            )
+            .await;
+            continue;
         }
 
         let req_text = String::from_utf8_lossy(&buf);
@@ -1768,7 +1978,7 @@ async fn accept_pkce_callback(listener: &TcpListener, expected_state: &str) -> R
                 "<!doctype html><html><body style=\"font-family:sans-serif;padding:2rem\"><h2>State mismatch</h2><p>Security verification (state) did not match.</p></body></html>",
             )
             .await;
-            bail!("OAuth state mismatch.");
+            continue;
         }
 
         let code = match params.get("code").filter(|s| !s.is_empty()) {
@@ -1780,7 +1990,7 @@ async fn accept_pkce_callback(listener: &TcpListener, expected_state: &str) -> R
                     "<!doctype html><html><body style=\"font-family:sans-serif;padding:2rem\"><h2>Missing code</h2><p>Authorization code is missing.</p></body></html>",
                 )
                 .await;
-                bail!("OAuth callback is missing authorization code.");
+                continue;
             }
         };
 
@@ -2665,5 +2875,127 @@ mod tests {
             explain_graph_permission_error("dns resolution failed", Some(&basic_jwt)),
             None
         );
+    }
+
+    #[test]
+    fn test_stored_tokens_debug_redacts_secrets() {
+        let tok = StoredTokens {
+            access_token: "super-secret-access-token".into(),
+            refresh_token: Some("super-secret-refresh-token".into()),
+            expires_at: 1_900_000_000,
+            client_id: "cid".into(),
+            tenant_id: "tid".into(),
+            user_id: Some("u1".into()),
+            user_display_name: Some("Alice".into()),
+            user_email: Some("alice@example.com".into()),
+            auth_mode: "pkce".into(),
+        };
+        let dbg = format!("{tok:?}");
+        assert!(!dbg.contains("super-secret-access-token"));
+        assert!(!dbg.contains("super-secret-refresh-token"));
+        assert!(dbg.contains("[REDACTED]"));
+        assert!(dbg.contains("Alice"));
+    }
+
+    #[tokio::test]
+    async fn test_external_token_file_mtime_len_cache_and_http_client() {
+        let dir = tempdir().unwrap();
+        let token_path = dir.path().join("ext_tok.json");
+        let now = chrono::Utc::now().timestamp();
+        let jwt1 = make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 3600, "oid": "u-1" }), false);
+        let jwt2 = make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 7200, "oid": "u-2-longer" }), false);
+
+        std::fs::write(&token_path, &jwt1).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.token_file = token_path.to_string_lossy().to_string();
+        let mgr = AuthManager::new(cfg).unwrap();
+        let _client = mgr.http_client();
+
+        let t1 = mgr.cached_external_token_file(&token_path).unwrap();
+        assert_eq!(t1.access_token, jwt1);
+        // Second call hits cache with identical (mtime, len)
+        let t1_cached = mgr.cached_external_token_file(&token_path).unwrap();
+        assert_eq!(t1_cached.access_token, jwt1);
+
+        // Changing file content (different len/mtime) invalidates cache
+        std::fs::write(&token_path, &jwt2).unwrap();
+        let t2 = mgr.cached_external_token_file(&token_path).unwrap();
+        assert_eq!(t2.access_token, jwt2);
+        assert_eq!(t2.user_id.as_deref(), Some("u-2-longer"));
+    }
+
+    #[tokio::test]
+    async fn test_token_refresh_cmd_cooldown_while_unexpired() {
+        let dir = tempdir().unwrap();
+        let token_path = dir.path().join("access_token");
+        let count_path = dir.path().join("fail_runs.log");
+        let now = chrono::Utc::now().timestamp();
+
+        let soon_jwt = make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 120 }), false);
+        std::fs::write(&token_path, &soon_jwt).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.token_file = token_path.to_string_lossy().to_string();
+        cfg.token_refresh_mins = 5;
+        #[cfg(windows)]
+        {
+            cfg.token_refresh_cmd = format!("echo hit>> \"{}\" && exit 1", count_path.display());
+        }
+        #[cfg(not(windows))]
+        {
+            cfg.token_refresh_cmd = format!("echo hit >> '{}' && exit 1", count_path.display());
+        }
+
+        let mgr = AuthManager::new(cfg).unwrap();
+        assert_eq!(mgr.valid_access_token().await.unwrap(), soon_jwt);
+        assert_eq!(mgr.valid_access_token().await.unwrap(), soon_jwt);
+        assert_eq!(mgr.valid_access_token().await.unwrap(), soon_jwt);
+
+        let runs = std::fs::read_to_string(&count_path).unwrap();
+        assert_eq!(
+            runs.lines().count(),
+            1,
+            "failing refresh_cmd while token is still valid must enter 15s cooldown"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_accept_pkce_callback_ignores_stray_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            accept_pkce_callback(&listener, "expected-state-123").await
+        });
+
+        let client = reqwest::Client::new();
+        // Stray request without state/code -> 400 Bad Request, listener keeps waiting
+        let stray1 = client
+            .get(format!("http://{addr}/?foo=bar"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stray1.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        // Stray request with mismatched state -> 400 Bad Request, listener keeps waiting
+        let stray2 = client
+            .get(format!("http://{addr}/callback?code=wrong&state=bad-state"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stray2.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        // Valid callback -> 200 OK and returns code
+        let ok_resp = client
+            .get(format!(
+                "http://{addr}/?code=valid-auth-code&state=expected-state-123"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok_resp.status(), reqwest::StatusCode::OK);
+
+        let code = server_task.await.unwrap().unwrap();
+        assert_eq!(code, "valid-auth-code");
     }
 }

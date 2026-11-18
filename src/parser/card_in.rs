@@ -6,10 +6,12 @@ use crate::models::{AttachmentInfo, RichBlock};
 
 pub const ADAPTIVE_CARD_CONTENT_TYPE: &str = "application/vnd.microsoft.card.adaptive";
 pub const CONNECTOR_CARD_CONTENT_TYPE: &str = "application/vnd.microsoft.teams.card.o365connector";
+const MAX_CARD_DEPTH: usize = 16;
 
 pub fn is_card_content_type(content_type: &str) -> bool {
-    let ct = content_type.trim().to_ascii_lowercase();
-    ct == ADAPTIVE_CARD_CONTENT_TYPE || ct == CONNECTOR_CARD_CONTENT_TYPE
+    let ct = content_type.trim();
+    ct.eq_ignore_ascii_case(ADAPTIVE_CARD_CONTENT_TYPE)
+        || ct.eq_ignore_ascii_case(CONNECTOR_CARD_CONTENT_TYPE)
 }
 
 pub fn parse_card_attachment(att: &AttachmentInfo) -> Option<RichBlock> {
@@ -59,6 +61,7 @@ fn parse_adaptive_card(obj: &serde_json::Map<String, Value>, fallback_name: Opti
                 &mut facts,
                 &mut body_lines,
                 &mut actions,
+                0,
             );
         }
     }
@@ -90,7 +93,11 @@ fn collect_adaptive_element(
     facts: &mut Vec<(String, String)>,
     body_lines: &mut Vec<String>,
     actions: &mut Vec<(String, String)>,
+    depth: usize,
 ) {
+    if depth >= MAX_CARD_DEPTH {
+        return;
+    }
     let Some(obj) = elem.as_object() else {
         return;
     };
@@ -146,7 +153,15 @@ fn collect_adaptive_element(
         "Container" => {
             if let Some(items) = obj.get("items").and_then(Value::as_array) {
                 for item in items {
-                    collect_adaptive_element(item, title, subtitle, facts, body_lines, actions);
+                    collect_adaptive_element(
+                        item,
+                        title,
+                        subtitle,
+                        facts,
+                        body_lines,
+                        actions,
+                        depth + 1,
+                    );
                 }
             }
         }
@@ -156,7 +171,13 @@ fn collect_adaptive_element(
                     if let Some(items) = col.get("items").and_then(Value::as_array) {
                         for item in items {
                             collect_adaptive_element(
-                                item, title, subtitle, facts, body_lines, actions,
+                                item,
+                                title,
+                                subtitle,
+                                facts,
+                                body_lines,
+                                actions,
+                                depth + 1,
                             );
                         }
                     }
@@ -197,7 +218,15 @@ fn collect_adaptive_element(
         _ => {
             if let Some(items) = obj.get("items").and_then(Value::as_array) {
                 for item in items {
-                    collect_adaptive_element(item, title, subtitle, facts, body_lines, actions);
+                    collect_adaptive_element(
+                        item,
+                        title,
+                        subtitle,
+                        facts,
+                        body_lines,
+                        actions,
+                        depth + 1,
+                    );
                 }
             }
         }
@@ -390,5 +419,41 @@ fn collect_connector_actions(arr: &[Value], actions: &mut Vec<(String, String)>)
             .map(str::trim)
             .unwrap_or("");
         actions.push((name.to_string(), uri.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_card_content_type_case_insensitive() {
+        assert!(is_card_content_type("Application/VND.Microsoft.Card.Adaptive"));
+        assert!(is_card_content_type("  application/vnd.microsoft.teams.card.o365connector "));
+        assert!(!is_card_content_type("reference"));
+    }
+
+    #[test]
+    fn test_collect_adaptive_element_respects_max_depth() {
+        let mut node = serde_json::json!({
+            "type": "TextBlock",
+            "text": "Too deep"
+        });
+        for _ in 0..(MAX_CARD_DEPTH + 4) {
+            node = serde_json::json!({
+                "type": "Container",
+                "items": [node]
+            });
+        }
+        let card = serde_json::json!({
+            "type": "AdaptiveCard",
+            "body": [node]
+        });
+        let parsed = parse_card_value(&card, Some("Depth Test")).unwrap();
+        if let RichBlock::Card { body_lines, .. } = parsed {
+            assert!(body_lines.is_empty());
+        } else {
+            panic!("expected RichBlock::Card");
+        }
     }
 }

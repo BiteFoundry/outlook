@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc};
 use clap::{Parser, Subcommand};
+use futures::stream::{self, StreamExt};
 use serde_json::json;
 
 use crate::{
@@ -877,20 +878,15 @@ async fn open_runtime(
 }
 
 fn db_path_in_dir(data_dir: &Path, user_id: Option<&str>) -> PathBuf {
-    let bucket = user_id
-        .filter(|id| !id.trim().is_empty())
-        .unwrap_or("default");
-    let sanitized: String = bucket
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    data_dir.join(sanitized).join("cache.db")
+    let default_path = config::db_path(user_id);
+    if let Ok(rel) = default_path.strip_prefix(config::data_dir()) {
+        return data_dir.join(rel);
+    }
+    let bucket = default_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .unwrap_or_else(|| std::ffi::OsStr::new("default"));
+    data_dir.join(bucket).join("cache.db")
 }
 
 fn extract_user_id_from_jwt(raw_token: &str) -> Option<String> {
@@ -1065,14 +1061,11 @@ pub(crate) fn open_storage_only(cfg: &AppConfig) -> Result<Storage> {
         return Storage::open(&path);
     }
 
-    // Fallback to OS keyring / AuthManager only when disk sources and single-DB lookup are ambiguous.
+    // Fallback to OS keyring only when disk sources and single-DB lookup are ambiguous.
     let uid = crate::auth::load_stored_tokens()
         .ok()
         .flatten()
-        .and_then(|t| t.user_id)
-        .or_else(|| {
-            AuthManager::new(cfg.clone()).ok().and_then(|_auth| None)
-        });
+        .and_then(|t| t.user_id);
     Storage::open(&config::db_path(uid.as_deref()))
 }
 
@@ -1865,7 +1858,7 @@ async fn cmd_channels(
     let teams = load_teams_with_refresh(&graph, &storage, refresh).await?;
     let team = resolve_team_from_slice(&teams, team_query)?;
 
-    let channels = if refresh {
+    let channels = if refresh && team.channels.is_empty() {
         graph.list_team_channels(&team.id, &team.display_name).await?
     } else {
         team.channels.clone()
@@ -2708,21 +2701,37 @@ async fn cmd_sync(
         }
     };
 
+    if !json_out && target.is_some() {
+        for conv in &targets {
+            println!("Syncing: {} ({}, target depth {})...", conv.title, conv.conv_key, depth);
+        }
+    }
+
     let mut total_messages = 0usize;
     let mut synced_convs = 0usize;
     let mut errors = Vec::new();
 
-    for conv in &targets {
-        if !json_out && target.is_some() {
-            println!("Syncing: {} ({}, target depth {})...", conv.title, conv.conv_key, depth);
-        }
-        match sync_conversation_depth(&storage, &graph, conv, depth).await {
+    let results: Vec<(String, Result<usize>)> = stream::iter(targets.iter())
+        .map(|conv| {
+            let storage = &storage;
+            let graph = &graph;
+            async move {
+                let res = sync_conversation_depth(storage, graph, conv, depth).await;
+                (conv.conv_key.clone(), res)
+            }
+        })
+        .buffer_unordered(6)
+        .collect()
+        .await;
+
+    for (conv_key, res) in results {
+        match res {
             Ok(count) => {
                 total_messages += count;
                 synced_convs += 1;
             }
             Err(err) => {
-                errors.push(format!("{}: {err:#}", conv.conv_key));
+                errors.push(format!("{conv_key}: {err:#}"));
             }
         }
     }
@@ -2789,20 +2798,42 @@ async fn cmd_export(
             ref channel_id,
         } = conv.target
         {
-            for msg in &messages {
-                if msg.reply_count > 0 {
-                    let replies = if offline {
-                        storage.list_thread_replies(&conv.conv_key, &msg.msg_id, limit)?
-                    } else {
-                        let r = graph
-                            .list_thread_replies(team_id, channel_id, &msg.msg_id, limit)
-                            .await
-                            .unwrap_or_default();
-                        let _ = storage.upsert_messages(&r);
-                        r
-                    };
+            let root_ids: Vec<&str> = messages
+                .iter()
+                .filter(|m| m.reply_count > 0)
+                .map(|m| m.msg_id.as_str())
+                .collect();
+
+            if offline {
+                for msg_id in root_ids {
+                    let replies = storage.list_thread_replies(&conv.conv_key, msg_id, limit)?;
                     if !replies.is_empty() {
-                        threads_by_root.insert(msg.msg_id.clone(), replies);
+                        threads_by_root.insert(msg_id.to_string(), replies);
+                    }
+                }
+            } else {
+                let fetched: Vec<(String, Vec<MessageItem>)> = stream::iter(root_ids)
+                    .map(|msg_id| {
+                        let graph = &graph;
+                        let storage = &storage;
+                        async move {
+                            let r = graph
+                                .list_thread_replies(team_id, channel_id, msg_id, limit)
+                                .await
+                                .unwrap_or_default();
+                            if !r.is_empty() {
+                                let _ = storage.upsert_messages(&r);
+                            }
+                            (msg_id.to_string(), r)
+                        }
+                    })
+                    .buffer_unordered(6)
+                    .collect()
+                    .await;
+
+                for (msg_id, replies) in fetched {
+                    if !replies.is_empty() {
+                        threads_by_root.insert(msg_id, replies);
                     }
                 }
             }

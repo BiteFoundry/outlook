@@ -225,6 +225,11 @@ impl ImagePreviewOverlay {
         let img_area = Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(1));
         let footer_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
 
+        let err_opt = self
+            .error
+            .as_deref()
+            .or_else(|| app.image_errors.get(&cache_key).map(String::as_str));
+
         if let Some(rendered) = cached {
             let x_pad = img_area.width.saturating_sub(rendered.cols) / 2;
             let y_pad = img_area.height.saturating_sub(rendered.rows) / 2;
@@ -235,7 +240,7 @@ impl ImagePreviewOverlay {
                 rendered.rows.min(img_area.height),
             );
             frame.render_widget(Paragraph::new(rendered.lines.clone()), target_rect);
-        } else if let Some(err) = &self.error {
+        } else if let Some(err) = err_opt {
             frame.render_widget(
                 Paragraph::new(Span::styled(
                     format!(" Failed to load/decode image: {err}"),

@@ -1,6 +1,6 @@
 [package]
 name = "teams-cli"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 description = "Microsoft Teams terminal client & AI agent toolkit (CLI, TUI, HTTP API, MCP)"
 license = "MIT"
@@ -19,19 +19,17 @@ arboard = { version = "3", features = ["image-data"] }
 axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 dirs = "5"
-futures = "0.3"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 hex = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 notify-rust = "4"
 open = "5"
 rand = "0.8"
 ratatui = "0.28"
-regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-rpassword = "7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "http2", "gzip"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 scraper = "0.20"
@@ -39,7 +37,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
-thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
@@ -58,6 +55,6 @@ keyring = { version = "3", features = ["apple-native"] }
 keyring = { version = "3", features = ["async-secret-service", "async-io", "crypto-rust"] }
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 strip = "symbols"

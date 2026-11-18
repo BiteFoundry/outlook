@@ -1,13 +1,14 @@
 openapi: 3.1.0
 info:
   title: teams HTTP JSON API
-  version: 0.6.0
+  version: 0.7.1
   description: |
     Local HTTP/JSON contract exposed by `teams serve` (alias `api`).
 
     Backed by Microsoft Graph v1.0, local SQLite WAL/FTS5 caching, and the
-    background sync engine. Binds to `127.0.0.1:8788` by default. When started
-    with `--token`, every endpoint except `GET /health` requires
+    background sync engine. Binds to `127.0.0.1:8788` by default (non-loopback
+    binds require `--token <SECRET>` or `TEAMS_ALLOW_INSECURE_SERVE=1`). When
+    started with `--token`, every endpoint except `GET /health` requires
     `Authorization: Bearer <token>`.
 
     All errors return `{"error": "<message>"}` with an appropriate HTTP status.
@@ -57,6 +58,14 @@ paths:
           schema:
             type: string
             enum: [oneOnOne, group, meeting, channel]
+        - name: limit
+          in: query
+          required: false
+          description: Optional maximum number of conversations to return (and chats to fetch when `refresh=true`).
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
       responses:
         "200":
           description: Conversation list
@@ -74,6 +83,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
   /chats:
@@ -103,6 +114,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
   /teams:
@@ -131,6 +144,8 @@ paths:
                       $ref: "#/components/schemas/TeamSummary"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
   /conversations/{key}/messages:
@@ -178,8 +193,12 @@ paths:
                     type: boolean
                   next_before:
                     type: [string, "null"]
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -204,6 +223,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -242,6 +263,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -280,6 +303,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -307,6 +332,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -335,8 +362,12 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /conversations/{key}/messages/{msg_id}/reactions:
     parameters:
       - $ref: "#/components/parameters/ConversationKey"
@@ -373,6 +404,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -401,6 +434,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -434,6 +469,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -459,6 +496,8 @@ paths:
                     type: string
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -488,6 +527,8 @@ paths:
                       $ref: "#/components/schemas/MemberInfo"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -561,6 +602,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
     post:
@@ -593,8 +636,23 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
+  /openapi.json:
+    get:
+      tags: [health]
+      summary: Runtime OpenAPI 3.0 specification JSON
+      responses:
+        "200":
+          description: OpenAPI 3.0.3 document
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 components:
   securitySchemes:
     bearerAuth:
@@ -633,6 +691,12 @@ components:
             $ref: "#/components/schemas/Error"
     Unauthorized:
       description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Insufficient Microsoft Graph permissions or missing token scopes
       content:
         application/json:
           schema:

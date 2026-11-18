@@ -150,19 +150,112 @@ pub async fn resolve_conversation(
     graph: &GraphClient,
     query: &str,
 ) -> Result<ConversationSummary> {
+    let q = query.trim();
+    if q.is_empty() {
+        bail!("Target conversation/channel name is empty.");
+    }
+
     let cached = storage.list_conversations()?;
-    if let Ok(found) = resolve_from_slice(&cached, query) {
+    if let Ok(found) = resolve_from_slice(&cached, q) {
         return Ok(found);
     }
-    let chats = graph.list_chats(150).await.unwrap_or_default();
-    storage.upsert_conversations(&chats)?;
-    let teams = graph
-        .list_joined_teams_with_channels()
-        .await
-        .unwrap_or_default();
-    storage.upsert_teams(&teams)?;
+
+    if q.starts_with("chat:") {
+        let chats = graph.list_chats(150).await?;
+        storage.upsert_conversations(&chats)?;
+        let refreshed = storage.list_conversations()?;
+        if let Ok(found) = resolve_from_slice(&refreshed, q) {
+            return Ok(found);
+        }
+        if let Some(target) = ConversationTarget::from_conv_key(q) {
+            return Ok(summary_from_target(target));
+        }
+        return resolve_from_slice(&refreshed, q);
+    }
+
+    if q.starts_with("chan:") {
+        let teams = graph.list_joined_teams_with_channels().await?;
+        storage.upsert_teams(&teams)?;
+        let refreshed = storage.list_conversations()?;
+        if let Ok(found) = resolve_from_slice(&refreshed, q) {
+            return Ok(found);
+        }
+        if let Some(target) = ConversationTarget::from_conv_key(q) {
+            return Ok(summary_from_target(target));
+        }
+        return resolve_from_slice(&refreshed, q);
+    }
+
+    let (chats_res, teams_res) = tokio::join!(
+        graph.list_chats(150),
+        graph.list_joined_teams_with_channels(),
+    );
+
+    let mut first_err: Option<anyhow::Error> = None;
+    let chats = match chats_res {
+        Ok(c) => {
+            storage.upsert_conversations(&c)?;
+            c
+        }
+        Err(err) => {
+            first_err = Some(err);
+            Vec::new()
+        }
+    };
+    let teams = match teams_res {
+        Ok(t) => {
+            storage.upsert_teams(&t)?;
+            t
+        }
+        Err(err) => {
+            if first_err.is_none() {
+                first_err = Some(err);
+            }
+            Vec::new()
+        }
+    };
+
     let refreshed = storage.list_conversations()?;
-    resolve_from_slice(&refreshed, query)
+    if (refreshed.is_empty() || chats.is_empty()) && teams.is_empty() {
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+    }
+
+    resolve_from_slice(&refreshed, q)
+}
+
+fn summary_from_target(target: ConversationTarget) -> ConversationSummary {
+    let conv_key = target.conv_key();
+    let (kind, team_id, title) = match &target {
+        ConversationTarget::Chat { chat_id } => (ConversationKind::Group, None, chat_id.clone()),
+        ConversationTarget::Channel {
+            team_id,
+            channel_id,
+        } => (
+            ConversationKind::Channel,
+            Some(team_id.clone()),
+            channel_id.clone(),
+        ),
+    };
+    ConversationSummary {
+        conv_key,
+        target,
+        kind,
+        team_id,
+        team_name: None,
+        title,
+        topic: None,
+        unread_count: 0,
+        last_read_at: None,
+        last_msg_id: None,
+        last_msg_author: None,
+        last_msg_preview: None,
+        last_updated_at: None,
+        pinned: false,
+        peer_user_id: None,
+        web_url: None,
+    }
 }
 
 fn format_candidates(candidates: &[&ConversationSummary]) -> String {
@@ -306,5 +399,165 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_conversation_domain_fast_path_and_error_preservation() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use axum::{http::StatusCode, routing::{get, post}, Json, Router};
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        use crate::{
+            auth::{AuthManager, StoredTokens},
+            config::AppConfig,
+        };
+
+        let chats_hits = Arc::new(AtomicUsize::new(0));
+        let teams_hits = Arc::new(AtomicUsize::new(0));
+        let fail_mode = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let ch_hits = chats_hits.clone();
+        let ch_fail = fail_mode.clone();
+        let tm_hits = teams_hits.clone();
+        let tm_fail = fail_mode.clone();
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/chats",
+                get(move || {
+                    let hits = ch_hits.clone();
+                    let fail = ch_fail.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        if fail.load(Ordering::SeqCst) {
+                            return (
+                                StatusCode::FORBIDDEN,
+                                Json(json!({"error": {"code": "Authorization_RequestDenied", "message": "Forbidden"}})),
+                            )
+                                .into_response();
+                        }
+                        Json(json!({
+                            "value": [{
+                                "id": "19:c1@thread.v2",
+                                "chatType": "group",
+                                "topic": "Ops Room",
+                                "members": []
+                            }]
+                        }))
+                        .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/joinedTeams",
+                get(move || {
+                    let hits = tm_hits.clone();
+                    let fail = tm_fail.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        if fail.load(Ordering::SeqCst) {
+                            return (
+                                StatusCode::FORBIDDEN,
+                                Json(json!({"error": {"code": "Authorization_RequestDenied", "message": "Forbidden"}})),
+                            )
+                                .into_response();
+                        }
+                        Json(json!({
+                            "value": [{
+                                "id": "t1",
+                                "displayName": "Engineering"
+                            }]
+                        }))
+                        .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/$batch",
+                post(|| async {
+                    Json(json!({
+                        "responses": [{
+                            "id": "0",
+                            "status": 200,
+                            "body": {
+                                "value": [{
+                                    "id": "19:ch1@thread.tacv2",
+                                    "displayName": "General",
+                                    "membershipType": "standard"
+                                }]
+                            }
+                        }]
+                    }))
+                }),
+            );
+
+        use axum::response::IntoResponse;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
+        let tokens = StoredTokens {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: cfg.client_id.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            user_id: Some("me-1".to_string()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "pkce".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg, auth).unwrap().with_my_user_id("me-1");
+
+        // 1. "chat:..." fast-path hits ONLY /me/chats, not /me/joinedTeams
+        let storage1 = Storage::open_in_memory().unwrap();
+        let found_chat = resolve_conversation(&storage1, &graph, "chat:19:c1@thread.v2")
+            .await
+            .unwrap();
+        assert_eq!(found_chat.title, "Ops Room");
+        assert_eq!(chats_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(teams_hits.load(Ordering::SeqCst), 0);
+
+        // Unlisted valid chat:... falls back to ConversationTarget::from_conv_key without hitting teams
+        let unlisted_chat = resolve_conversation(&storage1, &graph, "chat:19:older@thread.v2")
+            .await
+            .unwrap();
+        assert_eq!(unlisted_chat.conv_key, "chat:19:older@thread.v2");
+        assert_eq!(teams_hits.load(Ordering::SeqCst), 0);
+
+        // 2. "chan:..." fast-path hits ONLY /me/joinedTeams, not /me/chats
+        let storage2 = Storage::open_in_memory().unwrap();
+        let prev_chats = chats_hits.load(Ordering::SeqCst);
+        let found_chan = resolve_conversation(&storage2, &graph, "chan:t1:19:ch1@thread.tacv2")
+            .await
+            .unwrap();
+        assert_eq!(found_chan.title, "General");
+        assert_eq!(chats_hits.load(Ordering::SeqCst), prev_chats);
+        assert_eq!(teams_hits.load(Ordering::SeqCst), 1);
+
+        // 3. 403 error on cold cache is preserved rather than masked as "not found"
+        fail_mode.store(true, Ordering::SeqCst);
+        let storage3 = Storage::open_in_memory().unwrap();
+        let err = resolve_conversation(&storage3, &graph, "MissingRoom")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("403") || err.contains("Forbidden") || err.contains("Authorization_RequestDenied"),
+            "expected Graph 403 error, got: {err}"
+        );
+
+        server.abort();
     }
 }

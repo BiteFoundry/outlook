@@ -11,7 +11,7 @@ use std::{io::Write, path::PathBuf};
 
 use anyhow::Result;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
 use crate::{
     cli,
@@ -26,17 +26,127 @@ use crate::{
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
 const SERVER_NAME: &str = "teams";
+const MAX_RPC_LINE_BYTES: usize = 8 * 1024 * 1024;
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 
+enum BoundedLine {
+    Eof,
+    Line(String),
+    TooLong,
+}
+
+async fn read_line_bounded<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> std::io::Result<BoundedLine> {
+    let mut buf = Vec::new();
+    let mut oversized = false;
+
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if oversized {
+                return Ok(BoundedLine::TooLong);
+            }
+            if buf.is_empty() {
+                return Ok(BoundedLine::Eof);
+            }
+            let s = String::from_utf8(buf)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            return Ok(BoundedLine::Line(s));
+        }
+
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            if !oversized {
+                if buf.len() + pos > max_bytes {
+                    oversized = true;
+                    buf.clear();
+                } else {
+                    buf.extend_from_slice(&available[..pos]);
+                }
+            }
+            reader.consume(pos + 1);
+            if oversized {
+                return Ok(BoundedLine::TooLong);
+            }
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            let s = String::from_utf8(buf)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            return Ok(BoundedLine::Line(s));
+        } else {
+            if !oversized {
+                if buf.len() + available.len() > max_bytes {
+                    oversized = true;
+                    buf.clear();
+                } else {
+                    buf.extend_from_slice(available);
+                }
+            }
+            let len = available.len();
+            reader.consume(len);
+        }
+    }
+}
+
+async fn with_storage<T, F>(storage: &Storage, f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Storage) -> Result<T> + Send + 'static,
+{
+    let storage = storage.clone();
+    tokio::task::spawn_blocking(move || f(&storage))
+        .await
+        .map_err(|err| anyhow::anyhow!("storage task panicked: {err}"))?
+}
+
+async fn map_graph_result<T>(graph: &GraphClient, res: Result<T>) -> Result<T, String> {
+    match res {
+        Ok(val) => Ok(val),
+        Err(err) => Err(format_error(
+            cli::wrap_graph_permission_error(graph, err).await,
+        )),
+    }
+}
+
+async fn resolve_target_mcp(
+    storage: &Storage,
+    graph: &GraphClient,
+    target: &str,
+    offline: bool,
+) -> Result<ConversationSummary, String> {
+    if offline {
+        let target_owned = target.to_string();
+        return with_storage(storage, move |s| {
+            let cached = s.list_conversations()?;
+            resolver::resolve_from_slice(&cached, &target_owned)
+        })
+        .await
+        .map_err(format_error);
+    }
+
+    map_graph_result(graph, cli::resolve_target(storage, graph, target, false).await).await
+}
+
 /// Run the stdio MCP server until stdin reaches EOF.
 pub async fn run(config: AppConfig, graph: GraphClient, storage: Storage) -> Result<()> {
-    if storage.list_conversations().unwrap_or_default().is_empty() {
-        if let Err(err) = sync::bootstrap_conversations(&graph, &storage).await {
-            eprintln!("{SERVER_NAME} MCP warning: initial conversation bootstrap failed: {err:#}");
-        }
+    let is_empty = with_storage(&storage, |s| Ok(s.list_conversations()?.is_empty()))
+        .await
+        .unwrap_or(false);
+    if is_empty {
+        let bg_graph = graph.clone();
+        let bg_storage = storage.clone();
+        tokio::spawn(async move {
+            if let Err(err) = sync::bootstrap_conversations(&bg_graph, &bg_storage).await {
+                eprintln!(
+                    "{SERVER_NAME} MCP warning: initial conversation bootstrap failed: {err:#}"
+                );
+            }
+        });
     }
 
     eprintln!(
@@ -45,18 +155,35 @@ pub async fn run(config: AppConfig, graph: GraphClient, storage: Storage) -> Res
     );
 
     let stdin = tokio::io::stdin();
-    let mut lines = BufReader::new(stdin).lines();
+    let mut reader = BufReader::new(stdin);
     let mut stdout = std::io::stdout();
 
-    while let Some(line) = lines.next_line().await? {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
+    loop {
+        match read_line_bounded(&mut reader, MAX_RPC_LINE_BYTES).await? {
+            BoundedLine::Eof => break,
+            BoundedLine::TooLong => {
+                let err = error_response(
+                    Value::Null,
+                    INVALID_REQUEST,
+                    format!(
+                        "invalid request: line exceeds {} MiB limit",
+                        MAX_RPC_LINE_BYTES / (1024 * 1024)
+                    ),
+                );
+                stdout.write_all(encode_message(&err).as_bytes())?;
+                stdout.flush()?;
+            }
+            BoundedLine::Line(line) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
 
-        if let Some(response) = handle_rpc_line(&config, &graph, &storage, trimmed).await {
-            stdout.write_all(encode_message(&response).as_bytes())?;
-            stdout.flush()?;
+                if let Some(response) = handle_rpc_line(&config, &graph, &storage, trimmed).await {
+                    stdout.write_all(encode_message(&response).as_bytes())?;
+                    stdout.flush()?;
+                }
+            }
         }
     }
 
@@ -136,22 +263,27 @@ async fn call_tool(
                 1_000,
             )?;
 
-            let cached: Vec<ConversationSummary> = storage
-                .list_conversations()
-                .map_err(format_error)?
-                .into_iter()
-                .filter(|c| !c.kind.is_channel())
-                .collect();
-
-            let mut chats = if refresh || cached.is_empty() {
-                let fetched = graph.list_chats(limit).await.map_err(format_error)?;
-                storage.upsert_conversations(&fetched).map_err(format_error)?;
-                let stored: Vec<ConversationSummary> = storage
-                    .list_conversations()
-                    .map_err(format_error)?
+            let cached: Vec<ConversationSummary> = with_storage(storage, |s| {
+                Ok(s.list_conversations()?
                     .into_iter()
                     .filter(|c| !c.kind.is_channel())
-                    .collect();
+                    .collect())
+            })
+            .await
+            .map_err(format_error)?;
+
+            let mut chats = if refresh || cached.is_empty() {
+                let fetched = map_graph_result(graph, graph.list_chats(limit).await).await?;
+                let fetched_clone = fetched.clone();
+                let stored: Vec<ConversationSummary> = with_storage(storage, move |s| {
+                    s.upsert_conversations(&fetched_clone)?;
+                    Ok(s.list_conversations()?
+                        .into_iter()
+                        .filter(|c| !c.kind.is_channel())
+                        .collect())
+                })
+                .await
+                .map_err(format_error)?;
                 if stored.is_empty() {
                     fetched
                 } else {
@@ -168,13 +300,16 @@ async fn call_tool(
         "create_chat" => {
             let members = args.required_str_array("members")?;
             let topic = args.optional_str("topic")?;
-            let chat = graph
-                .create_chat(&members, topic.as_deref())
-                .await
-                .map_err(format_error)?;
-            storage
-                .upsert_conversations(std::slice::from_ref(&chat))
-                .map_err(format_error)?;
+            let chat =
+                map_graph_result(graph, graph.create_chat(&members, topic.as_deref()).await)
+                    .await?;
+            let chat_clone = chat.clone();
+            with_storage(storage, move |s| {
+                s.upsert_conversations(std::slice::from_ref(&chat_clone))?;
+                Ok(())
+            })
+            .await
+            .map_err(format_error)?;
 
             Ok(json!({
                 "ok": true,
@@ -184,14 +319,19 @@ async fn call_tool(
 
         "list_teams_channels" => {
             let refresh = args.optional_bool("refresh")?.unwrap_or(false);
-            let cached = storage.list_teams().map_err(format_error)?;
+            let cached = with_storage(storage, |s| s.list_teams())
+                .await
+                .map_err(format_error)?;
             let teams = if refresh || cached.is_empty() {
-                let fetched = graph
-                    .list_joined_teams_with_channels()
-                    .await
-                    .map_err(format_error)?;
-                storage.upsert_teams(&fetched).map_err(format_error)?;
-                let stored = storage.list_teams().map_err(format_error)?;
+                let fetched =
+                    map_graph_result(graph, graph.list_joined_teams_with_channels().await).await?;
+                let fetched_clone = fetched.clone();
+                let stored = with_storage(storage, move |s| {
+                    s.upsert_teams(&fetched_clone)?;
+                    s.list_teams()
+                })
+                .await
+                .map_err(format_error)?;
                 if stored.is_empty() {
                     fetched
                 } else {
@@ -215,21 +355,37 @@ async fn call_tool(
             let before = args.optional_str("before")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
 
-            let conv = cli::resolve_target(storage, graph, &target, offline)
-                .await
-                .map_err(format_error)?;
+            let conv = resolve_target_mcp(storage, graph, &target, offline).await?;
 
-            let res = cli::read_conversation_messages(
-                storage,
-                graph,
-                &conv,
-                limit,
-                before.as_deref(),
-                offline,
-                !offline,
-            )
-            .await
-            .map_err(format_error)?;
+            let res = if offline {
+                let conv_clone = conv.clone();
+                let before_clone = before.clone();
+                with_storage(storage, move |s| {
+                    cli::read_conversation_messages_offline(
+                        s,
+                        &conv_clone,
+                        limit,
+                        before_clone.as_deref(),
+                    )
+                })
+                .await
+                .map_err(format_error)?
+            } else {
+                map_graph_result(
+                    graph,
+                    cli::read_conversation_messages(
+                        storage,
+                        graph,
+                        &conv,
+                        limit,
+                        before.as_deref(),
+                        false,
+                        true,
+                    )
+                    .await,
+                )
+                .await?
+            };
 
             Ok(json!({
                 "conversation": conv,
@@ -249,9 +405,7 @@ async fn call_tool(
                 1_000,
             )?;
 
-            let conv = cli::resolve_target(storage, graph, &target, false)
-                .await
-                .map_err(format_error)?;
+            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
             let ConversationTarget::Channel {
                 ref team_id,
                 ref channel_id,
@@ -263,14 +417,22 @@ async fn call_tool(
                 ));
             };
 
-            let thread = graph
-                .get_thread(team_id, channel_id, &root_msg_id, limit)
-                .await
-                .map_err(format_error)?;
+            let thread = map_graph_result(
+                graph,
+                graph
+                    .get_thread(team_id, channel_id, &root_msg_id, limit)
+                    .await,
+            )
+            .await?;
             let mut all = Vec::with_capacity(1 + thread.replies.len());
             all.push(thread.root.clone());
             all.extend(thread.replies.iter().cloned());
-            storage.upsert_messages(&all).map_err(format_error)?;
+            with_storage(storage, move |s| {
+                s.upsert_messages(&all)?;
+                Ok(())
+            })
+            .await
+            .map_err(format_error)?;
 
             Ok(json!({
                 "conversation": conv,
@@ -285,9 +447,7 @@ async fn call_tool(
             let mentions = args.optional_mentions("mentions")?;
             let important = args.optional_bool("important")?.unwrap_or(false);
 
-            let conv = cli::resolve_target(storage, graph, &target, false)
-                .await
-                .map_err(format_error)?;
+            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
 
             let mut outgoing = parser::compile_outgoing_markdown(
                 &markdown,
@@ -301,11 +461,13 @@ async fn call_tool(
                 outgoing.importance = Some("high".to_string());
             }
 
-            let sent = graph
-                .send_message(&conv.target, &outgoing)
-                .await
-                .map_err(format_error)?;
-            let _ = storage.upsert_messages(std::slice::from_ref(&sent));
+            let sent =
+                map_graph_result(graph, graph.send_message(&conv.target, &outgoing).await).await?;
+            let sent_clone = sent.clone();
+            let _ = with_storage(storage, move |s| {
+                s.upsert_messages(std::slice::from_ref(&sent_clone))
+            })
+            .await;
 
             Ok(json!({
                 "ok": true,
@@ -318,25 +480,33 @@ async fn call_tool(
             let target = args.required_str("target")?;
             let msg_id = args.required_str("msg_id")?;
             let markdown = args.required_text("markdown")?;
+            let mentions = args.optional_mentions("mentions")?;
+            let important = args.optional_bool("important")?.unwrap_or(false);
 
-            let conv = cli::resolve_target(storage, graph, &target, false)
-                .await
-                .map_err(format_error)?;
+            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
             let quote = cli::build_quote_reply(storage, graph, &conv, &msg_id).await;
-            let outgoing = parser::compile_outgoing_markdown(
+            let mut outgoing = parser::compile_outgoing_markdown(
                 &markdown,
                 None,
-                vec![],
+                mentions,
                 vec![],
                 vec![],
                 quote,
             );
+            if important {
+                outgoing.importance = Some("high".to_string());
+            }
 
-            let sent = graph
-                .reply_message(&conv.target, &msg_id, &outgoing)
-                .await
-                .map_err(format_error)?;
-            let _ = storage.upsert_messages(std::slice::from_ref(&sent));
+            let sent = map_graph_result(
+                graph,
+                graph.reply_message(&conv.target, &msg_id, &outgoing).await,
+            )
+            .await?;
+            let sent_clone = sent.clone();
+            let _ = with_storage(storage, move |s| {
+                s.upsert_messages(std::slice::from_ref(&sent_clone))
+            })
+            .await;
 
             Ok(json!({
                 "ok": true,
@@ -353,20 +523,21 @@ async fn call_tool(
             let thread_root_id = args.optional_str("thread_root_id")?;
             let inline = args.optional_bool("inline")?.unwrap_or(false);
 
-            let conv = cli::resolve_target(storage, graph, &target, false)
-                .await
-                .map_err(format_error)?;
-            let sent = cli::send_file_or_inline(
+            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
+            let sent = map_graph_result(
                 graph,
-                storage,
-                &conv,
-                std::path::Path::new(&path),
-                caption.as_deref(),
-                thread_root_id.as_deref(),
-                inline,
+                cli::send_file_or_inline(
+                    graph,
+                    storage,
+                    &conv,
+                    std::path::Path::new(&path),
+                    caption.as_deref(),
+                    thread_root_id.as_deref(),
+                    inline,
+                )
+                .await,
             )
-            .await
-            .map_err(format_error)?;
+            .await?;
 
             Ok(json!({
                 "ok": true,
@@ -386,20 +557,21 @@ async fn call_tool(
                 .map(PathBuf::from)
                 .unwrap_or_else(|| config.resolved_download_dir());
 
-            let conv = cli::resolve_target(storage, graph, &target, false)
-                .await
-                .map_err(format_error)?;
-            let downloaded = cli::download_message_attachment(
+            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
+            let downloaded = map_graph_result(
                 graph,
-                storage,
-                &conv,
-                &msg_id,
-                index,
-                thread_root_id.as_deref(),
-                &out_dir,
+                cli::download_message_attachment(
+                    graph,
+                    storage,
+                    &conv,
+                    &msg_id,
+                    index,
+                    thread_root_id.as_deref(),
+                    &out_dir,
+                )
+                .await,
             )
-            .await
-            .map_err(format_error)?;
+            .await?;
 
             Ok(json!({
                 "ok": true,
@@ -417,19 +589,20 @@ async fn call_tool(
             let enable = args.optional_bool("enable")?.unwrap_or(true);
             let thread_root_id = args.optional_str("thread_root_id")?;
 
-            let conv = cli::resolve_target(storage, graph, &target, false)
-                .await
-                .map_err(format_error)?;
-            graph
-                .set_reaction(
-                    &conv.target,
-                    &msg_id,
-                    thread_root_id.as_deref(),
-                    &reaction,
-                    enable,
-                )
-                .await
-                .map_err(format_error)?;
+            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
+            map_graph_result(
+                graph,
+                graph
+                    .set_reaction(
+                        &conv.target,
+                        &msg_id,
+                        thread_root_id.as_deref(),
+                        &reaction,
+                        enable,
+                    )
+                    .await,
+            )
+            .await?;
 
             Ok(json!({
                 "ok": true,
@@ -446,9 +619,7 @@ async fn call_tool(
             let markdown = args.required_text("markdown")?;
             let thread_root_id = args.optional_str("thread_root_id")?;
 
-            let conv = cli::resolve_target(storage, graph, &target, false)
-                .await
-                .map_err(format_error)?;
+            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
             let compiled = parser::compile_outgoing_markdown(
                 &markdown,
                 None,
@@ -457,15 +628,18 @@ async fn call_tool(
                 vec![],
                 None,
             );
-            graph
-                .edit_message(
-                    &conv.target,
-                    &msg_id,
-                    thread_root_id.as_deref(),
-                    &compiled.body_html,
-                )
-                .await
-                .map_err(format_error)?;
+            map_graph_result(
+                graph,
+                graph
+                    .edit_message(
+                        &conv.target,
+                        &msg_id,
+                        thread_root_id.as_deref(),
+                        &compiled.body_html,
+                    )
+                    .await,
+            )
+            .await?;
 
             Ok(json!({
                 "ok": true,
@@ -480,13 +654,14 @@ async fn call_tool(
             args.required_true("confirm")?;
             let thread_root_id = args.optional_str("thread_root_id")?;
 
-            let conv = cli::resolve_target(storage, graph, &target, false)
-                .await
-                .map_err(format_error)?;
-            graph
-                .delete_message(&conv.target, &msg_id, thread_root_id.as_deref())
-                .await
-                .map_err(format_error)?;
+            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
+            map_graph_result(
+                graph,
+                graph
+                    .delete_message(&conv.target, &msg_id, thread_root_id.as_deref())
+                    .await,
+            )
+            .await?;
 
             Ok(json!({
                 "ok": true,
@@ -503,21 +678,20 @@ async fn call_tool(
                 1,
                 1_000,
             )?;
-            let conv_key_filter = match args.optional_str("target")? {
-                Some(t) => {
-                    let cached = storage.list_conversations().map_err(format_error)?;
-                    Some(
-                        resolver::resolve_from_slice(&cached, &t)
-                            .map_err(format_error)?
-                            .conv_key,
-                    )
-                }
-                None => None,
-            };
-
-            let hits = storage
-                .search_messages(&query, conv_key_filter.as_deref(), limit)
-                .map_err(format_error)?;
+            let target_opt = args.optional_str("target")?;
+            let query_clone = query.clone();
+            let hits = with_storage(storage, move |s| {
+                let conv_key_filter = match target_opt {
+                    Some(ref t) => {
+                        let cached = s.list_conversations()?;
+                        Some(resolver::resolve_from_slice(&cached, t)?.conv_key)
+                    }
+                    None => None,
+                };
+                s.search_messages(&query_clone, conv_key_filter.as_deref(), limit)
+            })
+            .await
+            .map_err(format_error)?;
 
             Ok(json!({
                 "query": query,
@@ -527,14 +701,14 @@ async fn call_tool(
 
         "list_members" => {
             let target = args.required_str("target")?;
-            let conv = cli::resolve_target(storage, graph, &target, false)
-                .await
-                .map_err(format_error)?;
-            let members = graph
-                .list_members(&conv.target)
-                .await
-                .map_err(format_error)?;
-            let _ = storage.upsert_members(&conv.conv_key, &members);
+            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
+            let members = map_graph_result(graph, graph.list_members(&conv.target).await).await?;
+            let conv_key = conv.conv_key.clone();
+            let members_clone = members.clone();
+            let _ = with_storage(storage, move |s| {
+                s.upsert_members(&conv_key, &members_clone)
+            })
+            .await;
 
             Ok(json!({
                 "conv_key": conv.conv_key,
@@ -545,16 +719,15 @@ async fn call_tool(
 
         "mark_read" => {
             let target = args.required_str("target")?;
-            let conv = cli::resolve_target(storage, graph, &target, false)
-                .await
-                .map_err(format_error)?;
+            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
 
             if let ConversationTarget::Chat { ref chat_id } = conv.target {
-                graph.mark_chat_read(chat_id).await.map_err(format_error)?;
+                map_graph_result(graph, graph.mark_chat_read(chat_id).await).await?;
             }
             let now = chrono::Utc::now().to_rfc3339();
-            storage
-                .mark_conversation_read(&conv.conv_key, &now)
+            let conv_key = conv.conv_key.clone();
+            with_storage(storage, move |s| s.mark_conversation_read(&conv_key, &now))
+                .await
                 .map_err(format_error)?;
 
             Ok(json!({
@@ -566,13 +739,11 @@ async fn call_tool(
         "get_presence" => {
             let user_ids = args.optional_str_array("user_ids")?;
             if let Some(ids) = user_ids {
-                let presences = graph
-                    .get_presences_by_user_ids(&ids)
-                    .await
-                    .map_err(format_error)?;
+                let presences =
+                    map_graph_result(graph, graph.get_presences_by_user_ids(&ids).await).await?;
                 Ok(json!({ "presences": presences }))
             } else {
-                let presence = graph.get_my_presence().await.map_err(format_error)?;
+                let presence = map_graph_result(graph, graph.get_my_presence().await).await?;
                 Ok(json!({ "presence": presence }))
             }
         }
@@ -586,10 +757,13 @@ async fn call_tool(
                 .unwrap_or_else(|| availability.clone());
             let expiration_mins = args.optional_u32("expiration_mins")?;
 
-            graph
-                .set_my_presence(&availability, &activity, expiration_mins)
-                .await
-                .map_err(format_error)?;
+            map_graph_result(
+                graph,
+                graph
+                    .set_my_presence(&availability, &activity, expiration_mins)
+                    .await,
+            )
+            .await?;
 
             Ok(json!({
                 "ok": true,
@@ -694,6 +868,28 @@ fn initialize_result(message: &Value) -> Value {
 // Tool catalog (17 Teams tools)
 // ---------------------------------------------------------------------------
 
+fn mentions_schema() -> Value {
+    json!({
+        "type": "array",
+        "description": "Mentions as \"user_id:DisplayName\" strings or {user_id, display_name} objects.",
+        "items": {
+            "oneOf": [
+                { "type": "string" },
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "minimum": 0 },
+                        "user_id": { "type": "string", "minLength": 1 },
+                        "display_name": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["user_id", "display_name"],
+                    "additionalProperties": false
+                }
+            ]
+        }
+    })
+}
+
 fn tool_catalog() -> Vec<Value> {
     vec![
         json!({
@@ -775,25 +971,7 @@ fn tool_catalog() -> Vec<Value> {
                     "target": { "type": "string", "description": "conv_key, \"Team/Channel\", or unique conversation title." },
                     "markdown": { "type": "string", "minLength": 1 },
                     "subject": { "type": "string", "description": "Optional subject line for team channel root posts." },
-                    "mentions": {
-                        "type": "array",
-                        "description": "Mentions as \"user_id:DisplayName\" strings or {user_id, display_name} objects.",
-                        "items": {
-                            "oneOf": [
-                                { "type": "string" },
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "id": { "type": "integer", "minimum": 0 },
-                                        "user_id": { "type": "string", "minLength": 1 },
-                                        "display_name": { "type": "string", "minLength": 1 }
-                                    },
-                                    "required": ["user_id", "display_name"],
-                                    "additionalProperties": false
-                                }
-                            ]
-                        }
-                    },
+                    "mentions": mentions_schema(),
                     "important": { "type": "boolean", "default": false }
                 },
                 "required": ["target", "markdown"],
@@ -808,7 +986,9 @@ fn tool_catalog() -> Vec<Value> {
                 "properties": {
                     "target": { "type": "string", "description": "conv_key, \"Team/Channel\", or unique conversation title." },
                     "msg_id": { "type": "string", "minLength": 1 },
-                    "markdown": { "type": "string", "minLength": 1 }
+                    "markdown": { "type": "string", "minLength": 1 },
+                    "mentions": mentions_schema(),
+                    "important": { "type": "boolean", "default": false }
                 },
                 "required": ["target", "msg_id", "markdown"],
                 "additionalProperties": false
@@ -1037,6 +1217,8 @@ fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             args.required_str("target")?;
             args.required_str("msg_id")?;
             args.required_text("markdown")?;
+            args.optional_mentions("mentions")?;
+            args.optional_bool("important")?;
         }
         "send_file" => {
             args.required_str("target")?;
@@ -1648,5 +1830,62 @@ mod tests {
         let payload: Value =
             serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(payload["hits"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reply_message_supports_mentions_and_important() {
+        let catalog = tool_catalog();
+        let reply_tool = catalog
+            .iter()
+            .find(|t| t["name"] == "reply_message")
+            .unwrap();
+        assert!(reply_tool["inputSchema"]["properties"]["mentions"].is_object());
+        assert!(reply_tool["inputSchema"]["properties"]["important"].is_object());
+
+        assert!(validate_tool_args(
+            "reply_message",
+            &json!({
+                "target": "Engineering/General",
+                "msg_id": "m1",
+                "markdown": "Thanks @Alice",
+                "mentions": ["u1:Alice"],
+                "important": true
+            })
+        )
+        .is_ok());
+
+        assert!(validate_tool_args(
+            "reply_message",
+            &json!({
+                "target": "Engineering/General",
+                "msg_id": "m1",
+                "markdown": "Thanks",
+                "important": "yes"
+            })
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_line_reader_caps_oversized_frames() {
+        let data = b"hello\r\n0123456789ABCDEF\nworld";
+        let mut reader = BufReader::new(std::io::Cursor::new(&data[..]));
+
+        match read_line_bounded(&mut reader, 10).await.unwrap() {
+            BoundedLine::Line(s) => assert_eq!(s, "hello"),
+            _ => panic!("expected first line"),
+        }
+        match read_line_bounded(&mut reader, 10).await.unwrap() {
+            BoundedLine::TooLong => {}
+            _ => panic!("expected TooLong"),
+        }
+        match read_line_bounded(&mut reader, 10).await.unwrap() {
+            BoundedLine::Line(s) => assert_eq!(s, "world"),
+            _ => panic!("expected trailing line at EOF"),
+        }
+        match read_line_bounded(&mut reader, 10).await.unwrap() {
+            BoundedLine::Eof => {}
+            _ => panic!("expected Eof"),
+        }
     }
 }

@@ -1,18 +1,24 @@
 //! Core HTTP transport, resilience (401 refresh-retry, 429/503 Retry-After backoff),
 //! `$batch` execution, and shared Graph `chatMessage` wire normalization.
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
+use futures::StreamExt;
+use rand::Rng;
 use reqwest::{Method, StatusCode};
 use scraper::{Html, Selector};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 
 use super::GraphClient;
 use crate::models::{AttachmentInfo, MentionInfo, MessageItem, ReactionSummary};
 
 const MAX_BATCH_SIZE: usize = 20;
 const MAX_THROTTLE_RETRIES: usize = 3;
+const MAX_RETRY_AFTER_SECS: u64 = 30;
+const STANDARD_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const MEDIA_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BatchSubRequest {
@@ -66,7 +72,7 @@ enum RequestBody {
     Empty,
     Json(serde_json::Value),
     Bytes {
-        data: Vec<u8>,
+        data: Arc<[u8]>,
         content_type: Option<String>,
     },
 }
@@ -83,45 +89,18 @@ impl GraphClient {
         )
     }
 
-    /// Resolves current user's Entra object ID using cached field, shared OnceLock, stored tokens, or `/me`.
-    pub(crate) async fn resolve_my_user_id(&self) -> Option<String> {
+    async fn resolve_my_user_id_inner(&self) -> Result<String> {
         if let Some(id) = self.my_user_id.as_deref().filter(|s| !s.trim().is_empty()) {
-            return Some(id.to_string());
+            return Ok(id.to_string());
         }
         if let Some(id) = self
             .cached_my_user_id
             .get()
             .filter(|s| !s.trim().is_empty())
         {
-            return Some(id.to_string());
-        }
-        if let Some(tok) = self.auth.current_tokens().await {
-            if let Some(id) = tok.user_id.filter(|s| !s.trim().is_empty()) {
-                let _ = self.cached_my_user_id.set(id.clone());
-                return Some(id);
-            }
-        }
-        if let Ok(me) = self.get_me().await {
-            if !me.id.trim().is_empty() {
-                let _ = self.cached_my_user_id.set(me.id.clone());
-            }
-            let _ = self
-                .auth
-                .update_identity(
-                    me.id.clone(),
-                    me.display_name.clone(),
-                    me.mail.clone().or(me.user_principal_name.clone()),
-                )
-                .await;
-            return Some(me.id);
-        }
-        None
-    }
-
-    pub(crate) async fn require_my_user_id(&self) -> Result<String> {
-        if let Some(id) = self.my_user_id.as_deref().filter(|s| !s.trim().is_empty()) {
             return Ok(id.to_string());
         }
+        let _guard = self.resolve_user_mutex.lock().await;
         if let Some(id) = self
             .cached_my_user_id
             .get()
@@ -153,10 +132,26 @@ impl GraphClient {
         Ok(me.id)
     }
 
+    /// Resolves current user's Entra object ID using cached field, shared OnceLock, stored tokens, or `/me`.
+    pub(crate) async fn resolve_my_user_id(&self) -> Option<String> {
+        self.resolve_my_user_id_inner().await.ok()
+    }
+
+    pub(crate) async fn require_my_user_id(&self) -> Result<String> {
+        self.resolve_my_user_id_inner().await
+    }
+
     pub async fn get_json<T: DeserializeOwned>(&self, path_or_url: &str) -> Result<T> {
         let url = self.resolve_url(path_or_url);
         let resp = self
-            .execute_with_retry(Method::GET, &url, RequestBody::Empty, &[], true)
+            .execute_with_retry(
+                Method::GET,
+                &url,
+                RequestBody::Empty,
+                &[],
+                true,
+                STANDARD_REQUEST_TIMEOUT,
+            )
             .await?;
         let bytes = resp.bytes().await.context("Failed to read Graph response body")?;
         serde_json::from_slice(&bytes)
@@ -171,7 +166,14 @@ impl GraphClient {
         let url = self.resolve_url(path_or_url);
         let json_val = serde_json::to_value(body)?;
         let resp = self
-            .execute_with_retry(Method::POST, &url, RequestBody::Json(json_val), &[], true)
+            .execute_with_retry(
+                Method::POST,
+                &url,
+                RequestBody::Json(json_val),
+                &[],
+                true,
+                STANDARD_REQUEST_TIMEOUT,
+            )
             .await?;
         let bytes = resp.bytes().await.context("Failed to read Graph response body")?;
         serde_json::from_slice(&bytes)
@@ -185,8 +187,15 @@ impl GraphClient {
     ) -> Result<()> {
         let url = self.resolve_url(path_or_url);
         let json_val = serde_json::to_value(body)?;
-        self.execute_with_retry(Method::POST, &url, RequestBody::Json(json_val), &[], true)
-            .await?;
+        self.execute_with_retry(
+            Method::POST,
+            &url,
+            RequestBody::Json(json_val),
+            &[],
+            true,
+            STANDARD_REQUEST_TIMEOUT,
+        )
+        .await?;
         Ok(())
     }
 
@@ -197,22 +206,43 @@ impl GraphClient {
     ) -> Result<()> {
         let url = self.resolve_url(path_or_url);
         let json_val = serde_json::to_value(body)?;
-        self.execute_with_retry(Method::PATCH, &url, RequestBody::Json(json_val), &[], true)
-            .await?;
+        self.execute_with_retry(
+            Method::PATCH,
+            &url,
+            RequestBody::Json(json_val),
+            &[],
+            true,
+            STANDARD_REQUEST_TIMEOUT,
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn post_empty(&self, path_or_url: &str) -> Result<()> {
         let url = self.resolve_url(path_or_url);
-        self.execute_with_retry(Method::POST, &url, RequestBody::Empty, &[], true)
-            .await?;
+        self.execute_with_retry(
+            Method::POST,
+            &url,
+            RequestBody::Empty,
+            &[],
+            true,
+            STANDARD_REQUEST_TIMEOUT,
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn delete_req(&self, path_or_url: &str) -> Result<()> {
         let url = self.resolve_url(path_or_url);
-        self.execute_with_retry(Method::DELETE, &url, RequestBody::Empty, &[], true)
-            .await?;
+        self.execute_with_retry(
+            Method::DELETE,
+            &url,
+            RequestBody::Empty,
+            &[],
+            true,
+            STANDARD_REQUEST_TIMEOUT,
+        )
+        .await?;
         Ok(())
     }
 
@@ -228,11 +258,12 @@ impl GraphClient {
                 Method::PUT,
                 &url,
                 RequestBody::Bytes {
-                    data: bytes,
+                    data: Arc::from(bytes),
                     content_type: content_type.map(str::to_string),
                 },
                 &[],
                 true,
+                MEDIA_REQUEST_TIMEOUT,
             )
             .await?;
         let resp_bytes = resp.bytes().await.context("Failed to read Graph PUT response body")?;
@@ -244,7 +275,7 @@ impl GraphClient {
     pub(crate) async fn put_upload_chunk(
         &self,
         upload_url: &str,
-        chunk: Vec<u8>,
+        chunk: &[u8],
         start: u64,
         end_inclusive: u64,
         total: u64,
@@ -261,11 +292,12 @@ impl GraphClient {
                 Method::PUT,
                 upload_url,
                 RequestBody::Bytes {
-                    data: chunk,
+                    data: Arc::from(chunk),
                     content_type: Some("application/octet-stream".to_string()),
                 },
                 &headers,
                 false,
+                MEDIA_REQUEST_TIMEOUT,
             )
             .await?;
         let status = resp.status();
@@ -281,16 +313,119 @@ impl GraphClient {
     pub async fn get_bytes(&self, path_or_url: &str) -> Result<Vec<u8>> {
         let url = self.resolve_url(path_or_url);
         let resp = self
-            .execute_with_retry(Method::GET, &url, RequestBody::Empty, &[], true)
+            .execute_with_retry(
+                Method::GET,
+                &url,
+                RequestBody::Empty,
+                &[],
+                true,
+                MEDIA_REQUEST_TIMEOUT,
+            )
             .await?;
         let bytes = resp.bytes().await.context("Failed to read Graph binary response")?;
         Ok(bytes.to_vec())
     }
 
+    pub(crate) async fn get_bytes_with_limit(
+        &self,
+        url_or_path: &str,
+        use_bearer: bool,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let url = self.resolve_url(url_or_path);
+        let resp = self
+            .execute_with_retry(
+                Method::GET,
+                &url,
+                RequestBody::Empty,
+                &[],
+                use_bearer,
+                MEDIA_REQUEST_TIMEOUT,
+            )
+            .await?;
+        if let Some(len) = resp.content_length() {
+            if len > max_bytes as u64 {
+                bail!(
+                    "Response size ({len} bytes) exceeds in-memory limit ({max_bytes} bytes) for {url}"
+                );
+            }
+        }
+        let mut out = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = chunk_res.context("Failed to read Graph binary stream chunk")?;
+            if out.len().saturating_add(chunk.len()) > max_bytes {
+                bail!(
+                    "Response body exceeded in-memory limit ({max_bytes} bytes) for {url}"
+                );
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+
+    /// Streams a Graph or external asset download directly to `dest_path` using a 64 KiB `BufWriter`.
+    pub async fn get_to_file(
+        &self,
+        url_or_path: &str,
+        dest_path: &Path,
+        use_bearer: bool,
+    ) -> Result<u64> {
+        let url = self.resolve_url(url_or_path);
+        let resp = self
+            .execute_with_retry(
+                Method::GET,
+                &url,
+                RequestBody::Empty,
+                &[],
+                use_bearer,
+                MEDIA_REQUEST_TIMEOUT,
+            )
+            .await?;
+
+        let file = tokio::fs::File::create(dest_path)
+            .await
+            .with_context(|| format!("Failed to create destination file: {}", dest_path.display()))?;
+        let mut writer = tokio::io::BufWriter::with_capacity(64 * 1024, file);
+        let mut stream = resp.bytes_stream();
+        let mut total_written: u64 = 0;
+
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = match chunk_res {
+                Ok(c) => c,
+                Err(err) => {
+                    let _ = tokio::fs::remove_file(dest_path).await;
+                    return Err(err).context("Failed to stream download chunk");
+                }
+            };
+            if let Err(err) = writer.write_all(&chunk).await {
+                let _ = tokio::fs::remove_file(dest_path).await;
+                return Err(err).with_context(|| {
+                    format!("Failed to write downloaded bytes to {}", dest_path.display())
+                });
+            }
+            total_written += chunk.len() as u64;
+        }
+        if let Err(err) = writer.flush().await {
+            let _ = tokio::fs::remove_file(dest_path).await;
+            return Err(err).with_context(|| {
+                format!("Failed to flush downloaded file {}", dest_path.display())
+            });
+        }
+        Ok(total_written)
+    }
+
     pub async fn get_text(&self, path_or_url: &str) -> Result<String> {
         let url = self.resolve_url(path_or_url);
         let resp = self
-            .execute_with_retry(Method::GET, &url, RequestBody::Empty, &[], true)
+            .execute_with_retry(
+                Method::GET,
+                &url,
+                RequestBody::Empty,
+                &[],
+                true,
+                STANDARD_REQUEST_TIMEOUT,
+            )
             .await?;
         resp.text().await.context("Failed to read Graph text response")
     }
@@ -307,11 +442,12 @@ impl GraphClient {
                 Method::POST,
                 &url,
                 RequestBody::Bytes {
-                    data: bytes,
+                    data: Arc::from(bytes),
                     content_type: Some(content_type.to_string()),
                 },
                 &[],
                 true,
+                STANDARD_REQUEST_TIMEOUT,
             )
             .await?;
         let resp_bytes = resp.bytes().await.context("Failed to read Graph POST response body")?;
@@ -330,11 +466,12 @@ impl GraphClient {
             Method::PATCH,
             &url,
             RequestBody::Bytes {
-                data: bytes,
+                data: Arc::from(bytes),
                 content_type: Some(content_type.to_string()),
             },
             &[],
             true,
+            STANDARD_REQUEST_TIMEOUT,
         )
         .await?;
         Ok(())
@@ -361,13 +498,15 @@ impl GraphClient {
         body: RequestBody,
         extra_headers: &[(&str, String)],
         use_bearer: bool,
+        timeout: Duration,
     ) -> Result<reqwest::Response> {
         let mut unauthorized_retried = false;
         let mut throttle_attempt = 0usize;
+        let mut transport_retried = false;
 
         loop {
             let mut token_used = None;
-            let mut req = self.http.request(method.clone(), url);
+            let mut req = self.http.request(method.clone(), url).timeout(timeout);
 
             if use_bearer {
                 let token = self.auth.valid_access_token().await?;
@@ -388,14 +527,26 @@ impl GraphClient {
                     if let Some(ct) = content_type {
                         req = req.header(reqwest::header::CONTENT_TYPE, ct.as_str());
                     }
-                    req = req.body(data.clone());
+                    req = req.body(data.to_vec());
                 }
             }
 
-            let resp = req
-                .send()
-                .await
-                .with_context(|| format!("Graph HTTP request failed ({method} {url})"))?;
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(err) => {
+                    if method == Method::GET
+                        && !transport_retried
+                        && (err.is_connect() || err.is_timeout())
+                    {
+                        transport_retried = true;
+                        let jitter_ms: u64 = rand::thread_rng().gen_range(0..=250);
+                        tokio::time::sleep(Duration::from_millis(100 + jitter_ms)).await;
+                        continue;
+                    }
+                    return Err(err)
+                        .with_context(|| format!("Graph HTTP request failed ({method} {url})"));
+                }
+            };
             let status = resp.status();
 
             if status == StatusCode::UNAUTHORIZED && use_bearer && !unauthorized_retried {
@@ -411,13 +562,21 @@ impl GraphClient {
                 }
             }
 
-            if (status == StatusCode::TOO_MANY_REQUESTS
-                || status == StatusCode::SERVICE_UNAVAILABLE)
-                && throttle_attempt < MAX_THROTTLE_RETRIES
+            if matches!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS
+                    | StatusCode::SERVICE_UNAVAILABLE
+                    | StatusCode::BAD_GATEWAY
+                    | StatusCode::GATEWAY_TIMEOUT
+            ) && throttle_attempt < MAX_THROTTLE_RETRIES
             {
                 let delay_secs = parse_retry_after_secs(resp.headers(), throttle_attempt);
                 throttle_attempt += 1;
-                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                let jitter_ms: u64 = rand::thread_rng().gen_range(0..=250);
+                tokio::time::sleep(
+                    Duration::from_secs(delay_secs) + Duration::from_millis(jitter_ms),
+                )
+                .await;
                 continue;
             }
 
@@ -439,7 +598,7 @@ pub(crate) fn parse_retry_after_secs(
     if let Some(raw) = headers.get(reqwest::header::RETRY_AFTER) {
         if let Ok(s) = raw.to_str() {
             if let Ok(secs) = s.trim().parse::<u64>() {
-                return secs.max(1);
+                return secs.clamp(1, MAX_RETRY_AFTER_SECS);
             }
         }
     }
@@ -1177,5 +1336,110 @@ mod tests {
         let batch_resps = client.batch(&sub_reqs).await.unwrap();
         assert_eq!(batch_resps.len(), 25);
         assert_eq!(batch_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_retry_after_cap_at_30_secs() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "3600".parse().unwrap());
+        assert_eq!(parse_retry_after_secs(&headers, 0), 30);
+
+        headers.insert(reqwest::header::RETRY_AFTER, "0".parse().unwrap());
+        assert_eq!(parse_retry_after_secs(&headers, 0), 1);
+    }
+
+    #[tokio::test]
+    async fn test_502_504_retries_and_single_flight_resolve_my_user_id() {
+        use axum::{http::StatusCode, routing::get, Json, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let gateway_calls = Arc::new(AtomicUsize::new(0));
+        let gw_clone = gateway_calls.clone();
+        let me_calls = Arc::new(AtomicUsize::new(0));
+        let me_clone = me_calls.clone();
+
+        let app = Router::new()
+            .route(
+                "/v1.0/gateway-flaky",
+                get(move || {
+                    let calls = gw_clone.clone();
+                    async move {
+                        let n = calls.fetch_add(1, Ordering::SeqCst);
+                        match n {
+                            0 => (
+                                StatusCode::BAD_GATEWAY,
+                                [("Retry-After", "0")],
+                                Json(serde_json::json!({ "error": { "code": "BadGateway" } })),
+                            ),
+                            1 => (
+                                StatusCode::GATEWAY_TIMEOUT,
+                                [("Retry-After", "0")],
+                                Json(serde_json::json!({ "error": { "code": "GatewayTimeout" } })),
+                            ),
+                            _ => (
+                                StatusCode::OK,
+                                [("Retry-After", "0")],
+                                Json(serde_json::json!({ "ok": true })),
+                            ),
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me",
+                get(move || {
+                    let calls = me_clone.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        Json(serde_json::json!({
+                            "id": "single-flight-u1",
+                            "displayName": "Single Flight",
+                            "mail": "sf@example.com"
+                        }))
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tok = crate::auth::StoredTokens {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: None,
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tok);
+        let client = GraphClient::new(cfg, auth).unwrap();
+
+        let gw_res: serde_json::Value = client.get_json("/gateway-flaky").await.unwrap();
+        assert_eq!(gw_res["ok"], true);
+        assert_eq!(gateway_calls.load(Ordering::SeqCst), 3);
+
+        let (r1, r2, r3, r4) = tokio::join!(
+            client.resolve_my_user_id(),
+            client.resolve_my_user_id(),
+            client.resolve_my_user_id(),
+            client.resolve_my_user_id(),
+        );
+        assert_eq!(r1.as_deref(), Some("single-flight-u1"));
+        assert_eq!(r2.as_deref(), Some("single-flight-u1"));
+        assert_eq!(r3.as_deref(), Some("single-flight-u1"));
+        assert_eq!(r4.as_deref(), Some("single-flight-u1"));
+        assert_eq!(me_calls.load(Ordering::SeqCst), 1);
     }
 }

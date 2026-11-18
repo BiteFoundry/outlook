@@ -83,6 +83,11 @@ impl NewChatState {
                     _ => {
                         self.field = 0;
                         self.peers_input.push_str(text);
+                        if !self.peers_input.contains(',') && self.peers_input.trim().len() >= 2 {
+                            return OverlayOutcome::Dispatch(Action::SearchUsers(
+                                self.peers_input.trim().to_string(),
+                            ));
+                        }
                     }
                 }
                 OverlayOutcome::Handled
@@ -91,14 +96,16 @@ impl NewChatState {
                 self.error = None;
                 match self.field {
                     0 => {
-                        self.peers_input.pop();
+                        if self.peers_input.is_empty() {
+                            self.selected_peers.pop();
+                        } else {
+                            self.peers_input.pop();
+                        }
                     }
                     1 => {
                         self.topic.pop();
                     }
-                    _ => {
-                        self.selected_peers.pop();
-                    }
+                    _ => {}
                 }
                 OverlayOutcome::Handled
             }
@@ -296,14 +303,29 @@ impl NewChatState {
 
         let list_y = inner.y.saturating_add(header_rows);
         let visible = inner.height.saturating_sub(header_rows) as usize;
+        if visible == 0 {
+            return;
+        }
+        let active_sel = self
+            .selected_result
+            .min(app.user_search_results.len().saturating_sub(1));
+        let skip = if self.field == 2 {
+            active_sel.saturating_sub(visible.saturating_sub(1))
+        } else {
+            0
+        };
         for (row, (idx, user)) in app
             .user_search_results
             .iter()
             .enumerate()
+            .skip(skip)
             .take(visible)
             .enumerate()
         {
             let y = list_y + row as u16;
+            if y >= inner.y + inner.height {
+                break;
+            }
             let selected = self.field == 2 && self.selected_result == idx;
             let style = if selected {
                 theme.selection()
@@ -345,5 +367,40 @@ mod tests {
             s.parsed_peers(),
             vec!["alice@contoso.com", "bob@contoso.com"]
         );
+    }
+
+    #[test]
+    fn backspace_pops_selected_peers_only_when_field0_empty_and_paste_searches() {
+        let cfg = crate::config::AppConfig::default();
+        let auth = crate::auth::AuthManager::new(cfg.clone()).unwrap();
+        let graph = crate::graph::GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = crate::storage::Storage::open_in_memory().unwrap();
+        let (event_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let sync_ctrl = crate::sync::SyncController::from_channels(
+            tokio::sync::watch::channel(crate::sync::FocusTarget::default()).0,
+            event_tx,
+            false,
+        );
+        let (ui_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let app = AppState::new(cfg, auth, graph, storage, sync_ctrl, ui_tx);
+
+        let mut s = NewChatState::new();
+        s.selected_peers.push("alice@contoso.com".into());
+        s.field = 2;
+        s.handle(&Action::Backspace, &app);
+        assert_eq!(s.selected_peers.len(), 1);
+
+        s.field = 0;
+        assert_eq!(
+            s.handle(&Action::Paste("bob".into()), &app),
+            OverlayOutcome::Dispatch(Action::SearchUsers("bob".into()))
+        );
+        s.handle(&Action::Backspace, &app);
+        assert_eq!(s.peers_input, "bo");
+        assert_eq!(s.selected_peers.len(), 1);
+
+        s.peers_input.clear();
+        s.handle(&Action::Backspace, &app);
+        assert!(s.selected_peers.is_empty());
     }
 }

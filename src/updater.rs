@@ -72,6 +72,7 @@ async fn check_or_apply_update_at(
     binary_path: &Path,
     token: Option<String>,
 ) -> Result<UpdateCheckResult> {
+    let repo = validate_github_repo(repo)?;
     let current_version = env!("CARGO_PKG_VERSION").to_string();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -141,18 +142,24 @@ async fn check_or_apply_update_at(
         );
     };
 
-    let asset_bytes = download_asset_bytes(&client, asset, &ua, token.as_deref()).await?;
-
-    if let Some(sums_asset) = release
+    let Some(sums_asset) = release
         .assets
         .iter()
         .find(|a| a.name.eq_ignore_ascii_case("SHA256SUMS.txt"))
-    {
-        let sums_bytes = download_asset_bytes(&client, sums_asset, &ua, token.as_deref()).await?;
-        let sums_text = String::from_utf8(sums_bytes)
-            .context("SHA256SUMS.txt is not valid UTF-8 text")?;
-        verify_sha256_sums(&sums_text, &asset.name, &asset_bytes)?;
-    }
+    else {
+        bail!(
+            "Release {} is missing SHA256SUMS.txt; refusing unverified binary update",
+            release.tag_name
+        );
+    };
+
+    let asset_bytes =
+        download_asset_bytes(&client, asset, &ua, token.as_deref(), api_base).await?;
+    let sums_bytes =
+        download_asset_bytes(&client, sums_asset, &ua, token.as_deref(), api_base).await?;
+    let sums_text = String::from_utf8(sums_bytes)
+        .context("SHA256SUMS.txt is not valid UTF-8 text")?;
+    verify_sha256_sums(&sums_text, &asset.name, &asset_bytes)?;
 
     let extracted_bytes = extract_binary_from_asset(&asset.name, &asset_bytes)?;
     replace_executable_at(binary_path, &extracted_bytes)?;
@@ -196,16 +203,63 @@ async fn discover_github_token(api_base_url: &str) -> Option<String> {
     None
 }
 
+fn validate_github_repo(repo: &str) -> Result<&str> {
+    let trimmed = repo.trim();
+    let Some((owner, name)) = trimmed.split_once('/') else {
+        bail!("Invalid GitHub repository '{repo}': expected '<owner>/<name>'");
+    };
+    if name.contains('/') {
+        bail!("Invalid GitHub repository '{repo}': expected '<owner>/<name>'");
+    }
+    let valid_part = |part: &str| -> bool {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && !part.contains("..")
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    if !valid_part(owner) || !valid_part(name) {
+        bail!("Invalid GitHub repository '{repo}': contains unsupported characters");
+    }
+    Ok(trimmed)
+}
+
+fn should_attach_github_auth(api_base: &str, target_url: &str) -> bool {
+    let Ok(target) = url::Url::parse(target_url.trim()) else {
+        return false;
+    };
+    let Some(target_host) = target.host_str() else {
+        return false;
+    };
+    if let Ok(base) = url::Url::parse(api_base.trim()) {
+        if let Some(base_host) = base.host_str() {
+            if target.scheme() == base.scheme()
+                && target.port_or_known_default() == base.port_or_known_default()
+                && target_host.eq_ignore_ascii_case(base_host)
+            {
+                return true;
+            }
+        }
+    }
+    target.scheme() == "https"
+        && (target_host.eq_ignore_ascii_case("api.github.com")
+            || target_host.eq_ignore_ascii_case("github.com"))
+}
+
 async fn download_asset_bytes(
     client: &reqwest::Client,
     asset: &GitHubAsset,
     ua: &str,
     token: Option<&str>,
+    api_base: &str,
 ) -> Result<Vec<u8>> {
     if let Some(tok) = token {
-        if !asset.url.trim().is_empty() {
+        let asset_url = asset.url.trim();
+        if !asset_url.is_empty() && should_attach_github_auth(api_base, asset_url) {
             let resp = client
-                .get(&asset.url)
+                .get(asset_url)
                 .header(USER_AGENT, ua)
                 .header(ACCEPT, "application/octet-stream")
                 .header(AUTHORIZATION, format!("Bearer {tok}"))
@@ -223,12 +277,13 @@ async fn download_asset_bytes(
         }
     }
 
-    if !asset.browser_download_url.trim().is_empty() {
-        let mut req = client
-            .get(&asset.browser_download_url)
-            .header(USER_AGENT, ua);
+    let browser_url = asset.browser_download_url.trim();
+    if !browser_url.is_empty() {
+        let mut req = client.get(browser_url).header(USER_AGENT, ua);
         if let Some(tok) = token {
-            req = req.header(AUTHORIZATION, format!("Bearer {tok}"));
+            if should_attach_github_auth(api_base, browser_url) {
+                req = req.header(AUTHORIZATION, format!("Bearer {tok}"));
+            }
         }
         let resp = req
             .send()
@@ -245,13 +300,16 @@ async fn download_asset_bytes(
         bail!("Failed to download asset '{}' (HTTP {status})", asset.name);
     }
 
-    if !asset.url.trim().is_empty() {
+    let asset_url = asset.url.trim();
+    if !asset_url.is_empty() {
         let mut req = client
-            .get(&asset.url)
+            .get(asset_url)
             .header(USER_AGENT, ua)
             .header(ACCEPT, "application/octet-stream");
         if let Some(tok) = token {
-            req = req.header(AUTHORIZATION, format!("Bearer {tok}"));
+            if should_attach_github_auth(api_base, asset_url) {
+                req = req.header(AUTHORIZATION, format!("Bearer {tok}"));
+            }
         }
         let resp = req
             .send()
@@ -425,59 +483,76 @@ fn extract_binary_from_asset(asset_name: &str, asset_bytes: &[u8]) -> Result<Vec
     let extract_dir = tmp.path().join("extracted");
     std::fs::create_dir_all(&extract_dir)?;
 
-    let status = if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
-        std::process::Command::new("tar")
-            .arg("-xzf")
-            .arg(&archive_path)
-            .arg("-C")
-            .arg(&extract_dir)
-            .status()
-            .context("Failed to run `tar -xzf`")?
+    let mut tar_cmd = std::process::Command::new("tar");
+    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        tar_cmd.arg("-xzf");
     } else {
-        std::process::Command::new("tar")
-            .arg("-xf")
-            .arg(&archive_path)
-            .arg("-C")
-            .arg(&extract_dir)
-            .status()
-            .context("Failed to run `tar -xf`")?
-    };
+        tar_cmd.arg("-xf");
+    }
+    tar_cmd.arg(&archive_path).arg("-C").arg(&extract_dir);
+    #[cfg(unix)]
+    {
+        tar_cmd.arg("--no-same-owner").arg("--no-same-permissions");
+    }
+    let status = tar_cmd.status().context("Failed to run `tar`")?;
 
     if !status.success() {
         bail!("Failed to extract archive ({asset_name}): exit code {status}");
     }
 
     let target_bin = if cfg!(windows) { "teams.exe" } else { "teams" };
-    let found = find_file_recursive(&extract_dir, target_bin).ok_or_else(|| {
+    let found = find_file_recursive(&extract_dir, target_bin)?.ok_or_else(|| {
         anyhow::anyhow!("Executable '{target_bin}' not found in extracted archive ({asset_name})")
     })?;
     std::fs::read(&found)
         .with_context(|| format!("Failed to read extracted binary: {}", found.display()))
 }
 
-fn find_file_recursive(dir: &Path, target_name: &str) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
+fn find_file_recursive(dir: &Path, target_name: &str) -> Result<Option<PathBuf>> {
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("Failed to read extracted directory: {}", dir.display()))?
+    {
+        let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
-            if let Some(found) = find_file_recursive(&path, target_name) {
-                return Some(found);
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            bail!("Refusing symlink inside update archive: {}", path.display());
+        }
+        if ft.is_dir() {
+            if let Some(found) = find_file_recursive(&path, target_name)? {
+                return Ok(Some(found));
             }
-        } else if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.eq_ignore_ascii_case(target_name))
-            .unwrap_or(false)
+        } else if ft.is_file()
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.eq_ignore_ascii_case(target_name))
+                .unwrap_or(false)
         {
-            return Some(path);
+            return Ok(Some(path));
         }
     }
-    None
+    Ok(None)
 }
 
 pub(crate) fn replace_executable_at(target_exe: &Path, new_bytes: &[u8]) -> Result<()> {
     let new_path = append_ext_suffix(target_exe, ".new");
     let old_path = append_ext_suffix(target_exe, ".old");
+
+    if let Ok(meta) = new_path.symlink_metadata() {
+        if meta.file_type().is_symlink() {
+            bail!(
+                "Refusing to write update binary through symlink: {}",
+                new_path.display()
+            );
+        }
+        std::fs::remove_file(&new_path).with_context(|| {
+            format!(
+                "Failed to remove stale temporary binary: {}",
+                new_path.display()
+            )
+        })?;
+    }
 
     std::fs::write(&new_path, new_bytes)
         .with_context(|| format!("Failed to write temporary new binary: {}", new_path.display()))?;
@@ -800,6 +875,94 @@ mod tests {
         assert!(err_chain.contains("SHA-256"), "unexpected error: {err_chain}");
         assert_eq!(std::fs::read(&fake_exe).unwrap(), b"ORIGINAL-SAFE-BINARY");
         assert!(!append_ext_suffix(&fake_exe, ".old").exists());
+
+        server.abort();
+    }
+
+    #[test]
+    fn test_validate_github_repo_and_auth_host_check() {
+        assert_eq!(
+            validate_github_repo("shinick-dev/teams").unwrap(),
+            "shinick-dev/teams"
+        );
+        assert!(validate_github_repo("../evil/teams").is_err());
+        assert!(validate_github_repo("owner/repo/extra").is_err());
+        assert!(validate_github_repo("owner").is_err());
+        assert!(validate_github_repo("owner/..").is_err());
+        assert!(validate_github_repo("owner/bad repo").is_err());
+
+        assert!(should_attach_github_auth(
+            "https://api.github.com",
+            "https://api.github.com/repos/a/b/releases/assets/1"
+        ));
+        assert!(should_attach_github_auth(
+            "https://api.github.com",
+            "https://github.com/a/b/releases/download/v1/teams"
+        ));
+        assert!(!should_attach_github_auth(
+            "https://api.github.com",
+            "https://objects.githubusercontent.com/github-production-release-asset/1"
+        ));
+        assert!(!should_attach_github_auth(
+            "http://127.0.0.1:8080",
+            "http://127.0.0.1:9090/assets/binary"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_apply_update_rejects_missing_sha256sums() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+        let asset_name = if cfg!(windows) { "teams.exe" } else { "teams" }.to_string();
+        let asset_name_clone = asset_name.clone();
+        let base_clone = base_url.clone();
+
+        let app = Router::new().route(
+            "/repos/shinick-dev/teams/releases/latest",
+            get(move || {
+                let asset_name = asset_name_clone.clone();
+                let base_url = base_clone.clone();
+                async move {
+                    Json(serde_json::json!({
+                        "tag_name": "v9.9.9",
+                        "html_url": format!("{base_url}/shinick-dev/teams/releases/tag/v9.9.9"),
+                        "assets": [
+                            {
+                                "name": asset_name,
+                                "size": 10,
+                                "url": format!("{base_url}/assets/binary"),
+                                "browser_download_url": format!("{base_url}/download/{asset_name}")
+                            }
+                        ]
+                    }))
+                }
+            }),
+        );
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_exe = tmp.path().join(&asset_name);
+        std::fs::write(&fake_exe, b"ORIGINAL-SAFE-BINARY").unwrap();
+
+        let err = check_or_apply_update_at(
+            &base_url,
+            "shinick-dev/teams",
+            false,
+            false,
+            &fake_exe,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("missing SHA256SUMS.txt"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(std::fs::read(&fake_exe).unwrap(), b"ORIGINAL-SAFE-BINARY");
 
         server.abort();
     }

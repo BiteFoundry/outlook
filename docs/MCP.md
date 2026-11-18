@@ -76,12 +76,13 @@ args = ["mcp"]
 
 ## Protocol
 
-- **Transport**: JSON-RPC 2.0 over stdio, **newline-delimited JSON** (one JSON object per line, no `Content-Length` headers).
+- **Transport**: JSON-RPC 2.0 over stdio, **newline-delimited JSON** (one JSON object per line, no `Content-Length` headers; maximum `8 MiB` per request line).
 - **Supported `protocolVersion`s**: `2024-11-05`, `2025-03-26`, `2025-06-18` (unknown versions fall back to `2025-06-18`).
-- **`serverInfo`**: `{ "name": "teams", "version": "<crate version>" }`.
+- **`serverInfo`**: `{ "name": "teams", "version": "0.7.1" }` (matches `CARGO_PKG_VERSION`).
+- **Startup**: `initialize` responds immediately; on an empty cache, initial conversation bootstrap runs asynchronously in the background.
 - **Notifications**: requests without `id` or methods starting with `notifications/` (such as `notifications/initialized`) emit no response.
 - **`ping`**: returns `{}`.
-- **Error codes**: `-32700` parse error, `-32600` invalid JSON-RPC envelope, `-32601` method not found.
+- **Error codes**: `-32700` parse error, `-32600` invalid JSON-RPC envelope (or oversized line > `8 MiB`), `-32601` method not found.
 - **`tools/call`**: returns `{ "content": [{ "type": "text", "text": "<pretty JSON>" }], "isError": false }` on success, or `"isError": true` with an error message (including JWT `scp`/`roles` permission diagnostics on `403`) on validation/Graph failures.
 
 ## Microsoft Teams Tools (17)
@@ -93,10 +94,10 @@ args = ["mcp"]
 | `list_chats` | `refresh?` (bool), `limit?` (1..1000) | `{ "chats": [...] }` |
 | `create_chat` | `members` (`string[]`, min 1), `topic?` | `{ "ok": true, "conversation": {...} }` |
 | `list_teams_channels` | `refresh?` (bool) | `{ "teams": [...] }` |
-| `get_messages` | `target`, `limit?` (1..1000), `before?` (ISO-8601 timestamp, `YYYY-MM-DD`, or `msg_id`), `offline?` (bool) | `{ "conversation": {...}, "messages": [...] }` |
+| `get_messages` | `target`, `limit?` (1..1000), `before?` (ISO-8601 timestamp, `YYYY-MM-DD`, or `msg_id`), `offline?` (bool) | `{ "conversation": {...}, "messages": [...], "has_more": bool, "next_before": string \| null }` |
 | `get_thread` | `target`, `root_msg_id`, `limit?` (1..1000) | `{ "conversation": {...}, "thread": {...} }` |
 | `send_message` | `target`, `markdown`, `subject?`, `mentions?`, `important?` | `{ "ok": true, "conversation": {...}, "message": {...} }` |
-| `reply_message` | `target`, `msg_id`, `markdown` | `{ "ok": true, "conversation": {...}, "reply_to": "...", "message": {...} }` |
+| `reply_message` | `target`, `msg_id`, `markdown`, `mentions?`, `important?` | `{ "ok": true, "conversation": {...}, "reply_to": "...", "message": {...} }` |
 | `send_file` | `target`, `path`, `caption?`, `thread_root_id?`, `inline?` | `{ "ok": true, "conversation": {...}, "path": "...", "message": {...} }` |
 | `download_attachment` | `target`, `msg_id`, `index?`, `out_dir?`, `thread_root_id?` | `{ "ok": true, "path": "...", "file_name": "...", "bytes_written": ... }` |
 | `react_message` | `target`, `msg_id`, `reaction`, `enable?` (default `true`), `thread_root_id?` | `{ "ok": true, "conv_key": "...", "msg_id": "...", "reaction": "...", "enable": ... }` |
@@ -108,9 +109,9 @@ args = ["mcp"]
 | `get_presence` | `user_ids?` (`string[]`) | `{ "presence": {...} }` or `{ "presences": [...] }` |
 | `set_presence` | `availability` (`Available\|Busy\|DoNotDisturb\|BeRightBack\|Away\|Reset`), `activity?`, `expiration_mins?` (1..1440) | `{ "ok": true, "availability": "...", "activity": "...", "expiration_mins": ... }` |
 
-### Mentions in `send_message`
+### Mentions and importance in `send_message` and `reply_message`
 
-`mentions` accepts either `"user_id:DisplayName"` strings or `{ "id"?: 0, "user_id": "...", "display_name": "..." }` objects.
+`mentions` accepts either `"user_id:DisplayName"` strings or `{ "id"?: 0, "user_id": "...", "display_name": "..." }` objects. Set `important: true` to mark the message with high importance.
 
 ### Destructive tool guard (`confirm: true`)
 

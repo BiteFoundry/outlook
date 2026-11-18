@@ -9,7 +9,7 @@ pub mod teams;
 use std::{
     cmp::Ordering,
     collections::HashSet,
-    sync::{Arc, OnceLock},
+    sync::{atomic::AtomicBool, Arc, OnceLock},
     time::Duration,
 };
 
@@ -31,12 +31,15 @@ pub struct GraphClient {
     http: reqwest::Client,
     my_user_id: Option<String>,
     cached_my_user_id: Arc<OnceLock<String>>,
+    chats_orderby_unsupported: Arc<AtomicBool>,
+    resolve_user_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl GraphClient {
     pub fn new(config: AppConfig, auth: AuthManager) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(concat!("teams-cli/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
             .tcp_nodelay(true)
             .pool_max_idle_per_host(16)
@@ -49,6 +52,8 @@ impl GraphClient {
             http,
             my_user_id: None,
             cached_my_user_id: Arc::new(OnceLock::new()),
+            chats_orderby_unsupported: Arc::new(AtomicBool::new(false)),
+            resolve_user_mutex: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 

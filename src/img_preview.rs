@@ -86,23 +86,7 @@ pub fn decode_and_render_halfblocks(
         bail!("Image dimensions are 0x0");
     }
 
-    let clamped_cols = max_cols.max(4);
-    let clamped_rows = max_rows.max(2);
-    let max_px_w = clamped_cols as u32;
-    let max_px_h = (clamped_rows as u32) * 2;
-
-    let scale = (max_px_w as f64 / width_px as f64)
-        .min(max_px_h as f64 / height_px as f64)
-        .min(1.0);
-    let target_w = ((width_px as f64 * scale).round() as u32).clamp(1, max_px_w);
-    let mut target_h = ((height_px as f64 * scale).round() as u32).clamp(2, max_px_h);
-    if target_h % 2 != 0 {
-        if target_h + 1 <= max_px_h {
-            target_h += 1;
-        } else {
-            target_h = target_h.saturating_sub(1).max(2);
-        }
-    }
+    let (target_w, target_h) = compute_target_dims(width_px, height_px, max_cols, max_rows);
 
     let resized = image::imageops::resize(&rgba, target_w, target_h, FilterType::Triangle);
     let mut lines = Vec::with_capacity((target_h / 2) as usize);
@@ -155,6 +139,27 @@ pub fn decode_and_render_halfblocks(
     })
 }
 
+fn compute_target_dims(width_px: u32, height_px: u32, max_cols: u16, max_rows: u16) -> (u32, u32) {
+    let clamped_cols = max_cols.max(4);
+    let clamped_rows = max_rows.max(2);
+    let max_px_w = clamped_cols as u32;
+    let max_px_h = (clamped_rows as u32) * 2;
+
+    let scale = (max_px_w as f64 / width_px as f64)
+        .min(max_px_h as f64 / height_px as f64)
+        .min(1.0);
+    let target_w = ((width_px as f64 * scale).round() as u32).clamp(1, max_px_w);
+    let mut target_h = ((height_px as f64 * scale).round() as u32).clamp(2, max_px_h);
+    if target_h % 2 != 0 {
+        if target_h + 1 <= max_px_h {
+            target_h += 1;
+        } else {
+            target_h = target_h.saturating_sub(1).max(2);
+        }
+    }
+    (target_w, target_h)
+}
+
 /// Renders an image for direct CLI terminal stdout (auto-detecting Kitty / iTerm2 / WezTerm / Ghostty or 24-bit ANSI Half-Blocks).
 pub fn render_ansi_stdout(bytes: &[u8], max_cols: u16, max_rows: u16) -> Result<String> {
     let protocol = detect_protocol_from_env();
@@ -167,24 +172,33 @@ fn render_ansi_stdout_with_protocol(
     max_rows: u16,
     protocol: TerminalImageProtocol,
 ) -> Result<String> {
-    let rendered = decode_and_render_halfblocks(bytes, max_cols, max_rows, (0, 0, 0))?;
-
     match protocol {
         TerminalImageProtocol::ITerm2 => {
+            let dyn_img = image::load_from_memory(bytes).context("Failed to decode image")?;
+            let (width_px, height_px) = (dyn_img.width(), dyn_img.height());
+            if width_px == 0 || height_px == 0 {
+                bail!("Image dimensions are 0x0");
+            }
+            let (cols, _) = compute_target_dims(width_px, height_px, max_cols, max_rows);
             let b64 = B64_STANDARD.encode(bytes);
             Ok(format!(
                 "\x1b]1337;File=inline=1;width={};preserveAspectRatio=1:{b64}\x07\n",
-                rendered.cols
+                cols
             ))
         }
         TerminalImageProtocol::Kitty => {
-            let png_bytes = if matches!(image::guess_format(bytes), Ok(ImageFormat::Png)) {
-                bytes.to_vec()
+            let dyn_img = image::load_from_memory(bytes).context("Failed to decode image")?;
+            if dyn_img.width() == 0 || dyn_img.height() == 0 {
+                bail!("Image dimensions are 0x0");
+            }
+            let png_owned;
+            let png_bytes: &[u8] = if matches!(image::guess_format(bytes), Ok(ImageFormat::Png)) {
+                bytes
             } else {
-                let dyn_img = image::load_from_memory(bytes).context("Failed to decode image")?;
-                encode_png(&dyn_img)?
+                png_owned = encode_png(&dyn_img)?;
+                &png_owned
             };
-            let b64 = B64_STANDARD.encode(&png_bytes);
+            let b64 = B64_STANDARD.encode(png_bytes);
             let chunks: Vec<&str> = b64
                 .as_bytes()
                 .chunks(4096)
@@ -204,6 +218,7 @@ fn render_ansi_stdout_with_protocol(
             Ok(out)
         }
         TerminalImageProtocol::Halfblock => {
+            let rendered = decode_and_render_halfblocks(bytes, max_cols, max_rows, (0, 0, 0))?;
             let mut out = String::new();
             for line in &rendered.lines {
                 for span in &line.spans {
@@ -414,5 +429,16 @@ mod tests {
         assert!(large_cells > small_cells);
         assert!(small.approx_heap_bytes() > empty.approx_heap_bytes());
         assert!(large.approx_heap_bytes() > small.approx_heap_bytes());
+    }
+
+    #[test]
+    fn test_render_ansi_stdout_rejects_invalid_bytes_all_protocols() {
+        for proto in [
+            TerminalImageProtocol::Halfblock,
+            TerminalImageProtocol::ITerm2,
+            TerminalImageProtocol::Kitty,
+        ] {
+            assert!(render_ansi_stdout_with_protocol(b"bad-bytes", 16, 8, proto).is_err());
+        }
     }
 }

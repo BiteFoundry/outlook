@@ -124,6 +124,9 @@ impl GraphClient {
         let user: GraphUser = self
             .get_json("/me?$select=id,displayName,mail,userPrincipalName")
             .await?;
+        if !user.id.trim().is_empty() {
+            let _ = self.cached_my_user_id.set(user.id.clone());
+        }
         Ok(user.into())
     }
 
@@ -192,18 +195,27 @@ impl GraphClient {
             Some(url) => self.get_json(url).await?,
             None => {
                 let page_top = top.clamp(1, 50);
-                let ordered_url = format!(
-                    "/me/chats?$expand=members,lastMessagePreview&$orderby=lastMessagePreview/createdDateTime%20desc&$top={page_top}"
+                let fallback_url = format!(
+                    "/me/chats?$expand=members,lastMessagePreview&$top={page_top}"
                 );
-                match self.get_json(&ordered_url).await {
-                    Ok(p) => p,
-                    Err(err) if is_chats_orderby_unsupported(&err) => {
-                        let fallback_url = format!(
-                            "/me/chats?$expand=members,lastMessagePreview&$top={page_top}"
-                        );
-                        self.get_json(&fallback_url).await?
+                if self
+                    .chats_orderby_unsupported
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    self.get_json(&fallback_url).await?
+                } else {
+                    let ordered_url = format!(
+                        "/me/chats?$expand=members,lastMessagePreview&$orderby=lastMessagePreview/createdDateTime%20desc&$top={page_top}"
+                    );
+                    match self.get_json(&ordered_url).await {
+                        Ok(p) => p,
+                        Err(err) if is_chats_orderby_unsupported(&err) => {
+                            self.chats_orderby_unsupported
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            self.get_json(&fallback_url).await?
+                        }
+                        Err(err) => return Err(err),
                     }
-                    Err(err) => return Err(err),
                 }
             }
         };
@@ -826,28 +838,43 @@ mod tests {
             auth_mode: "access_token".into(),
         };
         let auth = crate::auth::AuthManager::from_tokens(cfg.clone(), tok);
-        let client = GraphClient::new(cfg, auth).unwrap().with_my_user_id("me-1");
+        let client = GraphClient::new(cfg.clone(), auth.clone())
+            .unwrap()
+            .with_my_user_id("me-1");
 
-        // Attempt 0: 400 Bad Request triggers fallback
+        // Attempt 0: 400 Bad Request triggers fallback and memoizes unsupported $orderby
         let (p1, next) = client.list_chats_page(2, None).await.unwrap();
         assert_eq!(ordered_attempts.load(Ordering::SeqCst), 1);
         assert_eq!(p1.len(), 2);
         assert_eq!(next.as_deref(), Some(page2_url.as_str()));
 
-        // Attempt 1: list_chats follows nextLink and deduplicates chat-2
+        // Subsequent call on the same client skips $orderby completely (ordered_attempts stays 1)
         let all = client.list_chats(10).await.unwrap();
+        assert_eq!(ordered_attempts.load(Ordering::SeqCst), 1);
         let keys: Vec<&str> = all.iter().map(|c| c.conv_key.as_str()).collect();
         assert_eq!(keys, vec!["chat:chat-1", "chat:chat-2", "chat:chat-3"]);
         assert_eq!(all[0].title, "One");
         assert_eq!(all[1].title, "Two");
         assert_eq!(all[2].title, "Three");
 
-        // Attempt 2: 501 Not Implemented triggers fallback
-        let (p1_501, _) = client.list_chats_page(2, None).await.unwrap();
+        // Fresh client #2: 400 (n=1) -> fallback; fresh client #3: 501 Not Implemented (n=2) -> fallback
+        let client_400 = GraphClient::new(cfg.clone(), auth.clone())
+            .unwrap()
+            .with_my_user_id("me-1");
+        let (p1_400, _) = client_400.list_chats_page(2, None).await.unwrap();
+        assert_eq!(p1_400.len(), 2);
+
+        let client_501 = GraphClient::new(cfg.clone(), auth.clone())
+            .unwrap()
+            .with_my_user_id("me-1");
+        let (p1_501, _) = client_501.list_chats_page(2, None).await.unwrap();
         assert_eq!(p1_501.len(), 2);
 
-        // Attempt 3: 403 Forbidden must NOT trigger fallback
-        let err = client.list_chats_page(2, None).await.unwrap_err();
+        // Fresh client #4: 403 Forbidden (n=3) must NOT trigger fallback
+        let client_403 = GraphClient::new(cfg, auth)
+            .unwrap()
+            .with_my_user_id("me-1");
+        let err = client_403.list_chats_page(2, None).await.unwrap_err();
         assert!(err.to_string().contains("403"));
     }
 

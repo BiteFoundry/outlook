@@ -19,6 +19,9 @@ pub enum ButtonId {
     ComposerTargetToggle,
     SubjectToggle,
     NarrowToggle,
+    NarrowList,
+    NarrowChat,
+    NarrowThread,
     ImagePreview,
     CommandPalette,
     DensityToggle,
@@ -88,6 +91,8 @@ pub enum HitTarget {
     OverlayBody,
     /// Item inside the top overlay.
     OverlayItem { index: usize },
+    /// Candidate row inside the `@mention` autocomplete popup.
+    MentionCandidate(usize),
 }
 
 #[derive(Debug, Clone, Default)]

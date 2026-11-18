@@ -460,13 +460,16 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
 }
 
 fn draw_vertical_hairline(frame: &mut Frame, x: u16, y: u16, height: u16, style: Style) {
-    if height == 0 {
+    let buf_area = frame.area();
+    if height == 0 || x < buf_area.left() || x >= buf_area.right() {
         return;
     }
-    let lines: Vec<Line<'static>> = (0..height)
-        .map(|_| Line::from(Span::styled("│", style)))
-        .collect();
-    frame.render_widget(Paragraph::new(lines), Rect::new(x, y, 1, height));
+    let start_y = y.max(buf_area.top());
+    let end_y = y.saturating_add(height).min(buf_area.bottom());
+    let buf = frame.buffer_mut();
+    for row_y in start_y..end_y {
+        buf[(x, row_y)].set_symbol("│").set_style(style);
+    }
 }
 
 fn draw_chat_switch_footer(
@@ -516,19 +519,19 @@ fn draw_compact_bar(
     let mut pills: Vec<(&'static str, HitTarget, bool)> = vec![
         (
             " List ",
-            HitTarget::Button(ButtonId::NarrowToggle),
+            HitTarget::Button(ButtonId::NarrowList),
             ui.narrow_pane == NarrowPane::List,
         ),
         (
             " Chat ",
-            HitTarget::Button(ButtonId::NarrowToggle),
+            HitTarget::Button(ButtonId::NarrowChat),
             ui.narrow_pane == NarrowPane::Chat,
         ),
     ];
     if thread_open {
         pills.push((
             " Thread ",
-            HitTarget::Button(ButtonId::NarrowToggle),
+            HitTarget::Button(ButtonId::NarrowThread),
             ui.narrow_pane == NarrowPane::Thread,
         ));
     }
@@ -587,6 +590,8 @@ fn draw_compact_bar(
     }
 }
 
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 fn draw_status_bar(
     frame: &mut Frame,
     area: Rect,
@@ -606,11 +611,15 @@ fn draw_status_bar(
     };
     frame.render_widget(Paragraph::new("").style(bar_style), area);
 
-    let sync_tag = if app.syncing {
-        format!("⟳ {}", app.sync_summary)
+    let spinner_glyph = SPINNER_FRAMES[(ui.spinner_tick as usize) % SPINNER_FRAMES.len()];
+    let (sync_glyph, sync_glyph_color, sync_tail) = if app.syncing {
+        (spinner_glyph, Some(ui.theme.accent), format!(" {}", app.sync_summary))
+    } else if ui.poll_retrying {
+        (spinner_glyph, Some(ui.theme.warning), String::new())
     } else {
-        format!("✓ {}", app.sync_summary)
+        ("✓", None, format!(" {}", app.sync_summary))
     };
+    let sync_tag = format!("{sync_glyph}{sync_tail}");
     let (dot, dot_color) = ui
         .theme
         .presence_indicator(app.my_presence.as_ref().map(|p| p.availability.as_str()));
@@ -739,9 +748,28 @@ fn draw_status_bar(
     let mut spans = vec![
         Span::styled(mode_badge, badge_style),
         Span::styled(presence_prefix, dot_style),
-        Span::styled(left_trimmed, bar_style),
-        Span::styled(" ".repeat(pad), bar_style),
     ];
+    let avail_sep = format!("{avail} · ");
+    let avail_sep_w = avail_sep.width();
+    let glyph_w = sync_glyph.width();
+    if let Some(glyph_color) = sync_glyph_color {
+        if !ui.theme.no_color && left_budget >= avail_sep_w + glyph_w {
+            let after_glyph = truncate_width(
+                &format!("{sync_tail}{task_note}"),
+                left_budget.saturating_sub(avail_sep_w + glyph_w),
+            );
+            spans.push(Span::styled(avail_sep, bar_style));
+            spans.push(Span::styled(sync_glyph, bar_style.fg(glyph_color)));
+            if !after_glyph.is_empty() {
+                spans.push(Span::styled(after_glyph, bar_style));
+            }
+        } else {
+            spans.push(Span::styled(left_trimmed, bar_style));
+        }
+    } else {
+        spans.push(Span::styled(left_trimmed, bar_style));
+    }
+    spans.push(Span::styled(" ".repeat(pad), bar_style));
 
     let mut rx = area.x.saturating_add(left_total_w + pad as u16);
     for (seg, btn_opt) in chosen_right {

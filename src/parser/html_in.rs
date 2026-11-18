@@ -2,7 +2,7 @@
 
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use scraper::{ElementRef, Html, Node};
 
@@ -18,18 +18,31 @@ type HtmlCacheKey = (u64, u64, usize);
 
 #[derive(Default)]
 struct HtmlParseCache {
-    entries: HashMap<HtmlCacheKey, Vec<RichBlock>>,
+    entries: HashMap<HtmlCacheKey, Arc<[RichBlock]>>,
     order: VecDeque<HtmlCacheKey>,
 }
 
 impl HtmlParseCache {
-    fn get(&self, key: &HtmlCacheKey) -> Option<&Vec<RichBlock>> {
-        self.entries.get(key)
+    fn get(&mut self, key: &HtmlCacheKey) -> Option<Arc<[RichBlock]>> {
+        let val = self.entries.get(key).cloned()?;
+        if self.order.back() != Some(key) {
+            if let Some(pos) = self.order.iter().rposition(|k| k == key) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(*key);
+        }
+        Some(val)
     }
 
-    fn insert(&mut self, key: HtmlCacheKey, value: Vec<RichBlock>) {
+    fn insert(&mut self, key: HtmlCacheKey, value: Arc<[RichBlock]>) {
         if self.entries.contains_key(&key) {
             self.entries.insert(key, value);
+            if self.order.back() != Some(&key) {
+                if let Some(pos) = self.order.iter().rposition(|k| k == &key) {
+                    self.order.remove(pos);
+                }
+                self.order.push_back(key);
+            }
             return;
         }
         while self.entries.len() >= HTML_CACHE_MAX_ENTRIES {
@@ -132,28 +145,75 @@ fn compute_parse_fingerprint(
     (h1.finish(), h2.finish(), html.len())
 }
 
-pub fn parse_message_blocks(
+fn try_fast_path_plain_or_empty(
+    html: &str,
+    attachments: &[AttachmentInfo],
+) -> Option<Arc<[RichBlock]>> {
+    if !attachments.is_empty() {
+        return None;
+    }
+    if html.trim().is_empty() {
+        return Some(Arc::from([]));
+    }
+    if !html.contains('<') && !html.contains('&') && !html.contains('\0') {
+        let collapsed = collapse_html_whitespace(html);
+        let trimmed = collapsed.trim();
+        if trimmed.is_empty() {
+            return Some(Arc::from([]));
+        }
+        return Some(Arc::from([RichBlock::Paragraph(vec![RichSpan {
+            text: trimmed.to_string(),
+            style: TextStyleFlags::default(),
+        }])]));
+    }
+    None
+}
+
+pub fn parse_message_blocks_arc(
     html: &str,
     attachments: &[AttachmentInfo],
     mentions: &[MentionInfo],
-) -> Vec<RichBlock> {
+) -> Arc<[RichBlock]> {
+    if let Some(fast) = try_fast_path_plain_or_empty(html, attachments) {
+        return fast;
+    }
     if html.len() > HTML_CACHE_MAX_HTML_BYTES {
-        return parse_message_blocks_uncached(html, attachments, mentions);
+        return Arc::from(parse_message_blocks_uncached(html, attachments, mentions));
     }
 
     let key = compute_parse_fingerprint(html, attachments, mentions);
     let cache = HTML_PARSE_CACHE.get_or_init(|| Mutex::new(HtmlParseCache::default()));
     {
-        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = guard.get(&key) {
-            return cached.clone();
+            return cached;
         }
     }
 
-    let parsed = parse_message_blocks_uncached(html, attachments, mentions);
+    let parsed: Arc<[RichBlock]> =
+        Arc::from(parse_message_blocks_uncached(html, attachments, mentions));
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    guard.insert(key, parsed.clone());
+    guard.insert(key, Arc::clone(&parsed));
     parsed
+}
+
+pub fn parse_message_blocks(
+    html: &str,
+    attachments: &[AttachmentInfo],
+    mentions: &[MentionInfo],
+) -> Vec<RichBlock> {
+    parse_message_blocks_arc(html, attachments, mentions).to_vec()
+}
+
+pub(crate) fn parse_message_blocks_no_cache(
+    html: &str,
+    attachments: &[AttachmentInfo],
+    mentions: &[MentionInfo],
+) -> Arc<[RichBlock]> {
+    if let Some(fast) = try_fast_path_plain_or_empty(html, attachments) {
+        return fast;
+    }
+    Arc::from(parse_message_blocks_uncached(html, attachments, mentions))
 }
 
 fn parse_message_blocks_uncached(
@@ -787,21 +847,28 @@ fn spans_are_blank(spans: &[RichSpan]) -> bool {
 }
 
 fn trim_spans(mut spans: Vec<RichSpan>) -> Vec<RichSpan> {
-    while let Some(first) = spans.first_mut() {
-        let trimmed = first.text.trim_start_matches([' ', '\t', '\n', '\r']);
-        if trimmed.is_empty() {
-            spans.remove(0);
-        } else {
-            first.text = trimmed.to_string();
-            break;
+    let start_idx = spans
+        .iter()
+        .position(|s| !s.text.trim_start_matches([' ', '\t', '\n', '\r']).is_empty())
+        .unwrap_or(spans.len());
+    if start_idx > 0 {
+        spans.drain(..start_idx);
+    }
+    if let Some(first) = spans.first_mut() {
+        let trimmed_len = first.text.trim_start_matches([' ', '\t', '\n', '\r']).len();
+        let lead = first.text.len() - trimmed_len;
+        if lead > 0 {
+            first.text.drain(..lead);
         }
     }
     while let Some(last) = spans.last_mut() {
-        let trimmed = last.text.trim_end_matches([' ', '\t', '\n', '\r']);
-        if trimmed.is_empty() {
+        let trimmed_len = last.text.trim_end_matches([' ', '\t', '\n', '\r']).len();
+        if trimmed_len == 0 {
             spans.pop();
         } else {
-            last.text = trimmed.to_string();
+            if trimmed_len < last.text.len() {
+                last.text.truncate(trimmed_len);
+            }
             break;
         }
     }
@@ -813,37 +880,56 @@ fn spans_to_plain(spans: &[RichSpan]) -> String {
 }
 
 fn spans_to_markdown(spans: &[RichSpan]) -> String {
-    let mut out = String::new();
+    let total_len: usize = spans.iter().map(|s| s.text.len()).sum();
+    let mut out = String::with_capacity(total_len);
     for span in spans {
         if span.text.is_empty() {
             continue;
         }
-        let mut formatted = if span.style.code {
-            if span.text.contains('`') {
-                format!("`` {} ``", span.text)
-            } else {
-                format!("`{}`", span.text)
+        let has_link = span.style.link_url.is_some();
+        if has_link {
+            out.push('[');
+        }
+        if !span.style.code {
+            if span.style.underline {
+                out.push_str("<u>");
             }
+            if span.style.strike {
+                out.push_str("~~");
+            }
+            if span.style.italic {
+                out.push('*');
+            }
+            if span.style.bold {
+                out.push_str("**");
+            }
+            out.push_str(&span.text);
+            if span.style.bold {
+                out.push_str("**");
+            }
+            if span.style.italic {
+                out.push('*');
+            }
+            if span.style.strike {
+                out.push_str("~~");
+            }
+            if span.style.underline {
+                out.push_str("</u>");
+            }
+        } else if span.text.contains('`') {
+            out.push_str("`` ");
+            out.push_str(&span.text);
+            out.push_str(" ``");
         } else {
-            span.text.clone()
-        };
-
-        if span.style.bold && !span.style.code {
-            formatted = format!("**{formatted}**");
-        }
-        if span.style.italic && !span.style.code {
-            formatted = format!("*{formatted}*");
-        }
-        if span.style.strike && !span.style.code {
-            formatted = format!("~~{formatted}~~");
-        }
-        if span.style.underline && !span.style.code {
-            formatted = format!("<u>{formatted}</u>");
+            out.push('`');
+            out.push_str(&span.text);
+            out.push('`');
         }
         if let Some(url) = &span.style.link_url {
-            formatted = format!("[{formatted}]({url})");
+            out.push_str("](");
+            out.push_str(url);
+            out.push(')');
         }
-        out.push_str(&formatted);
     }
     out
 }
@@ -923,12 +1009,25 @@ mod tests {
     fn html_cache_evicts_at_max_capacity() {
         let mut cache = HtmlParseCache::default();
         for i in 0..(HTML_CACHE_MAX_ENTRIES + 50) {
-            cache.insert((i as u64, (i as u64) ^ 0x55, i), Vec::new());
+            cache.insert((i as u64, (i as u64) ^ 0x55, i), Arc::from(Vec::new()));
         }
         assert_eq!(cache.entries.len(), HTML_CACHE_MAX_ENTRIES);
         assert_eq!(cache.order.len(), HTML_CACHE_MAX_ENTRIES);
         assert!(cache.get(&(0, 0x55, 0)).is_none());
         let last = HTML_CACHE_MAX_ENTRIES + 49;
         assert!(cache.get(&(last as u64, (last as u64) ^ 0x55, last)).is_some());
+    }
+
+    #[test]
+    fn html_cache_promotes_on_get_lru() {
+        let mut cache = HtmlParseCache::default();
+        for i in 0..HTML_CACHE_MAX_ENTRIES {
+            cache.insert((i as u64, 1, i), Arc::from(Vec::new()));
+        }
+        // Promote key 0 to MRU before inserting one new item; key 1 should be evicted instead of 0.
+        assert!(cache.get(&(0, 1, 0)).is_some());
+        cache.insert((99999, 1, 99999), Arc::from(Vec::new()));
+        assert!(cache.get(&(0, 1, 0)).is_some());
+        assert!(cache.get(&(1, 1, 1)).is_none());
     }
 }

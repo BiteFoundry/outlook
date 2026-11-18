@@ -38,6 +38,7 @@ fn main() -> Result<()> {
         })
     } else {
         let _ = rustls::crypto::ring::default_provider().install_default();
+        teams_cli::updater::cleanup_stale_old_binary();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;

@@ -2,8 +2,12 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
@@ -19,7 +23,7 @@ use crate::models::{
 };
 use crate::parser;
 use crate::storage::Storage;
-use crate::sync::{self, SyncCommand, SyncController};
+use crate::sync::{self, SyncController};
 
 use super::composer::{ComposerState, ReplyPreview};
 use super::hitmap::{HitMap, MessageScope};
@@ -57,7 +61,7 @@ pub struct ScrollState {
     pub total_lines: usize,
     pub offset: usize,
     /// `(start_line, end_line_exclusive)` per rendered item (`0..N` in Chat, `0` = root and `1..=N` in Thread).
-    pub message_ranges: Vec<(usize, usize)>,
+    pub message_ranges: Arc<[(usize, usize)]>,
 }
 
 impl Default for ScrollState {
@@ -69,7 +73,7 @@ impl Default for ScrollState {
             area: Rect::default(),
             total_lines: 0,
             offset: 0,
-            message_ranges: Vec::new(),
+            message_ranges: Arc::from([]),
         }
     }
 }
@@ -158,6 +162,17 @@ pub enum UiMsg {
         conv_key: String,
         messages: Vec<MessageItem>,
         members: Vec<MemberInfo>,
+    },
+    MembersLoaded {
+        conv_key: String,
+        members: Vec<MemberInfo>,
+        clear_loading: bool,
+    },
+    ClipboardImageEncoded {
+        width: u32,
+        height: u32,
+        png_bytes: Vec<u8>,
+        preview: Option<RenderedTerminalImage>,
     },
     OlderMessagesLoaded {
         conv_key: String,
@@ -263,6 +278,8 @@ pub struct UiState {
     pub thread_scroll: ScrollState,
     /// `(old_total_lines, old_offset)` recorded right before prepending older messages.
     pub pending_prepend_anchor: Option<(usize, usize)>,
+    /// `old_offset` recorded right before appending new messages at the bottom while scrolled up.
+    pub pending_append_anchor: Option<usize>,
     pub attach_index: usize,
     pub show_nav_rail: bool,
     pub auto_thread_pane: bool,
@@ -287,6 +304,8 @@ pub struct UiState {
     pub last_conv_key: Option<String>,
     pub last_click: Option<(std::time::Instant, u16, u16, super::hitmap::HitTarget)>,
     pub thread_composer_area: Rect,
+    pub poll_retrying: bool,
+    pub spinner_tick: u8,
 }
 
 impl Default for UiState {
@@ -297,6 +316,19 @@ impl Default for UiState {
 
 impl UiState {
     pub fn new() -> Self {
+        let mut keymap = Keymap::default_teams();
+        keymap.bind(
+            Some(Focus::Composer),
+            KeyCode::BackTab,
+            KeyModifiers::SHIFT,
+            super::action::Action::PrevFocus,
+        );
+        keymap.bind(
+            Some(Focus::Composer),
+            KeyCode::BackTab,
+            KeyModifiers::NONE,
+            super::action::Action::PrevFocus,
+        );
         Self {
             focus: Focus::Nav,
             overlays: Vec::new(),
@@ -304,7 +336,7 @@ impl UiState {
             hitmap: HitMap::default(),
             toasts: ToastQueue::new(),
             tasks: TaskBoard::default(),
-            keymap: Keymap::default_teams(),
+            keymap,
             theme: Theme::default(),
             active_nav_tab: 0,
             nav_selected: 0,
@@ -313,6 +345,7 @@ impl UiState {
             chat_scroll: ScrollState::default(),
             thread_scroll: ScrollState::default(),
             pending_prepend_anchor: None,
+            pending_append_anchor: None,
             attach_index: 0,
             show_nav_rail: true,
             auto_thread_pane: true,
@@ -336,6 +369,8 @@ impl UiState {
             last_conv_key: None,
             last_click: None,
             thread_composer_area: Rect::default(),
+            poll_retrying: false,
+            spinner_tick: 0,
         }
     }
 
@@ -421,8 +456,11 @@ pub struct AppState {
     pub active_thread: Option<ThreadView>,
     pub activity_mentions: Vec<MessageItem>,
     pub members: Vec<MemberInfo>,
+    pub member_fetched_at: HashMap<String, Instant>,
     pub presences: HashMap<String, PresenceStatus>,
     pub drafts: HashMap<String, String>,
+    pub draft_save_seq: Arc<AtomicU64>,
+    pub draft_save_lock: Arc<Mutex<()>>,
     pub download_dir: PathBuf,
     pub loading_messages: bool,
     pub loading_older: bool,
@@ -445,8 +483,10 @@ pub struct AppState {
     pub image_cache: HashMap<String, RenderedTerminalImage>,
     pub image_cache_order: VecDeque<String>,
     pub image_cache_bytes: usize,
+    pub image_cache_gen: u64,
     pub image_pending: HashSet<String>,
     pub image_errors: HashMap<String, String>,
+    pub image_errors_order: VecDeque<String>,
     pub ui_tx: mpsc::UnboundedSender<UiMsg>,
 }
 
@@ -478,8 +518,11 @@ impl AppState {
             active_thread: None,
             activity_mentions: Vec::new(),
             members: Vec::new(),
+            member_fetched_at: HashMap::new(),
             presences: HashMap::new(),
             drafts,
+            draft_save_seq: Arc::new(AtomicU64::new(0)),
+            draft_save_lock: Arc::new(Mutex::new(())),
             download_dir,
             loading_messages: false,
             loading_older: false,
@@ -501,8 +544,10 @@ impl AppState {
             image_cache: HashMap::new(),
             image_cache_order: VecDeque::new(),
             image_cache_bytes: 0,
+            image_cache_gen: 0,
             image_pending: HashSet::new(),
             image_errors: HashMap::new(),
+            image_errors_order: VecDeque::new(),
             ui_tx,
         }
     }
@@ -574,12 +619,20 @@ impl AppState {
     }
 
     fn persist_drafts(&self) {
+        let seq = self.draft_save_seq.fetch_add(1, Ordering::SeqCst) + 1;
         if tokio::runtime::Handle::try_current().is_ok() {
             let snapshot = self.drafts.clone();
+            let seq_counter = Arc::clone(&self.draft_save_seq);
+            let save_lock = Arc::clone(&self.draft_save_lock);
             tokio::task::spawn_blocking(move || {
+                let _guard = save_lock.lock();
+                if seq_counter.load(Ordering::SeqCst) != seq {
+                    return;
+                }
                 let _ = config::save_drafts(&snapshot);
             });
         } else {
+            let _guard = self.draft_save_lock.lock();
             let _ = config::save_drafts(&self.drafts);
         }
     }
@@ -919,7 +972,7 @@ impl AppState {
         ui.chat_scroll = ScrollState::default();
         ui.thread_scroll = ScrollState::default();
         ui.pending_prepend_anchor = None;
-        self.loading_messages = true;
+        ui.pending_append_anchor = None;
 
         self.messages = self
             .storage
@@ -946,11 +999,23 @@ impl AppState {
         }
 
         self.sync_ctrl.set_focus(Some(target.clone()), None);
-        self.sync_ctrl.request(SyncCommand::SyncActiveNow);
+
+        const MEMBER_CACHE_TTL: Duration = Duration::from_secs(300);
+        let need_messages_fetch = self.messages.is_empty();
+        let need_members_fetch = self.members.is_empty()
+            || self
+                .member_fetched_at
+                .get(&new_key)
+                .is_none_or(|t| t.elapsed() >= MEMBER_CACHE_TTL);
+        self.loading_messages = need_messages_fetch;
 
         if tokio::runtime::Handle::try_current().is_err() {
             self.loading_messages = false;
             return;
+        }
+
+        if need_members_fetch {
+            self.member_fetched_at.insert(new_key.clone(), Instant::now());
         }
 
         let graph = self.graph.clone();
@@ -968,38 +1033,75 @@ impl AppState {
                     let _ = graph.mark_chat_read(chat_id).await;
                 }
             };
-            let (msgs_res, members_res, _, _) = tokio::join!(
-                graph.list_messages(&target, 60),
-                graph.list_members(&target),
-                mark_read_fut,
-                chat_read_fut,
-            );
-            let fetched_msgs = msgs_res.unwrap_or_default();
-            let fetched_members = members_res.ok();
-            let db_conv_key = conv_key.clone();
-            let (messages, members) = tokio::task::spawn_blocking(move || {
-                if !fetched_msgs.is_empty() {
-                    let _ = storage.upsert_messages(&fetched_msgs);
+            let msgs_fut = async {
+                if need_messages_fetch {
+                    Some(graph.list_messages(&target, 60).await)
+                } else {
+                    None
                 }
-                if let Some(ref members) = fetched_members {
-                    if !members.is_empty() {
-                        let _ = storage.upsert_members(&db_conv_key, members);
-                    }
+            };
+            let members_fut = async {
+                if need_members_fetch {
+                    Some(graph.list_members(&target).await)
+                } else {
+                    None
                 }
-                let messages = storage
-                    .list_root_messages(&db_conv_key, 80, None)
-                    .unwrap_or(fetched_msgs);
-                let members = storage.list_members(&db_conv_key).unwrap_or_default();
-                (messages, members)
-            })
-            .await
-            .unwrap_or_default();
+            };
+            let (msgs_res_opt, members_res_opt, _, _) =
+                tokio::join!(msgs_fut, members_fut, mark_read_fut, chat_read_fut);
 
-            let _ = tx.send(UiMsg::MessagesLoaded {
-                conv_key,
-                messages,
-                members,
-            });
+            let fetched_msgs = msgs_res_opt.and_then(Result::ok);
+            let fetched_members = members_res_opt.and_then(Result::ok);
+
+            if fetched_msgs.is_some() || fetched_members.is_some() {
+                let db_conv_key = conv_key.clone();
+                let had_msgs = fetched_msgs.is_some();
+                let (messages, members) = tokio::task::spawn_blocking(move || {
+                    if let Some(ref msgs) = fetched_msgs {
+                        if !msgs.is_empty() {
+                            let _ = storage.upsert_messages(msgs);
+                        }
+                    }
+                    if let Some(ref members) = fetched_members {
+                        if !members.is_empty() {
+                            let _ = storage.upsert_members(&db_conv_key, members);
+                        }
+                    }
+                    let messages = if had_msgs {
+                        Some(
+                            storage
+                                .list_root_messages(&db_conv_key, 80, None)
+                                .unwrap_or_default(),
+                        )
+                    } else {
+                        None
+                    };
+                    let members = storage.list_members(&db_conv_key).unwrap_or_default();
+                    (messages, members)
+                })
+                .await
+                .unwrap_or_default();
+
+                if let Some(messages) = messages {
+                    let _ = tx.send(UiMsg::MessagesLoaded {
+                        conv_key,
+                        messages,
+                        members,
+                    });
+                } else {
+                    let _ = tx.send(UiMsg::MembersLoaded {
+                        conv_key,
+                        members,
+                        clear_loading: need_messages_fetch,
+                    });
+                }
+            } else if need_messages_fetch {
+                let _ = tx.send(UiMsg::MembersLoaded {
+                    conv_key,
+                    members: Vec::new(),
+                    clear_loading: true,
+                });
+            }
         });
     }
 
@@ -1575,7 +1677,11 @@ impl AppState {
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: Some(raw_err),
-                        toast: Some((friendly_err, ToastKind::Error)),
+                        toast: if explicit {
+                            Some((friendly_err, ToastKind::Error))
+                        } else {
+                            None
+                        },
                     });
                 }
             }
@@ -2012,7 +2118,7 @@ impl AppState {
     pub fn insert_image_cache(&mut self, cache_key: String, rendered: RenderedTerminalImage) {
         const MAX_IMAGE_CACHE: usize = 32;
         self.image_pending.remove(&cache_key);
-        self.image_errors.remove(&cache_key);
+        self.clear_image_error(&cache_key);
         Self::insert_bounded_image_cache(
             &mut self.image_cache,
             &mut self.image_cache_order,
@@ -2021,12 +2127,36 @@ impl AppState {
             cache_key,
             rendered,
         );
+        self.image_cache_gen = self.image_cache_gen.wrapping_add(1);
+    }
+
+    pub fn insert_image_error(&mut self, cache_key: String, error: String) {
+        const MAX_IMAGE_ERRORS: usize = 64;
+        if self.image_errors.contains_key(&cache_key) {
+            self.image_errors_order.retain(|k| k != &cache_key);
+        }
+        self.image_errors.insert(cache_key.clone(), error);
+        self.image_errors_order.push_back(cache_key);
+        while self.image_errors_order.len() > MAX_IMAGE_ERRORS {
+            if let Some(evicted) = self.image_errors_order.pop_front() {
+                self.image_errors.remove(&evicted);
+            }
+        }
+    }
+
+    pub fn clear_image_error(&mut self, cache_key: &str) {
+        if self.image_errors.remove(cache_key).is_some() {
+            self.image_errors_order.retain(|k| k != cache_key);
+        }
     }
 
     pub fn clear_image_cache(&mut self) {
         self.image_cache.clear();
         self.image_cache_order.clear();
         self.image_cache_bytes = 0;
+        self.image_errors.clear();
+        self.image_errors_order.clear();
+        self.image_cache_gen = self.image_cache_gen.wrapping_add(1);
     }
 
     pub fn clear_image_caches(&mut self) {
@@ -2219,20 +2349,29 @@ impl AppState {
         }
         if let Some(msg) = warning.filter(|s| !s.trim().is_empty()) {
             self.scope_warned = true;
-            ui.error(msg);
+            ui.info(msg);
         }
     }
 
     pub fn handle_core_event(&mut self, ui: &mut UiState, event: CoreEvent) {
         match event {
             CoreEvent::SyncStateChanged { busy, summary } => {
-                self.syncing = busy;
-                self.sync_summary = summary;
+                if summary == crate::models::POLL_RETRY_SUMMARY {
+                    ui.poll_retrying = true;
+                    self.syncing = false;
+                } else {
+                    if !busy && summary == "Synced" {
+                        ui.poll_retrying = false;
+                    }
+                    self.syncing = busy;
+                    self.sync_summary = summary;
+                }
             }
             CoreEvent::SyncError(err) => {
                 ui.error(format!("Sync error: {err}"));
             }
             CoreEvent::ConversationsUpdated(convs) => {
+                ui.poll_retrying = false;
                 self.conversations = convs;
             }
             CoreEvent::TeamsUpdated(teams) => {
@@ -2241,13 +2380,28 @@ impl AppState {
             CoreEvent::MessagesUpdated {
                 conv_key,
                 parent_msg_id: _,
-                messages: _,
+                messages,
                 notify_candidate,
             } => {
+                ui.poll_retrying = false;
                 if self.active_conv_key.as_deref() == Some(&conv_key) {
+                    let prev_len = self.messages.len();
+                    let prev_last_id = self.messages.last().map(|m| m.msg_id.clone());
                     let window = self.messages.len().max(80);
                     if let Ok(msgs) = self.storage.list_root_messages(&conv_key, window, None) {
                         merge_optimistic_messages(&mut self.messages, msgs);
+                    }
+                    let appended_at_bottom = self.messages.len() > prev_len
+                        || self.messages.last().map(|m| m.msg_id.as_str())
+                            != prev_last_id.as_deref();
+                    if appended_at_bottom
+                        && !ui.chat_scroll.follow_tail
+                        && ui.chat_scroll.scroll_up > 0
+                        && ui.chat_scroll.total_lines > 0
+                        && ui.pending_prepend_anchor.is_none()
+                        && ui.pending_append_anchor.is_none()
+                    {
+                        ui.pending_append_anchor = Some(ui.chat_scroll.offset);
                     }
                     if let Some(root_id) =
                         self.active_thread.as_ref().map(|t| t.root.msg_id.clone())
@@ -2266,7 +2420,9 @@ impl AppState {
                         }
                     }
                 }
-                if !self.my_user_id.is_empty() {
+                if !self.my_user_id.is_empty()
+                    && messages.iter().any(|m| !m.mentions.is_empty() || m.deleted)
+                {
                     if let Ok(mentions) = self.storage.list_mentions_for_user(&self.my_user_id, 50)
                     {
                         self.activity_mentions = mentions;
@@ -2344,9 +2500,56 @@ impl AppState {
             } => {
                 if self.active_conv_key.as_deref() == Some(&conv_key) {
                     self.loading_messages = false;
-                    merge_optimistic_messages(&mut self.messages, messages);
-                    self.members = members;
+                    if !messages.is_empty() {
+                        let prev_len = self.messages.len();
+                        let prev_last_id = self.messages.last().map(|m| m.msg_id.clone());
+                        merge_optimistic_messages(&mut self.messages, messages);
+                        let appended_at_bottom = self.messages.len() > prev_len
+                            || self.messages.last().map(|m| m.msg_id.as_str())
+                                != prev_last_id.as_deref();
+                        if appended_at_bottom
+                            && !ui.chat_scroll.follow_tail
+                            && ui.chat_scroll.scroll_up > 0
+                            && ui.chat_scroll.total_lines > 0
+                            && ui.pending_prepend_anchor.is_none()
+                            && ui.pending_append_anchor.is_none()
+                        {
+                            ui.pending_append_anchor = Some(ui.chat_scroll.offset);
+                        }
+                    }
+                    if !members.is_empty() {
+                        self.members = members;
+                    }
                 }
+            }
+            UiMsg::MembersLoaded {
+                conv_key,
+                members,
+                clear_loading,
+            } => {
+                if self.active_conv_key.as_deref() == Some(&conv_key) {
+                    if clear_loading {
+                        self.loading_messages = false;
+                    }
+                    if !members.is_empty() {
+                        self.members = members;
+                    }
+                }
+            }
+            UiMsg::ClipboardImageEncoded {
+                width: _,
+                height: _,
+                png_bytes,
+                preview,
+            } => {
+                let n = ui.composer.pending_images.len() + 1;
+                ui.composer.stage_inline_image_with_preview(
+                    png_bytes,
+                    "image/png",
+                    Some(format!("clipboard-{n}.png")),
+                    preview,
+                );
+                ui.set_focus(Focus::Composer);
             }
             UiMsg::OlderMessagesLoaded {
                 conv_key,
@@ -2594,7 +2797,7 @@ impl AppState {
                 error,
             } => {
                 self.image_pending.remove(&cache_key);
-                self.image_errors.insert(cache_key, error.clone());
+                self.insert_image_error(cache_key, error.clone());
                 if let Some(Overlay::ImagePreview(preview)) = ui.overlays.last_mut() {
                     if let Some(cur) = preview.current() {
                         if cur.owner_id() == owner_id && cur.att_id() == att_id {
@@ -2725,6 +2928,7 @@ fn merge_optimistic_messages(target: &mut Vec<MessageItem>, incoming: Vec<Messag
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::SyncCommand;
 
     #[test]
     fn image_cache_key_formats_stably() {
@@ -3158,6 +3362,77 @@ mod tests {
         app.history_forward(&mut ui);
         assert_eq!(app.active_conv_key.as_deref(), Some("chat:r2"));
         assert_eq!(ui.focus(), Focus::Composer);
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn poll_retry_spinner_and_image_error_cap_and_append_anchor() {
+        let (mut app, mut ui) = make_test_app();
+        app.sync_summary = "Synced".to_string();
+
+        // Transient poll retry sets poll_retrying without clobbering sync_summary or setting syncing.
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::SyncStateChanged {
+                busy: false,
+                summary: crate::models::POLL_RETRY_SUMMARY.to_string(),
+            },
+        );
+        assert!(ui.poll_retrying);
+        assert!(!app.syncing);
+        assert_eq!(app.sync_summary, "Synced");
+
+        // Synced event clears poll_retrying.
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::SyncStateChanged {
+                busy: false,
+                summary: "Synced".to_string(),
+            },
+        );
+        assert!(!ui.poll_retrying);
+
+        // ConversationsUpdated clears poll_retrying.
+        ui.poll_retrying = true;
+        app.handle_core_event(&mut ui, CoreEvent::ConversationsUpdated(vec![]));
+        assert!(!ui.poll_retrying);
+
+        // image_errors is capped at 64 entries and cleared by clear_image_cache.
+        for i in 0..70 {
+            app.insert_image_error(format!("k{i}"), format!("err{i}"));
+        }
+        assert_eq!(app.image_errors.len(), 64);
+        assert!(!app.image_errors.contains_key("k0"));
+        assert!(app.image_errors.contains_key("k69"));
+
+        let gen_before = app.image_cache_gen;
+        app.clear_image_cache();
+        assert!(app.image_errors.is_empty());
+        assert_eq!(app.image_cache_gen, gen_before + 1);
+
+        // Appending messages while scrolled up preserves viewport offset.
+        let conv = "chat:c1";
+        app.active_conv_key = Some(conv.to_string());
+        let m1 = make_test_msg(conv, "m1", "2026-11-18T01:00:00Z", "one");
+        let m2 = make_test_msg(conv, "m2", "2026-11-18T02:00:00Z", "two");
+        app.storage.upsert_messages(&[m1.clone(), m2]).unwrap();
+        app.messages = vec![m1];
+        ui.chat_scroll.follow_tail = false;
+        ui.chat_scroll.scroll_up = 10;
+        ui.chat_scroll.total_lines = 50;
+        ui.chat_scroll.offset = 20;
+
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::MessagesUpdated {
+                conv_key: conv.to_string(),
+                parent_msg_id: None,
+                messages: vec![],
+                notify_candidate: None,
+            },
+        );
+        assert_eq!(ui.pending_append_anchor, Some(20));
 
         app.sync_ctrl.request(SyncCommand::Shutdown);
     }

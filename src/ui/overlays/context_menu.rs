@@ -100,13 +100,16 @@ impl ContextMenu {
                     Action::CopyMessage { scope, msg_index },
                 ));
                 if has_attach {
+                    let attach_index = ui.attach_index.min(
+                        msg.map_or(0, |m| m.attachments.len().saturating_sub(1)),
+                    );
                     items.push(MenuItem::new(
                         "Download Attachment",
                         Some("d"),
                         Action::DownloadAttachment {
                             scope,
                             msg_index,
-                            attach_index: ui.attach_index,
+                            attach_index,
                         },
                     ));
                 }
@@ -238,16 +241,18 @@ impl ContextMenu {
             } else {
                 theme.muted_style()
             };
-            let used = unicode_width::UnicodeWidthStr::width(item.label.as_str());
             let hint = item.shortcut.clone().unwrap_or_default();
-            let pad = inner
-                .width
-                .saturating_sub(used as u16)
-                .saturating_sub(unicode_width::UnicodeWidthStr::width(hint.as_str()) as u16)
-                .saturating_sub(2) as usize;
+            let hint_w = unicode_width::UnicodeWidthStr::width(hint.as_str());
+            let max_label_w = (inner.width as usize).saturating_sub(hint_w + 2);
+            let label = crate::ui::truncate_width(&item.label, max_label_w);
+            let used = unicode_width::UnicodeWidthStr::width(label.as_str());
+            let pad = (inner.width as usize)
+                .saturating_sub(used)
+                .saturating_sub(hint_w)
+                .saturating_sub(2);
             let line = Line::from(vec![
-                Span::styled(format!(" {:<used$}", item.label), label_style),
-                Span::raw(" ".repeat(pad)),
+                Span::styled(format!(" {label}"), label_style),
+                Span::styled(" ".repeat(pad), label_style),
                 Span::styled(hint, hint_style),
                 Span::styled(" ", label_style),
             ]);

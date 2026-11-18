@@ -74,7 +74,7 @@ impl SearchOverlay {
                     return OverlayOutcome::Handled;
                 }
                 let len = app.search_results.len();
-                if query == app.search_query && len > 0 && self.selected < len {
+                if query == app.search_query.trim() && len > 0 && self.selected < len {
                     return OverlayOutcome::CloseAndDispatch(Action::JumpToSearchHit(
                         self.selected,
                     ));
@@ -207,5 +207,40 @@ mod tests {
         assert_eq!(search.selected, 1);
         search.move_down(0);
         assert_eq!(search.selected, 0);
+    }
+
+    #[test]
+    fn activate_jumps_even_when_query_has_trailing_space() {
+        let cfg = crate::config::AppConfig::default();
+        let auth = crate::auth::AuthManager::new(cfg.clone()).unwrap();
+        let graph = crate::graph::GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = crate::storage::Storage::open_in_memory().unwrap();
+        let (event_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let sync_ctrl = crate::sync::SyncController::from_channels(
+            tokio::sync::watch::channel(crate::sync::FocusTarget::default()).0,
+            event_tx,
+            false,
+        );
+        let (ui_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg, auth, graph, storage, sync_ctrl, ui_tx);
+        app.search_query = "deploy ".to_string();
+        app.search_results = vec![crate::models::SearchHit {
+            conv_key: "chat:c1".into(),
+            conv_title: "General".into(),
+            kind: crate::models::ConversationKind::OneOnOne,
+            msg_id: "m1".into(),
+            parent_msg_id: None,
+            author_name: "Alice".into(),
+            created_at: "2026-11-18T00:00:00Z".into(),
+            snippet: "deploy now".into(),
+        }];
+        let mut search = SearchOverlay {
+            query: "deploy ".to_string(),
+            selected: 0,
+        };
+        assert_eq!(
+            search.handle(&Action::Activate, &app),
+            OverlayOutcome::CloseAndDispatch(Action::JumpToSearchHit(0))
+        );
     }
 }

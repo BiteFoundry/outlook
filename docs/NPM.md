@@ -101,8 +101,8 @@ version because the root package pins its platform packages exactly.
 Tag the release with a matching `v` prefix:
 
 ```sh
-git tag v0.5.0
-git push origin v0.5.0
+git tag v0.7.1
+git push origin v0.7.1
 ```
 
 ## Publishing

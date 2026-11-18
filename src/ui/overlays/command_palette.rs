@@ -133,7 +133,7 @@ fn palette_commands() -> Vec<PaletteItem> {
             "?",
             Action::OpenOverlay(OverlayKind::Help),
         ),
-        ("Quit Teams", "Ctrl+Q", Action::Quit),
+        ("Quit Teams", "Ctrl+Q", Action::QuitConfirm),
     ];
 
     cmds.into_iter()
@@ -486,12 +486,12 @@ impl CommandPalette {
                 .min(18)
                 .max(10);
             let label_w = (inner.width as usize).saturating_sub(right_w + 3).max(10);
+            let truncated_label = crate::ui::truncate_width(&item.label, label_w);
+            let used_w = unicode_width::UnicodeWidthStr::width(truncated_label.as_str());
+            let pad = label_w.saturating_sub(used_w);
             let line = Line::from(vec![
                 Span::styled(
-                    format!(
-                        " {:<label_w$}",
-                        crate::ui::truncate_width(&item.label, label_w)
-                    ),
+                    format!(" {truncated_label}{}", " ".repeat(pad)),
                     style,
                 ),
                 Span::styled(
@@ -662,7 +662,7 @@ mod tests {
         let outcome = palette.handle(&Action::Activate, &app, &ui);
         assert!(matches!(
             outcome,
-            OverlayOutcome::CloseAndDispatch(Action::Quit)
+            OverlayOutcome::CloseAndDispatch(Action::QuitConfirm)
         ));
         app.sync_ctrl.request(SyncCommand::Shutdown);
     }

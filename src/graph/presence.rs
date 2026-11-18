@@ -38,7 +38,9 @@ impl From<GraphPresence> for PresenceStatus {
 
 impl GraphClient {
     pub async fn get_my_presence(&self) -> Result<PresenceStatus> {
-        let raw: GraphPresence = self.get_json("/me/presence").await?;
+        let raw: GraphPresence = self
+            .get_json("/me/presence?$select=id,availability,activity")
+            .await?;
         let mut status: PresenceStatus = raw.into();
         if status.user_id.is_empty() {
             if let Some(me) = self.resolve_my_user_id().await {

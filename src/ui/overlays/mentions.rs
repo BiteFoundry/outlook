@@ -9,7 +9,13 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::{models::MemberInfo, ui::theme::Theme};
+use crate::{
+    models::MemberInfo,
+    ui::{
+        hitmap::{HitMap, HitTarget},
+        theme::Theme,
+    },
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MentionCandidate {
@@ -82,7 +88,7 @@ impl MentionPopup {
         }
     }
 
-    pub fn draw(&self, frame: &mut Frame, composer_area: Rect, theme: &Theme) {
+    pub fn draw(&self, frame: &mut Frame, composer_area: Rect, theme: &Theme, hitmap: &mut HitMap) {
         if !self.active || self.candidates.is_empty() {
             return;
         }
@@ -148,6 +154,14 @@ impl MentionPopup {
         }
         let list_area = Rect::new(inner.x, inner.y, inner.width, inner.height.min(rows as u16));
         frame.render_widget(Paragraph::new(lines), list_area);
+        for index in 0..list_area.height as usize {
+            hitmap.add_line(
+                list_area.x,
+                list_area.y + index as u16,
+                list_area.width,
+                HitTarget::MentionCandidate(index),
+            );
+        }
     }
 }
 

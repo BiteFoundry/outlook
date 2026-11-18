@@ -1,5 +1,6 @@
 //! Repository CRUD queries for conversations, teams, messages, threads, members, presences, and sync cursors.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
@@ -226,19 +227,30 @@ pub fn mark_conversation_read(conn: &Connection, conv_key: &str, read_at: &str) 
     Ok(())
 }
 
+fn serialize_json_slice<T: serde::Serialize>(items: &[T]) -> Result<Cow<'static, str>> {
+    if items.is_empty() {
+        Ok(Cow::Borrowed("[]"))
+    } else {
+        Ok(Cow::Owned(serde_json::to_string(items)?))
+    }
+}
+
 pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Result<usize> {
     if messages.is_empty() {
         return Ok(0);
     }
     let tx = conn.transaction()?;
 
+    let mut changed_count = 0usize;
     let mut touched_threads: HashSet<(String, String)> = HashSet::new();
     let mut newest_by_conv: HashMap<String, &MessageItem> = HashMap::new();
 
     {
         let mut check_stmt = tx.prepare_cached(
             "
-            SELECT last_modified_at, deleted, reply_count, reactions_json, body_plain, author_name, subject
+            SELECT
+                last_modified_at, deleted, reply_count, reactions_json, body_plain, author_name, subject,
+                attachments_json, mentions_json
             FROM messages
             WHERE msg_key = ?1
             ",
@@ -250,12 +262,12 @@ pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Resul
                 msg_key, conv_key, msg_id, parent_msg_id, reply_to_id, reply_to_author, reply_to_preview,
                 subject, author_id, author_name, is_me, created_at, last_modified_at, deleted,
                 importance, message_type, body_html, body_plain, attachments_json, mentions_json,
-                reactions_json, reply_count, web_url
+                reactions_json, reply_count, web_url, has_mentions
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7,
                 ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                 ?15, ?16, ?17, ?18, ?19, ?20,
-                ?21, ?22, ?23
+                ?21, ?22, ?23, ?24
             )
             ON CONFLICT(msg_key) DO UPDATE SET
                 parent_msg_id = COALESCE(excluded.parent_msg_id, messages.parent_msg_id),
@@ -275,6 +287,7 @@ pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Resul
                 body_plain = excluded.body_plain,
                 attachments_json = excluded.attachments_json,
                 mentions_json = excluded.mentions_json,
+                has_mentions = excluded.has_mentions,
                 reactions_json = excluded.reactions_json,
                 reply_count = MAX(messages.reply_count, excluded.reply_count),
                 web_url = COALESCE(excluded.web_url, messages.web_url)
@@ -290,12 +303,11 @@ pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Resul
         )?;
 
         for msg in messages {
-            let msg_key = if msg.msg_key.is_empty() {
-                MessageItem::make_msg_key(&msg.conv_key, &msg.msg_id)
+            let msg_key: Cow<'_, str> = if msg.msg_key.is_empty() {
+                Cow::Owned(MessageItem::make_msg_key(&msg.conv_key, &msg.msg_id))
             } else {
-                msg.msg_key.clone()
+                Cow::Borrowed(msg.msg_key.as_str())
             };
-            let reactions_json = serde_json::to_string(&msg.reactions)?;
             let deleted_int = if msg.deleted { 1i32 } else { 0i32 };
             let reply_count_i64 = msg.reply_count as i64;
 
@@ -307,8 +319,10 @@ pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Resul
                 String,
                 String,
                 Option<String>,
+                String,
+                String,
             )> = check_stmt
-                .query_row(params![&msg_key], |row| {
+                .query_row(params![msg_key.as_ref()], |row| {
                     Ok((
                         row.get(0)?,
                         row.get(1)?,
@@ -317,9 +331,15 @@ pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Resul
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
                     ))
                 })
                 .optional()?;
+
+            let mut reactions_json_opt: Option<Cow<'static, str>> = None;
+            let mut attachments_json_opt: Option<Cow<'static, str>> = None;
+            let mut mentions_json_opt: Option<Cow<'static, str>> = None;
 
             let fts_unchanged = if let Some((
                 ref ex_last_mod,
@@ -329,17 +349,33 @@ pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Resul
                 ref ex_body_plain,
                 ref ex_author_name,
                 ref ex_subject,
+                ref ex_attachments_json,
+                ref ex_mentions_json,
             )) = existing
             {
-                let row_unchanged = *ex_last_mod == msg.last_modified_at
+                let scalars_unchanged = *ex_last_mod == msg.last_modified_at
                     && ex_deleted == deleted_int
                     && reply_count_i64 <= ex_reply_count
-                    && *ex_reactions_json == reactions_json
                     && *ex_body_plain == msg.body_plain
                     && *ex_author_name == msg.author_name
                     && *ex_subject == msg.subject;
-                if row_unchanged {
-                    continue;
+                if scalars_unchanged {
+                    let rj = serialize_json_slice(&msg.reactions)?;
+                    let r_same = *ex_reactions_json == rj.as_ref();
+                    reactions_json_opt = Some(rj);
+                    if r_same {
+                        let aj = serialize_json_slice(&msg.attachments)?;
+                        let a_same = *ex_attachments_json == aj.as_ref();
+                        attachments_json_opt = Some(aj);
+                        if a_same {
+                            let mj = serialize_json_slice(&msg.mentions)?;
+                            let m_same = *ex_mentions_json == mj.as_ref();
+                            mentions_json_opt = Some(mj);
+                            if m_same {
+                                continue;
+                            }
+                        }
+                    }
                 }
                 ex_deleted == deleted_int
                     && *ex_author_name == msg.author_name
@@ -349,11 +385,22 @@ pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Resul
                 false
             };
 
-            let attachments_json = serde_json::to_string(&msg.attachments)?;
-            let mentions_json = serde_json::to_string(&msg.mentions)?;
+            let reactions_json = match reactions_json_opt {
+                Some(v) => v,
+                None => serialize_json_slice(&msg.reactions)?,
+            };
+            let attachments_json = match attachments_json_opt {
+                Some(v) => v,
+                None => serialize_json_slice(&msg.attachments)?,
+            };
+            let mentions_json = match mentions_json_opt {
+                Some(v) => v,
+                None => serialize_json_slice(&msg.mentions)?,
+            };
+            let has_mentions_int = i32::from(!msg.mentions.is_empty());
 
             msg_stmt.execute(params![
-                msg_key,
+                msg_key.as_ref(),
                 msg.conv_key,
                 msg.msg_id,
                 msg.parent_msg_id,
@@ -371,18 +418,22 @@ pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Resul
                 msg.message_type,
                 msg.body_html,
                 msg.body_plain,
-                attachments_json,
-                mentions_json,
-                reactions_json,
+                attachments_json.as_ref(),
+                mentions_json.as_ref(),
+                reactions_json.as_ref(),
                 reply_count_i64,
                 msg.web_url,
+                has_mentions_int,
             ])?;
+            changed_count += 1;
 
             if !fts_unchanged {
-                fts_del_stmt.execute(params![msg_key])?;
+                if existing.is_some() {
+                    fts_del_stmt.execute(params![msg_key.as_ref()])?;
+                }
                 if !msg.deleted {
                     fts_ins_stmt.execute(params![
-                        msg_key,
+                        msg_key.as_ref(),
                         msg.conv_key,
                         msg.author_name,
                         msg.body_plain,
@@ -414,15 +465,18 @@ pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Resul
         let mut reply_count_stmt = tx.prepare_cached(
             "
             UPDATE messages
-            SET reply_count = MAX(
-                reply_count,
-                (SELECT COUNT(*) FROM messages WHERE conv_key = ?1 AND parent_msg_id = ?2 AND deleted = 0)
-            )
-            WHERE conv_key = ?1 AND msg_id = ?2
+            SET reply_count = CASE
+                WHEN (SELECT COUNT(*) FROM messages WHERE conv_key = ?1 AND parent_msg_id = ?2 AND deleted = 0) > 0
+                     OR EXISTS(SELECT 1 FROM messages WHERE conv_key = ?1 AND parent_msg_id = ?2)
+                THEN (SELECT COUNT(*) FROM messages WHERE conv_key = ?1 AND parent_msg_id = ?2 AND deleted = 0)
+                ELSE reply_count
+            END
+            WHERE msg_key = ?3
             ",
         )?;
         for (conv_key, root_id) in touched_threads {
-            reply_count_stmt.execute(params![conv_key, root_id])?;
+            let parent_msg_key = MessageItem::make_msg_key(&conv_key, &root_id);
+            reply_count_stmt.execute(params![conv_key, root_id, parent_msg_key])?;
         }
     }
 
@@ -452,7 +506,7 @@ pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Resul
     }
 
     tx.commit()?;
-    Ok(messages.len())
+    Ok(changed_count)
 }
 
 pub fn list_root_messages(
@@ -509,7 +563,7 @@ pub fn list_older_root_messages(
             FROM messages
             WHERE parent_msg_id IS NULL
               AND conv_key = ?1
-              AND (created_at < ?2 OR (created_at = ?2 AND msg_id < ?3))
+              AND (created_at, msg_id) < (?2, ?3)
             ORDER BY created_at DESC, msg_id DESC
             LIMIT ?4
             ",
@@ -623,6 +677,7 @@ pub fn list_mentions_for_user(
         return Ok(Vec::new());
     }
     let pattern = format!("%{}%", escape_like(my_user_id));
+    let sql_limit = i64::try_from(limit.saturating_mul(4)).unwrap_or(i64::MAX);
     let mut stmt = conn.prepare_cached(
         "
         SELECT
@@ -631,11 +686,14 @@ pub fn list_mentions_for_user(
             importance, message_type, body_html, body_plain, attachments_json, mentions_json,
             reactions_json, reply_count, web_url
         FROM messages
-        WHERE deleted = 0 AND mentions_json LIKE ?1 ESCAPE '\\'
+        WHERE deleted = 0
+          AND has_mentions = 1
+          AND mentions_json LIKE ?1 ESCAPE '\\'
         ORDER BY created_at DESC, msg_id DESC
+        LIMIT ?2
         ",
     )?;
-    let rows = stmt.query_map(params![pattern], map_message_row)?;
+    let rows = stmt.query_map(params![pattern, sql_limit], map_message_row)?;
     let mut out = Vec::new();
     for row in rows {
         let msg = row?;
@@ -871,31 +929,72 @@ fn map_message_row(row: &Row<'_>) -> rusqlite::Result<MessageItem> {
     })
 }
 
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(max_chars.min(text.len()));
+    let mut count = 0usize;
+    for ch in text.chars() {
+        if count >= max_chars {
+            while out.chars().count() >= max_chars {
+                out.pop();
+            }
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+        count += 1;
+    }
+    out
+}
+
 fn build_message_preview(msg: &MessageItem) -> String {
-    let single_line: String = msg
-        .body_plain
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let base = if !single_line.is_empty() {
-        single_line
-    } else if let Some(subj) = msg.subject.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        subj.to_string()
+    const MAX_CHARS: usize = 120;
+    let mut single_line = String::with_capacity(MAX_CHARS.min(msg.body_plain.len()));
+    let mut char_count = 0usize;
+    let mut truncated = false;
+
+    for word in msg.body_plain.split_whitespace() {
+        if char_count > 0 {
+            if char_count >= MAX_CHARS - 1 {
+                truncated = true;
+                break;
+            }
+            single_line.push(' ');
+            char_count += 1;
+        }
+        for ch in word.chars() {
+            if char_count >= MAX_CHARS {
+                truncated = true;
+                break;
+            }
+            single_line.push(ch);
+            char_count += 1;
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    if truncated {
+        while single_line.chars().count() >= MAX_CHARS {
+            single_line.pop();
+        }
+        single_line.push('…');
+        return single_line;
+    }
+    if !single_line.is_empty() {
+        return single_line;
+    }
+
+    if let Some(subj) = msg.subject.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        truncate_chars(subj, MAX_CHARS)
     } else if let Some(att) = msg.attachments.first() {
-        format!(
+        let label = format!(
             "[Attachment: {}]",
             att.name.as_deref().unwrap_or(att.id.as_str())
-        )
+        );
+        truncate_chars(&label, MAX_CHARS)
     } else {
         String::new()
-    };
-
-    const MAX_CHARS: usize = 120;
-    if base.chars().count() <= MAX_CHARS {
-        base
-    } else {
-        let truncated: String = base.chars().take(MAX_CHARS - 1).collect();
-        format!("{truncated}…")
     }
 }
 

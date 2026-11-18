@@ -19,7 +19,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf},
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc, watch},
 };
@@ -28,7 +28,7 @@ use crate::{
     auth::AuthManager,
     config::{ensure_parent, AppConfig},
     graph::GraphClient,
-    models::CoreEvent,
+    models::{CoreEvent, POLL_RETRY_SUMMARY},
     storage::Storage,
     sync::{self, FocusTarget, SyncCommand, SyncController},
 };
@@ -36,6 +36,8 @@ use crate::{
 const IPC_CONNECT_TIMEOUT: Duration = Duration::from_millis(400);
 const TUI_CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const FAST_TCP_PROBE_TIMEOUT: Duration = Duration::from_millis(25);
+const IPC_WRITE_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_IPC_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const STARTUP_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(60);
 const STOP_WAIT_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -237,18 +239,26 @@ impl DaemonSharedState {
     }
 }
 
-struct AttachedClientGuard(Arc<AtomicUsize>);
+struct AttachedClientGuard {
+    counter: Arc<AtomicUsize>,
+    sync_ctrl: SyncController,
+}
 
 impl AttachedClientGuard {
-    fn acquire(counter: &Arc<AtomicUsize>) -> Self {
+    fn acquire(counter: &Arc<AtomicUsize>, sync_ctrl: &SyncController) -> Self {
         counter.fetch_add(1, Ordering::SeqCst);
-        Self(Arc::clone(counter))
+        Self {
+            counter: Arc::clone(counter),
+            sync_ctrl: sync_ctrl.clone(),
+        }
     }
 }
 
 impl Drop for AttachedClientGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        if self.counter.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.sync_ctrl.set_focus(None, None);
+        }
     }
 }
 
@@ -599,7 +609,13 @@ async fn connect_ipc(transport: &str, endpoint: &str, timeout: Duration) -> Resu
             if !addr.ip().is_loopback() {
                 bail!("Refusing to connect to non-loopback IPC address for security: {endpoint}");
             }
-            let stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+            // Windows loopback TCP connect takes ~2s to surface WSAECONNREFUSED on a dead port.
+            let connect_timeout = if cfg!(windows) {
+                timeout.max(Duration::from_millis(2_500))
+            } else {
+                timeout
+            };
+            let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
                 .await
                 .context("TCP IPC connection timed out")?
                 .context("TCP IPC connection failed")?;
@@ -610,14 +626,54 @@ async fn connect_ipc(transport: &str, endpoint: &str, timeout: Duration) -> Resu
     }
 }
 
+fn is_stale_connect_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|io_err| {
+            matches!(
+                io_err.kind(),
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::NotFound
+                    | io::ErrorKind::AddrNotAvailable
+            )
+        })
+    })
+}
+
+async fn read_limited_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Option<String>> {
+    let mut line = String::new();
+    let mut limited = reader.take(MAX_IPC_FRAME_BYTES as u64 + 1);
+    let n = limited.read_line(&mut line).await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if line.len() > MAX_IPC_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "IPC frame exceeds 4 MiB limit",
+        ));
+    }
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+    }
+    Ok(Some(line))
+}
+
 async fn write_json_line<W: AsyncWrite + Unpin, T: Serialize>(
     writer: &mut W,
     frame: &T,
 ) -> Result<()> {
     let mut bytes = serde_json::to_vec(frame)?;
     bytes.push(b'\n');
-    writer.write_all(&bytes).await?;
-    writer.flush().await?;
+    tokio::time::timeout(IPC_WRITE_TIMEOUT, async {
+        writer.write_all(&bytes).await?;
+        writer.flush().await?;
+        Ok::<_, io::Error>(())
+    })
+    .await
+    .context("IPC write timed out")??;
     Ok(())
 }
 
@@ -631,8 +687,10 @@ async fn ipc_roundtrip(
     };
     let stream = match connect_ipc(&info.transport, &info.endpoint, timeout).await {
         Ok(s) => s,
-        Err(_) => {
-            cleanup_stale_files(paths, Some(&info));
+        Err(err) => {
+            if is_stale_connect_error(&err) {
+                cleanup_stale_files(paths, Some(&info));
+            }
             return Ok(None);
         }
     };
@@ -642,31 +700,20 @@ async fn ipc_roundtrip(
         secret: info.secret.clone(),
         op,
     };
-    if tokio::time::timeout(timeout, write_json_line(&mut write_half, &req))
-        .await
-        .is_err()
-    {
-        cleanup_stale_files(paths, Some(&info));
+    if !matches!(
+        tokio::time::timeout(timeout, write_json_line(&mut write_half, &req)).await,
+        Ok(Ok(()))
+    ) {
         return Ok(None);
     }
 
-    let mut lines = BufReader::new(read_half).lines();
-    match tokio::time::timeout(timeout, lines.next_line()).await {
+    let mut reader = BufReader::new(read_half);
+    match tokio::time::timeout(timeout, read_limited_line(&mut reader)).await {
         Ok(Ok(Some(line))) => match serde_json::from_str::<ServerFrame>(&line) {
-            Ok(ServerFrame::Error { .. }) => {
-                cleanup_stale_files(paths, Some(&info));
-                Ok(None)
-            }
+            Ok(ServerFrame::Error { .. }) | Err(_) => Ok(None),
             Ok(frame) => Ok(Some(frame)),
-            Err(_) => {
-                cleanup_stale_files(paths, Some(&info));
-                Ok(None)
-            }
         },
-        _ => {
-            cleanup_stale_files(paths, Some(&info));
-            Ok(None)
-        }
+        _ => Ok(None),
     }
 }
 
@@ -861,8 +908,10 @@ async fn try_connect_tui_at(
 
     let stream = match connect_ipc(&info.transport, &info.endpoint, TUI_CONNECT_TIMEOUT).await {
         Ok(s) => s,
-        Err(_) => {
-            cleanup_stale_files(paths, Some(&info));
+        Err(err) => {
+            if is_stale_connect_error(&err) {
+                cleanup_stale_files(paths, Some(&info));
+            }
             return None;
         }
     };
@@ -872,24 +921,26 @@ async fn try_connect_tui_at(
         secret: info.secret,
         op: ClientOp::Subscribe,
     };
-    if tokio::time::timeout(
-        TUI_CONNECT_TIMEOUT,
-        write_json_line(&mut write_half, &subscribe_frame),
-    )
-    .await
-    .is_err()
-    {
+    if !matches!(
+        tokio::time::timeout(
+            TUI_CONNECT_TIMEOUT,
+            write_json_line(&mut write_half, &subscribe_frame),
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
         return None;
     }
 
-    let mut lines = BufReader::new(read_half).lines();
-    let initial_status = match tokio::time::timeout(TUI_CONNECT_TIMEOUT, lines.next_line()).await {
-        Ok(Ok(Some(raw))) => match serde_json::from_str::<ServerFrame>(&raw) {
-            Ok(ServerFrame::Subscribed(status)) => status,
+    let mut reader = BufReader::new(read_half);
+    let initial_status =
+        match tokio::time::timeout(TUI_CONNECT_TIMEOUT, read_limited_line(&mut reader)).await {
+            Ok(Ok(Some(raw))) => match serde_json::from_str::<ServerFrame>(&raw) {
+                Ok(ServerFrame::Subscribed(status)) => status,
+                _ => return None,
+            },
             _ => return None,
-        },
-        _ => return None,
-    };
+        };
 
     let (focus_tx, mut focus_rx) = watch::channel(FocusTarget::default());
     let (nudge_tx, mut nudge_rx) = mpsc::unbounded_channel::<SyncCommand>();
@@ -929,7 +980,7 @@ async fn try_connect_tui_at(
                         None => break,
                     }
                 }
-                line = lines.next_line() => {
+                line = read_limited_line(&mut reader) => {
                     match line {
                         Ok(Some(raw)) => {
                             match serde_json::from_str::<ServerFrame>(&raw) {
@@ -993,7 +1044,7 @@ async fn run_daemon_inner(
 
     if run_bootstrap {
         let boot_graph = graph;
-        let boot_storage = storage;
+        let boot_storage = storage.clone();
         let boot_tx = engine_event_tx.clone();
         tokio::spawn(async move {
             run_initial_bootstrap(boot_graph, boot_storage, boot_tx).await;
@@ -1003,6 +1054,7 @@ async fn run_daemon_inner(
     run_daemon_with_engine(
         paths,
         user_id,
+        storage,
         sync_ctrl,
         engine_event_rx,
         enable_signals,
@@ -1022,29 +1074,35 @@ async fn run_initial_bootstrap(
 
     match sync::bootstrap_conversations(&graph, &storage).await {
         Ok(()) => {
-            if let Ok(convs) = storage.list_conversations() {
+            let st_convs = storage.clone();
+            if let Ok(Ok(convs)) =
+                tokio::task::spawn_blocking(move || st_convs.list_conversations()).await
+            {
                 let _ = event_tx.send(CoreEvent::ConversationsUpdated(convs));
             }
-            if let Ok(teams) = storage.list_teams() {
+            let st_teams = storage.clone();
+            if let Ok(Ok(teams)) = tokio::task::spawn_blocking(move || st_teams.list_teams()).await
+            {
                 let _ = event_tx.send(CoreEvent::TeamsUpdated(teams));
             }
+            let _ = event_tx.send(CoreEvent::SyncStateChanged {
+                busy: false,
+                summary: "Idle".to_string(),
+            });
         }
-        Err(err) => {
-            let _ = event_tx.send(CoreEvent::SyncError(format!(
-                "Initial conversation sync failed: {err}"
-            )));
+        Err(_) => {
+            let _ = event_tx.send(CoreEvent::SyncStateChanged {
+                busy: false,
+                summary: POLL_RETRY_SUMMARY.to_string(),
+            });
         }
     }
-
-    let _ = event_tx.send(CoreEvent::SyncStateChanged {
-        busy: false,
-        summary: "Idle".to_string(),
-    });
 }
 
 async fn run_daemon_with_engine(
     paths: DaemonPaths,
     user_id: Option<String>,
+    storage: Storage,
     sync_ctrl: SyncController,
     mut engine_event_rx: mpsc::UnboundedReceiver<CoreEvent>,
     enable_signals: bool,
@@ -1133,6 +1191,7 @@ async fn run_daemon_with_engine(
                 match accept_res {
                     Ok(stream) => {
                         let conn_shared = Arc::clone(&shared);
+                        let conn_storage = storage.clone();
                         let conn_ctrl = sync_ctrl.clone();
                         let conn_broadcast = broadcast_tx.clone();
                         let conn_shutdown_tx = shutdown_tx.clone();
@@ -1141,6 +1200,7 @@ async fn run_daemon_with_engine(
                             let _ = handle_client_connection(
                                 stream,
                                 conn_shared,
+                                conn_storage,
                                 conn_ctrl,
                                 conn_broadcast,
                                 conn_shutdown_tx,
@@ -1166,15 +1226,16 @@ async fn run_daemon_with_engine(
 async fn handle_client_connection(
     stream: IpcStream,
     shared: Arc<DaemonSharedState>,
+    storage: Storage,
     sync_ctrl: SyncController,
     broadcast_tx: broadcast::Sender<CoreEvent>,
     shutdown_tx: watch::Sender<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let (read_half, mut write_half) = tokio::io::split(stream);
-    let mut lines = BufReader::new(read_half).lines();
+    let mut reader = BufReader::new(read_half);
 
-    let Some(first_line) = lines.next_line().await? else {
+    let Some(first_line) = read_limited_line(&mut reader).await? else {
         return Ok(());
     };
     let Ok(frame) = serde_json::from_str::<ClientFrame>(&first_line) else {
@@ -1234,7 +1295,7 @@ async fn handle_client_connection(
             .await?;
         }
         ClientOp::Subscribe => {
-            let _guard = AttachedClientGuard::acquire(&shared.attached_clients);
+            let _guard = AttachedClientGuard::acquire(&shared.attached_clients, &sync_ctrl);
             sync_ctrl.notify_activity();
             let mut broadcast_rx = broadcast_tx.subscribe();
             let status = shared.snapshot_status();
@@ -1250,7 +1311,7 @@ async fn handle_client_connection(
                             break;
                         }
                     }
-                    line = lines.next_line() => {
+                    line = read_limited_line(&mut reader) => {
                         match line {
                             Ok(Some(raw)) => {
                                 match serde_json::from_str::<ClientStreamCmd>(&raw) {
@@ -1280,13 +1341,13 @@ async fn handle_client_connection(
                                     break;
                                 }
                             }
-                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                                let hint = CoreEvent::SyncStateChanged {
-                                    busy: false,
-                                    summary: format!("Skipped {skipped} sync event(s)"),
-                                };
-                                if write_json_line(&mut write_half, &ServerFrame::Event(hint)).await.is_err() {
-                                    break;
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                let st = storage.clone();
+                                if let Ok(Ok(convs)) = tokio::task::spawn_blocking(move || st.list_conversations()).await {
+                                    let ev = CoreEvent::ConversationsUpdated(convs);
+                                    if write_json_line(&mut write_half, &ServerFrame::Event(ev)).await.is_err() {
+                                        break;
+                                    }
                                 }
                             }
                             Err(broadcast::error::RecvError::Closed) => break,
@@ -1325,8 +1386,10 @@ mod tests {
 
             let task_paths = paths.clone();
             let uid = user_id.map(str::to_string);
+            let storage = Storage::open_in_memory().unwrap();
             let handle = tokio::spawn(async move {
-                run_daemon_with_engine(task_paths, uid, sync_ctrl, engine_event_rx, false).await
+                run_daemon_with_engine(task_paths, uid, storage, sync_ctrl, engine_event_rx, false)
+                    .await
             });
 
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -1544,6 +1607,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(15)).await;
         }
         assert!(detached, "daemon should remain running with 0 clients");
+        assert!(
+            harness.focus_rx.borrow().target.is_none(),
+            "focus must be cleared when last TUI client detaches"
+        );
 
         // Also test nudge_daemon RPC directly.
         assert!(nudge_daemon_at(
@@ -1622,9 +1689,15 @@ mod tests {
         let (_ev_tx, ev_rx) = mpsc::unbounded_channel();
         let dup_ctrl = SyncController::from_channels(focus_tx, nudge_tx, true);
 
-        let dup_res =
-            run_daemon_with_engine(harness.paths.clone(), Some("user-dup".into()), dup_ctrl, ev_rx, false)
-                .await;
+        let dup_res = run_daemon_with_engine(
+            harness.paths.clone(),
+            Some("user-dup".into()),
+            Storage::open_in_memory().unwrap(),
+            dup_ctrl,
+            ev_rx,
+            false,
+        )
+        .await;
         assert!(dup_res.is_ok());
 
         // Original daemon must still be alive.
@@ -1632,5 +1705,68 @@ mod tests {
 
         assert!(stop_daemon_at(&harness.paths).await.unwrap());
         harness.wait_exit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ipc_roundtrip_preserves_state_file_on_read_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DaemonPaths::from_config_dir(dir.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+
+        // Accept the connection and hold it open without responding so read times out.
+        let stall_server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                drop(stream);
+            }
+        });
+
+        let info = DaemonRuntimeInfo {
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            transport: "tcp".to_string(),
+            endpoint,
+            secret: "b".repeat(64),
+            user_id: Some("slow-user".to_string()),
+            started_at_unix: 1_700_000_000,
+            started_at: "2023-11-14T22:13:20Z".to_string(),
+        };
+        write_secret_file_atomic(
+            &paths.state_file,
+            &serde_json::to_vec_pretty(&info).unwrap(),
+        )
+        .unwrap();
+
+        let resp = ipc_roundtrip(&paths, ClientOp::Status, Duration::from_millis(80))
+            .await
+            .unwrap();
+        assert!(resp.is_none());
+        assert!(
+            paths.state_file.exists(),
+            "read timeout must NOT delete live daemon.json"
+        );
+
+        stall_server.abort();
+    }
+
+    #[tokio::test]
+    async fn read_limited_line_rejects_oversized_frame() {
+        let oversized = vec![b'x'; MAX_IPC_FRAME_BYTES + 16];
+        let mut reader = BufReader::new(std::io::Cursor::new(oversized));
+        let err = read_limited_line(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let valid = b"{\"ok\":true}\n{\"ok\":false}\n";
+        let mut valid_reader = BufReader::new(std::io::Cursor::new(valid));
+        assert_eq!(
+            read_limited_line(&mut valid_reader).await.unwrap().as_deref(),
+            Some("{\"ok\":true}")
+        );
+        assert_eq!(
+            read_limited_line(&mut valid_reader).await.unwrap().as_deref(),
+            Some("{\"ok\":false}")
+        );
+        assert_eq!(read_limited_line(&mut valid_reader).await.unwrap(), None);
     }
 }

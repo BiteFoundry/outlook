@@ -62,6 +62,14 @@ impl ToastQueue {
     }
 
     pub fn push(&mut self, toast: Toast) {
+        if let Some(existing) = self
+            .toasts
+            .iter_mut()
+            .find(|t| t.kind == toast.kind && t.message == toast.message)
+        {
+            existing.created = Instant::now();
+            return;
+        }
         self.toasts.push_back(toast);
         while self.toasts.len() > self.max {
             self.toasts.pop_front();
@@ -197,6 +205,32 @@ mod tests {
         assert_eq!(queue.current().unwrap().message, "b");
         queue.tick(Instant::now());
         assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn toasts_deduplicate_active_same_kind_and_message() {
+        let mut queue = ToastQueue::new();
+        let older = Instant::now() - Duration::from_secs(3);
+        queue.push(Toast {
+            message: "Sync failed".to_string(),
+            kind: ToastKind::Error,
+            created: older,
+            ttl: Duration::from_secs(4),
+        });
+        assert_eq!(queue.len(), 1);
+
+        // Same kind + same message refreshes `created` in place without adding a duplicate.
+        queue.error("Sync failed");
+        assert_eq!(queue.len(), 1);
+        assert!(queue.current().unwrap().created > older);
+
+        // Same message with a different kind is kept distinct.
+        queue.info("Sync failed");
+        assert_eq!(queue.len(), 2);
+
+        // Different message of same kind is also added.
+        queue.error("Another error");
+        assert_eq!(queue.len(), 3);
     }
 
     #[test]

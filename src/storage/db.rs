@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-const SCHEMA_USER_VERSION_UNICODE61: i32 = 50;
-const SCHEMA_USER_VERSION_TRIGRAM: i32 = 51;
+const SCHEMA_USER_VERSION_UNICODE61: i32 = 52;
+const SCHEMA_USER_VERSION_TRIGRAM: i32 = 53;
 
 /// Initializes SQLite PRAGMAs, tables, indexes, and FTS5 virtual table.
 /// Returns `true` if `messages_fts` uses the `trigram` tokenizer, `false` if using `unicode61`.
@@ -39,7 +39,9 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             let intact: bool = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts')
-                     AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_conv_root_created_id')",
+                     AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_conv_root_created_id')
+                     AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_has_mentions')
+                     AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_conversations_sort_v2')",
                     [],
                     |row| row.get(0),
                 )
@@ -91,8 +93,10 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             web_url TEXT
         );
 
-        CREATE INDEX IF NOT EXISTS idx_conversations_sort
-            ON conversations(pinned DESC, last_updated_at DESC);
+        DROP INDEX IF EXISTS idx_conversations_sort;
+
+        CREATE INDEX IF NOT EXISTS idx_conversations_sort_v2
+            ON conversations(pinned DESC, COALESCE(last_updated_at, '') DESC, title ASC);
 
         CREATE TABLE IF NOT EXISTS teams (
             team_id TEXT PRIMARY KEY,
@@ -124,11 +128,11 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             mentions_json TEXT NOT NULL,
             reactions_json TEXT NOT NULL,
             reply_count INTEGER NOT NULL DEFAULT 0,
-            web_url TEXT
+            web_url TEXT,
+            has_mentions INTEGER NOT NULL DEFAULT 0
         );
 
-        CREATE INDEX IF NOT EXISTS idx_messages_conv_parent_created
-            ON messages(conv_key, parent_msg_id, created_at);
+        DROP INDEX IF EXISTS idx_messages_conv_parent_created;
 
         CREATE INDEX IF NOT EXISTS idx_messages_conv_root_created_id
             ON messages(conv_key, parent_msg_id, created_at DESC, msg_id DESC);
@@ -165,6 +169,31 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
         ",
     )
     .context("Failed to create base SQLite schema")?;
+
+    let has_mentions_col: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('messages') WHERE name = 'has_mentions')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !has_mentions_col {
+        conn.execute_batch(
+            "
+            ALTER TABLE messages ADD COLUMN has_mentions INTEGER NOT NULL DEFAULT 0;
+            UPDATE messages SET has_mentions = 1 WHERE mentions_json != '[]' AND mentions_json != '';
+            ",
+        )
+        .context("Failed to migrate messages.has_mentions column")?;
+    }
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_messages_has_mentions
+            ON messages(created_at DESC, msg_id DESC)
+            WHERE deleted = 0 AND has_mentions = 1;
+        ",
+    )
+    .context("Failed to create idx_messages_has_mentions index")?;
 
     let messages_trigram = ensure_fts5_table(
         conn,
@@ -446,5 +475,100 @@ mod tests {
                 .unwrap();
             assert_eq!(title, "Alice");
         }
+    }
+
+    #[test]
+    fn test_v51_migration_adds_has_mentions_and_aligns_indexes() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("v51_upgrade.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE conversations (
+                    conv_key TEXT PRIMARY KEY,
+                    target_json TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    team_id TEXT,
+                    team_name TEXT,
+                    title TEXT NOT NULL,
+                    topic TEXT,
+                    unread_count INTEGER NOT NULL DEFAULT 0,
+                    last_read_at TEXT,
+                    last_msg_id TEXT,
+                    last_msg_author TEXT,
+                    last_msg_preview TEXT,
+                    last_updated_at TEXT,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    peer_user_id TEXT,
+                    web_url TEXT
+                );
+                CREATE INDEX idx_conversations_sort ON conversations(pinned DESC, last_updated_at DESC);
+                CREATE TABLE messages (
+                    msg_key TEXT PRIMARY KEY,
+                    conv_key TEXT NOT NULL,
+                    msg_id TEXT NOT NULL,
+                    parent_msg_id TEXT,
+                    reply_to_id TEXT,
+                    reply_to_author TEXT,
+                    reply_to_preview TEXT,
+                    subject TEXT,
+                    author_id TEXT,
+                    author_name TEXT NOT NULL,
+                    is_me INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    last_modified_at TEXT,
+                    deleted INTEGER NOT NULL DEFAULT 0,
+                    importance TEXT NOT NULL,
+                    message_type TEXT NOT NULL,
+                    body_html TEXT NOT NULL,
+                    body_plain TEXT NOT NULL,
+                    attachments_json TEXT NOT NULL,
+                    mentions_json TEXT NOT NULL,
+                    reactions_json TEXT NOT NULL,
+                    reply_count INTEGER NOT NULL DEFAULT 0,
+                    web_url TEXT
+                );
+                CREATE INDEX idx_messages_conv_parent_created ON messages(conv_key, parent_msg_id, created_at);
+                INSERT INTO messages (
+                    msg_key, conv_key, msg_id, author_name, created_at, importance,
+                    message_type, body_html, body_plain, attachments_json, mentions_json, reactions_json
+                ) VALUES
+                    ('chat:c1|m1', 'chat:c1', 'm1', 'Alice', '2026-11-15T10:00:00Z', 'normal', 'message', '<p>hi</p>', 'hi', '[]', '[{\"id\":0,\"user_id\":\"u1\",\"display_name\":\"Bob\"}]', '[]'),
+                    ('chat:c1|m2', 'chat:c1', 'm2', 'Bob', '2026-11-15T10:01:00Z', 'normal', 'message', '<p>yo</p>', 'yo', '[]', '[]', '[]');
+                PRAGMA user_version = 51;
+                ",
+            )
+            .unwrap();
+        }
+
+        let conn = Connection::open(&db_path).unwrap();
+        let trigram = init_connection(&conn, false).unwrap();
+        let ver: i32 = conn
+            .query_row("PRAGMA user_version;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            ver,
+            if trigram {
+                SCHEMA_USER_VERSION_TRIGRAM
+            } else {
+                SCHEMA_USER_VERSION_UNICODE61
+            }
+        );
+
+        assert!(index_exists(&conn, "idx_messages_has_mentions"));
+        assert!(index_exists(&conn, "idx_conversations_sort_v2"));
+        assert!(!index_exists(&conn, "idx_conversations_sort"));
+        assert!(!index_exists(&conn, "idx_messages_conv_parent_created"));
+
+        let hm1: i32 = conn
+            .query_row("SELECT has_mentions FROM messages WHERE msg_key = 'chat:c1|m1'", [], |r| r.get(0))
+            .unwrap();
+        let hm2: i32 = conn
+            .query_row("SELECT has_mentions FROM messages WHERE msg_key = 'chat:c1|m2'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(hm1, 1);
+        assert_eq!(hm2, 0);
     }
 }

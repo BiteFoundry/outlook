@@ -31,6 +31,7 @@ pub enum Action {
     ToggleNavRail,
     ToggleAutoThreadPane,
     ToggleNarrowPane,
+    SelectNarrowPane(NarrowPane),
     ToggleNotify,
     ToggleDensity,
     CycleTheme,
@@ -115,6 +116,7 @@ pub enum Action {
     Undo,
     Redo,
     AcceptMention,
+    SelectMention(usize),
     OpenExternalEditor,
 
     // Threads & replies
@@ -350,6 +352,22 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 NarrowPane::Thread => ui.set_focus(Focus::Thread),
             }
         }
+        Action::SelectNarrowPane(pane) => match pane {
+            NarrowPane::List => {
+                ui.narrow_pane = NarrowPane::List;
+                ui.set_focus(Focus::Nav);
+            }
+            NarrowPane::Chat => {
+                ui.narrow_pane = NarrowPane::Chat;
+                ui.set_focus(Focus::Composer);
+            }
+            NarrowPane::Thread => {
+                if ui.thread_drawer_open && app.active_thread.is_some() {
+                    ui.narrow_pane = NarrowPane::Thread;
+                    ui.set_focus(Focus::Thread);
+                }
+            }
+        },
         Action::ToggleNotify => {
             ui.notify = !ui.notify;
             app.config.notify = ui.notify;
@@ -576,6 +594,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             }
             Focus::Thread => ui.thread_scroll.top(),
             _ => {
+                ui.pending_append_anchor = None;
                 ui.chat_scroll.top();
                 if !app.oldest_reached && !app.loading_older && app.active_conv_key.is_some() {
                     app.load_older_auto(ui);
@@ -587,7 +606,10 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 let _ = dispatch(Action::NavLast, app, ui);
             }
             Focus::Thread => ui.thread_scroll.bottom(),
-            _ => ui.chat_scroll.bottom(),
+            _ => {
+                ui.pending_append_anchor = None;
+                ui.chat_scroll.bottom();
+            }
         },
         Action::MouseScroll { delta, column, row } => {
             handle_mouse_scroll(app, ui, delta, column, row);
@@ -746,6 +768,13 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::AcceptMention => {
             ui.composer.accept_mention();
+        }
+        Action::SelectMention(index) => {
+            if ui.composer.mention_active() && index < ui.composer.popup.candidates.len() {
+                ui.composer.popup.selected = index;
+                ui.composer.accept_mention();
+                ui.set_focus(Focus::Composer);
+            }
         }
         Action::OpenExternalEditor => {
             ui.set_focus(Focus::Composer);
@@ -1209,6 +1238,8 @@ fn open_image_preview(app: &mut AppState, ui: &mut UiState) {
     ui.close_overlays_of(OverlayKind::ImagePreview);
     if let Some(target) = preview.current().cloned() {
         let (cols, rows) = preview.target_dimensions(ui.term_width, ui.term_height);
+        let key = AppState::image_cache_key(target.owner_id(), target.att_id(), cols, rows);
+        app.clear_image_error(&key);
         app.request_preview_image(&target, cols, rows);
     }
     ui.push_overlay(Overlay::ImagePreview(preview));
@@ -1485,6 +1516,7 @@ fn chat_scroll_is_at_top(ui: &UiState) -> bool {
 }
 
 fn scroll_chat_with_autoload(app: &mut AppState, ui: &mut UiState, delta: i32) {
+    ui.pending_append_anchor = None;
     let was_at_top = chat_scroll_is_at_top(ui);
     if delta < 0 {
         ui.chat_scroll.scroll_up((-delta) as u16);
@@ -1737,6 +1769,9 @@ fn action_for_target(target: HitTarget) -> Action {
             ButtonId::ComposerTargetToggle => Action::ToggleComposerTarget,
             ButtonId::SubjectToggle => Action::ToggleSubject,
             ButtonId::NarrowToggle => Action::ToggleNarrowPane,
+            ButtonId::NarrowList => Action::SelectNarrowPane(NarrowPane::List),
+            ButtonId::NarrowChat => Action::SelectNarrowPane(NarrowPane::Chat),
+            ButtonId::NarrowThread => Action::SelectNarrowPane(NarrowPane::Thread),
             ButtonId::ImagePreview => Action::OpenImagePreview,
             ButtonId::CommandPalette => Action::OpenOverlay(OverlayKind::CommandPalette),
             ButtonId::DensityToggle => Action::ToggleDensity,
@@ -1760,6 +1795,7 @@ fn action_for_target(target: HitTarget) -> Action {
         HitTarget::ThreadComposer => Action::OpenComposer,
         HitTarget::OverlayBody => Action::Noop,
         HitTarget::OverlayItem { index } => Action::OverlaySelect(index),
+        HitTarget::MentionCandidate(index) => Action::SelectMention(index),
     }
 }
 
@@ -1863,19 +1899,65 @@ fn paste_clipboard(app: &mut AppState, ui: &mut UiState) {
     if let Ok(img) = with_clipboard(|cb| cb.get_image()) {
         let width = img.width as u32;
         let height = img.height as u32;
-        match composer::encode_rgba_to_png(width, height, img.bytes.into_owned()) {
-            Ok(png_bytes) => {
-                let n = ui.composer.pending_images.len() + 1;
-                ui.composer.stage_inline_image(
-                    png_bytes,
-                    "image/png",
-                    Some(format!("clipboard-{n}.png")),
-                );
-                ui.set_focus(Focus::Composer);
-                ui.info(format!("Attached clipboard image ({width}x{height})"));
-            }
-            Err(err) => {
-                ui.error(format!("Image encoding failed: {err}"));
+        let rgba = img.bytes.into_owned();
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let task_label = format!("Paste image ({width}x{height})");
+            ui.tasks.begin(task_label.clone());
+            ui.set_focus(Focus::Composer);
+            ui.info(format!("Encoding clipboard image ({width}x{height})…"));
+            let tx = app.ui_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                match composer::encode_rgba_to_png(width, height, rgba) {
+                    Ok(png_bytes) => {
+                        let preview = crate::img_preview::decode_and_render_halfblocks(
+                            &png_bytes,
+                            24,
+                            5,
+                            (20, 22, 26),
+                        )
+                        .ok();
+                        let _ = tx.send(super::app::UiMsg::ClipboardImageEncoded {
+                            width,
+                            height,
+                            png_bytes,
+                            preview,
+                        });
+                        let _ = tx.send(super::app::UiMsg::TaskDone {
+                            label: task_label,
+                            error: None,
+                            toast: Some((
+                                format!("Attached clipboard image ({width}x{height})"),
+                                super::toast::ToastKind::Info,
+                            )),
+                        });
+                    }
+                    Err(err) => {
+                        let _ = tx.send(super::app::UiMsg::TaskDone {
+                            label: task_label,
+                            error: Some(err.clone()),
+                            toast: Some((
+                                format!("Image encoding failed: {err}"),
+                                super::toast::ToastKind::Error,
+                            )),
+                        });
+                    }
+                }
+            });
+        } else {
+            match composer::encode_rgba_to_png(width, height, rgba) {
+                Ok(png_bytes) => {
+                    let n = ui.composer.pending_images.len() + 1;
+                    ui.composer.stage_inline_image(
+                        png_bytes,
+                        "image/png",
+                        Some(format!("clipboard-{n}.png")),
+                    );
+                    ui.set_focus(Focus::Composer);
+                    ui.info(format!("Attached clipboard image ({width}x{height})"));
+                }
+                Err(err) => {
+                    ui.error(format!("Image encoding failed: {err}"));
+                }
             }
         }
     }
@@ -2146,6 +2228,66 @@ mod tests {
         // Empty composer exits immediately on Ctrl+Q
         ui.composer.load_text("");
         assert!(dispatch(Action::QuitConfirm, &mut app, &mut ui));
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn narrow_bar_buttons_and_thread_composer_click_targets() {
+        let (mut app, mut ui) = test_app_and_ui();
+        ui.term_width = 140;
+        ui.thread_drawer_open = true;
+        ui.composer_target_thread = true;
+        app.active_thread = Some(crate::models::ThreadView {
+            conv_key: "chan:t1:c1".to_string(),
+            root: crate::models::MessageItem {
+                msg_key: "chan:t1:c1|r1".to_string(),
+                conv_key: "chan:t1:c1".to_string(),
+                msg_id: "r1".to_string(),
+                parent_msg_id: None,
+                reply_to_id: None,
+                reply_to_author: None,
+                reply_to_preview: None,
+                subject: None,
+                author_id: None,
+                author_name: "Alice".to_string(),
+                is_me: false,
+                created_at: "2026-11-18T00:00:00Z".to_string(),
+                last_modified_at: None,
+                deleted: false,
+                importance: "normal".to_string(),
+                message_type: "message".to_string(),
+                body_html: String::new(),
+                body_plain: "hi".to_string(),
+                attachments: vec![],
+                mentions: vec![],
+                reactions: vec![],
+                reply_count: 0,
+                web_url: None,
+            },
+            replies: vec![],
+        });
+
+        ui.hitmap.clear();
+        ui.hitmap.add(
+            ratatui::layout::Rect::new(80, 30, 40, 5),
+            HitTarget::ThreadComposer,
+        );
+        dispatch(Action::Click { column: 90, row: 32 }, &mut app, &mut ui);
+        assert!(ui.composer_target_thread);
+        assert_eq!(ui.focus(), Focus::Composer);
+
+        dispatch(Action::SelectNarrowPane(NarrowPane::List), &mut app, &mut ui);
+        assert_eq!(ui.narrow_pane, NarrowPane::List);
+        assert_eq!(ui.focus(), Focus::Nav);
+
+        dispatch(Action::SelectNarrowPane(NarrowPane::Chat), &mut app, &mut ui);
+        assert_eq!(ui.narrow_pane, NarrowPane::Chat);
+        assert_eq!(ui.focus(), Focus::Composer);
+
+        dispatch(Action::SelectNarrowPane(NarrowPane::Thread), &mut app, &mut ui);
+        assert_eq!(ui.narrow_pane, NarrowPane::Thread);
+        assert_eq!(ui.focus(), Focus::Thread);
 
         app.sync_ctrl.request(SyncCommand::Shutdown);
     }

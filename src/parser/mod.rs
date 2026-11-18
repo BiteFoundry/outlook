@@ -9,15 +9,17 @@ use crate::models::{
     UploadedReferenceAttachment,
 };
 
+pub use html_in::parse_message_blocks_arc;
+
 /// Strips HTML tags and formats Adaptive Cards into clean plain text for previews & FTS5 indexing.
 pub fn html_and_cards_to_plain(html: &str, attachments: &[AttachmentInfo]) -> String {
-    let blocks = html_in::parse_message_blocks(html, attachments, &[]);
+    let blocks = html_in::parse_message_blocks_no_cache(html, attachments, &[]);
     html_in::blocks_to_plain(&blocks)
 }
 
 /// Converts a Teams HTML message + attachments into clean GitHub-flavored Markdown (used by `export --format md`).
 pub fn html_and_cards_to_markdown(html: &str, attachments: &[AttachmentInfo]) -> String {
-    let blocks = html_in::parse_message_blocks(html, attachments, &[]);
+    let blocks = html_in::parse_message_blocks_no_cache(html, attachments, &[]);
     html_in::blocks_to_markdown(&blocks)
 }
 
@@ -280,5 +282,20 @@ mod tests {
         assert!(out
             .body_html
             .contains("<attachment id=\"guid-1\"></attachment>"));
+    }
+
+    #[test]
+    fn test_parse_message_blocks_arc_fast_path_and_styled_markdown() {
+        let empty = parse_message_blocks_arc("   \n\t ", &[], &[]);
+        assert!(empty.is_empty());
+
+        let plain = parse_message_blocks_arc("  Hello   world \n ", &[], &[]);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(html_in::blocks_to_plain(&plain), "Hello world");
+
+        let styled_html = "<p>  <a href=\"https://example.com\"><u><s><i><b>combo</b></i></s></u></a>  </p>";
+        let styled_arc = parse_message_blocks_arc(styled_html, &[], &[]);
+        let md = html_in::blocks_to_markdown(&styled_arc);
+        assert_eq!(md, "[<u>~~***combo***~~</u>](https://example.com)");
     }
 }

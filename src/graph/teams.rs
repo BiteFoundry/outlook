@@ -64,7 +64,7 @@ impl GraphChannel {
 
 impl GraphClient {
     pub async fn list_joined_teams_with_channels(&self) -> Result<Vec<TeamSummary>> {
-        let mut next_url = Some("/me/joinedTeams".to_string());
+        let mut next_url = Some("/me/joinedTeams?$select=id,displayName,description".to_string());
         let mut teams = Vec::new();
         while let Some(url) = next_url {
             let page: GraphListPage<GraphTeam> = self.get_json(&url).await?;
@@ -82,7 +82,10 @@ impl GraphClient {
             .map(|(idx, team)| BatchSubRequest {
                 id: idx.to_string(),
                 method: "GET".to_string(),
-                url: format!("/teams/{}/channels", urlencoding::encode(&team.id)),
+                url: format!(
+                    "/teams/{}/channels?$select=id,displayName,description,membershipType,webUrl",
+                    urlencoding::encode(&team.id)
+                ),
                 body: None,
                 headers: None,
             })
@@ -133,7 +136,7 @@ impl GraphClient {
         team_name: &str,
     ) -> Result<Vec<ChannelSummary>> {
         let mut next_url = Some(format!(
-            "/teams/{}/channels",
+            "/teams/{}/channels?$select=id,displayName,description,membershipType,webUrl",
             urlencoding::encode(team_id)
         ));
         let mut channels = Vec::new();
