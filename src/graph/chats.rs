@@ -267,7 +267,7 @@ impl GraphClient {
             .filter(|s| !s.is_empty())
             .collect();
         if peers.is_empty() {
-            bail!("대화 상대를 1명 이상 지정해야 합니다.");
+            bail!("At least one recipient must be specified.");
         }
 
         let my_id = self.require_my_user_id().await?;
@@ -485,7 +485,7 @@ impl GraphClient {
 fn is_chats_orderby_unsupported(err: &anyhow::Error) -> bool {
     let msg = err.to_string();
     let detail = msg
-        .strip_prefix("Graph API 오류 (")
+        .strip_prefix(crate::graph::GRAPH_API_ERROR_PREFIX)
         .and_then(|rest| rest.split_once("): ").map(|(_, d)| d))
         .unwrap_or(&msg);
     let lower = detail.to_ascii_lowercase();
@@ -551,7 +551,7 @@ fn map_graph_chat(chat: GraphChat, my_user_id: Option<&str>) -> ConversationSumm
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
             })
-            .unwrap_or("1:1 채팅")
+            .unwrap_or("Direct Message")
             .to_string()
     } else {
         let names: Vec<String> = non_self_members
@@ -564,9 +564,9 @@ fn map_graph_chat(chat: GraphChat, my_user_id: Option<&str>) -> ConversationSumm
             .collect();
         if names.is_empty() {
             if kind == ConversationKind::Meeting {
-                "모임 채팅".to_string()
+                "Meeting Chat".to_string()
             } else {
-                "그룹 채팅".to_string()
+                "Group Chat".to_string()
             }
         } else {
             names.join(", ")
@@ -581,7 +581,7 @@ fn map_graph_chat(chat: GraphChat, my_user_id: Option<&str>) -> ConversationSumm
     let (last_msg_id, last_msg_author, last_msg_preview, last_msg_created, last_msg_sender_id) =
         if let Some(preview) = chat.last_message_preview {
             let preview_text = if preview.is_deleted == Some(true) {
-                Some("[삭제된 메시지]".to_string())
+                Some("[deleted message]".to_string())
             } else {
                 let raw_html = preview
                     .body
@@ -661,8 +661,8 @@ mod tests {
             "id": "19:abc@unq.gbl.spaces",
             "chatType": "oneOnOne",
             "members": [
-                { "userId": "me-1", "displayName": "나" },
-                { "userId": "peer-2", "displayName": "김영수" }
+                { "userId": "me-1", "displayName": "Me" },
+                { "userId": "peer-2", "displayName": "Alice" }
             ],
             "viewpoint": {
                 "lastMessageReadDateTime": "2026-11-15T05:00:00Z"
@@ -670,18 +670,18 @@ mod tests {
             "lastMessagePreview": {
                 "id": "m100",
                 "createdDateTime": "2026-11-15T06:00:00Z",
-                "from": { "user": { "id": "peer-2", "displayName": "김영수" } },
-                "body": { "contentType": "html", "content": "안녕하세요" }
+                "from": { "user": { "id": "peer-2", "displayName": "Alice" } },
+                "body": { "contentType": "html", "content": "Hello" }
             }
         }))
         .unwrap();
 
         let summary = map_graph_chat(raw, Some("me-1"));
         assert_eq!(summary.kind, ConversationKind::OneOnOne);
-        assert_eq!(summary.title, "김영수");
+        assert_eq!(summary.title, "Alice");
         assert_eq!(summary.peer_user_id.as_deref(), Some("peer-2"));
         assert_eq!(summary.unread_count, 1);
-        assert_eq!(summary.last_msg_author.as_deref(), Some("김영수"));
+        assert_eq!(summary.last_msg_author.as_deref(), Some("Alice"));
     }
 
     #[test]
@@ -691,12 +691,12 @@ mod tests {
             "chatType": "group",
             "topic": "",
             "members": [
-                { "userId": "me-1", "displayName": "나" },
-                { "userId": "u2", "displayName": "박민수" },
-                { "userId": "u3", "displayName": "이지은" },
-                { "userId": "u4", "displayName": "최준호" },
-                { "userId": "u5", "displayName": "정수빈" },
-                { "userId": "u6", "displayName": "한지민" }
+                { "userId": "me-1", "displayName": "Me" },
+                { "userId": "u2", "displayName": "Bob" },
+                { "userId": "u3", "displayName": "Carol" },
+                { "userId": "u4", "displayName": "Dave" },
+                { "userId": "u5", "displayName": "Eve" },
+                { "userId": "u6", "displayName": "Frank" }
             ],
             "viewpoint": {
                 "lastMessageReadDateTime": "2026-11-15T05:00:00Z"
@@ -704,15 +704,15 @@ mod tests {
             "lastMessagePreview": {
                 "id": "m200",
                 "createdDateTime": "2026-11-15T06:00:00Z",
-                "from": { "user": { "id": "me-1", "displayName": "나" } },
-                "body": { "contentType": "text", "content": "내가 보낸 메시지" }
+                "from": { "user": { "id": "me-1", "displayName": "Me" } },
+                "body": { "contentType": "text", "content": "Message I sent" }
             }
         }))
         .unwrap();
 
         let summary = map_graph_chat(raw, Some("me-1"));
         assert_eq!(summary.kind, ConversationKind::Group);
-        assert_eq!(summary.title, "박민수, 이지은, 최준호, 정수빈");
+        assert_eq!(summary.title, "Bob, Carol, Dave, Eve");
         assert_eq!(summary.peer_user_id, None);
         // Sent by me -> unread_count must be 0
         assert_eq!(summary.unread_count, 0);
@@ -723,17 +723,17 @@ mod tests {
         let raw: GraphChat = serde_json::from_value(serde_json::json!({
             "id": "19:grp2@thread.v2",
             "chatType": "group",
-            "topic": "백엔드 스프린트",
+            "topic": "Backend Sprint",
             "members": [
-                { "userId": "me-1", "displayName": "나" },
-                { "userId": "u2", "displayName": "박민수" }
+                { "userId": "me-1", "displayName": "Me" },
+                { "userId": "u2", "displayName": "Bob" }
             ]
         }))
         .unwrap();
 
         let summary = map_graph_chat(raw, Some("me-1"));
-        assert_eq!(summary.title, "백엔드 스프린트");
-        assert_eq!(summary.topic.as_deref(), Some("백엔드 스프린트"));
+        assert_eq!(summary.title, "Backend Sprint");
+        assert_eq!(summary.topic.as_deref(), Some("Backend Sprint"));
         assert_eq!(summary.unread_count, 0);
     }
 

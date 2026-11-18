@@ -4,7 +4,7 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -25,32 +25,32 @@ pub const REACTION_OPTIONS: [ReactionOption; 6] = [
     ReactionOption {
         reaction_type: "like",
         emoji: "👍",
-        label: "좋아요 (like)",
+        label: "Like",
     },
     ReactionOption {
         reaction_type: "heart",
         emoji: "❤️",
-        label: "하트 (heart)",
+        label: "Heart",
     },
     ReactionOption {
         reaction_type: "laugh",
         emoji: "😆",
-        label: "웃음 (laugh)",
+        label: "Laugh",
     },
     ReactionOption {
         reaction_type: "surprised",
         emoji: "😮",
-        label: "놀람 (surprised)",
+        label: "Surprised",
     },
     ReactionOption {
         reaction_type: "sad",
         emoji: "😢",
-        label: "슬픔 (sad)",
+        label: "Sad",
     },
     ReactionOption {
         reaction_type: "angry",
         emoji: "😡",
-        label: "화남 (angry)",
+        label: "Angry",
     },
 ];
 
@@ -109,7 +109,7 @@ impl ReactionsOverlay {
                 reaction_type: REACTION_OPTIONS[self.selected].reaction_type.to_string(),
             }),
             Action::CloseOverlay => OverlayOutcome::Close,
-            Action::Quit => OverlayOutcome::NotHandled,
+            Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
             _ => OverlayOutcome::Handled,
         }
     }
@@ -125,10 +125,13 @@ impl ReactionsOverlay {
         let theme = &ui.theme;
         let rect = centered_rect(area, 42, 11);
         frame.render_widget(Clear, rect);
+        hitmap.add(rect, HitTarget::OverlayBody);
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
             .title(Line::from(Span::styled(
-                " 반응 선택 (1-6) · Enter 토글 ",
+                " React (1-6) · Enter Toggle ",
                 theme.title(true),
             )))
             .border_style(theme.border_style(true));

@@ -4,7 +4,7 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -26,37 +26,37 @@ pub const PRESENCE_OPTIONS: [PresenceOption; 6] = [
     PresenceOption {
         availability: "Available",
         activity: "Available",
-        label: "Available (대화 가능)",
+        label: "Available",
         badge: "●",
     },
     PresenceOption {
         availability: "Busy",
         activity: "Busy",
-        label: "Busy (다른 용무 중)",
+        label: "Busy",
         badge: "●",
     },
     PresenceOption {
         availability: "DoNotDisturb",
         activity: "DoNotDisturb",
-        label: "DoNotDisturb (방해 금지)",
+        label: "Do Not Disturb",
         badge: "⛔",
     },
     PresenceOption {
         availability: "BeRightBack",
         activity: "BeRightBack",
-        label: "BeRightBack (곧 돌아오겠음)",
+        label: "Be Right Back",
         badge: "●",
     },
     PresenceOption {
         availability: "Away",
         activity: "Away",
-        label: "Away (자리 비움)",
+        label: "Away",
         badge: "●",
     },
     PresenceOption {
         availability: "Reset",
         activity: "Reset",
-        label: "Reset (자동 상태로 초기화)",
+        label: "Reset to Automatic",
         badge: "○",
     },
 ];
@@ -108,7 +108,7 @@ impl PresenceOverlay {
                 })
             }
             Action::CloseOverlay => OverlayOutcome::Close,
-            Action::Quit => OverlayOutcome::NotHandled,
+            Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
             _ => OverlayOutcome::Handled,
         }
     }
@@ -124,10 +124,13 @@ impl PresenceOverlay {
         let theme = &ui.theme;
         let rect = centered_rect(area, 52, 12);
         frame.render_widget(Clear, rect);
+        hitmap.add(rect, HitTarget::OverlayBody);
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
             .title(Line::from(Span::styled(
-                " 내 상태 (Presence) · Enter 적용 · Esc 닫기 ",
+                " Presence · Enter Apply · Esc Close ",
                 theme.title(true),
             )))
             .border_style(theme.border_style(true));
@@ -138,8 +141,8 @@ impl PresenceOverlay {
         }
 
         let current_text = match &app.my_presence {
-            Some(p) => format!(" 현재 상태: {} ({})", p.availability, p.activity),
-            None => " 현재 상태: 알 수 없음".to_string(),
+            Some(p) => format!(" Current: {} ({})", p.availability, p.activity),
+            None => " Current: Unknown".to_string(),
         };
         frame.render_widget(
             Paragraph::new(Span::styled(current_text, theme.muted_style())),

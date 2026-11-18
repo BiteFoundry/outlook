@@ -1474,7 +1474,7 @@ mod tests {
         assert!(validate_tool_args(
             "send_message",
             &json!({
-                "target": "개발팀/일반",
+                "target": "Engineering/General",
                 "markdown": "Hello @Alice",
                 "mentions": ["u1:Alice", { "user_id": "u2", "display_name": "Bob" }]
             })
@@ -1534,13 +1534,13 @@ mod tests {
                 kind: ConversationKind::Group,
                 team_id: None,
                 team_name: None,
-                title: "개발 논의방".to_string(),
-                topic: Some("개발 논의방".to_string()),
+                title: "Engineering Discussion".to_string(),
+                topic: Some("Engineering Discussion".to_string()),
                 unread_count: 0,
                 last_read_at: None,
                 last_msg_id: Some("msg-2".to_string()),
-                last_msg_author: Some("김철수".to_string()),
-                last_msg_preview: Some("릴리스 태그 확인".to_string()),
+                last_msg_author: Some("Bob".to_string()),
+                last_msg_preview: Some("Check release tag".to_string()),
                 last_updated_at: Some("2026-11-15T06:00:00Z".to_string()),
                 pinned: false,
                 peer_user_id: None,
@@ -1559,15 +1559,15 @@ mod tests {
                     reply_to_preview: None,
                     subject: None,
                     author_id: Some("u1".to_string()),
-                    author_name: "김철수".to_string(),
+                    author_name: "Bob".to_string(),
                     is_me: false,
                     created_at: "2026-11-10T06:00:00Z".to_string(),
                     last_modified_at: None,
                     deleted: false,
                     importance: "normal".to_string(),
                     message_type: "message".to_string(),
-                    body_html: "<p>과거 메시지</p>".to_string(),
-                    body_plain: "과거 메시지".to_string(),
+                    body_html: "<p>Older message</p>".to_string(),
+                    body_plain: "Older message".to_string(),
                     attachments: vec![],
                     mentions: vec![],
                     reactions: vec![],
@@ -1584,15 +1584,15 @@ mod tests {
                     reply_to_preview: None,
                     subject: None,
                     author_id: Some("u1".to_string()),
-                    author_name: "김철수".to_string(),
+                    author_name: "Bob".to_string(),
                     is_me: false,
                     created_at: "2026-11-15T06:00:00Z".to_string(),
                     last_modified_at: None,
                     deleted: false,
                     importance: "normal".to_string(),
                     message_type: "message".to_string(),
-                    body_html: "<p>릴리스 태그 확인 부탁합니다</p>".to_string(),
-                    body_plain: "릴리스 태그 확인 부탁합니다".to_string(),
+                    body_html: "<p>Please check the release tag</p>".to_string(),
+                    body_plain: "Please check the release tag".to_string(),
                     attachments: vec![],
                     mentions: vec![],
                     reactions: vec![],
@@ -1612,7 +1612,7 @@ mod tests {
                 "method": "tools/call",
                 "params": {
                     "name": "get_messages",
-                    "arguments": { "target": "개발 논의방", "offline": true, "before": "msg-2" }
+                    "arguments": { "target": "Engineering Discussion", "offline": true, "before": "msg-2" }
                 }
             })
             .to_string(),
@@ -1637,7 +1637,7 @@ mod tests {
                 "method": "tools/call",
                 "params": {
                     "name": "search_messages",
-                    "arguments": { "query": "릴리스", "target": "개발 논의방" }
+                    "arguments": { "query": "release", "target": "Engineering Discussion" }
                 }
             })
             .to_string(),

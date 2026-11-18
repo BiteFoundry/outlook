@@ -9,7 +9,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -25,6 +25,7 @@ use crate::{
 };
 
 const MAX_UNDO: usize = 200;
+pub const SUBJECT_PREFIX: &str = "Subject: ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplyPreview {
@@ -90,6 +91,11 @@ impl ComposerState {
 
     pub fn is_empty(&self) -> bool {
         self.text.trim().is_empty() && self.pending_images.is_empty()
+    }
+
+    /// True when the composer text buffer itself has zero characters (used for empty-composer arrow scroll).
+    pub fn has_no_text(&self) -> bool {
+        self.text.is_empty()
     }
 
     pub fn reply(&self) -> Option<&ReplyPreview> {
@@ -205,6 +211,65 @@ impl ComposerState {
         }
         if let Some(next) = next_boundary(&self.text, self.cursor) {
             self.delete_range(self.cursor..next);
+        }
+    }
+
+    pub fn delete_word_backward(&mut self) {
+        if self.subject_focused {
+            if self.subject_cursor == 0 {
+                return;
+            }
+            let head = &self.subject[..self.subject_cursor.min(self.subject.len())];
+            let mut idx = head.len();
+            while let Some((pos, ch)) = head[..idx].char_indices().next_back() {
+                if ch.is_whitespace() {
+                    idx = pos;
+                } else {
+                    break;
+                }
+            }
+            while let Some((pos, ch)) = head[..idx].char_indices().next_back() {
+                if !ch.is_whitespace() {
+                    idx = pos;
+                } else {
+                    break;
+                }
+            }
+            self.subject.replace_range(idx..self.subject_cursor, "");
+            self.subject_cursor = idx;
+            return;
+        }
+        if self.delete_selection() {
+            return;
+        }
+        let pos = self.cursor.min(self.text.len());
+        if pos == 0 {
+            return;
+        }
+        let head = &self.text[..pos];
+        let mut idx = head.len();
+        while let Some((p, ch)) = head[..idx].char_indices().next_back() {
+            if ch.is_whitespace() && ch != '\n' {
+                idx = p;
+            } else {
+                break;
+            }
+        }
+        if idx == head.len() {
+            if let Some((p, '\n')) = head.char_indices().next_back() {
+                self.delete_range(p..pos);
+                return;
+            }
+        }
+        while let Some((p, ch)) = head[..idx].char_indices().next_back() {
+            if !ch.is_whitespace() {
+                idx = p;
+            } else {
+                break;
+            }
+        }
+        if idx < pos {
+            self.delete_range(idx..pos);
         }
     }
 
@@ -644,36 +709,39 @@ impl ComposerState {
         self.text.split('\n').count().max(1)
     }
 
-    pub fn desired_height(&self, show_subject: bool) -> u16 {
+    pub fn desired_height(&self, show_subject: bool, inline_images: bool) -> u16 {
         let mut extra = 0u16;
         if show_subject {
             extra += 1;
         }
-        if self.reply.is_some() {
+        if self.reply.is_some() && show_subject {
             extra += 1;
         }
         if !self.pending_images.is_empty() {
             extra += 1;
-            if let Some(ref preview) = self.pending_preview {
-                extra = extra.saturating_add(preview.rows.min(4));
+            if inline_images {
+                if let Some(ref preview) = self.pending_preview {
+                    extra = extra.saturating_add(preview.rows.min(4));
+                }
             }
         }
-        ((self.line_count() as u16) + 2 + extra).clamp(3, 14)
+        let body_lines = (self.line_count() as u16).clamp(1, 8);
+        (1 + extra + body_lines).clamp(2, 13)
     }
 }
 
 /// Encodes raw RGBA8 pixel buffer into PNG bytes.
 pub fn encode_rgba_to_png(width: u32, height: u32, rgba: Vec<u8>) -> Result<Vec<u8>, String> {
     if width == 0 || height == 0 {
-        return Err("이미지 크기가 0입니다".to_string());
+        return Err("Clipboard has 0x0 image data".to_string());
     }
     let img = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(width, height, rgba)
-        .ok_or_else(|| "클립보드 이미지 버퍼 크기가 일치하지 않습니다".to_string())?;
+        .ok_or_else(|| "Clipboard image RGBA buffer size mismatch".to_string())?;
     let mut out = Vec::new();
     let encoder = PngEncoder::new(&mut out);
     encoder
         .write_image(img.as_raw(), width, height, ExtendedColorType::Rgba8)
-        .map_err(|err| format!("PNG 인코딩 실패: {err}"))?;
+        .map_err(|err| format!("Failed to encode clipboard image as PNG: {err}"))?;
     Ok(out)
 }
 
@@ -688,37 +756,57 @@ pub fn draw(
     ui: &mut UiState,
     hitmap: &mut HitMap,
 ) -> Option<(u16, u16)> {
-    let focused = ui.focus == Focus::Composer && ui.overlays.is_empty();
-    let theme = ui.theme.clone();
-
-    let title = composer_title(ui, app);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(Span::styled(title, theme.title(focused))))
-        .border_style(theme.border_style(focused));
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    hitmap.add(area, HitTarget::Composer);
-
-    if inner.width == 0 || inner.height == 0 {
+    if area.width == 0 || area.height == 0 {
         return None;
     }
 
-    let mut y = inner.y;
+    let focused = ui.focus == Focus::Composer && ui.overlays.is_empty();
+    let theme = ui.theme.clone();
+    let surface_style = if theme.no_color {
+        Style::default()
+    } else {
+        Style::default().bg(theme.bg_composer).fg(theme.fg_primary)
+    };
+    frame.render_widget(Paragraph::new("").style(surface_style), area);
+    hitmap.add(area, HitTarget::Composer);
+    if ui.thread_drawer_open && ui.composer_target_thread && app.active_thread.is_some() {
+        hitmap.add_line(area.x, area.y, area.width, HitTarget::ThreadComposer);
+    }
+
     let is_channel_root = is_composing_channel_root(app, ui);
     let show_subject = is_channel_root && ui.show_subject;
 
-    if show_subject && y < inner.y + inner.height {
-        let prefix = "제목: ";
-        let prefix_w = UnicodeWidthStr::width(prefix);
+    // Row 0: top hairline (`─`) with embedded context label
+    let hairline_style = if theme.no_color {
+        if focused {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        }
+    } else if focused {
+        Style::default().fg(theme.accent).bg(theme.bg_composer)
+    } else {
+        Style::default().fg(theme.fg_subtle).bg(theme.bg_composer)
+    };
+    let hairline = composer_hairline(ui, app, show_subject, is_channel_root, area.width as usize);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(hairline, hairline_style))),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+
+    let mut y = area.y.saturating_add(1);
+    let mut subject_y: Option<u16> = None;
+
+    if show_subject && y < area.bottom() {
+        subject_y = Some(y);
+        let prefix_w = UnicodeWidthStr::width(SUBJECT_PREFIX);
         let subj_style = if focused && ui.composer.subject_focused {
             theme.subject_style()
         } else {
             theme.accent_style()
         };
         let body_text = if ui.composer.subject.is_empty() {
-            "(채널 게시물 제목 입력 · Ctrl+S 숨김)".to_string()
+            "(Post subject · Ctrl+S to hide)".to_string()
         } else {
             ui.composer.subject.clone()
         };
@@ -727,68 +815,80 @@ pub fn draw(
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };
-        let max_body = (inner.width as usize).saturating_sub(prefix_w);
+        let max_body = (area.width as usize).saturating_sub(prefix_w);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(prefix, subj_style),
+                Span::styled(SUBJECT_PREFIX, subj_style),
                 Span::styled(truncate_display(&body_text, max_body), body_style),
-            ])),
-            Rect::new(inner.x, y, inner.width, 1),
+            ]))
+            .style(surface_style),
+            Rect::new(area.x, y, area.width, 1),
         );
-        hitmap.add_line(inner.x, y, inner.width, HitTarget::SubjectInput);
+        hitmap.add_line(area.x, y, area.width, HitTarget::SubjectInput);
         y = y.saturating_add(1);
     }
 
-    if let Some(reply) = ui.composer.reply() {
-        if y < inner.y + inner.height {
-            let text = format!(
-                "↩ [답장: {}] {}",
-                reply.author,
-                reply.summary(inner.width.saturating_sub(14) as usize)
-            );
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    truncate_display(&text, inner.width as usize),
-                    theme.quote_style(),
-                ))),
-                Rect::new(inner.x, y, inner.width, 1),
-            );
-            y = y.saturating_add(1);
+    if show_subject {
+        if let Some(reply) = ui.composer.reply() {
+            if y < area.bottom() {
+                let text = format!(
+                    "↩ Replying to {}: \"{}\" · Esc cancel",
+                    reply.author,
+                    reply.summary(area.width.saturating_sub(32).max(6) as usize)
+                );
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        truncate_display(&text, area.width as usize),
+                        theme.quote_style(),
+                    )))
+                    .style(surface_style),
+                    Rect::new(area.x, y, area.width, 1),
+                );
+                y = y.saturating_add(1);
+            }
         }
     }
 
-    if !ui.composer.pending_images.is_empty() && y < inner.y + inner.height {
+    if !ui.composer.pending_images.is_empty() && y < area.bottom() {
         let count = ui.composer.pending_images.len();
         let chip = if let Some(ref preview) = ui.composer.pending_preview {
-            format!(
-                "[📋 클립보드 이미지 {}개 ({}x{}) — 전송 시 인라인 업로드]",
-                count, preview.width_px, preview.height_px
-            )
+            if count == 1 {
+                format!(
+                    "[Clipboard image ({}x{}) — uploaded inline on send]",
+                    preview.width_px, preview.height_px
+                )
+            } else {
+                format!(
+                    "[{count} clipboard images ({}x{}) — uploaded inline on send]",
+                    preview.width_px, preview.height_px
+                )
+            }
         } else if count == 1 {
-            "[📋 클립보드 이미지 첨부됨 — 전송 시 인라인 업로드]".to_string()
+            "[Clipboard image attached — uploaded inline on send]".to_string()
         } else {
-            format!("[📋 클립보드 이미지 {count}개 첨부됨 — 전송 시 인라인 업로드]")
+            format!("[{count} clipboard images attached — uploaded inline on send]")
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                truncate_display(&chip, inner.width as usize),
+                truncate_display(&chip, area.width as usize),
                 Style::default()
                     .fg(theme.success)
                     .add_modifier(Modifier::BOLD),
-            ))),
-            Rect::new(inner.x, y, inner.width, 1),
+            )))
+            .style(surface_style),
+            Rect::new(area.x, y, area.width, 1),
         );
         y = y.saturating_add(1);
 
         if ui.inline_images {
             if let Some(ref preview) = ui.composer.pending_preview {
                 for thumb_line in preview.lines.iter().take(4) {
-                    if y >= inner.y + inner.height.saturating_sub(1) {
+                    if y >= area.bottom().saturating_sub(1) {
                         break;
                     }
                     frame.render_widget(
-                        Paragraph::new(thumb_line.clone()),
-                        Rect::new(inner.x, y, inner.width, 1),
+                        Paragraph::new(thumb_line.clone()).style(surface_style),
+                        Rect::new(area.x, y, area.width, 1),
                     );
                     y = y.saturating_add(1);
                 }
@@ -796,16 +896,17 @@ pub fn draw(
         }
     }
 
-    let text_height = (inner.y + inner.height).saturating_sub(y);
+    let text_height = area.bottom().saturating_sub(y);
     if text_height == 0 {
         return None;
     }
-    let text_area = Rect::new(inner.x, y, inner.width, text_height);
+    let text_area = Rect::new(area.x, y, area.width, text_height);
 
-    let width = inner.width as usize;
+    let gutter_w = if text_area.width > 4 { 2usize } else { 0usize };
+    let body_width = (text_area.width as usize).saturating_sub(gutter_w).max(1);
     let text = ui.composer.text();
     let selection = ui.composer.selection_range();
-    let (visual, cursor_row, cursor_col) = text_layout(text, width, ui.composer.cursor());
+    let (visual, cursor_row, cursor_col) = text_layout(text, body_width, ui.composer.cursor());
 
     let height = text_height as usize;
     let mut offset = if cursor_row >= height {
@@ -815,28 +916,60 @@ pub fn draw(
     };
     offset = offset.min(visual.len().saturating_sub(height));
 
+    let prompt_style = if focused {
+        theme.accent_style().add_modifier(Modifier::BOLD)
+    } else {
+        theme.muted_style()
+    };
+
     let mut lines: Vec<Line> = Vec::with_capacity(height);
     if text.is_empty() {
-        let hint = if focused {
-            if is_channel_root {
-                "Markdown 입력 (Enter 전송 · Shift+Enter 줄바꿈 · Ctrl+S 제목 · Ctrl+V 이미지 · @ 멘션)"
-            } else {
-                "Markdown 입력 (Enter 전송 · Shift+Enter 줄바꿈 · Ctrl+V 이미지 · @ 멘션 · Ctrl+E 편집)"
-            }
+        let nl = if ui.kitty_keyboard_supported {
+            "Shift+Enter"
         } else {
-            "i/Enter: 입력 · ↑↓: 탐색 · t: 스레드 · +: 반응 · Ctrl+K: 명령팔레트"
+            "Alt+Enter / Ctrl+J"
         };
-        lines.push(Line::from(Span::styled(
-            truncate_display(hint, width),
+        let hint = if focused {
+            format!("Write a message (Enter send · {nl} newline · PgUp/↑↓ scroll · @ mention)")
+        } else {
+            "Press i or Enter to compose · j/k select · Ctrl+K jump".to_string()
+        };
+        let placeholder_span = Span::styled(
+            truncate_display(&hint, body_width),
             theme.muted_style().add_modifier(Modifier::ITALIC),
-        )));
+        );
+        if gutter_w == 2 {
+            lines.push(Line::from(vec![
+                Span::styled("> ", prompt_style),
+                placeholder_span,
+            ]));
+        } else {
+            lines.push(Line::from(placeholder_span));
+        }
     } else {
-        for &(start, end) in visual.iter().skip(offset).take(height) {
-            push_line_spans(&mut lines, text, start, end, selection, theme.selection());
+        for (vis_idx, &(start, end)) in visual.iter().enumerate().skip(offset).take(height) {
+            let gutter = if gutter_w == 2 {
+                Some(if vis_idx == 0 {
+                    Span::styled("> ", prompt_style)
+                } else {
+                    Span::raw("  ")
+                })
+            } else {
+                None
+            };
+            push_line_spans(
+                &mut lines,
+                text,
+                start,
+                end,
+                selection,
+                theme.selection(),
+                gutter,
+            );
         }
     }
 
-    frame.render_widget(Paragraph::new(lines), text_area);
+    frame.render_widget(Paragraph::new(lines).style(surface_style), text_area);
 
     if focused && !ui.composer.subject_focused {
         ui.composer.popup.draw(frame, area, &theme);
@@ -845,27 +978,28 @@ pub fn draw(
         return None;
     }
 
-    if show_subject && ui.composer.subject_focused {
-        let prefix_w = UnicodeWidthStr::width("제목: ") as u16;
+    if let Some(subj_y) = subject_y.filter(|_| ui.composer.subject_focused) {
+        let prefix_w = UnicodeWidthStr::width(SUBJECT_PREFIX) as u16;
         let subj_col = UnicodeWidthStr::width(
             &ui.composer.subject[..ui.composer.subject_cursor.min(ui.composer.subject.len())],
         ) as u16;
-        let cx = inner
+        let cx = area
             .x
             .saturating_add(prefix_w)
             .saturating_add(subj_col)
-            .min(inner.x + inner.width.saturating_sub(1));
-        return Some((cx, inner.y));
+            .min(area.right().saturating_sub(1));
+        return Some((cx, subj_y));
     }
 
     let cursor_y = text_area
         .y
         .saturating_add(cursor_row.saturating_sub(offset) as u16)
-        .min(text_area.y + text_area.height.saturating_sub(1));
+        .min(text_area.bottom().saturating_sub(1));
     let cursor_x = text_area
         .x
+        .saturating_add(gutter_w as u16)
         .saturating_add(cursor_col as u16)
-        .min(text_area.x + text_area.width.saturating_sub(1));
+        .min(text_area.right().saturating_sub(1));
 
     Some((cursor_x, cursor_y))
 }
@@ -880,27 +1014,53 @@ fn is_composing_channel_root(app: &AppState, ui: &UiState) -> bool {
     !(ui.thread_drawer_open && ui.composer_target_thread && app.active_thread.is_some())
 }
 
-fn composer_title(ui: &UiState, app: &AppState) -> String {
+fn composer_hairline(
+    ui: &UiState,
+    app: &AppState,
+    show_subject: bool,
+    is_channel_root: bool,
+    width: usize,
+) -> String {
+    if width == 0 {
+        return String::new();
+    }
     let conv_name = app
         .active_conversation()
         .map(|c| c.title.as_str())
-        .unwrap_or("대화 없음");
+        .unwrap_or("No conversation");
 
-    if ui.thread_drawer_open && ui.composer_target_thread {
-        if let Some(thread) = &app.active_thread {
-            return format!(
-                " 스레드 답글 · ↩ {} ({}) · Enter 전송 · Shift+Enter 줄바꿈 ",
-                thread.root.author_name, conv_name
-            );
+    let prefix = if !show_subject {
+        if let Some(reply) = ui.composer.reply() {
+            let max_summary = width
+                .saturating_sub(UnicodeWidthStr::width(reply.author.as_str()) + 34)
+                .max(6);
+            format!(
+                "─ ↩ Replying to {}: \"{}\" · Esc cancel ",
+                reply.author,
+                reply.summary(max_summary)
+            )
+        } else if ui.thread_drawer_open && ui.composer_target_thread && app.active_thread.is_some()
+        {
+            "─ Reply in thread · Alt+T channel ".to_string()
+        } else if is_channel_root {
+            format!("─ New post in {conv_name} · Ctrl+S subject ")
+        } else {
+            format!("─ {conv_name} ")
         }
+    } else if ui.thread_drawer_open && ui.composer_target_thread && app.active_thread.is_some() {
+        "─ Reply in thread · Alt+T channel ".to_string()
+    } else if is_channel_root {
+        format!("─ New post in {conv_name} · Ctrl+S subject ")
+    } else {
+        format!("─ {conv_name} ")
+    };
+
+    let mut out = truncate_display(&prefix, width);
+    let used = UnicodeWidthStr::width(out.as_str());
+    for _ in used..width {
+        out.push('─');
     }
-    if ui.composer.reply().is_some() {
-        return format!(" 답장 · {conv_name} · Enter 전송 · Shift+Enter 줄바꿈 ");
-    }
-    if is_composing_channel_root(app, ui) {
-        return format!(" 채널 새 글 · {conv_name} · Ctrl+S 제목 · Enter 전송 ");
-    }
-    format!(" 입력 · {conv_name} · Enter 전송 · Shift+Enter 줄바꿈 ")
+    out
 }
 
 fn push_line_spans(
@@ -910,8 +1070,12 @@ fn push_line_spans(
     end: usize,
     selection: Option<(usize, usize)>,
     selection_style: Style,
+    gutter: Option<Span<'static>>,
 ) {
     let mut spans: Vec<Span> = Vec::new();
+    if let Some(g) = gutter {
+        spans.push(g);
+    }
     let mut run = String::new();
     let mut run_selected = false;
 
@@ -1201,5 +1365,31 @@ mod tests {
         composer.stage_inline_image(png, "image/png", Some("clip.png".into()));
         assert!(!composer.is_empty());
         assert_eq!(composer.pending_images.len(), 1);
+        assert_eq!(
+            encode_rgba_to_png(0, 2, vec![]),
+            Err("Clipboard has 0x0 image data".to_string())
+        );
+    }
+
+    #[test]
+    fn desired_height_auto_sizes_with_two_row_minimum() {
+        let mut composer = ComposerState::new();
+        assert_eq!(composer.desired_height(false, false), 2);
+        assert_eq!(composer.desired_height(true, false), 3);
+
+        composer.set_reply(ReplyPreview {
+            msg_id: "m1".into(),
+            author: "Alice".into(),
+            text: "hi".into(),
+        });
+        assert_eq!(composer.desired_height(false, false), 2);
+        assert_eq!(composer.desired_height(true, false), 4);
+
+        composer.insert_str("line1\nline2\nline3");
+        assert_eq!(composer.desired_height(false, false), 4);
+
+        let png = encode_rgba_to_png(2, 2, vec![255; 16]).unwrap();
+        composer.stage_inline_image(png, "image/png", None);
+        assert!(composer.desired_height(false, false) < composer.desired_height(false, true));
     }
 }

@@ -20,6 +20,68 @@ pub const DEFAULT_PUBLIC_CLIENT_ID: &str = "14d82eec-204b-4c2f-b7e8-296a70dab67e
 pub const DEFAULT_TENANT_ID: &str = "common";
 pub const DEFAULT_GITHUB_REPO: &str = "shinick-dev/teams";
 
+/// Message stream density mode in TUI (`Cozy` grouped default vs `Compact` single-line gutter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DensityMode {
+    #[default]
+    Cozy,
+    Compact,
+}
+
+impl DensityMode {
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Cozy => Self::Compact,
+            Self::Compact => Self::Cozy,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cozy => "Cozy",
+            Self::Compact => "Compact",
+        }
+    }
+}
+
+/// Terminal color theme preset (`Auto` detects `NO_COLOR`, `COLORTERM`, and `TERM`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemePreset {
+    #[default]
+    Auto,
+    Dark,
+    Light,
+    Ansi256,
+    Ansi16,
+    NoColor,
+}
+
+impl ThemePreset {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Dark,
+            Self::Dark => Self::Light,
+            Self::Light => Self::Ansi256,
+            Self::Ansi256 => Self::Ansi16,
+            Self::Ansi16 => Self::NoColor,
+            Self::NoColor => Self::Auto,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Dark => "Midnight Dark",
+            Self::Light => "Daylight Light",
+            Self::Ansi256 => "ANSI 256",
+            Self::Ansi16 => "ANSI 16",
+            Self::NoColor => "No Color",
+        }
+    }
+}
+
 /// Entry persona (`teams`), kept as an enum for stable configuration/caller ergonomics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -83,6 +145,12 @@ pub struct AppConfig {
     pub cli_cache_ttl_secs: u64,
     /// Automatically start and attach to the lightweight background sync daemon (`TEAMS_AUTO_DAEMON=1|true`, default `false`).
     pub auto_daemon: bool,
+    /// TUI message density (`cozy` or `compact`).
+    pub density: DensityMode,
+    /// TUI color theme preset (`auto`, `dark`, `light`, `ansi256`, `ansi16`, `nocolor`).
+    pub theme: ThemePreset,
+    /// Pinned conversation keys (`conv_key`) shown at the top of the Chats sidebar.
+    pub pinned_convs: Vec<String>,
 }
 
 impl Default for AppConfig {
@@ -139,6 +207,9 @@ impl Default for AppConfig {
                 .ok()
                 .and_then(|s| parse_env_bool(&s))
                 .unwrap_or(false),
+            density: DensityMode::default(),
+            theme: ThemePreset::default(),
+            pinned_convs: Vec::new(),
         }
     }
 }
@@ -202,8 +273,9 @@ impl AppConfig {
 
     pub fn load_from(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
-            .with_context(|| format!("설정 파일 읽기 실패: {}", path.display()))?;
-        toml::from_str(&raw).with_context(|| format!("설정 파일 파싱 실패: {}", path.display()))
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+        toml::from_str(&raw)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))
     }
 
     pub fn save(&self) -> Result<()> {
@@ -212,7 +284,7 @@ impl AppConfig {
 
     pub fn save_to(&self, path: &Path) -> Result<()> {
         ensure_parent(path)?;
-        let raw = toml::to_string_pretty(self).context("설정 직렬화 실패")?;
+        let raw = toml::to_string_pretty(self).context("Failed to serialize config")?;
         write_atomic(path, raw.as_bytes())
     }
 
@@ -307,7 +379,7 @@ pub fn default_download_dir() -> PathBuf {
 pub fn ensure_parent(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
-            .with_context(|| format!("디렉터리 생성 실패: {}", parent.display()))?;
+            .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
     }
     Ok(())
 }
@@ -315,16 +387,17 @@ pub fn ensure_parent(path: &Path) -> Result<()> {
 pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     ensure_parent(path)?;
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, data).with_context(|| format!("임시 파일 쓰기 실패: {}", tmp.display()))?;
+    fs::write(&tmp, data)
+        .with_context(|| format!("Failed to write temp file: {}", tmp.display()))?;
     if let Err(err) = fs::rename(&tmp, path) {
         if path.exists() {
             fs::remove_file(path)
-                .with_context(|| format!("기존 파일 교체 실패: {}", path.display()))?;
+                .with_context(|| format!("Failed to replace existing file: {}", path.display()))?;
             fs::rename(&tmp, path)
-                .with_context(|| format!("원자적 저장 실패: {}", path.display()))?;
+                .with_context(|| format!("Atomic file save failed: {}", path.display()))?;
         } else {
             let _ = fs::remove_file(&tmp);
-            return Err(err).with_context(|| format!("파일 저장 실패: {}", path.display()));
+            return Err(err).with_context(|| format!("Failed to save file: {}", path.display()));
         }
     }
     Ok(())

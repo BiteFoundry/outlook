@@ -30,30 +30,30 @@ use crate::{
     sync, tui, updater,
 };
 
-const DELETE_JSON_REQUIRES_YES: &str = "--json 모드에서 삭제하려면 --yes 를 함께 지정해야 합니다.";
+const DELETE_JSON_REQUIRES_YES: &str = "Deleting with --json requires passing --yes.";
 
 const ENV_AFTER_HELP: &str = "\
-환경 변수 (Environment Variables):
-  TEAMS_TOKEN_FILE=<PATH>               외부 토큰 파일(JWT 또는 JSON) 직접 로드 (키링 자동 생략)
-  TEAMS_TOKEN_REFRESH_CMD=<CMD>         토큰 만료 임박 시 자동 실행할 갱신 커맨드 훅
-  TEAMS_TOKEN_REFRESH_MINS=<MINS>       갱신 훅 실행 기준 남은 시간(분) [기본: 5]
-  TEAMS_ACCESS_TOKEN=<JWT>              직접 Bearer 액세스 토큰 주입 (키링 자동 생략)
-  TEAMS_DISABLE_KEYRING=1               OS 키링 비활성화 (credentials.json 파일 전용)
-  TEAMS_CLIENT_ID / TEAMS_TENANT_ID     Entra 앱 Client ID / Tenant ID 재정의
-  TEAMS_CONFIG_DIR / TEAMS_DATA_DIR     설정 및 로컬 SQLite 캐시 디렉터리 재정의
-  TEAMS_CLI_CACHE_SECS=<SECS>           CLI 읽기 명령 로컬 캐시 유효 시간(초) [기본: 0, --cached/--fast 시 캐시 우선]
-  TEAMS_AUTO_DAEMON=1                   백그라운드 동기화 데몬 자동 시작/연결 (config.toml: auto_daemon = true) [기본: false]
+Environment Variables:
+  TEAMS_TOKEN_FILE=<PATH>               Load an external token file (JWT or JSON) directly (skips OS keyring)
+  TEAMS_TOKEN_REFRESH_CMD=<CMD>         Command hook to run automatically when the token is about to expire
+  TEAMS_TOKEN_REFRESH_MINS=<MINS>       Minutes remaining before triggering refresh hook [default: 5]
+  TEAMS_ACCESS_TOKEN=<JWT>              Inject a Bearer access token directly (skips OS keyring)
+  TEAMS_DISABLE_KEYRING=1               Disable the OS keyring (use credentials.json file only)
+  TEAMS_CLIENT_ID / TEAMS_TENANT_ID     Override Entra app Client ID / Tenant ID
+  TEAMS_CONFIG_DIR / TEAMS_DATA_DIR     Override config and local SQLite cache directories
+  TEAMS_CLI_CACHE_SECS=<SECS>           Local cache TTL in seconds for CLI read commands [default: 0; --cached/--fast prefers cache]
+  TEAMS_AUTO_DAEMON=1                   Auto-start/connect to background sync daemon (config.toml: auto_daemon = true) [default: false]
 
-백그라운드 동기화 데몬 (Background Sync Daemon):
+Background Sync Daemon:
   teams daemon start | status | stop | restart";
 
 #[derive(Parser, Debug)]
 #[command(
     name = "teams",
     version,
-    about = "Microsoft Teams 터미널 클라이언트 (CLI · TUI · HTTP API · MCP)",
-    long_about = "Microsoft Graph v1.0 기반 Microsoft Teams 터미널 클라이언트입니다.\n\
-                  인자 없이 실행하면 로그인 상태를 확인한 뒤 TUI를 엽니다.",
+    about = "Microsoft Teams terminal client (CLI · TUI · HTTP API · MCP)",
+    long_about = "Terminal client for Microsoft Teams powered by Microsoft Graph v1.0.\n\
+                  Running without a subcommand checks authentication and launches the TUI.",
     after_help = ENV_AFTER_HELP
 )]
 pub struct Cli {
@@ -63,7 +63,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Microsoft Entra ID(OAuth 2.0)로 로그인하고 토큰을 저장합니다
+    /// Sign in with Microsoft Entra ID (OAuth 2.0) and store tokens
     #[command(visible_alias = "in")]
     Login {
         #[arg(long)]
@@ -81,43 +81,43 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 저장된 토큰을 삭제합니다
+    /// Remove stored authentication tokens
     #[command(visible_alias = "out")]
     Logout {
         #[arg(long)]
         json: bool,
     },
-    /// 현재 로그인한 사용자 프로필과 토큰 상태를 표시합니다
+    /// Display the currently signed-in user profile and token status
     Whoami {
         #[arg(long)]
         json: bool,
     },
-    /// 설정/DB/키링 경로 및 선택적 Graph 연결 진단을 표시합니다
+    /// Show config/DB/keyring paths and optional Graph connectivity diagnostics
     Doctor {
-        /// Graph `/me` 및 `/me/presence` 호출로 실시간 연결을 점검합니다
+        /// Probe live connectivity via Graph `/me` and `/me/presence`
         #[arg(long)]
         probe: bool,
         #[arg(long)]
         json: bool,
     },
-    /// 1:1, 그룹 및 모임 채팅 목록을 표시합니다
+    /// List 1:1, group, and meeting chats
     #[command(visible_alias = "ls")]
     Chats {
-        /// 최대 조회 개수
+        /// Maximum number of chats to fetch [default: 50]
         #[arg(long, visible_alias = "top", default_value_t = 50)]
         limit: usize,
         #[arg(long)]
         refresh: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (네트워크 호출 생략)
+        /// Read from local SQLite cache first (skips network requests)
         #[arg(long, visible_alias = "fast")]
         cached: bool,
         #[arg(long)]
         json: bool,
     },
-    /// 새 1:1 또는 그룹 채팅을 생성합니다
+    /// Create a new 1:1 or group chat
     #[command(name = "new-chat")]
     NewChat {
-        /// 초대할 사용자 이메일 또는 Entra 사용자 ID (여러 번 지정 가능)
+        /// User email or Entra user ID to invite (repeatable)
         #[arg(long = "to", required = true, value_name = "email_or_id")]
         to: Vec<String>,
         #[arg(long)]
@@ -127,53 +127,53 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 가입된 팀과 채널 목록을 표시합니다
+    /// List joined teams and channels
     Teams {
         #[arg(long)]
         refresh: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (네트워크 호출 생략)
+        /// Read from local SQLite cache first (skips network requests)
         #[arg(long, visible_alias = "fast")]
         cached: bool,
         #[arg(long)]
         json: bool,
     },
-    /// 특정 팀의 채널 목록을 표시합니다
+    /// List channels for a specific team
     Channels {
         team_query: String,
         #[arg(long)]
         refresh: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (네트워크 호출 생략)
+        /// Read from local SQLite cache first (skips network requests)
         #[arg(long, visible_alias = "fast")]
         cached: bool,
         #[arg(long)]
         json: bool,
     },
-    /// 채팅방 또는 채널의 최근 메시지를 읽습니다
+    /// Read recent messages from a chat or channel
     #[command(visible_alias = "cat")]
     Read {
         target: String,
-        /// 최대 조회 개수
+        /// Maximum number of messages to fetch [default: 30]
         #[arg(long, visible_alias = "top", default_value_t = 30)]
         limit: usize,
-        /// 이 타임스탬프(ISO-8601 / YYYY-MM-DD) 또는 메시지 ID 이전의 과거 메시지 조회
+        /// Fetch messages older than this timestamp (ISO-8601 / YYYY-MM-DD) or message ID
         #[arg(long, value_name = "TIMESTAMP_OR_MSG_ID")]
         before: Option<String>,
-        /// 특정 채널 스레드(루트 메시지 ID) 읽기
+        /// Read a specific channel thread by root message ID
         #[arg(long)]
         thread: Option<String>,
         #[arg(long)]
         offline: bool,
-        /// 로컬 SQLite 캐시 우선 조회 (캐시가 비어 있거나 부족하면 네트워크 조회)
+        /// Read from local SQLite cache first (falls back to network if empty or insufficient)
         #[arg(long, visible_alias = "fast")]
         cached: bool,
         #[arg(long)]
         json: bool,
     },
-    /// 팀 채널 루트 게시물과 스레드 답글을 읽습니다
+    /// Read a team channel root post and its thread replies
     Thread {
         channel_target: String,
         root_msg_id: String,
-        /// 최대 조회 개수
+        /// Maximum number of replies to fetch [default: 50]
         #[arg(long, visible_alias = "top", default_value_t = 50)]
         limit: usize,
         #[arg(long)]
@@ -181,14 +181,14 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Markdown 메시지를 전송합니다
+    /// Send a Markdown message
     #[command(visible_alias = "msg")]
     Send {
         target: String,
         markdown: String,
         #[arg(long)]
         subject: Option<String>,
-        /// 멘션 추가: <user_id:DisplayName> (여러 번 지정 가능)
+        /// Add a mention: <user_id:DisplayName> (repeatable)
         #[arg(long = "mention", value_name = "user_id:DisplayName")]
         mention: Vec<String>,
         #[arg(long)]
@@ -196,7 +196,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 채널 스레드에 답글을 달거나 채팅 메시지를 인용 답장합니다
+    /// Reply to a channel thread or quote-reply to a chat message
     Reply {
         target: String,
         msg_id: String,
@@ -208,7 +208,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 파일을 OneDrive/SharePoint에 업로드해 전송합니다 (`--inline` 시 인라인 이미지)
+    /// Upload and send a file via OneDrive/SharePoint (or inline image with `--inline`)
     #[command(name = "send-file", visible_alias = "file")]
     SendFile {
         target: String,
@@ -222,7 +222,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 메시지의 첨부 파일을 다운로드합니다
+    /// Download a message attachment
     #[command(visible_alias = "dl")]
     Download {
         target: String,
@@ -236,7 +236,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 메시지에 리액션(like, heart, laugh, surprised, sad, angry)을 설정하거나 해제합니다
+    /// Set or remove a reaction (like, heart, laugh, surprised, sad, angry) on a message
     React {
         target: String,
         msg_id: String,
@@ -248,7 +248,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 자신이 보낸 메시지를 수정합니다
+    /// Edit a message you sent
     Edit {
         target: String,
         msg_id: String,
@@ -258,7 +258,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 자신이 보낸 메시지를 삭제합니다
+    /// Delete a message you sent
     Delete {
         target: String,
         msg_id: String,
@@ -269,7 +269,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 채팅방 또는 채널의 구성원 목록을 표시합니다
+    /// List members of a chat or channel
     Members {
         target: String,
         #[arg(long)]
@@ -277,39 +277,39 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 로컬 SQLite FTS5 캐시에서 메시지를 검색합니다
+    /// Search messages in the local SQLite FTS5 cache
     Search {
         query: String,
         #[arg(long)]
         target: Option<String>,
-        /// 최대 조회 개수
+        /// Maximum number of results to return [default: 50]
         #[arg(long, visible_alias = "top", default_value_t = 50)]
         limit: usize,
         #[arg(long)]
         json: bool,
     },
-    /// 채팅방/팀/채널 목록과 과거 메시지를 로컬 SQLite 캐시에 동기화합니다
+    /// Sync chats, teams, channels, and message history to the local SQLite cache
     Sync {
-        /// 특정 대화방/채널만 지정하여 깊이 동기화
+        /// Deep-sync only a specific conversation or channel
         #[arg(long)]
         target: Option<String>,
-        /// 동기화할 최근 채팅방 개수
+        /// Number of recent chats to sync [default: 100]
         #[arg(long, default_value_t = 100)]
         chats: usize,
-        /// 대화방/채널당 로컬 FTS5 캐시에 백필할 메시지 수
+        /// Number of messages per conversation/channel to backfill into local FTS5 cache [default: 50]
         #[arg(long, visible_aliases = ["limit", "top"], default_value_t = 50)]
         depth: usize,
         #[arg(long)]
         json: bool,
     },
-    /// 대화를 Markdown, JSON 또는 텍스트로 내보냅니다
+    /// Export a conversation to Markdown, JSON, or plain text
     Export {
         target: String,
         #[arg(long, default_value = "md", value_parser = ["md", "json", "txt"])]
         format: String,
         #[arg(long)]
         include_threads: bool,
-        /// 최대 조회 개수
+        /// Maximum number of messages to export [default: 200]
         #[arg(long, visible_alias = "top", default_value_t = 200)]
         limit: usize,
         #[arg(long)]
@@ -317,7 +317,7 @@ pub enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// 내 현재 상태(Presence)를 조회하거나 설정합니다
+    /// Get or set your presence status
     Presence {
         #[arg(long, value_name = "Available|Busy|DoNotDisturb|BeRightBack|Away|Reset")]
         set: Option<String>,
@@ -328,7 +328,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 메시지 이미지 첨부 또는 로컬 이미지를 터미널에 미리보기 렌더링합니다
+    /// Render a message image attachment or local image in the terminal
     Preview {
         target: Option<String>,
         msg_id: Option<String>,
@@ -343,7 +343,7 @@ pub enum Command {
         #[arg(long)]
         rows: Option<u16>,
     },
-    /// 로컬 이미지 파일을 터미널에 미리보기 렌더링합니다
+    /// Render a local image file in the terminal
     #[command(name = "preview-file")]
     PreviewFile {
         path: PathBuf,
@@ -352,7 +352,7 @@ pub enum Command {
         #[arg(long)]
         rows: Option<u16>,
     },
-    /// GitHub Releases에서 최신 버전을 확인하거나 자가 업데이트합니다
+    /// Check for or apply updates from GitHub Releases
     Update {
         #[arg(long)]
         check: bool,
@@ -363,10 +363,10 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 터미널 UI(TUI)를 실행합니다
+    /// Launch the interactive terminal UI (TUI)
     #[command(visible_alias = "chat")]
     Tui,
-    /// 에이전트용 로컬 HTTP JSON API 서버를 실행합니다
+    /// Start the local HTTP JSON API server for agents
     #[command(visible_alias = "api")]
     Serve {
         #[arg(long, default_value = "127.0.0.1")]
@@ -376,10 +376,10 @@ pub enum Command {
         #[arg(long)]
         token: Option<String>,
     },
-    /// 에이전트용 stdio MCP(JSON-RPC 2.0) 서버를 실행합니다
+    /// Start the stdio MCP (JSON-RPC 2.0) server for agents
     #[command(visible_alias = "mcp-server")]
     Mcp,
-    /// 백그라운드 동기화 데몬을 제어합니다 (`start` | `stop` | `status` | `restart` | `run`)
+    /// Control the background sync daemon (`start` | `stop` | `status` | `restart` | `run`)
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -388,27 +388,27 @@ pub enum Command {
 
 #[derive(Subcommand, Debug)]
 pub enum DaemonCommand {
-    /// 백그라운드 동기화 데몬을 시작합니다 (이미 실행 중이면 상태를 반환)
+    /// Start the background sync daemon (returns status if already running)
     Start {
         #[arg(long)]
         json: bool,
     },
-    /// 실행 중인 백그라운드 동기화 데몬을 중지합니다
+    /// Stop the running background sync daemon
     Stop {
         #[arg(long)]
         json: bool,
     },
-    /// 백그라운드 동기화 데몬의 상태를 조회합니다
+    /// Query the background sync daemon status
     Status {
         #[arg(long)]
         json: bool,
     },
-    /// 백그라운드 동기화 데몬을 재시작합니다
+    /// Restart the background sync daemon
     Restart {
         #[arg(long)]
         json: bool,
     },
-    /// 백그라운드 동기화 데몬을 포그라운드에서 실행합니다 (내부 실행용)
+    /// Run the background sync daemon in the foreground (internal use)
     Run,
 }
 
@@ -825,9 +825,9 @@ async fn dispatch_daemon_command(cfg: &AppConfig, command: DaemonCommand) -> Res
                     }))?
                 );
             } else if stopped {
-                println!("백그라운드 동기화 데몬을 중지했습니다.");
+                println!("Background sync daemon stopped.");
             } else {
-                println!("실행 중인 백그라운드 동기화 데몬이 없습니다.");
+                println!("Background sync daemon is not running.");
             }
             Ok(())
         }
@@ -863,7 +863,7 @@ async fn open_runtime(
     let tokens = auth.current_tokens().await;
     if require_login && tokens.is_none() {
         bail!(
-            "로그인이 필요합니다. 먼저 `{} login` 을 실행하세요.",
+            "Sign-in required. Run `{} login` first.",
             Persona::detect().bin_name()
         );
     }
@@ -1121,9 +1121,9 @@ fn record_cli_sync_cursor(storage: &Storage, scope_key: &str) {
 async fn cmd_tui(cfg: &mut AppConfig, persona: Persona) -> Result<()> {
     let auth = AuthManager::new(cfg.clone())?;
     if auth.current_tokens().await.is_none() {
-        println!("저장된 로그인 정보가 없습니다. Microsoft 계정 로그인을 시작합니다.");
+        println!("No stored sign-in credentials found. Starting Microsoft account sign-in.");
         println!(
-            "(자체 Azure App 사용 시: {} login --client-id <APP_ID> --tenant-id <TENANT_ID>)",
+            "(To use a custom Azure App: {} login --client-id <APP_ID> --tenant-id <TENANT_ID>)",
             persona.bin_name()
         );
         cmd_login(cfg, LoginOptions::default(), false).await?;
@@ -1184,13 +1184,13 @@ async fn cmd_login(cfg: &mut AppConfig, opts: LoginOptions, json_out: bool) -> R
         );
     } else {
         println!(
-            "로그인 성공: {} ({}) [id={}]",
+            "Signed in as: {} ({}) [id={}]",
             me.display_name,
             email.as_deref().unwrap_or("-"),
             me.id
         );
         println!(
-            "방식: {} · tenant={} · 만료: {}",
+            "Auth mode: {} · tenant={} · expires: {}",
             updated.auth_mode,
             updated.tenant_id,
             format_unix_ts(updated.expires_at)
@@ -1205,7 +1205,7 @@ async fn cmd_logout(cfg: &AppConfig, json_out: bool) -> Result<()> {
     if json_out {
         println!("{}", serde_json::to_string_pretty(&json!({ "ok": true }))?);
     } else {
-        println!("로그아웃했습니다. 저장된 토큰을 삭제했습니다.");
+        println!("Signed out and removed stored tokens.");
     }
     Ok(())
 }
@@ -1218,19 +1218,19 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
             if let Some(ref tf) = cfg.resolved_token_file() {
                 if !tf.exists() {
                     bail!(
-                        "로그인이 필요합니다. 먼저 `{} login` 을 실행하거나 `TEAMS_TOKEN_FILE` / `TEAMS_ACCESS_TOKEN` 을 설정하세요. (설정된 TEAMS_TOKEN_FILE 경로를 찾을 수 없음: {})",
+                        "Sign-in required. Run `{} login` or set `TEAMS_TOKEN_FILE` / `TEAMS_ACCESS_TOKEN`. (Configured TEAMS_TOKEN_FILE not found: {})",
                         persona.bin_name(),
                         tf.display()
                     );
                 }
                 bail!(
-                    "로그인이 필요합니다. 먼저 `{} login` 을 실행하거나 유효한 `TEAMS_TOKEN_FILE` ({}) / `TEAMS_ACCESS_TOKEN` 을 설정하세요.",
+                    "Sign-in required. Run `{} login` or set a valid `TEAMS_TOKEN_FILE` ({}) / `TEAMS_ACCESS_TOKEN`.",
                     persona.bin_name(),
                     tf.display()
                 );
             }
             bail!(
-                "로그인이 필요합니다. 먼저 `{} login` 을 실행하거나 `TEAMS_TOKEN_FILE` / `TEAMS_ACCESS_TOKEN` 을 설정하세요.",
+                "Sign-in required. Run `{} login` or set `TEAMS_TOKEN_FILE` / `TEAMS_ACCESS_TOKEN`.",
                 persona.bin_name()
             );
         }
@@ -1248,7 +1248,7 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
                     refresh_failure = Some(refresh_err);
                 } else {
                     eprintln!(
-                        "경고: 토큰 자동 갱신 실패 ({refresh_err}); 기존 토큰(만료: {})으로 계속 조회합니다.",
+                        "Warning: automatic token refresh failed ({refresh_err}); continuing with existing token (expires: {}).",
                         format_unix_ts(tokens.expires_at)
                     );
                 }
@@ -1261,12 +1261,12 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
     if tokens.is_expired_soon(0) {
         let err_detail = match refresh_failure {
             Some(ref err) => format!(
-                "토큰 만료 (exp: {}, auth_mode={}) — 자동 갱신 실패: {err:#}",
+                "Token expired (exp: {}, auth_mode={}) — automatic refresh failed: {err:#}",
                 format_unix_ts(tokens.expires_at),
                 tokens.auth_mode
             ),
             None => format!(
-                "토큰 만료 (exp: {}, auth_mode={}) — 토큰을 갱신(refresh)한 뒤 재시도하세요.",
+                "Token expired (exp: {}, auth_mode={}) — refresh the token and retry.",
                 format_unix_ts(tokens.expires_at),
                 tokens.auth_mode
             ),
@@ -1290,10 +1290,10 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
                     "scopes": scope_diag.scopes,
                     "roles": scope_diag.roles,
                     "scope_warnings": scope_diag.warnings,
-                    "error": format!("토큰 만료 (exp: {}) — refresh 후 재시도하세요", format_unix_ts(tokens.expires_at)),
+                    "error": format!("Token expired (exp: {}) — refresh and retry", format_unix_ts(tokens.expires_at)),
                 }))?
             );
-            bail!("토큰 만료 (exp: {}) — 토큰을 갱신한 뒤 재시도하세요.", format_unix_ts(tokens.expires_at));
+            bail!("Token expired (exp: {}) — refresh the token and retry.", format_unix_ts(tokens.expires_at));
         }
         bail!("{err_detail}");
     }
@@ -1329,7 +1329,7 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
     if display_name.is_none() && user_id.is_none() {
         if let Some(err) = profile_err {
             bail!(
-                "프로필 조회(/me) 실패 (auth_mode={}, 만료 시각: {}): {err:#}",
+                "Failed to fetch profile (/me) (auth_mode={}, expires: {}): {err:#}",
                 tokens.auth_mode,
                 format_unix_ts(tokens.expires_at)
             );
@@ -1363,7 +1363,7 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
     } else {
         println!("persona: {}", persona.bin_name());
         println!(
-            "사용자: {} ({})",
+            "user: {} ({})",
             display_name.as_deref().unwrap_or("-"),
             email.as_deref().unwrap_or("-")
         );
@@ -1372,24 +1372,24 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
         println!("tenant_id: {}", tokens.tenant_id);
         println!("auth_mode: {}", tokens.auth_mode);
         println!(
-            "토큰 만료: {} ({})",
+            "token_expires: {} ({})",
             format_unix_ts(tokens.expires_at),
             if expiring_soon {
-                "만료 임박 — 갱신 권장"
+                "expiring soon — refresh recommended"
             } else {
-                "유효"
+                "valid"
             }
         );
         if !scope_diag.scopes.is_empty() {
-            println!("토큰 권한(scp): {}", scope_diag.scopes.join(" "));
+            println!("token_scopes (scp): {}", scope_diag.scopes.join(" "));
         } else if !scope_diag.has_scope_claims {
-            println!("토큰 권한(scp): (JWT 클레임 없음)");
+            println!("token_scopes (scp): (no JWT claims)");
         }
         if !scope_diag.roles.is_empty() {
-            println!("토큰 역할(roles): {}", scope_diag.roles.join(" "));
+            println!("token_roles: {}", scope_diag.roles.join(" "));
         }
         for warning in &scope_diag.warnings {
-            println!("권한 경고: {warning}");
+            println!("scope_warning: {warning}");
         }
     }
     Ok(())
@@ -1455,13 +1455,13 @@ async fn cmd_doctor(
                     Ok(p) => probe_presence = Some(serde_json::to_value(&p)?),
                     Err(err) => {
                         let wrapped = wrap_graph_permission_error(&graph, err).await;
-                        probe_error = Some(format!("presence probe 실패: {wrapped:#}"));
+                        probe_error = Some(format!("presence probe failed: {wrapped:#}"));
                     }
                 }
             }
             Err(err) => {
                 let wrapped = wrap_graph_permission_error(&graph, err).await;
-                probe_error = Some(format!("get_me probe 실패: {wrapped:#}"));
+                probe_error = Some(format!("get_me probe failed: {wrapped:#}"));
             }
         }
     }
@@ -1548,7 +1548,7 @@ async fn cmd_doctor(
                 token_diag.scopes.join(" ")
             );
         } else if tokens.is_some() {
-            println!("token_scopes: (JWT scp 클레임 없음)");
+            println!("token_scopes: (no JWT scp claims)");
         }
         if !token_diag.roles.is_empty() {
             println!(
@@ -1558,7 +1558,7 @@ async fn cmd_doctor(
             );
         }
         for warning in &token_diag.warnings {
-            println!("권한 경고: {warning}");
+            println!("scope_warning: {warning}");
         }
         println!("client_id: {}", cfg.client_id);
         println!("tenant_id: {}", cfg.tenant_id);
@@ -1581,7 +1581,7 @@ async fn cmd_doctor(
             token_file
                 .as_ref()
                 .map(|p| format!("{} (exists={})", p.display(), p.exists()))
-                .unwrap_or_else(|| "(미설정)".to_string())
+                .unwrap_or_else(|| "(unset)".to_string())
         );
         println!(
             "token_refresh_cmd_configured: {token_refresh_cmd_configured} (token_refresh_mins={})",
@@ -1594,10 +1594,10 @@ async fn cmd_doctor(
         );
         if probe {
             if let Some(err) = probe_error {
-                println!("probe: 실패 ({err})");
+                println!("probe: failed ({err})");
             } else {
                 println!(
-                    "probe: 성공 (me={}, presence={})",
+                    "probe: ok (me={}, presence={})",
                     probe_me
                         .as_ref()
                         .and_then(|v| v.get("display_name"))
@@ -1618,17 +1618,17 @@ async fn cmd_doctor(
 
 fn describe_keyring_status(tokens: Option<&StoredTokens>, fallback_path: &Path) -> String {
     match tokens {
-        None => "미로그인 (저장된 토큰 없음)".to_string(),
+        None => "not signed in (no stored token)".to_string(),
         Some(tok) if tok.auth_mode == "env_token" => {
-            "env_token (TEAMS_ACCESS_TOKEN 사용 중)".to_string()
+            "env_token (using TEAMS_ACCESS_TOKEN)".to_string()
         }
         Some(tok) if tok.auth_mode == "token_file" => {
-            "token_file (TEAMS_TOKEN_FILE 사용 중)".to_string()
+            "token_file (using TEAMS_TOKEN_FILE)".to_string()
         }
         Some(_) if fallback_path.exists() => {
-            "credentials.json 파일 폴백 사용 중".to_string()
+            "using credentials.json file fallback".to_string()
         }
-        Some(_) => "OS 키링 활성 (토큰 로드됨)".to_string(),
+        Some(_) => "OS keyring active (token loaded)".to_string(),
     }
 }
 
@@ -1639,7 +1639,7 @@ fn print_chats_output(chats: &[ConversationSummary], json_out: bool) -> Result<(
             serde_json::to_string_pretty(&json!({ "chats": chats }))?
         );
     } else if chats.is_empty() {
-        println!("표시할 채팅이 없습니다.");
+        println!("No chats to display.");
     } else {
         for c in chats {
             let unread = if c.unread_count > 0 {
@@ -1734,7 +1734,7 @@ async fn cmd_new_chat(
         .filter(|s| !s.is_empty())
         .collect();
     if members.is_empty() {
-        bail!("최소 1명의 수신자(--to)를 지정해야 합니다.");
+        bail!("At least one recipient (--to) must be specified.");
     }
 
     let chat = graph.create_chat(&members, topic.as_deref()).await?;
@@ -1761,9 +1761,9 @@ async fn cmd_new_chat(
             }))?
         );
     } else {
-        println!("채팅 생성 완료: {} ({})", chat.title, chat.conv_key);
+        println!("Chat created: {} ({})", chat.title, chat.conv_key);
         if let Some(msg) = sent_msg {
-            println!("초기 메시지 전송됨: msg_id={}", msg.msg_id);
+            println!("Initial message sent: msg_id={}", msg.msg_id);
         }
     }
     Ok(())
@@ -1776,7 +1776,7 @@ fn print_teams_output(teams: &[TeamSummary], json_out: bool) -> Result<()> {
             serde_json::to_string_pretty(&json!({ "teams": teams }))?
         );
     } else if teams.is_empty() {
-        println!("가입된 팀이 없습니다.");
+        println!("No joined teams found.");
     } else {
         for team in teams {
             println!("{} ({})", team.display_name, team.id);
@@ -1898,7 +1898,7 @@ async fn load_teams_with_refresh(
 fn resolve_team_from_slice(teams: &[TeamSummary], query: &str) -> Result<TeamSummary> {
     let q = query.trim();
     if q.is_empty() {
-        bail!("팀 이름 또는 ID를 입력하세요.");
+        bail!("Team name or ID is required.");
     }
     if let Some(exact_id) = teams.iter().find(|t| t.id == q) {
         return Ok(exact_id.clone());
@@ -1916,14 +1916,14 @@ fn resolve_team_from_slice(teams: &[TeamSummary], query: &str) -> Result<TeamSum
         .filter(|t| t.display_name.to_lowercase().contains(&q_lower))
         .collect();
     match matches.len() {
-        0 => bail!("팀을 찾을 수 없습니다: {q}"),
+        0 => bail!("Team not found: {q}"),
         1 => Ok(matches[0].clone()),
         _ => {
             let names: Vec<String> = matches
                 .iter()
                 .map(|t| format!("{} ({})", t.display_name, t.id))
                 .collect();
-            bail!("여러 팀이 일치합니다 ({q}): {}", names.join(", "))
+            bail!("Multiple teams match ({q}): {}", names.join(", "))
         }
     }
 }
@@ -1946,7 +1946,7 @@ fn print_read_output(
     } else {
         println!("# {} ({})", conv.title, conv.conv_key);
         if res.messages.is_empty() {
-            println!("(메시지가 없습니다)");
+            println!("(No messages)");
         } else {
             for msg in &res.messages {
                 print_message_line(msg, "");
@@ -1954,7 +1954,7 @@ fn print_read_output(
             if res.has_more {
                 if let Some(ref next_before) = res.next_before {
                     println!(
-                        "--- 이전 메시지 더 보기: teams read \"{}\" --before {} ---",
+                        "--- Load older messages: teams read \"{}\" --before {} ---",
                         conv.conv_key, next_before
                     );
                 }
@@ -2066,7 +2066,7 @@ async fn cmd_thread_with_cache(
             }
         }
         if offline {
-            bail!("로컬 캐시에 스레드가 없습니다: {root_msg_id}");
+            bail!("Thread not found in local cache: {root_msg_id}");
         }
     }
 
@@ -2078,13 +2078,13 @@ async fn cmd_thread_with_cache(
         ref channel_id,
     } = conv.target
     else {
-        bail!("thread 명령은 팀 채널에서만 사용할 수 있습니다: {}", conv.conv_key);
+        bail!("The `thread` command can only be used in team channels: {}", conv.conv_key);
     };
 
     let thread = if offline {
         storage
             .get_thread(&conv.conv_key, root_msg_id, limit)?
-            .with_context(|| format!("로컬 캐시에 스레드가 없습니다: {root_msg_id}"))?
+            .with_context(|| format!("Thread not found in local cache: {root_msg_id}"))?
     } else {
         let view = match graph
             .get_thread(team_id, channel_id, root_msg_id, limit)
@@ -2117,10 +2117,10 @@ fn print_thread_output(
             }))?
         );
     } else {
-        println!("# {} ({}) — 스레드 {}", conv.title, conv.conv_key, thread.root.msg_id);
+        println!("# {} ({}) — Thread {}", conv.title, conv.conv_key, thread.root.msg_id);
         print_message_line(&thread.root, "");
         if thread.replies.is_empty() {
-            println!("  (답글 없음)");
+            println!("  (No replies)");
         } else {
             for reply in &thread.replies {
                 print_message_line(reply, "  ↳ ");
@@ -2134,11 +2134,11 @@ fn print_message_line(msg: &MessageItem, indent: &str) {
     let mut tags = Vec::new();
     if let Some(ref subj) = msg.subject {
         if !subj.trim().is_empty() {
-            tags.push(format!("[주제: {}]", subj.trim()));
+            tags.push(format!("[Subject: {}]", subj.trim()));
         }
     }
     if msg.importance.eq_ignore_ascii_case("high") || msg.importance.eq_ignore_ascii_case("urgent") {
-        tags.push(format!("[중요:{}]", msg.importance));
+        tags.push(format!("[Importance:{}]", msg.importance));
     }
     if msg.reply_count > 0 {
         tags.push(format!("[💬 {}]", msg.reply_count));
@@ -2165,7 +2165,7 @@ fn print_message_line(msg: &MessageItem, indent: &str) {
     }
 
     let body = if msg.deleted {
-        "(삭제된 메시지)".to_string()
+        "(deleted message)".to_string()
     } else if !msg.body_plain.trim().is_empty() {
         msg.body_plain.trim().to_string()
     } else {
@@ -2213,7 +2213,7 @@ async fn cmd_send(
     json_out: bool,
 ) -> Result<()> {
     if markdown.trim().is_empty() {
-        bail!("보낼 메시지가 비어 있습니다.");
+        bail!("Message body is empty.");
     }
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
     let conv = resolve_target(&storage, &graph, target, false).await?;
@@ -2238,7 +2238,7 @@ async fn cmd_send(
             }))?
         );
     } else {
-        println!("전송 완료: {} ({}) msg_id={}", conv.title, conv.conv_key, sent.msg_id);
+        println!("Sent: {} ({}) msg_id={}", conv.title, conv.conv_key, sent.msg_id);
     }
     Ok(())
 }
@@ -2253,7 +2253,7 @@ async fn cmd_reply(
     json_out: bool,
 ) -> Result<()> {
     if markdown.trim().is_empty() {
-        bail!("보낼 답글이 비어 있습니다.");
+        bail!("Reply body is empty.");
     }
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
     let conv = resolve_target(&storage, &graph, target, false).await?;
@@ -2281,7 +2281,7 @@ async fn cmd_reply(
         );
     } else {
         println!(
-            "답장 완료: {} ({}) msg_id={} (대상 {})",
+            "Replied: {} ({}) msg_id={} (to {})",
             conv.title, conv.conv_key, sent.msg_id, msg_id
         );
     }
@@ -2314,7 +2314,7 @@ async fn cmd_send_file(
         );
     } else {
         println!(
-            "파일 전송 완료: {} ({}) msg_id={} ({})",
+            "File sent: {} ({}) msg_id={} ({})",
             conv.title,
             conv.conv_key,
             sent.msg_id,
@@ -2354,7 +2354,7 @@ async fn cmd_download(
         );
     } else {
         println!(
-            "다운로드 완료: {} ({} bytes)",
+            "Downloaded: {} ({} bytes)",
             downloaded.path.display(),
             downloaded.bytes_written
         );
@@ -2391,8 +2391,8 @@ async fn cmd_react(
         );
     } else {
         println!(
-            "리액션 {}: {} ({}) msg_id={}",
-            if enable { "설정" } else { "해제" },
+            "Reaction {}: {} ({}) msg_id={}",
+            if enable { "set" } else { "removed" },
             normalized,
             conv.conv_key,
             msg_id
@@ -2410,7 +2410,7 @@ async fn cmd_edit(
     json_out: bool,
 ) -> Result<()> {
     if new_markdown.trim().is_empty() {
-        bail!("수정할 메시지 본문이 비어 있습니다.");
+        bail!("Edited message body is empty.");
     }
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
     let conv = resolve_target(&storage, &graph, target, false).await?;
@@ -2430,7 +2430,7 @@ async fn cmd_edit(
             }))?
         );
     } else {
-        println!("메시지 수정 완료: {} msg_id={}", conv.conv_key, msg_id);
+        println!("Message edited: {} msg_id={}", conv.conv_key, msg_id);
     }
     Ok(())
 }
@@ -2454,7 +2454,7 @@ async fn cmd_delete(
         None
     } else {
         Some(prompt(&format!(
-            "'{}' ({}) 의 메시지 {msg_id} 를 삭제합니다. 계속하려면 'yes' 입력: ",
+            "Delete message {msg_id} in '{}' ({})? Type 'yes' to continue: ",
             conv.title, conv.conv_key
         ))?)
     };
@@ -2472,7 +2472,7 @@ async fn cmd_delete(
             }))?
         );
     } else {
-        println!("메시지 삭제 완료: {} msg_id={}", conv.conv_key, msg_id);
+        println!("Message deleted: {} msg_id={}", conv.conv_key, msg_id);
     }
     Ok(())
 }
@@ -2484,9 +2484,9 @@ fn delete_gate(yes: bool, json: bool, answer: Option<&str>) -> Result<()> {
     if json {
         bail!("{DELETE_JSON_REQUIRES_YES}");
     }
-    let answer = answer.context("확인 입력을 받지 못했습니다. 메시지를 삭제하지 않았습니다.")?;
+    let answer = answer.context("No confirmation input received. Message was not deleted.")?;
     if !answer.trim().eq_ignore_ascii_case("yes") {
-        bail!("취소했습니다. 메시지를 삭제하지 않았습니다.");
+        bail!("Cancelled. Message was not deleted.");
     }
     Ok(())
 }
@@ -2513,9 +2513,9 @@ async fn cmd_members(cfg: &AppConfig, target: &str, offline: bool, json_out: boo
             }))?
         );
     } else if members.is_empty() {
-        println!("구성원 정보가 없습니다.");
+        println!("No member information available.");
     } else {
-        println!("# {} ({}) 구성원 ({}명)", conv.title, conv.conv_key, members.len());
+        println!("# {} ({}) Members ({})", conv.title, conv.conv_key, members.len());
         for m in &members {
             let role = if m.roles.is_empty() {
                 String::new()
@@ -2547,7 +2547,7 @@ async fn cmd_search(
     json_out: bool,
 ) -> Result<()> {
     if query.trim().is_empty() {
-        bail!("검색어가 비어 있습니다.");
+        bail!("Search query is empty.");
     }
     let storage = open_storage_only(cfg)?;
     let limit = clamp_limit(limit);
@@ -2571,7 +2571,7 @@ async fn cmd_search(
             }))?
         );
     } else if hits.is_empty() {
-        println!("'{query}' 와 일치하는 메시지가 없습니다.");
+        println!("No messages matching '{query}'.");
     } else {
         for hit in &hits {
             println!(
@@ -2714,7 +2714,7 @@ async fn cmd_sync(
 
     for conv in &targets {
         if !json_out && target.is_some() {
-            println!("동기화 중: {} ({}, 목표 깊이 {}건)...", conv.title, conv.conv_key, depth);
+            println!("Syncing: {} ({}, target depth {})...", conv.title, conv.conv_key, depth);
         }
         match sync_conversation_depth(&storage, &graph, conv, depth).await {
             Ok(count) => {
@@ -2742,13 +2742,13 @@ async fn cmd_sync(
         );
     } else {
         println!(
-            "동기화 완료: 대화 {synced_convs}/{}개 · 메시지 {total_messages}건 (chats={}, depth={})",
+            "Sync complete: {synced_convs}/{} conversations · {total_messages} messages (chats={}, depth={})",
             targets.len(),
             chats_limit,
             depth
         );
         for err in &errors {
-            eprintln!("경고: {err}");
+            eprintln!("Warning: {err}");
         }
     }
     Ok(())
@@ -2905,8 +2905,8 @@ async fn cmd_export(
         Some(path) => {
             config::ensure_parent(path)?;
             std::fs::write(path, body)
-                .with_context(|| format!("내보내기 파일 쓰기 실패: {}", path.display()))?;
-            println!("내보내기 완료: {}", path.display());
+                .with_context(|| format!("Failed to write export file: {}", path.display()))?;
+            println!("Exported: {}", path.display());
         }
         None => print!("{body}"),
     }
@@ -2945,14 +2945,14 @@ async fn cmd_presence(
                 }))?
             );
         } else {
-            println!("상태 설정 완료: {availability} ({act})");
+            println!("Presence updated: {availability} ({act})");
         }
     } else {
         let status = graph.get_my_presence().await?;
         if json_out {
             println!("{}", serde_json::to_string_pretty(&status)?);
         } else {
-            println!("현재 상태: {} ({})", status.availability, status.activity);
+            println!("Current presence: {} ({})", status.availability, status.activity);
         }
     }
     Ok(())
@@ -2988,7 +2988,8 @@ pub(crate) fn is_forbidden_error(err: &anyhow::Error) -> bool {
         || lower.contains("insufficient privileges")
         || lower.contains("missing scope")
         || lower.contains("aclcheckfailed")
-        || lower.contains("권한 부족")
+        || lower.contains("insufficient graph permissions")
+        || lower.contains("insufficient permissions")
 }
 
 pub(crate) async fn wrap_graph_permission_error(
@@ -2998,7 +2999,7 @@ pub(crate) async fn wrap_graph_permission_error(
     let raw = format!("{err:#}");
     let token = graph.auth().current_tokens().await.map(|t| t.access_token);
     if let Some(explained) = explain_graph_permission_error(&raw, token.as_deref()) {
-        anyhow::anyhow!("{explained}\n원본 오류: {raw}")
+        anyhow::anyhow!("{explained}\nRaw error: {raw}")
     } else {
         err
     }
@@ -3012,7 +3013,7 @@ pub(crate) fn resolve_before_cursor(
 ) -> Result<(String, Option<String>)> {
     let trimmed = before_input.trim();
     if trimmed.is_empty() {
-        bail!("--before 값이 비어 있습니다.");
+        bail!("--before value is empty.");
     }
 
     if let Some(msg) = storage.get_message(conv_key, trimmed)? {
@@ -3046,14 +3047,14 @@ fn normalize_before_timestamp(raw: &str) -> Result<String> {
                 .from_local_datetime(&ndt)
                 .single()
                 .or_else(|| Local.from_local_datetime(&ndt).earliest())
-                .context("로컬 시간 변환에 실패했습니다")?;
+                .context("Failed to convert local timestamp")?;
             return Ok(local_dt
                 .with_timezone(&Utc)
                 .to_rfc3339_opts(SecondsFormat::Secs, true));
         }
     }
     bail!(
-        "유효하지 않은 --before 값입니다: '{trimmed}' (ISO-8601 타임스탬프, YYYY-MM-DD, 또는 캐시된 메시지 ID)"
+        "Invalid --before value: '{trimmed}' (expected ISO-8601 timestamp, YYYY-MM-DD, or cached message ID)"
     )
 }
 
@@ -3271,12 +3272,12 @@ pub(crate) fn parse_mentions_cli(values: &[String]) -> Result<Vec<MentionInfo>> 
 
 pub(crate) fn parse_mention_spec(spec: &str, id: i32) -> Result<MentionInfo> {
     let Some((uid, name)) = spec.split_once(':') else {
-        bail!("멘션 형식이 잘못되었습니다: '{spec}' (user_id:DisplayName)");
+        bail!("Invalid mention format: '{spec}' (expected user_id:DisplayName)");
     };
     let user_id = uid.trim();
     let display_name = name.trim();
     if user_id.is_empty() || display_name.is_empty() {
-        bail!("멘션 user_id 와 DisplayName 은 비어 있을 수 없습니다: '{spec}'");
+        bail!("Mention user_id and DisplayName cannot be empty: '{spec}'");
     }
     Ok(MentionInfo {
         id,
@@ -3288,14 +3289,14 @@ pub(crate) fn parse_mention_spec(spec: &str, id: i32) -> Result<MentionInfo> {
 pub(crate) fn normalize_reaction(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        bail!("리액션 이름이 비어 있습니다.");
+        bail!("Reaction name is empty.");
     }
     let lower = trimmed.to_ascii_lowercase();
     match lower.as_str() {
         "like" | "heart" | "laugh" | "surprised" | "sad" | "angry" => Ok(lower),
         _ if !trimmed.is_ascii() => Ok(trimmed.to_string()),
         _ => bail!(
-            "지원하지 않는 리액션입니다: '{trimmed}' (like, heart, laugh, surprised, sad, angry 또는 이모지)"
+            "Unsupported reaction: '{trimmed}' (use like, heart, laugh, surprised, sad, angry, or an emoji)"
         ),
     }
 }
@@ -3309,7 +3310,7 @@ pub(crate) fn normalize_presence_availability(raw: &str) -> Result<String> {
         "away" => Ok("Away".to_string()),
         "reset" => Ok("Reset".to_string()),
         other => bail!(
-            "지원하지 않는 상태 값입니다: '{other}' (Available|Busy|DoNotDisturb|BeRightBack|Away|Reset)"
+            "Unsupported presence availability: '{other}' (Available|Busy|DoNotDisturb|BeRightBack|Away|Reset)"
         ),
     }
 }
@@ -3363,18 +3364,18 @@ pub(crate) async fn send_file_or_inline(
     inline: bool,
 ) -> Result<MessageItem> {
     if !path.exists() || !path.is_file() {
-        bail!("파일을 찾을 수 없습니다: {}", path.display());
+        bail!("File not found: {}", path.display());
     }
 
     let sent = if inline {
         let mime_type = image_mime_for_path(path).with_context(|| {
             format!(
-                "--inline 은 이미지 파일(png/jpg/jpeg/gif/webp/bmp)만 지원합니다: {}",
+                "--inline only supports image files (png/jpg/jpeg/gif/webp/bmp): {}",
                 path.display()
             )
         })?;
         let bytes = std::fs::read(path)
-            .with_context(|| format!("이미지 파일 읽기 실패: {}", path.display()))?;
+            .with_context(|| format!("Failed to read image file: {}", path.display()))?;
         let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -3457,7 +3458,7 @@ pub(crate) async fn find_message_with_fallback(
     let _ = storage.upsert_messages(&msgs);
     msgs.into_iter()
         .find(|m| m.msg_id == msg_id)
-        .with_context(|| format!("메시지를 찾을 수 없습니다: {msg_id}"))
+        .with_context(|| format!("Message not found: {msg_id}"))
 }
 
 pub(crate) async fn download_message_attachment(
@@ -3471,11 +3472,11 @@ pub(crate) async fn download_message_attachment(
 ) -> Result<DownloadedFile> {
     let msg = find_message_with_fallback(graph, storage, conv, msg_id, thread_root_id).await?;
     if msg.attachments.is_empty() {
-        bail!("이 메시지에는 첨부 파일이 없습니다: {msg_id}");
+        bail!("Message has no attachments: {msg_id}");
     }
     let att = msg.attachments.get(index).with_context(|| {
         format!(
-            "첨부 파일 인덱스 {index} 가 범위를 벗어났습니다 (총 {}개)",
+            "Attachment index {index} is out of range (total {})",
             msg.attachments.len()
         )
     })?;
@@ -3502,22 +3503,22 @@ async fn cmd_update(
     if json_out {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
-        println!("저장소: {repo}");
-        println!("현재 버전: v{}", result.current_version);
-        println!("최신 버전: v{}", result.latest_version);
+        println!("Repository: {repo}");
+        println!("Current version: v{}", result.current_version);
+        println!("Latest version: v{}", result.latest_version);
         if result.updated {
             println!(
-                "업데이트 완료: {} ({})",
+                "Update complete: {} ({})",
                 result.binary_path.display(),
                 result.asset_name.as_deref().unwrap_or("-")
             );
         } else if result.update_available {
-            println!("새 버전이 있습니다: {}", result.release_url);
+            println!("New version available: {}", result.release_url);
             if check {
-                println!("--check 모드이므로 바이너리를 교체하지 않았습니다.");
+                println!("Running in --check mode; binary was not replaced.");
             }
         } else {
-            println!("이미 최신 버전입니다.");
+            println!("Already up to date.");
         }
     }
     Ok(())
@@ -3532,10 +3533,10 @@ pub(crate) fn default_preview_dimensions(cols: Option<u16>, rows: Option<u16>) -
 
 fn cmd_preview_local_file(path: &Path, cols: Option<u16>, rows: Option<u16>) -> Result<()> {
     if !path.exists() || !path.is_file() {
-        bail!("이미지 파일을 찾을 수 없습니다: {}", path.display());
+        bail!("Image file not found: {}", path.display());
     }
     let bytes =
-        std::fs::read(path).with_context(|| format!("이미지 파일 읽기 실패: {}", path.display()))?;
+        std::fs::read(path).with_context(|| format!("Failed to read image file: {}", path.display()))?;
     let (c, r) = default_preview_dimensions(cols, rows);
     let rendered = img_preview::render_ansi_stdout(&bytes, c, r)?;
     print!("{rendered}");
@@ -3560,8 +3561,8 @@ async fn cmd_preview_teams(
     if let Some(path) = file {
         return cmd_preview_local_file(path, cols, rows);
     }
-    let target = target.context("대상 대화방(<target>) 또는 --file <path> 를 지정하세요.")?;
-    let msg_id = msg_id.context("메시지 ID(<msg_id>) 또는 --file <path> 를 지정하세요.")?;
+    let target = target.context("Specify a target conversation (<target>) or --file <path>.")?;
+    let msg_id = msg_id.context("Specify a message ID (<msg_id>) or --file <path>.")?;
 
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
     let conv = resolve_target(&storage, &graph, target, false).await?;
@@ -3584,13 +3585,13 @@ pub(crate) fn select_teams_attachment<'a>(
     selector: Option<&str>,
 ) -> Result<&'a AttachmentInfo> {
     if msg.attachments.is_empty() {
-        bail!("이 메시지에는 첨부 파일이 없습니다: {}", msg.msg_id);
+        bail!("Message has no attachments: {}", msg.msg_id);
     }
     if let Some(sel) = selector.map(str::trim).filter(|s| !s.is_empty()) {
         if let Ok(idx) = sel.parse::<usize>() {
             return msg.attachments.get(idx).with_context(|| {
                 format!(
-                    "첨부 파일 인덱스 {idx} 가 범위를 벗어났습니다 (총 {}개)",
+                    "Attachment index {idx} is out of range (total {})",
                     msg.attachments.len()
                 )
             });
@@ -3603,7 +3604,7 @@ pub(crate) fn select_teams_attachment<'a>(
         }) {
             return Ok(found);
         }
-        bail!("일치하는 첨부 파일을 찾을 수 없습니다: {sel}");
+        bail!("Matching attachment not found: {sel}");
     }
     Ok(msg
         .attachments
@@ -3655,7 +3656,7 @@ mod tests {
         ));
 
         // Default `teams read` limit is 30, supports `--before` and `--thread`
-        let cli = Cli::try_parse_from(["teams", "read", "개발팀/일반"]).unwrap();
+        let cli = Cli::try_parse_from(["teams", "read", "Engineering/General"]).unwrap();
         match cli.command.unwrap() {
             Command::Read {
                 target,
@@ -3666,7 +3667,7 @@ mod tests {
                 cached,
                 json,
             } => {
-                assert_eq!(target, "개발팀/일반");
+                assert_eq!(target, "Engineering/General");
                 assert_eq!(limit, 30);
                 assert!(before.is_none());
                 assert!(thread.is_none());
@@ -3718,7 +3719,7 @@ mod tests {
             }
         ));
         let cli = Cli::try_parse_from([
-            "teams", "sync", "--target", "개발팀/일반", "--chats", "250", "--depth", "500", "--json",
+            "teams", "sync", "--target", "Engineering/General", "--chats", "250", "--depth", "500", "--json",
         ])
         .unwrap();
         match cli.command.unwrap() {
@@ -3728,7 +3729,7 @@ mod tests {
                 depth,
                 json,
             } => {
-                assert_eq!(target.as_deref(), Some("개발팀/일반"));
+                assert_eq!(target.as_deref(), Some("Engineering/General"));
                 assert_eq!(chats, 250);
                 assert_eq!(depth, 500);
                 assert!(json);
@@ -3739,12 +3740,12 @@ mod tests {
         let cli = Cli::try_parse_from([
             "teams",
             "msg",
-            "개발팀/일반",
-            "안녕하세요",
+            "Engineering/General",
+            "Hello",
             "--subject",
-            "공지",
+            "Notice",
             "--mention",
-            "u1:홍길동",
+            "u1:Alice",
             "--important",
             "--json",
         ])
@@ -3758,10 +3759,10 @@ mod tests {
                 important,
                 json,
             } => {
-                assert_eq!(target, "개발팀/일반");
-                assert_eq!(markdown, "안녕하세요");
-                assert_eq!(subject.as_deref(), Some("공지"));
-                assert_eq!(mention, vec!["u1:홍길동"]);
+                assert_eq!(target, "Engineering/General");
+                assert_eq!(markdown, "Hello");
+                assert_eq!(subject.as_deref(), Some("Notice"));
+                assert_eq!(mention, vec!["u1:Alice"]);
                 assert!(important);
                 assert!(json);
             }
@@ -3771,10 +3772,10 @@ mod tests {
         let cli = Cli::try_parse_from([
             "teams",
             "file",
-            "홍길동",
+            "Alice",
             "C:\\tmp\\shot.png",
             "--caption",
-            "화면",
+            "Screenshot",
             "--thread",
             "root1",
             "--inline",
@@ -3790,9 +3791,9 @@ mod tests {
                 inline,
                 json,
             } => {
-                assert_eq!(target, "홍길동");
+                assert_eq!(target, "Alice");
                 assert_eq!(path, PathBuf::from("C:\\tmp\\shot.png"));
-                assert_eq!(caption.as_deref(), Some("화면"));
+                assert_eq!(caption.as_deref(), Some("Screenshot"));
                 assert_eq!(thread.as_deref(), Some("root1"));
                 assert!(inline);
                 assert!(json);
@@ -3917,7 +3918,7 @@ mod tests {
             kind: ConversationKind::OneOnOne,
             team_id: None,
             team_name: None,
-            title: "이력 테스트".to_string(),
+            title: "History Test".to_string(),
             topic: None,
             unread_count: 0,
             last_read_at: None,
@@ -3941,7 +3942,7 @@ mod tests {
             reply_to_preview: None,
             subject: None,
             author_id: Some("u1".to_string()),
-            author_name: "김철수".to_string(),
+            author_name: "Bob".to_string(),
             is_me: false,
             created_at: ts.to_string(),
             last_modified_at: None,

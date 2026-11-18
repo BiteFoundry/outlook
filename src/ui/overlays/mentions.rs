@@ -4,7 +4,7 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
@@ -30,6 +30,10 @@ pub struct MentionPopup {
 }
 
 impl MentionPopup {
+    pub fn is_open(&self) -> bool {
+        self.active
+    }
+
     pub fn close(&mut self) {
         self.active = false;
         self.query.clear();
@@ -112,7 +116,9 @@ impl MentionPopup {
         frame.render_widget(Clear, area);
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(Line::from(Span::styled(" @멘션 ", theme.title(true))))
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
+            .title(Line::from(Span::styled(" @Mention ", theme.title(true))))
             .border_style(theme.border_style(true));
         let inner = block.inner(area);
         frame.render_widget(block, area);

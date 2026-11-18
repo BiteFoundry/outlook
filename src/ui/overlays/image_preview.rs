@@ -6,7 +6,7 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -16,7 +16,7 @@ use crate::{
     ui::{
         action::Action,
         app::{AppState, UiState},
-        hitmap::HitMap,
+        hitmap::{HitMap, HitTarget},
         overlays::{centered_rect, OverlayOutcome},
     },
 };
@@ -101,10 +101,16 @@ impl ImagePreviewOverlay {
 
     pub fn target_dimensions(&self, term_width: u16, term_height: u16) -> (u16, u16) {
         let rect = Self::modal_rect(Rect::new(0, 0, term_width.max(24), term_height.max(12)));
+        let inner_w = rect.width.saturating_sub(2).max(12);
+        let inner_h = rect.height.saturating_sub(3).max(6);
         let base_cols = rect.width.saturating_sub(4).max(12);
         let base_rows = rect.height.saturating_sub(4).max(6);
-        let scaled_cols = ((base_cols as u32 * self.zoom_pct as u32) / 100).clamp(8, base_cols as u32) as u16;
-        let scaled_rows = ((base_rows as u32 * self.zoom_pct as u32) / 100).clamp(4, base_rows as u32) as u16;
+        let max_cols = inner_w.max(base_cols);
+        let max_rows = inner_h.max(base_rows);
+        let scaled_cols =
+            ((base_cols as u32 * self.zoom_pct as u32) / 100).clamp(8, max_cols as u32) as u16;
+        let scaled_rows =
+            ((base_rows as u32 * self.zoom_pct as u32) / 100).clamp(4, max_rows as u32) as u16;
         (scaled_cols, scaled_rows)
     }
 
@@ -135,8 +141,8 @@ impl ImagePreviewOverlay {
             Action::CloseOverlay
             | Action::OpenImagePreview
             | Action::Input('q')
-            | Action::Input('v')
-            | Action::Quit => OverlayOutcome::Close,
+            | Action::Input('v') => OverlayOutcome::Close,
+            Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
             Action::Input('[') | Action::AttachmentPrev | Action::CursorLeft => {
                 self.prev_image();
                 OverlayOutcome::Dispatch(Action::LoadPreviewImage)
@@ -166,19 +172,22 @@ impl ImagePreviewOverlay {
         area: Rect,
         app: &AppState,
         ui: &UiState,
-        _hitmap: &mut HitMap,
+        hitmap: &mut HitMap,
     ) {
         let theme = &ui.theme;
         let rect = Self::modal_rect(area);
         frame.render_widget(Clear, rect);
+        hitmap.add(rect, HitTarget::OverlayBody);
 
         let (cols, rows) = self.target_dimensions(area.width, area.height);
         let Some(cur) = self.current() else {
             let block = Block::default()
                 .borders(Borders::ALL)
-                .title(Line::from(Span::styled(" 이미지 미리보기 ", theme.title(true))))
+                .border_type(BorderType::Rounded)
+                .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
+                .title(Line::from(Span::styled(" Image Preview ", theme.title(true))))
                 .border_style(theme.border_style(true));
-            frame.render_widget(Paragraph::new("표시할 이미지가 없습니다").block(block), rect);
+            frame.render_widget(Paragraph::new("No image to display").block(block), rect);
             return;
         };
 
@@ -200,6 +209,8 @@ impl ImagePreviewOverlay {
 
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
             .title(Line::from(Span::styled(
                 crate::ui::truncate_width(&title, rect.width.saturating_sub(2) as usize),
                 theme.title(true),
@@ -227,7 +238,7 @@ impl ImagePreviewOverlay {
         } else if let Some(err) = &self.error {
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    format!(" 이미지 로드/디코드 실패: {err}"),
+                    format!(" Failed to load/decode image: {err}"),
                     Style::default().fg(theme.error),
                 )),
                 img_area,
@@ -235,14 +246,14 @@ impl ImagePreviewOverlay {
         } else {
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    " 이미지를 불러오고 있습니다…",
+                    " Loading image…",
                     theme.muted_style(),
                 )),
                 img_area,
             );
         }
 
-        let footer = " [/]: 이전·다음 이미지   +/-: 확대·축소   d: 다운로드   Esc/q/v: 닫기 ";
+        let footer = " [/]: Prev/Next   +/-: Zoom   d: Download   Esc/q/v: Close ";
         frame.render_widget(
             Paragraph::new(Span::styled(
                 crate::ui::truncate_width(footer, footer_area.width as usize),
@@ -327,7 +338,11 @@ mod tests {
 
         overlay.handle(&Action::Input('+'));
         assert_eq!(overlay.zoom_pct, 125);
+        let (cols_125, rows_125) = overlay.target_dimensions(120, 40);
         overlay.handle(&Action::Input('-'));
+        let (cols_100, rows_100) = overlay.target_dimensions(120, 40);
+        assert!(cols_125 > cols_100);
+        assert!(rows_125 > rows_100);
         overlay.handle(&Action::Input('-'));
         assert_eq!(overlay.zoom_pct, 75);
 

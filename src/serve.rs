@@ -316,16 +316,16 @@ pub async fn run(
 
     let addr: SocketAddr = format!("{}:{}", opts.bind, opts.port)
         .parse()
-        .with_context(|| format!("잘못된 바인드 주소: {}:{}", opts.bind, opts.port))?;
+        .with_context(|| format!("Invalid bind address: {}:{}", opts.bind, opts.port))?;
     let listener = TcpListener::bind(addr)
         .await
-        .with_context(|| format!("리스너 바인드 실패: {addr}"))?;
+        .with_context(|| format!("Failed to bind listener: {addr}"))?;
 
     println!("teams HTTP API listening on http://{addr}");
 
     axum::serve(listener, app)
         .await
-        .context("HTTP 서버 오류")?;
+        .context("HTTP server error")?;
 
     Ok(())
 }
@@ -1145,16 +1145,16 @@ mod tests {
             kind: ConversationKind::OneOnOne,
             team_id: None,
             team_name: None,
-            title: "홍길동".to_string(),
+            title: "Alice".to_string(),
             topic: None,
             unread_count: 1,
             last_read_at: None,
             last_msg_id: Some("m1".to_string()),
-            last_msg_author: Some("홍길동".to_string()),
-            last_msg_preview: Some("배포 완료".to_string()),
+            last_msg_author: Some("Alice".to_string()),
+            last_msg_preview: Some("Deploy complete".to_string()),
             last_updated_at: Some("2026-11-15T06:00:00Z".to_string()),
             pinned: false,
-            peer_user_id: Some("u-hong".to_string()),
+            peer_user_id: Some("u-alice".to_string()),
             web_url: None,
         };
         storage.upsert_conversations(&[conv]).unwrap();
@@ -1168,16 +1168,16 @@ mod tests {
                 reply_to_author: None,
                 reply_to_preview: None,
                 subject: None,
-                author_id: Some("u-hong".to_string()),
-                author_name: "홍길동".to_string(),
+                author_id: Some("u-alice".to_string()),
+                author_name: "Alice".to_string(),
                 is_me: false,
                 created_at: "2026-11-15T06:00:00Z".to_string(),
                 last_modified_at: None,
                 deleted: false,
                 importance: "normal".to_string(),
                 message_type: "message".to_string(),
-                body_html: "<p>배포 완료했습니다</p>".to_string(),
-                body_plain: "배포 완료했습니다".to_string(),
+                body_html: "<p>Deployment completed</p>".to_string(),
+                body_plain: "Deployment completed".to_string(),
                 attachments: vec![],
                 mentions: vec![],
                 reactions: vec![],
@@ -1205,13 +1205,13 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let body: Value = res.json().await.unwrap();
-        assert_eq!(body["conversation"]["title"], "홍길동");
+        assert_eq!(body["conversation"]["title"], "Alice");
         assert_eq!(body["messages"].as_array().unwrap().len(), 1);
-        assert_eq!(body["messages"][0]["body_plain"], "배포 완료했습니다");
+        assert_eq!(body["messages"][0]["body_plain"], "Deployment completed");
 
         // Search finds cached message
         let res = client
-            .get(format!("{base}/search?q=%EB%B0%B0%ED%8F%AC&target=%ED%99%8D%EA%B8%B8%EB%8F%99"))
+            .get(format!("{base}/search?q=Deployment&target=Alice"))
             .send()
             .await
             .unwrap();
@@ -1252,8 +1252,8 @@ mod tests {
         };
         storage
             .upsert_conversations(&[
-                mk_conv("c1", "첫번째 방", "2026-11-15T06:00:00Z"),
-                mk_conv("c2", "두번째 방", "2026-11-15T05:00:00Z"),
+                mk_conv("c1", "First Room", "2026-11-15T06:00:00Z"),
+                mk_conv("c2", "Second Room", "2026-11-15T05:00:00Z"),
             ])
             .unwrap();
 
@@ -1267,7 +1267,7 @@ mod tests {
             reply_to_preview: None,
             subject: None,
             author_id: Some("u1".to_string()),
-            author_name: "김철수".to_string(),
+            author_name: "Bob".to_string(),
             is_me: false,
             created_at: ts.to_string(),
             last_modified_at: None,

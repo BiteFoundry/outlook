@@ -289,7 +289,7 @@ impl StartupLockGuard {
                 }
                 Err(err) => {
                     return Err(err).with_context(|| {
-                        format!("데몬 시작 잠금 파일 생성 실패: {}", path.display())
+                        format!("Failed to create daemon startup lock file: {}", path.display())
                     });
                 }
             }
@@ -407,7 +407,7 @@ fn write_secret_file_atomic(path: &Path, data: &[u8]) -> Result<()> {
     ensure_parent(path)?;
     let parent = path
         .parent()
-        .ok_or_else(|| anyhow!("유효하지 않은 상태 파일 경로: {}", path.display()))?;
+        .ok_or_else(|| anyhow!("Invalid state file path: {}", path.display()))?;
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -423,13 +423,13 @@ fn write_secret_file_atomic(path: &Path, data: &[u8]) -> Result<()> {
             .truncate(true)
             .mode(0o600)
             .open(&tmp)
-            .with_context(|| format!("임시 상태 파일 생성 실패: {}", tmp.display()))?;
+            .with_context(|| format!("Failed to create temporary state file: {}", tmp.display()))?;
         file.write_all(data)
-            .with_context(|| format!("임시 상태 파일 쓰기 실패: {}", tmp.display()))?;
+            .with_context(|| format!("Failed to write temporary state file: {}", tmp.display()))?;
         file.sync_all()
-            .with_context(|| format!("임시 상태 파일 동기화 실패: {}", tmp.display()))?;
+            .with_context(|| format!("Failed to sync temporary state file: {}", tmp.display()))?;
         fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("상태 파일 권한 설정 실패: {}", tmp.display()))?;
+            .with_context(|| format!("Failed to set permissions on state file: {}", tmp.display()))?;
     }
 
     #[cfg(not(unix))]
@@ -439,22 +439,22 @@ fn write_secret_file_atomic(path: &Path, data: &[u8]) -> Result<()> {
             .create(true)
             .truncate(true)
             .open(&tmp)
-            .with_context(|| format!("임시 상태 파일 생성 실패: {}", tmp.display()))?;
+            .with_context(|| format!("Failed to create temporary state file: {}", tmp.display()))?;
         file.write_all(data)
-            .with_context(|| format!("임시 상태 파일 쓰기 실패: {}", tmp.display()))?;
+            .with_context(|| format!("Failed to write temporary state file: {}", tmp.display()))?;
         file.sync_all()
-            .with_context(|| format!("임시 상태 파일 동기화 실패: {}", tmp.display()))?;
+            .with_context(|| format!("Failed to sync temporary state file: {}", tmp.display()))?;
     }
 
     if let Err(err) = fs::rename(&tmp, path) {
         if path.exists() {
             fs::remove_file(path)
-                .with_context(|| format!("기존 상태 파일 교체 실패: {}", path.display()))?;
+                .with_context(|| format!("Failed to replace existing state file: {}", path.display()))?;
             fs::rename(&tmp, path)
-                .with_context(|| format!("상태 파일 원자적 저장 실패: {}", path.display()))?;
+                .with_context(|| format!("Failed to atomically save state file: {}", path.display()))?;
         } else {
             let _ = fs::remove_file(&tmp);
-            return Err(err).with_context(|| format!("상태 파일 저장 실패: {}", path.display()));
+            return Err(err).with_context(|| format!("Failed to save state file: {}", path.display()));
         }
     }
     Ok(())
@@ -531,9 +531,9 @@ fn ensure_unix_socket_dir(sock_path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     if let Some(parent) = sock_path.parent() {
         fs::create_dir_all(parent)
-            .with_context(|| format!("소켓 디렉터리 생성 실패: {}", parent.display()))?;
+            .with_context(|| format!("Failed to create socket directory: {}", parent.display()))?;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("소켓 디렉터리 권한 설정 실패: {}", parent.display()))?;
+            .with_context(|| format!("Failed to set permissions on socket directory: {}", parent.display()))?;
     }
     Ok(())
 }
@@ -549,7 +549,7 @@ async fn bind_ipc_listener(
         if ensure_unix_socket_dir(&sock_path).is_ok() {
             if sock_path.exists() {
                 if std::os::unix::net::UnixStream::connect(&sock_path).is_ok() {
-                    bail!("이미 실행 중인 데몬 소켓이 있습니다: {}", sock_path.display());
+                    bail!("Daemon socket is already active: {}", sock_path.display());
                 }
                 let _ = fs::remove_file(&sock_path);
             }
@@ -568,10 +568,10 @@ async fn bind_ipc_listener(
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
-        .context("로컬 IPC TCP 리스너 바인드 실패")?;
+        .context("Failed to bind local IPC TCP listener")?;
     let endpoint = listener
         .local_addr()
-        .context("로컬 IPC TCP 주소 조회 실패")?
+        .context("Failed to get local IPC TCP address")?
         .to_string();
     Ok((
         IpcListener::Tcp(listener),
@@ -588,25 +588,25 @@ async fn connect_ipc(transport: &str, endpoint: &str, timeout: Duration) -> Resu
             let stream =
                 tokio::time::timeout(timeout, tokio::net::UnixStream::connect(endpoint))
                     .await
-                    .context("Unix 소켓 연결 시간 초과")?
-                    .context("Unix 소켓 연결 실패")?;
+                    .context("Unix socket connection timed out")?
+                    .context("Unix socket connection failed")?;
             Ok(IpcStream::Unix(stream))
         }
         "tcp" => {
             let addr: SocketAddr = endpoint
                 .parse()
-                .with_context(|| format!("유효하지 않은 TCP 엔드포인트: {endpoint}"))?;
+                .with_context(|| format!("Invalid TCP endpoint: {endpoint}"))?;
             if !addr.ip().is_loopback() {
-                bail!("보안상 루프백 이외의 IPC 주소에는 연결할 수 없습니다: {endpoint}");
+                bail!("Refusing to connect to non-loopback IPC address for security: {endpoint}");
             }
             let stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
                 .await
-                .context("TCP IPC 연결 시간 초과")?
-                .context("TCP IPC 연결 실패")?;
+                .context("TCP IPC connection timed out")?
+                .context("TCP IPC connection failed")?;
             let _ = stream.set_nodelay(true);
             Ok(IpcStream::Tcp(stream))
         }
-        other => bail!("지원하지 않는 IPC 전송 방식: {other}"),
+        other => bail!("Unsupported IPC transport: {other}"),
     }
 }
 
@@ -748,7 +748,7 @@ async fn ensure_daemon_started_at(cfg: &AppConfig, paths: &DaemonPaths) -> Resul
         let _ = stop_daemon_at(paths).await?;
     }
 
-    let exe = std::env::current_exe().context("현재 실행 파일 경로 조회 실패")?;
+    let exe = std::env::current_exe().context("Failed to get current executable path")?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["daemon", "run"])
         .stdin(Stdio::null())
@@ -763,7 +763,7 @@ async fn ensure_daemon_started_at(cfg: &AppConfig, paths: &DaemonPaths) -> Resul
         cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
     }
 
-    let mut child = cmd.spawn().context("백그라운드 데몬 프로세스 실행 실패")?;
+    let mut child = cmd.spawn().context("Failed to spawn background daemon process")?;
     let deadline = Instant::now() + STARTUP_WAIT_TIMEOUT;
     while Instant::now() < deadline {
         let status = query_daemon_status_at(paths).await?;
@@ -774,10 +774,10 @@ async fn ensure_daemon_started_at(cfg: &AppConfig, paths: &DaemonPaths) -> Resul
             if !exit.success() {
                 if let Ok(auth) = AuthManager::new(cfg.clone()) {
                     if auth.current_tokens().await.is_none() {
-                        bail!("로그인이 필요합니다. 먼저 `teams login`을 실행해 주세요.");
+                        bail!("Not logged in. Run 'teams login' first.");
                     }
                 }
-                bail!("백그라운드 데몬이 예기치 않게 종료되었습니다 (exit: {exit})");
+                bail!("Background daemon exited unexpectedly (exit: {exit})");
             }
         }
         tokio::time::sleep(STARTUP_POLL_INTERVAL).await;
@@ -787,7 +787,7 @@ async fn ensure_daemon_started_at(cfg: &AppConfig, paths: &DaemonPaths) -> Resul
     if final_status.running {
         return Ok(final_status);
     }
-    bail!("백그라운드 데몬 시작 시간 초과 (3초)")
+    bail!("Background daemon startup timed out (3s)")
 }
 
 /// Gracefully stops the running background daemon over IPC, if running.
@@ -961,7 +961,7 @@ async fn try_connect_tui_at(
 pub async fn run_daemon_foreground(cfg: AppConfig) -> Result<()> {
     let auth = AuthManager::new(cfg.clone())?;
     let Some(tokens) = auth.current_tokens().await else {
-        bail!("로그인이 필요합니다. 먼저 `teams login`을 실행해 주세요.");
+        bail!("Not logged in. Run 'teams login' first.");
     };
     let user_id = tokens.user_id.clone();
     let storage = Storage::open(&crate::config::db_path(user_id.as_deref()))?;
@@ -1017,7 +1017,7 @@ async fn run_initial_bootstrap(
 ) {
     let _ = event_tx.send(CoreEvent::SyncStateChanged {
         busy: true,
-        summary: "초기 동기화 중...".to_string(),
+        summary: "Initial sync...".to_string(),
     });
 
     match sync::bootstrap_conversations(&graph, &storage).await {
@@ -1031,14 +1031,14 @@ async fn run_initial_bootstrap(
         }
         Err(err) => {
             let _ = event_tx.send(CoreEvent::SyncError(format!(
-                "초기 대화 동기화 실패: {err}"
+                "Initial conversation sync failed: {err}"
             )));
         }
     }
 
     let _ = event_tx.send(CoreEvent::SyncStateChanged {
         busy: false,
-        summary: "동기화 대기".to_string(),
+        summary: "Idle".to_string(),
     });
 }
 
@@ -1283,7 +1283,7 @@ async fn handle_client_connection(
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                 let hint = CoreEvent::SyncStateChanged {
                                     busy: false,
-                                    summary: format!("동기화 이벤트 {skipped}건 건너뜀"),
+                                    summary: format!("Skipped {skipped} sync event(s)"),
                                 };
                                 if write_json_line(&mut write_half, &ServerFrame::Event(hint)).await.is_err() {
                                     break;
@@ -1481,7 +1481,7 @@ mod tests {
             .engine_event_tx
             .send(CoreEvent::SyncStateChanged {
                 busy: true,
-                summary: "동기화 중".to_string(),
+                summary: "Syncing".to_string(),
             })
             .unwrap();
         harness
@@ -1525,7 +1525,7 @@ mod tests {
 
         let updated_status = query_daemon_status_at(&harness.paths).await.unwrap();
         assert!(updated_status.sync_busy);
-        assert_eq!(updated_status.sync_summary, "동기화 중");
+        assert_eq!(updated_status.sync_summary, "Syncing");
         assert!(updated_status.last_sync_at.is_some());
 
         // Simulating TUI exit sends Shutdown through sync_ctrl then drops connection:

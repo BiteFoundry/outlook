@@ -6,13 +6,14 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event as CrosstermEvent, EventStream, KeyboardEnhancementFlags, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
-    EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, BeginSynchronizedUpdate,
+    EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use futures::{FutureExt, StreamExt};
 use ratatui::backend::CrosstermBackend;
@@ -46,14 +47,18 @@ impl TerminalGuard {
             EnableMouseCapture,
             EnableBracketedPaste
         )?;
-        let keyboard_enhanced = execute!(
-            stdout,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        let keyboard_enhanced = if supports_keyboard_enhancement().unwrap_or(false) {
+            execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                )
             )
-        )
-        .is_ok();
+            .is_ok()
+        } else {
+            false
+        };
 
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
@@ -104,10 +109,161 @@ fn install_panic_hook(keyboard_enhanced: bool) {
 
 const MAX_COALESCED_EVENTS: usize = 64;
 const ACTIVITY_THROTTLE: Duration = Duration::from_secs(5);
+const PASTE_BURST_POLL: Duration = Duration::from_millis(4);
+const MAX_PASTE_BURST_EVENTS: usize = 4096;
+
+#[derive(Debug, Default)]
+struct PasteBurstDetector {
+    keys: Vec<KeyEvent>,
+}
+
+impl PasteBurstDetector {
+    fn is_candidate_key(key: &KeyEvent) -> bool {
+        if key.kind != KeyEventKind::Press {
+            return false;
+        }
+        match key.code {
+            KeyCode::Enter => key.modifiers == KeyModifiers::NONE,
+            KeyCode::Char(ch) => {
+                !ch.is_control()
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            }
+            _ => false,
+        }
+    }
+
+    fn push(&mut self, key: KeyEvent) {
+        self.keys.push(key);
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn into_paste_or_keys(mut self) -> std::result::Result<String, Vec<KeyEvent>> {
+        let has_enter = self
+            .keys
+            .iter()
+            .any(|k| k.code == KeyCode::Enter && k.modifiers == KeyModifiers::NONE);
+        let has_char = self
+            .keys
+            .iter()
+            .any(|k| matches!(k.code, KeyCode::Char(_)));
+        if self.keys.len() >= 2 && has_enter && has_char {
+            let mut out = String::with_capacity(self.keys.len());
+            for k in self.keys.drain(..) {
+                match k.code {
+                    KeyCode::Char(ch) => out.push(ch),
+                    KeyCode::Enter => out.push('\n'),
+                    _ => {}
+                }
+            }
+            Ok(out)
+        } else {
+            Err(self.keys)
+        }
+    }
+}
 
 enum LoopStep {
     Continue,
     Quit,
+}
+
+async fn process_terminal_event_with_burst(
+    first_ev: CrosstermEvent,
+    events: &mut EventStream,
+    app: &mut AppState,
+    ui: &mut UiState,
+    dirty: &mut bool,
+    last_activity_sent: &mut Option<Instant>,
+) -> LoopStep {
+    let CrosstermEvent::Key(first_key) = first_ev else {
+        return handle_terminal_event(first_ev, app, ui, dirty, last_activity_sent);
+    };
+    if !ui.accepts_text_input() || !PasteBurstDetector::is_candidate_key(&first_key) {
+        return handle_terminal_event(
+            CrosstermEvent::Key(first_key),
+            app,
+            ui,
+            dirty,
+            last_activity_sent,
+        );
+    }
+
+    let mut detector = PasteBurstDetector::default();
+    detector.push(first_key);
+    let mut trailing_event: Option<CrosstermEvent> = None;
+    let mut stream_ended = false;
+
+    while detector.len() < MAX_PASTE_BURST_EVENTS {
+        let next_ev = match events.next().now_or_never() {
+            Some(item) => item,
+            None => match tokio::time::timeout(PASTE_BURST_POLL, events.next()).await {
+                Ok(item) => item,
+                Err(_) => break,
+            },
+        };
+        match next_ev {
+            Some(Ok(CrosstermEvent::Key(k))) if k.kind == KeyEventKind::Release => {
+                continue;
+            }
+            Some(Ok(CrosstermEvent::Key(k))) if PasteBurstDetector::is_candidate_key(&k) => {
+                detector.push(k);
+            }
+            Some(Ok(other)) => {
+                trailing_event = Some(other);
+                break;
+            }
+            Some(Err(_)) | None => {
+                stream_ended = true;
+                break;
+            }
+        }
+    }
+
+    match detector.into_paste_or_keys() {
+        Ok(coalesced) => {
+            notify_activity_throttled(app, last_activity_sent);
+            *dirty = true;
+            if action::dispatch(Action::Paste(coalesced), app, ui) {
+                return LoopStep::Quit;
+            }
+        }
+        Err(keys) => {
+            for k in keys {
+                if matches!(
+                    handle_terminal_event(
+                        CrosstermEvent::Key(k),
+                        app,
+                        ui,
+                        dirty,
+                        last_activity_sent
+                    ),
+                    LoopStep::Quit
+                ) {
+                    return LoopStep::Quit;
+                }
+            }
+        }
+    }
+
+    if let Some(extra) = trailing_event {
+        if matches!(
+            handle_terminal_event(extra, app, ui, dirty, last_activity_sent),
+            LoopStep::Quit
+        ) {
+            return LoopStep::Quit;
+        }
+    }
+
+    if stream_ended {
+        LoopStep::Quit
+    } else {
+        LoopStep::Continue
+    }
 }
 
 fn notify_activity_throttled(app: &AppState, last_activity_sent: &mut Option<Instant>) {
@@ -366,6 +522,7 @@ pub async fn run_with_persona(
     let sync_ctrl = SyncController::from_channels(proxy_focus_tx, proxy_nudge_tx, false);
 
     let mut ui = UiState::from_config(&config);
+    ui.kitty_keyboard_supported = guard.keyboard_enhanced;
     let mut app = AppState::new(
         config.clone(),
         auth.clone(),
@@ -421,10 +578,10 @@ pub async fn run_with_persona(
             match result {
                 Ok(edited) => {
                     ui.composer.load_text(&edited);
-                    ui.info("외부 편집기 내용을 반영했습니다");
+                    ui.info("Updated draft from external editor");
                 }
                 Err(err) => {
-                    ui.error(format!("외부 편집기 실행 실패: {err}"));
+                    ui.error(format!("External editor error: {err}"));
                 }
             }
         }
@@ -462,7 +619,15 @@ pub async fn run_with_persona(
                 match maybe_ev {
                     Some(Ok(ev)) => {
                         if matches!(
-                            handle_terminal_event(ev, &mut app, &mut ui, &mut dirty, &mut last_activity_sent),
+                            process_terminal_event_with_burst(
+                                ev,
+                                &mut events,
+                                &mut app,
+                                &mut ui,
+                                &mut dirty,
+                                &mut last_activity_sent
+                            )
+                            .await,
                             LoopStep::Quit
                         ) {
                             should_quit = true;
@@ -515,7 +680,15 @@ pub async fn run_with_persona(
                         drained += 1;
                         progressed = true;
                         if matches!(
-                            handle_terminal_event(ev, &mut app, &mut ui, &mut dirty, &mut last_activity_sent),
+                            process_terminal_event_with_burst(
+                                ev,
+                                &mut events,
+                                &mut app,
+                                &mut ui,
+                                &mut dirty,
+                                &mut last_activity_sent
+                            )
+                            .await,
                             LoopStep::Quit
                         ) {
                             should_quit = true;
@@ -542,4 +715,52 @@ pub async fn run_with_persona(
     let _ = sync_ctrl.request(SyncCommand::Shutdown);
     drop(guard);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn paste_burst_detector_coalesces_multiline_burst() {
+        let mut d = PasteBurstDetector::default();
+        for ch in ['h', 'i'] {
+            let k = press(KeyCode::Char(ch), KeyModifiers::NONE);
+            assert!(PasteBurstDetector::is_candidate_key(&k));
+            d.push(k);
+        }
+        d.push(press(KeyCode::Enter, KeyModifiers::NONE));
+        d.push(press(KeyCode::Char('b'), KeyModifiers::SHIFT));
+        assert_eq!(d.into_paste_or_keys(), Ok("hi\nb".to_string()));
+    }
+
+    #[test]
+    fn paste_burst_detector_preserves_single_enter_and_plain_typing() {
+        let mut single_enter = PasteBurstDetector::default();
+        single_enter.push(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(single_enter.into_paste_or_keys().is_err());
+
+        let mut plain_typing = PasteBurstDetector::default();
+        plain_typing.push(press(KeyCode::Char('a'), KeyModifiers::NONE));
+        plain_typing.push(press(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert!(plain_typing.into_paste_or_keys().is_err());
+
+        let mut only_enters = PasteBurstDetector::default();
+        only_enters.push(press(KeyCode::Enter, KeyModifiers::NONE));
+        only_enters.push(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(only_enters.into_paste_or_keys().is_err());
+
+        assert!(!PasteBurstDetector::is_candidate_key(&press(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!PasteBurstDetector::is_candidate_key(&press(
+            KeyCode::Enter,
+            KeyModifiers::ALT
+        )));
+    }
 }

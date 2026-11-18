@@ -1,4 +1,4 @@
-//! Fuzzy target resolver for CLI, HTTP API, and MCP (`"홍길동"`, `"그룹방"`, `"개발팀/일반"`, `chat:...`, `chan:...:...`).
+//! Fuzzy target resolver for CLI, HTTP API, and MCP (`"Alice"`, `"Group Chat"`, `"Engineering/General"`, `chat:...`, `chan:...:...`).
 
 use anyhow::{bail, Result};
 
@@ -22,7 +22,7 @@ pub fn resolve_from_slice(
 ) -> Result<ConversationSummary> {
     let q = query.trim();
     if q.is_empty() {
-        bail!("대상 대화방/채널 이름이 비어 있습니다.");
+        bail!("Target conversation/channel name is empty.");
     }
 
     // Priority 1: Exact conv_key
@@ -42,7 +42,7 @@ pub fn resolve_from_slice(
         return Ok(raw_id_matches[0].clone());
     } else if raw_id_matches.len() > 1 {
         bail!(
-            "대상 ID '{q}'와 일치하는 대화방/채널이 여러 개입니다:\n{}",
+            "Multiple conversations/channels match target ID '{q}':\n{}",
             format_candidates(&raw_id_matches)
         );
     }
@@ -73,7 +73,7 @@ pub fn resolve_from_slice(
                 return Ok(exact_matches[0].clone());
             } else if exact_matches.len() > 1 {
                 bail!(
-                    "'{q}'와 정확히 일치하는 채널이 여러 개입니다:\n{}",
+                    "Multiple channels match '{q}' exactly:\n{}",
                     format_candidates(&exact_matches)
                 );
             }
@@ -93,7 +93,7 @@ pub fn resolve_from_slice(
                 return Ok(sub_matches[0].clone());
             } else if sub_matches.len() > 1 {
                 bail!(
-                    "'{q}'와 일치하는 채널이 여러 개입니다. 더 구체적으로 지정하세요:\n{}",
+                    "Multiple channels match '{q}'. Please specify a more specific target:\n{}",
                     format_candidates(&sub_matches)
                 );
             }
@@ -111,7 +111,7 @@ pub fn resolve_from_slice(
         return Ok(exact_title_matches[0].clone());
     } else if exact_title_matches.len() > 1 {
         bail!(
-            "제목 '{q}'와 정확히 일치하는 대상이 여러 개입니다. conv_key 또는 '팀이름/채널이름'을 사용하세요:\n{}",
+            "Multiple targets match title '{q}' exactly. Use conv_key or 'TeamName/ChannelName':\n{}",
             format_candidates(&exact_title_matches)
         );
     }
@@ -137,10 +137,10 @@ pub fn resolve_from_slice(
     match sub_matches.len() {
         1 => Ok(sub_matches[0].clone()),
         n if n > 1 => bail!(
-            "'{q}'와 일치하는 대화방/채널이 {n}개 있습니다. 더 구체적으로 지정하세요:\n{}",
+            "Ambiguous target '{q}' matches multiple conversations ({n}):\n{}",
             format_candidates(&sub_matches)
         ),
-        _ => bail!("대화방/채널을 찾을 수 없습니다: {q}"),
+        _ => bail!("Conversation/channel not found: {q}"),
     }
 }
 
@@ -178,7 +178,7 @@ fn format_candidates(candidates: &[&ConversationSummary]) -> String {
         })
         .collect();
     if candidates.len() > MAX_LIST {
-        lines.push(format!("  ... 외 {}건", candidates.len() - MAX_LIST));
+        lines.push(format!("  ... and {} more", candidates.len() - MAX_LIST));
     }
     lines.join("\n")
 }
@@ -244,65 +244,67 @@ mod tests {
     #[test]
     fn test_resolver_priorities_and_slash_notation() {
         let convs = vec![
-            make_chat("19:hong@unq.gbl.spaces", "홍길동"),
-            make_chat("19:kim@unq.gbl.spaces", "김철수"),
-            make_channel("t1", "개발팀", "19:gen1@thread.tacv2", "일반"),
-            make_channel("t1", "개발팀", "19:dep1@thread.tacv2", "배포"),
-            make_channel("t2", "인프라팀", "19:dep2@thread.tacv2", "배포-알림"),
-            make_channel("t2", "인프라팀", "19:gen2@thread.tacv2", "일반"),
+            make_chat("19:alice@unq.gbl.spaces", "Alice Smith"),
+            make_chat("19:bob@unq.gbl.spaces", "Bob Jones"),
+            make_channel("t1", "Engineering", "19:gen1@thread.tacv2", "General"),
+            make_channel("t1", "Engineering", "19:dep1@thread.tacv2", "Deploy"),
+            make_channel("t2", "Infra", "19:dep2@thread.tacv2", "Deploy-Alerts"),
+            make_channel("t2", "Infra", "19:gen2@thread.tacv2", "General"),
         ];
 
         // Priority 1: exact conv_key
         let r1 = resolve_from_slice(&convs, "chan:t1:19:dep1@thread.tacv2").unwrap();
-        assert_eq!(r1.title, "배포");
+        assert_eq!(r1.title, "Deploy");
 
         // Priority 2: raw chat_id / channel_id
-        let r2 = resolve_from_slice(&convs, "19:hong@unq.gbl.spaces").unwrap();
-        assert_eq!(r2.title, "홍길동");
+        let r2 = resolve_from_slice(&convs, "19:alice@unq.gbl.spaces").unwrap();
+        assert_eq!(r2.title, "Alice Smith");
         let r2b = resolve_from_slice(&convs, "19:dep2@thread.tacv2").unwrap();
-        assert_eq!(r2b.title, "배포-알림");
+        assert_eq!(r2b.title, "Deploy-Alerts");
 
         // Priority 3: slash notation exact & substring
-        let r3 = resolve_from_slice(&convs, "개발팀/배포").unwrap();
+        let r3 = resolve_from_slice(&convs, "Engineering/Deploy").unwrap();
         assert_eq!(r3.conv_key, "chan:t1:19:dep1@thread.tacv2");
-        let r3b = resolve_from_slice(&convs, "인프/알림").unwrap();
+        let r3b = resolve_from_slice(&convs, "inf/alerts").unwrap();
         assert_eq!(r3b.conv_key, "chan:t2:19:dep2@thread.tacv2");
 
         // Priority 4: exact title match
-        let r4 = resolve_from_slice(&convs, "홍길동").unwrap();
-        assert_eq!(r4.conv_key, "chat:19:hong@unq.gbl.spaces");
+        let r4 = resolve_from_slice(&convs, "Alice Smith").unwrap();
+        assert_eq!(r4.conv_key, "chat:19:alice@unq.gbl.spaces");
 
         // Priority 5: unique substring match
-        let r5 = resolve_from_slice(&convs, "철수").unwrap();
-        assert_eq!(r5.title, "김철수");
+        let r5 = resolve_from_slice(&convs, "Jones").unwrap();
+        assert_eq!(r5.title, "Bob Jones");
     }
 
     #[test]
     fn test_resolver_ambiguity_error_lists_candidates() {
         let convs = vec![
-            make_channel("t1", "개발팀", "c1", "일반"),
-            make_channel("t2", "디자인팀", "c2", "일반"),
-            make_channel("t3", "개발2팀", "c3", "배포-일반"),
+            make_channel("t1", "Engineering", "c1", "General"),
+            make_channel("t2", "Design", "c2", "General"),
+            make_channel("t3", "Engineering2", "c3", "Deploy-General"),
         ];
 
         // Ambiguous exact title
-        let err = resolve_from_slice(&convs, "일반").unwrap_err().to_string();
-        assert!(err.contains("개발팀/일반 (chan:t1:c1)"));
-        assert!(err.contains("디자인팀/일반 (chan:t2:c2)"));
+        let err = resolve_from_slice(&convs, "General").unwrap_err().to_string();
+        assert!(err.contains("Engineering/General (chan:t1:c1)"));
+        assert!(err.contains("Design/General (chan:t2:c2)"));
 
         // Ambiguous slash notation
-        let err2 = resolve_from_slice(&convs, "개발/일반")
+        let err2 = resolve_from_slice(&convs, "Eng/General")
             .unwrap_err()
             .to_string();
-        assert!(err2.contains("개발팀/일반 (chan:t1:c1)"));
-        assert!(err2.contains("개발2팀/배포-일반 (chan:t3:c3)"));
+        assert!(err2.contains("Engineering/General (chan:t1:c1)"));
+        assert!(err2.contains("Engineering2/Deploy-General (chan:t3:c3)"));
     }
 
     #[test]
     fn test_resolver_empty_and_not_found() {
-        let convs = vec![make_chat("c1", "홍길동")];
+        let convs = vec![make_chat("c1", "Alice")];
         assert!(resolve_from_slice(&convs, "   ").is_err());
-        let err = resolve_from_slice(&convs, "없는방").unwrap_err().to_string();
-        assert!(err.contains("찾을 수 없습니다"));
+        let err = resolve_from_slice(&convs, "nonexistent")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not found"));
     }
 }

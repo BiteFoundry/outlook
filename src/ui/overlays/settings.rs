@@ -1,10 +1,11 @@
-//! Settings overlay (`Ctrl+,` or `[설정]`).
+//! Settings overlay (`Ctrl+,` or `[Settings]`).
 //! Reads & persists `crate::config::AppConfig` (`config.toml`).
 
 use ratatui::{
     layout::Rect,
+    style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -18,7 +19,7 @@ use crate::{
     },
 };
 
-const ITEMS: usize = 8;
+const ITEMS: usize = 10;
 
 #[derive(Debug, Clone, Default)]
 pub struct SettingsState {
@@ -34,21 +35,23 @@ impl SettingsState {
 
     pub fn rows(app: &AppState, ui: &UiState) -> [(&'static str, String); ITEMS] {
         [
-            ("알림", toggle(ui.notify)),
-            ("좌측 레일", toggle(ui.show_nav_rail)),
-            ("자동 스레드창", toggle(ui.auto_thread_pane)),
-            ("인라인 이미지 미리보기", toggle(ui.inline_images)),
+            ("Notifications", toggle(ui.notify)),
+            ("Left rail", toggle(ui.show_nav_rail)),
+            ("Auto thread pane", toggle(ui.auto_thread_pane)),
+            ("Inline image previews", toggle(ui.inline_images)),
+            ("Message density", ui.density.label().to_string()),
+            ("Color theme", ui.theme_preset.label().to_string()),
             (
-                "다운로드 경로",
+                "Download folder",
                 app.download_dir.to_string_lossy().to_string(),
             ),
-            ("키보드 도움말", "도움말 보기".to_string()),
+            ("Keyboard shortcuts", "View help".to_string()),
             ("Graph URL", app.config.graph_base_url.clone()),
-            ("설정 파일", config::config_file_path().to_string_lossy().to_string()),
+            ("Config file", config::config_file_path().to_string_lossy().to_string()),
         ]
     }
 
-    pub fn handle(&mut self, action: &Action) -> OverlayOutcome {
+    pub fn handle(&mut self, action: &Action, app: &AppState) -> OverlayOutcome {
         match action {
             Action::MoveUp => {
                 self.selected = (self.selected + ITEMS - 1) % ITEMS;
@@ -63,15 +66,20 @@ impl SettingsState {
                 1 => OverlayOutcome::Dispatch(Action::ToggleNavRail),
                 2 => OverlayOutcome::Dispatch(Action::ToggleAutoThreadPane),
                 3 => OverlayOutcome::Dispatch(Action::ToggleInlineImages),
-                4 => OverlayOutcome::Dispatch(Action::ShowDownloadDir),
-                5 => OverlayOutcome::CloseAndDispatch(Action::OpenOverlay(OverlayKind::Help)),
-                6 => OverlayOutcome::CloseAndDispatch(Action::OpenOverlay(OverlayKind::Presence)),
+                4 => OverlayOutcome::Dispatch(Action::ToggleDensity),
+                5 => OverlayOutcome::Dispatch(Action::CycleTheme),
+                6 => OverlayOutcome::Dispatch(Action::ShowDownloadDir),
+                7 => OverlayOutcome::CloseAndDispatch(Action::OpenOverlay(OverlayKind::Help)),
+                8 => OverlayOutcome::Dispatch(Action::ShowToast(format!(
+                    "Graph URL: {} (edit in config.toml)",
+                    app.config.graph_base_url
+                ))),
                 _ => OverlayOutcome::Dispatch(Action::ShowToast(
                     config::config_file_path().display().to_string(),
                 )),
             },
             Action::CloseOverlay => OverlayOutcome::Close,
-            Action::Quit => OverlayOutcome::NotHandled,
+            Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
             _ => OverlayOutcome::Handled,
         }
     }
@@ -85,17 +93,23 @@ impl SettingsState {
         hitmap: &mut HitMap,
     ) {
         let theme = &ui.theme;
-        let rect = centered_rect(area, 72, (ITEMS as u16 + 4).min(area.height));
+        let rect = centered_rect(area, 76, (ITEMS as u16 + 4).min(area.height));
         frame.render_widget(Clear, rect);
+        hitmap.add(rect, HitTarget::OverlayBody);
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
             .title(Line::from(Span::styled(
-                " 설정 · Enter 변경/열기 · Esc 닫기 ",
+                " Settings · Enter Toggle/Open · Esc Close ",
                 theme.title(true),
             )))
             .border_style(theme.border_style(true));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
 
         let rows = SettingsState::rows(app, ui);
         for (index, (label, value)) in rows.iter().enumerate() {
@@ -107,13 +121,13 @@ impl SettingsState {
             let style = if selected {
                 theme.selection()
             } else {
-                ratatui::style::Style::default()
+                Style::default()
             };
-            let used = unicode_width::UnicodeWidthStr::width(*label) + 4;
+            let used = unicode_width::UnicodeWidthStr::width(*label) + 6;
             let value =
                 crate::ui::truncate_width(value, (inner.width as usize).saturating_sub(used + 2));
             let line = Line::from(vec![
-                Span::styled(format!(" {:<16}", label), style),
+                Span::styled(format!(" {:<22}", label), style),
                 Span::styled(value, theme.muted_style()),
             ]);
             frame.render_widget(Paragraph::new(line), Rect::new(inner.x, y, inner.width, 1));
@@ -123,7 +137,7 @@ impl SettingsState {
         let hint_y = inner.y + inner.height.saturating_sub(1);
         frame.render_widget(
             Paragraph::new(Span::styled(
-                " 변경 사항은 config.toml 에 자동 저장됩니다",
+                " Changes are saved automatically to config.toml",
                 theme.muted_style(),
             )),
             Rect::new(inner.x, hint_y, inner.width, 1),
@@ -133,8 +147,8 @@ impl SettingsState {
 
 fn toggle(on: bool) -> String {
     if on {
-        "켜짐".to_string()
+        "On".to_string()
     } else {
-        "꺼짐".to_string()
+        "Off".to_string()
     }
 }

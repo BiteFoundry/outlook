@@ -20,6 +20,21 @@ pub enum ButtonId {
     SubjectToggle,
     NarrowToggle,
     ImagePreview,
+    CommandPalette,
+    DensityToggle,
+    Help,
+    FilterToggle,
+    ConfirmOk,
+    ConfirmCancel,
+}
+
+/// Inline quick actions shown on the selected message row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineActionKind {
+    Reply,
+    Thread,
+    React,
+    More,
 }
 
 /// Identifies which list a message belongs to.
@@ -33,12 +48,18 @@ pub enum MessageScope {
 /// Clickable targets on the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitTarget {
-    /// Navigation tab (`0` = 채팅, `1` = 팀/채널, `2` = 활동).
+    /// Navigation tab (`0` = Chats, `1` = Teams, `2` = Activity).
     NavTab(usize),
     /// A row in the active navigation pane list.
     NavRow(usize),
     /// Any rendered line belonging to message `msg_index`.
     Message { scope: MessageScope, msg_index: usize },
+    /// Clickable inline action chip on the selected message (`Reply`, `Thread`, `React`, `More`).
+    InlineAction {
+        scope: MessageScope,
+        msg_index: usize,
+        action: InlineActionKind,
+    },
     /// Clickable attachment or inline image chip.
     Attachment {
         scope: MessageScope,
@@ -51,16 +72,20 @@ pub enum HitTarget {
         msg_index: usize,
         reaction_index: usize,
     },
-    /// Channel post thread indicator (`[💬 답글 N개 — Enter/t 로 스레드 열기]`).
+    /// Channel post thread indicator (`↳ N replies · Enter to open`).
     OpenThread { msg_index: usize },
-    /// Clickable top history banner / retry prompt (`[ ↑ 위로 스크롤하거나 o · H 키로 이전 메시지 더 불러오기 ]`).
+    /// Clickable top history banner / retry prompt (`[ ↑ Scroll up or press o / H to load older messages ]`).
     LoadOlderMessages,
-    /// Header / toolbar / rail button.
+    /// Header / toolbar / footer button.
     Button(ButtonId),
     /// Subject field inside composer.
     SubjectInput,
     /// Composer body area.
     Composer,
+    /// Thread-anchored composer body area (in Wide layout when thread drawer is open).
+    ThreadComposer,
+    /// Modal / overlay outer frame (prevents clicks inside modal padding from closing the modal).
+    OverlayBody,
     /// Item inside the top overlay.
     OverlayItem { index: usize },
 }

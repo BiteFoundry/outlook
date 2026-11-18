@@ -1,12 +1,12 @@
-//! New Chat overlay (`Ctrl+N` or `[+ 새 채팅]`):
+//! New Chat overlay (`Ctrl+N` or `[+ New Chat]`):
 //! Enter comma-separated user emails/IDs or search users via `graph.search_users`,
 //! optionally specify a group topic, and call `graph.create_chat(...)`.
 
 use ratatui::{
     layout::Rect,
-    style::Modifier,
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -181,7 +181,7 @@ impl NewChatState {
 
                 let peers = self.parsed_peers();
                 if peers.is_empty() {
-                    self.error = Some("이메일 또는 사용자 ID를 입력하세요".to_string());
+                    self.error = Some("Enter an email or user ID".to_string());
                     return OverlayOutcome::Handled;
                 }
                 let topic = {
@@ -195,7 +195,7 @@ impl NewChatState {
                 OverlayOutcome::CloseAndDispatch(Action::CreateChat { peers, topic })
             }
             Action::CloseOverlay => OverlayOutcome::Close,
-            Action::Quit => OverlayOutcome::NotHandled,
+            Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
             _ => OverlayOutcome::Handled,
         }
     }
@@ -215,10 +215,13 @@ impl NewChatState {
             area.height.saturating_sub(4).min(20),
         );
         frame.render_widget(Clear, rect);
+        hitmap.add(rect, HitTarget::OverlayBody);
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
             .title(Line::from(Span::styled(
-                " 새 채팅 · Tab 이동 · Enter 추가/생성 · Esc 닫기 ",
+                " New Chat · Tab Field · Enter Add/Create · Esc Close ",
                 theme.title(true),
             )))
             .border_style(theme.border_style(true));
@@ -241,7 +244,7 @@ impl NewChatState {
 
         let mut lines = vec![
             Line::from(Span::styled(
-                " 대상 (이메일/ID 쉼표 구분 또는 이름 검색):",
+                " Recipients (comma-separated email/ID or search name):",
                 theme.muted_style(),
             )),
             Line::from(vec![
@@ -251,14 +254,14 @@ impl NewChatState {
             ]),
             Line::from(Span::styled(
                 if self.selected_peers.is_empty() {
-                    " 선택됨: 없음".to_string()
+                    " Selected: none".to_string()
                 } else {
-                    format!(" 선택됨: {}", self.selected_peers.join(", "))
+                    format!(" Selected: {}", self.selected_peers.join(", "))
                 },
                 theme.accent_style(),
             )),
             Line::from(Span::styled(
-                " 그룹 제목 (2명 이상일 때 선택):",
+                " Group topic (optional for 2+ recipients):",
                 theme.muted_style(),
             )),
             Line::from(vec![
@@ -270,17 +273,17 @@ impl NewChatState {
 
         if let Some(err) = &self.error {
             lines.push(Line::from(Span::styled(
-                format!(" 오류: {err}"),
-                ratatui::style::Style::default().fg(theme.error),
+                format!(" Error: {err}"),
+                Style::default().fg(theme.error),
             )));
         } else if app.user_searching {
             lines.push(Line::from(Span::styled(
-                " 사용자 검색 중…",
+                " Searching users…",
                 theme.muted_style(),
             )));
         } else {
             lines.push(Line::from(Span::styled(
-                " 검색 결과 (클릭 또는 ↓ 후 Enter 로 추가):",
+                " Search results (click or ↓ then Enter to add):",
                 theme.muted_style(),
             )));
         }

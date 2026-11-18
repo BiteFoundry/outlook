@@ -56,6 +56,8 @@ pub struct ScrollState {
     pub area: Rect,
     pub total_lines: usize,
     pub offset: usize,
+    /// `(start_line, end_line_exclusive)` per rendered item (`0..N` in Chat, `0` = root and `1..=N` in Thread).
+    pub message_ranges: Vec<(usize, usize)>,
 }
 
 impl Default for ScrollState {
@@ -67,6 +69,7 @@ impl Default for ScrollState {
             area: Rect::default(),
             total_lines: 0,
             offset: 0,
+            message_ranges: Vec::new(),
         }
     }
 }
@@ -105,6 +108,38 @@ impl ScrollState {
             max_off
         } else {
             max_off.saturating_sub(self.scroll_up as usize)
+        }
+    }
+
+    /// Adjusts `scroll_up` / `follow_tail` so item `idx` in `message_ranges` stays visible inside `viewport_height`.
+    pub fn ensure_visible(&mut self, idx: usize, viewport_height: usize) {
+        if viewport_height == 0 || self.total_lines <= viewport_height {
+            return;
+        }
+        let Some(&(start, end)) = self.message_ranges.get(idx) else {
+            return;
+        };
+        let max_off = self.total_lines - viewport_height;
+        let cur_off = self.offset(viewport_height);
+        let new_off = if start < cur_off {
+            start
+        } else if end > cur_off + viewport_height {
+            if end.saturating_sub(start) >= viewport_height {
+                start
+            } else {
+                end - viewport_height
+            }
+        } else {
+            return;
+        };
+        let clamped = new_off.min(max_off);
+        let up = max_off.saturating_sub(clamped);
+        if up == 0 {
+            self.scroll_up = 0;
+            self.follow_tail = true;
+        } else {
+            self.follow_tail = false;
+            self.scroll_up = up.min(u16::MAX as usize) as u16;
         }
     }
 }
@@ -240,6 +275,18 @@ pub struct UiState {
     pub show_subject: bool,
     pub term_width: u16,
     pub term_height: u16,
+    pub density: crate::config::DensityMode,
+    pub theme_preset: crate::config::ThemePreset,
+    pub kitty_keyboard_supported: bool,
+    pub nav_unread_only: bool,
+    pub pinned_convs: HashSet<String>,
+    /// `(conv_key, last_read_at_iso)` captured right before marking a conversation read so `chat_view` renders the unread divider.
+    pub unread_anchor: Option<(String, String)>,
+    pub conv_history: Vec<String>,
+    pub conv_history_pos: usize,
+    pub last_conv_key: Option<String>,
+    pub last_click: Option<(std::time::Instant, u16, u16, super::hitmap::HitTarget)>,
+    pub thread_composer_area: Rect,
 }
 
 impl Default for UiState {
@@ -278,6 +325,17 @@ impl UiState {
             show_subject: false,
             term_width: 120,
             term_height: 40,
+            density: crate::config::DensityMode::default(),
+            theme_preset: crate::config::ThemePreset::default(),
+            kitty_keyboard_supported: false,
+            nav_unread_only: false,
+            pinned_convs: HashSet::new(),
+            unread_anchor: None,
+            conv_history: Vec::new(),
+            conv_history_pos: 0,
+            last_conv_key: None,
+            last_click: None,
+            thread_composer_area: Rect::default(),
         }
     }
 
@@ -287,6 +345,10 @@ impl UiState {
         s.auto_thread_pane = config.auto_thread_pane;
         s.notify = config.notify;
         s.inline_images = config.inline_images;
+        s.density = config.density;
+        s.theme_preset = config.theme;
+        s.theme = Theme::detect(config.theme);
+        s.pinned_convs = config.pinned_convs.iter().cloned().collect();
         s
     }
 
@@ -425,7 +487,7 @@ impl AppState {
             loading_older_chats: false,
             chats_oldest_reached: false,
             syncing: false,
-            sync_summary: "준비".to_string(),
+            sync_summary: "Ready".to_string(),
             daemon_attached: false,
             daemon_pid: None,
             searching: false,
@@ -472,7 +534,7 @@ impl AppState {
         if let Some((team, ch)) = self.active_channel() {
             return format!("{} › #{}", team.display_name, ch.display_name);
         }
-        "대화를 선택하세요".to_string()
+        "Select a conversation".to_string()
     }
 
     pub fn message_at(&self, scope: MessageScope, msg_index: usize) -> Option<&MessageItem> {
@@ -542,6 +604,16 @@ impl AppState {
         if self.stash_draft_in_memory(ui) {
             self.persist_drafts();
         }
+    }
+
+    pub fn stash_and_reset_draft(&mut self, ui: &mut UiState) {
+        self.stash_draft(ui);
+        ui.composer.reply = None;
+        ui.composer.subject.clear();
+        ui.composer.subject_cursor = 0;
+        ui.composer.subject_focused = false;
+        ui.composer.clear_pending_images();
+        ui.composer.popup.close();
     }
 
     pub fn restore_draft(&self, ui: &mut UiState) {
@@ -727,21 +799,108 @@ impl AppState {
     }
 
     pub fn spawn_bootstrap(&mut self, ui: &mut UiState) {
-        let task_label = "초기 동기화".to_string();
+        let task_label = "Initial sync".to_string();
         ui.tasks.begin(task_label.clone());
         self.syncing = true;
-        self.sync_summary = "동기화 중...".to_string();
+        self.sync_summary = "Syncing...".to_string();
         self.spawn_teams_bootstrap(Some(task_label));
     }
 
     pub fn select_conversation(&mut self, ui: &mut UiState, target: ConversationTarget) {
+        self.select_conversation_internal(ui, target, true);
+    }
+
+    pub fn history_back(&mut self, ui: &mut UiState) {
+        if ui.conv_history_pos == 0 || ui.conv_history.is_empty() {
+            return;
+        }
+        ui.conv_history_pos -= 1;
+        let key = ui.conv_history[ui.conv_history_pos].clone();
+        if let Some(target) = self.target_for_conv_key(&key) {
+            self.select_conversation_internal(ui, target, false);
+        }
+    }
+
+    pub fn history_forward(&mut self, ui: &mut UiState) {
+        if ui.conv_history_pos + 1 >= ui.conv_history.len() {
+            return;
+        }
+        ui.conv_history_pos += 1;
+        let key = ui.conv_history[ui.conv_history_pos].clone();
+        if let Some(target) = self.target_for_conv_key(&key) {
+            self.select_conversation_internal(ui, target, false);
+        }
+    }
+
+    pub fn target_for_conv_key(&self, conv_key: &str) -> Option<ConversationTarget> {
+        self.conversations
+            .iter()
+            .find(|c| c.conv_key == conv_key)
+            .map(|c| c.target.clone())
+            .or_else(|| ConversationTarget::from_conv_key(conv_key))
+    }
+
+    pub fn maybe_autoload_older_on_scroll_top(&mut self, ui: &mut UiState) {
+        let height = ui.chat_scroll.area.height as usize;
+        let near_or_at_top = if ui.chat_scroll.total_lines > 0 && height > 0 {
+            let max_up = ui.chat_scroll.total_lines.saturating_sub(height);
+            ui.chat_scroll.offset(height) <= 1 || ui.chat_scroll.scroll_up as usize >= max_up
+        } else {
+            ui.chat_scroll.offset == 0
+        };
+        if near_or_at_top
+            && !self.oldest_reached
+            && !self.loading_older
+            && self.active_conv_key.is_some()
+        {
+            self.load_older_auto(ui);
+        }
+    }
+
+    fn select_conversation_internal(
+        &mut self,
+        ui: &mut UiState,
+        target: ConversationTarget,
+        record_history: bool,
+    ) {
         let new_key = target.conv_key();
         if self.active_conv_key.as_deref() == Some(&new_key) {
             self.focus_conversation_pane(ui);
             return;
         }
 
-        self.stash_draft(ui);
+        let prev_key = self.active_conv_key.clone();
+        self.stash_and_reset_draft(ui);
+
+        if let Some(prev) = prev_key {
+            ui.last_conv_key = Some(prev);
+        }
+        if record_history {
+            if !ui.conv_history.is_empty() {
+                let keep = (ui.conv_history_pos + 1).min(ui.conv_history.len());
+                ui.conv_history.truncate(keep);
+            }
+            if ui.conv_history.last().map(String::as_str) != Some(new_key.as_str()) {
+                ui.conv_history.push(new_key.clone());
+            }
+            if ui.conv_history.len() > 64 {
+                let excess = ui.conv_history.len() - 64;
+                ui.conv_history.drain(..excess);
+            }
+            ui.conv_history_pos = ui.conv_history.len().saturating_sub(1);
+        }
+
+        let (prev_unread, prev_last_read_at) = self
+            .conversations
+            .iter()
+            .find(|c| c.conv_key == new_key)
+            .map(|c| (c.unread_count, c.last_read_at.clone()))
+            .unwrap_or((0, None));
+        ui.unread_anchor = if prev_unread > 0 {
+            prev_last_read_at.map(|ts| (new_key.clone(), ts))
+        } else {
+            None
+        };
 
         self.active_conv_key = Some(new_key.clone());
         self.active_target = Some(target.clone());
@@ -757,9 +916,6 @@ impl AppState {
         ui.thread_drawer_open = false;
         ui.composer_target_thread = false;
         ui.show_subject = false;
-        ui.composer.clear_reply();
-        ui.composer.subject.clear();
-        ui.composer.close_mentions();
         ui.chat_scroll = ScrollState::default();
         ui.thread_scroll = ScrollState::default();
         ui.pending_prepend_anchor = None;
@@ -769,17 +925,33 @@ impl AppState {
             .storage
             .list_root_messages(&new_key, 80, None)
             .unwrap_or_default();
+        if prev_unread > 0 && ui.unread_anchor.is_none() {
+            let unread_n = prev_unread as usize;
+            if self.messages.len() > unread_n {
+                let anchor_idx = self.messages.len() - unread_n - 1;
+                ui.unread_anchor = Some((
+                    new_key.clone(),
+                    self.messages[anchor_idx].created_at.clone(),
+                ));
+            }
+        }
         self.members = self.storage.list_members(&new_key).unwrap_or_default();
         self.restore_draft(ui);
         self.focus_conversation_pane(ui);
 
+        let now_ts = Utc::now().to_rfc3339();
         if let Some(conv) = self.conversations.iter_mut().find(|c| c.conv_key == new_key) {
             conv.unread_count = 0;
+            conv.last_read_at = Some(now_ts.clone());
         }
-        let now_ts = Utc::now().to_rfc3339();
 
         self.sync_ctrl.set_focus(Some(target.clone()), None);
         self.sync_ctrl.request(SyncCommand::SyncActiveNow);
+
+        if tokio::runtime::Handle::try_current().is_err() {
+            self.loading_messages = false;
+            return;
+        }
 
         let graph = self.graph.clone();
         let storage = self.storage.clone();
@@ -833,7 +1005,7 @@ impl AppState {
 
     fn focus_conversation_pane(&self, ui: &mut UiState) {
         ui.narrow_pane = NarrowPane::Chat;
-        ui.set_focus(Focus::Chat);
+        ui.set_focus(Focus::Composer);
     }
 
     pub fn select_nav_row(&mut self, ui: &mut UiState, idx: usize) {
@@ -842,6 +1014,7 @@ impl AppState {
         };
         ui.nav_selected = idx;
         match row {
+            NavRow::SectionHeader { .. } => {}
             NavRow::Chat { conv_key, .. } => {
                 if let Some(target) = self
                     .conversations
@@ -916,7 +1089,7 @@ impl AppState {
             return;
         };
 
-        self.stash_draft(ui);
+        self.stash_and_reset_draft(ui);
         self.loading_thread = true;
         if let Ok(Some(cached)) = self.storage.get_thread(&conv_key, &root_msg_id, 200) {
             self.active_thread = Some(cached);
@@ -988,7 +1161,7 @@ impl AppState {
         }
 
         self.loading_thread = true;
-        let task_label = "스레드 답글 동기화".to_string();
+        let task_label = "Sync thread replies".to_string();
         ui.tasks.begin(task_label.clone());
 
         let graph = self.graph.clone();
@@ -1029,7 +1202,7 @@ impl AppState {
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: Some(err.to_string()),
-                        toast: Some((format!("스레드 동기화 실패: {err}"), ToastKind::Error)),
+                        toast: Some((format!("Thread sync failed: {err}"), ToastKind::Error)),
                     });
                 }
             }
@@ -1037,7 +1210,7 @@ impl AppState {
     }
 
     pub fn close_thread(&mut self, ui: &mut UiState) {
-        self.stash_draft(ui);
+        self.stash_and_reset_draft(ui);
         ui.thread_drawer_open = false;
         ui.composer_target_thread = false;
         self.active_thread = None;
@@ -1049,7 +1222,7 @@ impl AppState {
 
     pub fn send_composer(&mut self, ui: &mut UiState) {
         let Some(target) = self.active_target.clone() else {
-            ui.info("전송할 대화가 선택되지 않았습니다");
+            ui.info("Select a conversation first");
             return;
         };
         let Some(conv_key) = self.active_conv_key.clone() else {
@@ -1099,7 +1272,7 @@ impl AppState {
                 .as_ref()
                 .map(|p| p.display_name.clone())
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "나".to_string());
+                .unwrap_or_else(|| "Me".to_string());
             let optimistic_msg = MessageItem {
                 msg_key: format!("{conv_key}|{opt_id}"),
                 conv_key: conv_key.clone(),
@@ -1141,7 +1314,7 @@ impl AppState {
             None
         };
 
-        let task_label = "메시지 전송".to_string();
+        let task_label = "Send message".to_string();
         ui.tasks.begin(task_label.clone());
         self.clear_current_draft(ui);
         ui.show_subject = false;
@@ -1192,7 +1365,7 @@ impl AppState {
                             text,
                         });
                     }
-                    let msg = format!("전송 실패: {err}");
+                    let msg = format!("Send failed: {err}");
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: Some(err.to_string()),
@@ -1221,7 +1394,7 @@ impl AppState {
         }
         if self.oldest_reached && batch_size <= 50 && !(explicit && self.history_error.is_some()) {
             if explicit {
-                ui.info("이미 대화의 첫 메시지까지 모두 불러왔습니다.");
+                ui.info("All older messages loaded.");
             }
             return;
         }
@@ -1248,7 +1421,7 @@ impl AppState {
 
         self.loading_older = true;
         self.history_error = None;
-        let task_label = "이전 메시지 로드".to_string();
+        let task_label = "Load older messages".to_string();
         ui.tasks.begin(task_label.clone());
 
         let graph = self.graph.clone();
@@ -1393,7 +1566,7 @@ impl AppState {
                     let tok = graph.auth().current_tokens().await.map(|t| t.access_token);
                     let friendly_err =
                         auth::explain_graph_permission_error(&raw_err, tok.as_deref())
-                            .unwrap_or_else(|| format!("이전 메시지 조회 실패: {raw_err}"));
+                            .unwrap_or_else(|| format!("Failed to load older messages: {raw_err}"));
                     let _ = tx.send(UiMsg::OlderMessagesFailed {
                         conv_key,
                         local_messages: local_older,
@@ -1516,7 +1689,7 @@ impl AppState {
         let graph = self.graph.clone();
         let tx = self.ui_tx.clone();
         let msg_id = msg.msg_id.clone();
-        let task_label = "리액션".to_string();
+        let task_label = "Reaction".to_string();
         ui.tasks.begin(task_label.clone());
 
         tokio::spawn(async move {
@@ -1547,7 +1720,7 @@ impl AppState {
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: Some(err.to_string()),
-                        toast: Some((format!("리액션 실패: {err}"), ToastKind::Error)),
+                        toast: Some((format!("Reaction failed: {err}"), ToastKind::Error)),
                     });
                 }
             }
@@ -1566,7 +1739,7 @@ impl AppState {
         };
         let graph = self.graph.clone();
         let tx = self.ui_tx.clone();
-        let task_label = "메시지 삭제".to_string();
+        let task_label = "Delete message".to_string();
         ui.tasks.begin(task_label.clone());
 
         tokio::spawn(async move {
@@ -1583,14 +1756,14 @@ impl AppState {
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: None,
-                        toast: Some(("메시지를 삭제했습니다".to_string(), ToastKind::Success)),
+                        toast: Some(("Message deleted".to_string(), ToastKind::Success)),
                     });
                 }
                 Err(err) => {
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: Some(err.to_string()),
-                        toast: Some((format!("삭제 실패: {err}"), ToastKind::Error)),
+                        toast: Some((format!("Delete failed: {err}"), ToastKind::Error)),
                     });
                 }
             }
@@ -1608,20 +1781,20 @@ impl AppState {
             return;
         };
         let Some(att) = msg.attachments.get(attach_index).cloned() else {
-            ui.info("첨부파일을 찾을 수 없습니다");
+            ui.info("Attachment not found");
             return;
         };
         let att_name = att.name.clone().unwrap_or_else(|| "attachment".to_string());
         let graph = self.graph.clone();
         let dest = self.download_dir.clone();
         let tx = self.ui_tx.clone();
-        let task_label = format!("다운로드: {att_name}");
+        let task_label = format!("Download: {att_name}");
         ui.tasks.begin(task_label.clone());
 
         tokio::spawn(async move {
             match graph.download_attachment(&att, &dest).await {
                 Ok(file) => {
-                    let msg = format!("저장됨: {}", file.path.display());
+                    let msg = format!("Saved: {}", file.path.display());
                     let _ = tx.send(UiMsg::AttachmentDownloaded(file));
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
@@ -1633,7 +1806,7 @@ impl AppState {
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: Some(err.to_string()),
-                        toast: Some((format!("다운로드 실패: {err}"), ToastKind::Error)),
+                        toast: Some((format!("Download failed: {err}"), ToastKind::Error)),
                     });
                 }
             }
@@ -1642,7 +1815,7 @@ impl AppState {
 
     pub fn send_file(&mut self, ui: &mut UiState, path: String, caption: String) {
         let Some(target) = self.active_target.clone() else {
-            ui.info("전송할 대화가 선택되지 않았습니다");
+            ui.info("Select a conversation first");
             return;
         };
         let Some(conv_key) = self.active_conv_key.clone() else {
@@ -1672,7 +1845,7 @@ impl AppState {
         let graph = self.graph.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
-        let task_label = "파일 업로드".to_string();
+        let task_label = "Upload file".to_string();
         ui.tasks.begin(task_label.clone());
 
         tokio::spawn(async move {
@@ -1691,14 +1864,14 @@ impl AppState {
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: None,
-                        toast: Some(("파일을 전송했습니다".to_string(), ToastKind::Success)),
+                        toast: Some(("File sent".to_string(), ToastKind::Success)),
                     });
                 }
                 Err(err) => {
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: Some(err.to_string()),
-                        toast: Some((format!("파일 전송 실패: {err}"), ToastKind::Error)),
+                        toast: Some((format!("File send failed: {err}"), ToastKind::Error)),
                     });
                 }
             }
@@ -1715,7 +1888,7 @@ impl AppState {
         self.searching = true;
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
-        let task_label = "검색".to_string();
+        let task_label = "Search".to_string();
         ui.tasks.begin(task_label.clone());
 
         tokio::spawn(async move {
@@ -1745,7 +1918,7 @@ impl AppState {
         self.user_searching = true;
         let graph = self.graph.clone();
         let tx = self.ui_tx.clone();
-        let task_label = "사용자 검색".to_string();
+        let task_label = "Search users".to_string();
         ui.tasks.begin(task_label.clone());
 
         tokio::spawn(async move {
@@ -1761,13 +1934,13 @@ impl AppState {
 
     pub fn create_chat(&mut self, ui: &mut UiState, peers: Vec<String>, topic: Option<String>) {
         if peers.is_empty() {
-            ui.info("대화 상대를 선택하세요");
+            ui.info("Select at least one recipient");
             return;
         }
         let graph = self.graph.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
-        let task_label = "새 채팅 생성".to_string();
+        let task_label = "Create chat".to_string();
         ui.tasks.begin(task_label.clone());
 
         tokio::spawn(async move {
@@ -1778,14 +1951,14 @@ impl AppState {
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: None,
-                        toast: Some(("새 채팅이 열렸습니다".to_string(), ToastKind::Success)),
+                        toast: Some(("New chat opened".to_string(), ToastKind::Success)),
                     });
                 }
                 Err(err) => {
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: Some(err.to_string()),
-                        toast: Some((format!("채팅 생성 실패: {err}"), ToastKind::Error)),
+                        toast: Some((format!("Failed to create chat: {err}"), ToastKind::Error)),
                     });
                 }
             }
@@ -1937,9 +2110,9 @@ impl AppState {
         let repo = self.config.github_repo.clone();
         let tx = self.ui_tx.clone();
         let task_label = if check_only {
-            "업데이트 확인".to_string()
+            "Check updates".to_string()
         } else {
-            "자체 업데이트 설치".to_string()
+            "Install update".to_string()
         };
         ui.tasks.begin(task_label.clone());
 
@@ -1948,16 +2121,16 @@ impl AppState {
                 Ok(res) => {
                     let toast_msg = if res.updated {
                         format!(
-                            "업데이트 완료: {} -> {} (재시작 권장)",
+                            "Updated: {} -> {} (restart recommended)",
                             res.current_version, res.latest_version
                         )
                     } else if res.update_available {
                         format!(
-                            "새 버전 사용 가능: {} (현재 {})",
+                            "Update available: {} (current {})",
                             res.latest_version, res.current_version
                         )
                     } else {
-                        format!("최신 버전입니다 ({})", res.current_version)
+                        format!("Up to date ({})", res.current_version)
                     };
                     let _ = tx.send(UiMsg::UpdateChecked(res));
                     let _ = tx.send(UiMsg::TaskDone {
@@ -1970,7 +2143,7 @@ impl AppState {
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: Some(err.to_string()),
-                        toast: Some((format!("업데이트 확인 실패: {err}"), ToastKind::Error)),
+                        toast: Some((format!("Update check failed: {err}"), ToastKind::Error)),
                     });
                 }
             }
@@ -1980,7 +2153,7 @@ impl AppState {
     pub fn set_presence(&mut self, ui: &mut UiState, availability: String, activity: String) {
         let graph = self.graph.clone();
         let tx = self.ui_tx.clone();
-        let task_label = "상태 변경".to_string();
+        let task_label = "Update presence".to_string();
         ui.tasks.begin(task_label.clone());
 
         tokio::spawn(async move {
@@ -1995,14 +2168,14 @@ impl AppState {
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: None,
-                        toast: Some((format!("상태 변경: {availability}"), ToastKind::Success)),
+                        toast: Some((format!("Presence: {availability}"), ToastKind::Success)),
                     });
                 }
                 Err(err) => {
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: Some(err.to_string()),
-                        toast: Some((format!("상태 변경 실패: {err}"), ToastKind::Error)),
+                        toast: Some((format!("Presence update failed: {err}"), ToastKind::Error)),
                     });
                 }
             }
@@ -2057,7 +2230,7 @@ impl AppState {
                 self.sync_summary = summary;
             }
             CoreEvent::SyncError(err) => {
-                ui.error(format!("동기화 오류: {err}"));
+                ui.error(format!("Sync error: {err}"));
             }
             CoreEvent::ConversationsUpdated(convs) => {
                 self.conversations = convs;
@@ -2155,7 +2328,7 @@ impl AppState {
                 self.activity_mentions = mentions;
                 self.presences.extend(presences);
                 self.syncing = false;
-                self.sync_summary = "최신 상태".to_string();
+                self.sync_summary = "Synced".to_string();
                 self.emit_scope_warning_once(ui, scope_warning);
 
                 if self.active_conv_key.is_none() {
@@ -2435,7 +2608,7 @@ impl AppState {
                 self.daemon_attached = true;
                 self.daemon_pid = pid;
                 self.syncing = sync_busy;
-                self.sync_summary = "데몬 연결됨".to_string();
+                self.sync_summary = "Daemon connected".to_string();
                 self.sync_ctrl.set_focus(
                     self.active_target.clone(),
                     self.active_thread.as_ref().map(|t| t.root.msg_id.clone()),
@@ -2448,7 +2621,7 @@ impl AppState {
                 self.daemon_attached = false;
                 self.daemon_pid = None;
                 if !self.syncing {
-                    self.sync_summary = "로컬 동기화".to_string();
+                    self.sync_summary = "Local sync".to_string();
                 }
                 self.sync_ctrl.set_focus(
                     self.active_target.clone(),
@@ -2516,9 +2689,9 @@ impl AppState {
     pub fn conversation_kind_label(kind: ConversationKind) -> &'static str {
         match kind {
             ConversationKind::OneOnOne => "1:1",
-            ConversationKind::Group => "그룹",
-            ConversationKind::Meeting => "모임",
-            ConversationKind::Channel => "채널",
+            ConversationKind::Group => "Group",
+            ConversationKind::Meeting => "Meeting",
+            ConversationKind::Channel => "Channel",
         }
     }
 }
@@ -2797,18 +2970,19 @@ mod tests {
         app.oldest_reached = false;
         app.messages = vec![make_test_msg(conv, "m3", "2026-11-18T03:00:00Z", "three")];
 
+        let err_msg = format!("{} missing Chat.Read", crate::auth::INSUFFICIENT_PERMISSIONS_PREFIX);
         app.handle_ui_msg(
             &mut ui,
             UiMsg::OlderMessagesFailed {
                 conv_key: conv.to_string(),
                 local_messages: vec![make_test_msg(conv, "m2", "2026-11-18T02:00:00Z", "two")],
-                error: "권한 부족 (403)".to_string(),
+                error: err_msg.clone(),
             },
         );
 
         assert!(!app.loading_older);
         assert!(!app.oldest_reached);
-        assert_eq!(app.history_error.as_deref(), Some("권한 부족 (403)"));
+        assert_eq!(app.history_error.as_deref(), Some(err_msg.as_str()));
         let ids: Vec<&str> = app.messages.iter().map(|m| m.msg_id.as_str()).collect();
         assert_eq!(ids, vec!["m2", "m3"]);
 
@@ -2870,7 +3044,7 @@ mod tests {
         assert!(app.daemon_attached);
         assert_eq!(app.daemon_pid, Some(4242));
         assert!(!app.syncing);
-        assert_eq!(app.sync_summary, "데몬 연결됨");
+        assert_eq!(app.sync_summary, "Daemon connected");
         assert!(ui.tasks.first_running().is_none());
 
         assert!(nudge_rx.try_recv().is_err(), "unexpected extra bootstrap command");
@@ -2884,6 +3058,107 @@ mod tests {
         app.handle_ui_msg(&mut ui, UiMsg::DaemonDetached);
         assert!(!app.daemon_attached);
         assert_eq!(app.daemon_pid, None);
-        assert_eq!(app.sync_summary, "로컬 동기화");
+        assert_eq!(app.sync_summary, "Local sync");
+    }
+
+    #[tokio::test]
+    async fn select_conversation_focuses_composer_snapshots_unread_and_resets_transient_state() {
+        let (mut app, mut ui) = make_test_app();
+        app.conversations = vec![
+            ConversationSummary {
+                conv_key: "chat:r1".to_string(),
+                target: ConversationTarget::Chat {
+                    chat_id: "r1".to_string(),
+                },
+                kind: ConversationKind::OneOnOne,
+                team_id: None,
+                team_name: None,
+                title: "Room 1".to_string(),
+                topic: None,
+                unread_count: 3,
+                last_read_at: Some("2026-11-18T09:00:00Z".to_string()),
+                last_msg_id: None,
+                last_msg_author: None,
+                last_msg_preview: None,
+                last_updated_at: None,
+                pinned: false,
+                peer_user_id: None,
+                web_url: None,
+            },
+            ConversationSummary {
+                conv_key: "chat:r2".to_string(),
+                target: ConversationTarget::Chat {
+                    chat_id: "r2".to_string(),
+                },
+                kind: ConversationKind::OneOnOne,
+                team_id: None,
+                team_name: None,
+                title: "Room 2".to_string(),
+                topic: None,
+                unread_count: 0,
+                last_read_at: None,
+                last_msg_id: None,
+                last_msg_author: None,
+                last_msg_preview: None,
+                last_updated_at: None,
+                pinned: false,
+                peer_user_id: None,
+                web_url: None,
+            },
+        ];
+
+        assert_eq!(ui.focus(), Focus::Nav);
+        app.select_conversation(
+            &mut ui,
+            ConversationTarget::Chat {
+                chat_id: "r1".to_string(),
+            },
+        );
+        assert_eq!(ui.focus(), Focus::Composer);
+        assert_eq!(ui.narrow_pane, NarrowPane::Chat);
+        assert_eq!(
+            ui.unread_anchor,
+            Some(("chat:r1".to_string(), "2026-11-18T09:00:00Z".to_string()))
+        );
+        assert_eq!(app.conversations[0].unread_count, 0);
+
+        ui.composer.load_text("draft one");
+        ui.composer.set_reply(ReplyPreview {
+            msg_id: "m1".to_string(),
+            author: "Alice".to_string(),
+            text: "hi".to_string(),
+        });
+        ui.composer.subject = "Sub".to_string();
+        ui.composer.subject_cursor = 3;
+        ui.composer.subject_focused = true;
+        ui.composer
+            .stage_inline_image(vec![1, 2, 3], "image/png", Some("a.png".to_string()));
+
+        app.select_conversation(
+            &mut ui,
+            ConversationTarget::Chat {
+                chat_id: "r2".to_string(),
+            },
+        );
+        assert_eq!(ui.focus(), Focus::Composer);
+        assert!(ui.composer.reply.is_none());
+        assert!(ui.composer.subject.is_empty());
+        assert_eq!(ui.composer.subject_cursor, 0);
+        assert!(!ui.composer.subject_focused);
+        assert!(ui.composer.pending_images.is_empty());
+        assert_eq!(ui.last_conv_key.as_deref(), Some("chat:r1"));
+        assert_eq!(ui.conv_history, vec!["chat:r1", "chat:r2"]);
+        assert_eq!(ui.conv_history_pos, 1);
+
+        app.history_back(&mut ui);
+        assert_eq!(app.active_conv_key.as_deref(), Some("chat:r1"));
+        assert_eq!(ui.composer.text(), "draft one");
+        assert_eq!(ui.focus(), Focus::Composer);
+
+        app.history_forward(&mut ui);
+        assert_eq!(app.active_conv_key.as_deref(), Some("chat:r2"));
+        assert_eq!(ui.focus(), Focus::Composer);
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
     }
 }

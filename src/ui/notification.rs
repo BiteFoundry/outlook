@@ -137,8 +137,8 @@ mod tests {
 
     #[test]
     fn chat_body_contains_sender_and_fits_limit() {
-        let body = chat_body("보낸이", "아주 긴 메시지");
-        assert!(body.starts_with("보낸이: "));
+        let body = chat_body("From", "Very long message text");
+        assert!(body.starts_with("From: "));
         assert!(body.chars().count() <= MAX_BODY_CHARS + 1);
     }
 

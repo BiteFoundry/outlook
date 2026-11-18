@@ -1,7 +1,7 @@
 //! Left navigation pane:
-//! - Tab 0 (`Ctrl+1`): 채팅 (1:1 · 그룹 · 회의)
-//! - Tab 1 (`Ctrl+2`): 팀/채널
-//! - Tab 2 (`Ctrl+3`): 활동 (`@멘션` 모아보기)
+//! - Tab 0 (`Ctrl+1`): Chats (1:1 · Group · Meeting)
+//! - Tab 1 (`Ctrl+2`): Teams / Channels
+//! - Tab 2 (`Ctrl+3`): Activity (`@mentions`)
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -12,7 +12,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -20,7 +20,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     models::ConversationKind,
     ui::{
-        app::{AppState, Focus, UiState},
+        app::{AppState, UiState},
         chat_view::DualHasher,
         hitmap::{ButtonId, HitMap, HitTarget},
     },
@@ -31,7 +31,7 @@ pub const TAB_TEAMS: usize = 1;
 pub const TAB_ACTIVITY: usize = 2;
 pub const TAB_COUNT: usize = 3;
 
-pub const TAB_LABELS: [&str; TAB_COUNT] = ["채팅", "팀/채널", "활동"];
+pub const TAB_LABELS: [&str; TAB_COUNT] = ["Chats", "Teams", "Activity"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavTab {
@@ -56,6 +56,9 @@ impl NavTab {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavRow {
+    SectionHeader {
+        label: &'static str,
+    },
     Chat {
         conv_key: String,
         title: String,
@@ -68,6 +71,7 @@ pub enum NavRow {
         display_name: String,
         collapsed: bool,
         channel_count: usize,
+        unread: i32,
     },
     TeamChannel {
         conv_key: String,
@@ -83,6 +87,12 @@ pub enum NavRow {
         preview: String,
         created_at: String,
     },
+}
+
+impl NavRow {
+    pub fn is_selectable(&self) -> bool {
+        !matches!(self, Self::SectionHeader { .. })
+    }
 }
 
 const NAV_CACHE_CAPACITY: usize = 16;
@@ -138,8 +148,15 @@ fn write_opt_str(h: &mut DualHasher, s: Option<&str>) {
 fn compute_nav_sig(app: &AppState, ui: &UiState) -> (u64, u64) {
     let mut h = DualHasher::new(0x4e41_565f_524f_5753);
     h.write_hash(&ui.active_nav_tab);
+    h.write_hash(&ui.nav_unread_only);
     match ui.active_nav_tab {
         TAB_CHATS => {
+            let mut pinned_keys: Vec<&str> = ui.pinned_convs.iter().map(String::as_str).collect();
+            pinned_keys.sort_unstable();
+            h.write_hash(&pinned_keys.len());
+            for key in pinned_keys {
+                h.write_str(key);
+            }
             let mut count = 0usize;
             for c in &app.conversations {
                 if c.kind != ConversationKind::Channel {
@@ -148,6 +165,7 @@ fn compute_nav_sig(app: &AppState, ui: &UiState) -> (u64, u64) {
                     h.write_hash(&c.kind);
                     write_opt_str(&mut h, c.peer_user_id.as_deref());
                     h.write_hash(&c.unread_count);
+                    h.write_hash(&c.pinned);
                     count += 1;
                 }
             }
@@ -161,13 +179,11 @@ fn compute_nav_sig(app: &AppState, ui: &UiState) -> (u64, u64) {
                 let collapsed = ui.collapsed_team_ids.contains(&team.id);
                 h.write_hash(&collapsed);
                 h.write_hash(&team.channels.len());
-                if !collapsed {
-                    for ch in &team.channels {
-                        h.write_str(&ch.team_id);
-                        h.write_str(&ch.id);
-                        h.write_str(&ch.display_name);
-                        h.write_hash(&(!ch.membership_type.eq_ignore_ascii_case("standard")));
-                    }
+                for ch in &team.channels {
+                    h.write_str(&ch.team_id);
+                    h.write_str(&ch.id);
+                    h.write_str(&ch.display_name);
+                    h.write_hash(&(!ch.membership_type.eq_ignore_ascii_case("standard")));
                 }
             }
             let mut chan_conv_count = 0usize;
@@ -207,25 +223,82 @@ pub fn nav_rows_cached(app: &AppState, ui: &UiState) -> Arc<[NavRow]> {
     rows
 }
 
+#[inline]
+fn is_conv_pinned(conv_key: &str, conv_pinned: bool, ui: &UiState) -> bool {
+    conv_pinned || ui.pinned_convs.contains(conv_key)
+}
+
 /// Returns the number of visible rows in the active nav tab without allocating rows.
 pub fn nav_row_count(app: &AppState, ui: &UiState) -> usize {
     match ui.active_nav_tab {
-        TAB_CHATS => app
-            .conversations
-            .iter()
-            .filter(|c| c.kind != ConversationKind::Channel)
-            .count(),
-        TAB_TEAMS => app
-            .teams
-            .iter()
-            .map(|team| {
-                1 + if ui.collapsed_team_ids.contains(&team.id) {
-                    0
-                } else {
-                    team.channels.len()
+        TAB_CHATS => {
+            let mut pinned = 0usize;
+            let mut unread = 0usize;
+            let mut recent = 0usize;
+            for c in &app.conversations {
+                if c.kind == ConversationKind::Channel {
+                    continue;
                 }
-            })
-            .sum(),
+                if ui.nav_unread_only && c.unread_count <= 0 {
+                    continue;
+                }
+                if is_conv_pinned(&c.conv_key, c.pinned, ui) {
+                    pinned += 1;
+                } else if c.unread_count > 0 {
+                    unread += 1;
+                } else {
+                    recent += 1;
+                }
+            }
+            if pinned == 0 && unread == 0 {
+                recent
+            } else {
+                (if pinned > 0 { 1 + pinned } else { 0 })
+                    + (if unread > 0 { 1 + unread } else { 0 })
+                    + (if recent > 0 { 1 + recent } else { 0 })
+            }
+        }
+        TAB_TEAMS => {
+            if !ui.nav_unread_only {
+                return app
+                    .teams
+                    .iter()
+                    .map(|team| {
+                        1 + if ui.collapsed_team_ids.contains(&team.id) {
+                            0
+                        } else {
+                            team.channels.len()
+                        }
+                    })
+                    .sum();
+            }
+            let mut channel_unread: HashMap<&str, i32> =
+                HashMap::with_capacity(app.conversations.len());
+            for c in &app.conversations {
+                if c.kind == ConversationKind::Channel || c.conv_key.starts_with("chan:") {
+                    channel_unread
+                        .entry(c.conv_key.as_str())
+                        .or_insert(c.unread_count);
+                }
+            }
+            let mut total = 0usize;
+            for team in &app.teams {
+                let unread_chans = team
+                    .channels
+                    .iter()
+                    .filter(|ch| channel_unread.get(ch.conv_key().as_str()).copied().unwrap_or(0) > 0)
+                    .count();
+                if unread_chans > 0 {
+                    total += 1
+                        + if ui.collapsed_team_ids.contains(&team.id) {
+                            0
+                        } else {
+                            unread_chans
+                        };
+                }
+            }
+            total
+        }
         TAB_ACTIVITY => app.activity_mentions.len(),
         _ => 0,
     }
@@ -241,18 +314,50 @@ pub fn build_nav_rows(app: &AppState, ui: &UiState) -> Vec<NavRow> {
 
 fn build_nav_rows_uncached(app: &AppState, ui: &UiState) -> Vec<NavRow> {
     match ui.active_nav_tab {
-        TAB_CHATS => app
-            .conversations
-            .iter()
-            .filter(|c| c.kind != ConversationKind::Channel)
-            .map(|c| NavRow::Chat {
-                conv_key: c.conv_key.clone(),
-                title: c.title.clone(),
-                kind: c.kind,
-                peer_user_id: c.peer_user_id.clone(),
-                unread: c.unread_count,
-            })
-            .collect(),
+        TAB_CHATS => {
+            let mut pinned = Vec::new();
+            let mut unread = Vec::new();
+            let mut recent = Vec::new();
+            for c in &app.conversations {
+                if c.kind == ConversationKind::Channel {
+                    continue;
+                }
+                if ui.nav_unread_only && c.unread_count <= 0 {
+                    continue;
+                }
+                let row = NavRow::Chat {
+                    conv_key: c.conv_key.clone(),
+                    title: c.title.clone(),
+                    kind: c.kind,
+                    peer_user_id: c.peer_user_id.clone(),
+                    unread: c.unread_count,
+                };
+                if is_conv_pinned(&c.conv_key, c.pinned, ui) {
+                    pinned.push(row);
+                } else if c.unread_count > 0 {
+                    unread.push(row);
+                } else {
+                    recent.push(row);
+                }
+            }
+            if pinned.is_empty() && unread.is_empty() {
+                return recent;
+            }
+            let mut rows = Vec::with_capacity(pinned.len() + unread.len() + recent.len() + 3);
+            if !pinned.is_empty() {
+                rows.push(NavRow::SectionHeader { label: "PINNED" });
+                rows.extend(pinned);
+            }
+            if !unread.is_empty() {
+                rows.push(NavRow::SectionHeader { label: "UNREAD" });
+                rows.extend(unread);
+            }
+            if !recent.is_empty() {
+                rows.push(NavRow::SectionHeader { label: "RECENT" });
+                rows.extend(recent);
+            }
+            rows
+        }
         TAB_TEAMS => {
             let mut channel_unread: HashMap<&str, i32> =
                 HashMap::with_capacity(app.conversations.len());
@@ -266,16 +371,34 @@ fn build_nav_rows_uncached(app: &AppState, ui: &UiState) -> Vec<NavRow> {
             let mut rows = Vec::new();
             for team in &app.teams {
                 let collapsed = ui.collapsed_team_ids.contains(&team.id);
+                let team_unread: i32 = team
+                    .channels
+                    .iter()
+                    .map(|ch| {
+                        channel_unread
+                            .get(ch.conv_key().as_str())
+                            .copied()
+                            .unwrap_or(0)
+                            .max(0)
+                    })
+                    .sum();
+                if ui.nav_unread_only && team_unread <= 0 {
+                    continue;
+                }
                 rows.push(NavRow::TeamHeader {
                     team_id: team.id.clone(),
                     display_name: team.display_name.clone(),
                     collapsed,
                     channel_count: team.channels.len(),
+                    unread: team_unread,
                 });
                 if !collapsed {
                     for ch in &team.channels {
                         let conv_key = ch.conv_key();
                         let unread = channel_unread.get(conv_key.as_str()).copied().unwrap_or(0);
+                        if ui.nav_unread_only && unread <= 0 {
+                            continue;
+                        }
                         let is_private = !ch.membership_type.eq_ignore_ascii_case("standard");
                         rows.push(NavRow::TeamChannel {
                             conv_key,
@@ -315,113 +438,263 @@ pub fn tab_counts(app: &AppState) -> [usize; TAB_COUNT] {
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hitmap: &mut HitMap) {
-    let theme = &ui.theme;
-    let focused = ui.focus == Focus::Nav;
-    let rows = nav_rows_cached(app, ui);
-    let label = TAB_LABELS.get(ui.active_nav_tab).copied().unwrap_or("채팅");
-    let count_badge = rows.len();
-    let title = if ui.active_nav_tab == TAB_CHATS && app.loading_older_chats {
-        format!(" {label} {count_badge} ⟳ ")
-    } else {
-        format!(" {label} {count_badge} ")
-    };
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(Span::styled(
-            truncate(&title, area.width.saturating_sub(2) as usize),
-            theme.title(focused),
-        )))
-        .border_style(theme.border_style(focused));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if inner.width == 0 || inner.height == 0 {
+    if area.width == 0 || area.height == 0 {
         ui.nav_area = Rect::default();
         return;
     }
 
-    let show_footer = inner.height > 1;
-    let list_area = if show_footer {
-        Rect::new(inner.x, inner.y, inner.width, inner.height - 1)
+    let theme = &ui.theme;
+    let sidebar_style = if theme.no_color {
+        Style::default()
     } else {
-        inner
+        Style::default().bg(theme.bg_sidebar).fg(theme.fg_primary)
     };
-    ui.nav_area = list_area;
+    frame.render_widget(Paragraph::new("").style(sidebar_style), area);
 
-    if rows.is_empty() {
-        let empty_msg = match ui.active_nav_tab {
-            TAB_CHATS => "채팅이 없습니다 (Ctrl+N 새 채팅)",
-            TAB_TEAMS => "가입된 팀/채널이 없습니다",
-            TAB_ACTIVITY => "최근 @멘션 활동이 없습니다",
-            _ => "항목 없음",
-        };
-        frame.render_widget(
-            Paragraph::new(truncate(empty_msg, list_area.width as usize)).style(theme.muted_style()),
-            list_area,
-        );
-    } else if list_area.width > 0 && list_area.height > 0 {
-        let selected = ui.nav_selected.min(rows.len().saturating_sub(1));
-        let height = list_area.height as usize;
-        let offset = selection_offset(selected, height, rows.len());
-        let width = list_area.width as usize;
+    draw_tab_strip(frame, area, app, ui, hitmap);
 
-        let mut lines = Vec::with_capacity(height);
-        for (idx, row) in rows.iter().enumerate().skip(offset).take(height) {
-            let is_selected = idx == selected;
-            let is_active = match row {
-                NavRow::Chat { conv_key, .. } | NavRow::TeamChannel { conv_key, .. } => {
-                    app.active_conv_key.as_deref() == Some(conv_key.as_str())
-                }
-                _ => false,
-            };
-            lines.push(render_nav_row(row, width, is_selected, is_active, app, ui));
-            hitmap.add_line(
-                list_area.x,
-                list_area.y + lines.len() as u16 - 1,
-                list_area.width,
-                HitTarget::NavRow(idx),
-            );
-        }
-        frame.render_widget(Paragraph::new(lines), list_area);
+    if area.height < 2 {
+        ui.nav_area = Rect::default();
+        return;
     }
 
-    if show_footer {
-        draw_footer(frame, inner, app, ui, hitmap);
+    draw_filter_strip(frame, area, ui, hitmap);
+
+    let show_loading =
+        ui.active_nav_tab == TAB_CHATS && app.loading_older_chats && area.height > 3;
+    let list_y = area.y.saturating_add(2);
+    let list_h = area
+        .height
+        .saturating_sub(2 + if show_loading { 1 } else { 0 });
+    let list_area = Rect::new(area.x, list_y, area.width, list_h);
+    ui.nav_area = list_area;
+
+    let rows = nav_rows_cached(app, ui);
+
+    if list_area.width > 0 && list_area.height > 0 {
+        if rows.is_empty() {
+            let empty_msg = match ui.active_nav_tab {
+                TAB_CHATS => {
+                    if ui.nav_unread_only {
+                        "No unread chats"
+                    } else {
+                        "No chats yet"
+                    }
+                }
+                TAB_TEAMS => "No teams joined",
+                TAB_ACTIVITY => "No @mentions yet",
+                _ => "No items",
+            };
+            let empty_style = if theme.no_color {
+                theme.muted_style()
+            } else {
+                theme.muted_style().bg(theme.bg_sidebar)
+            };
+            frame.render_widget(
+                Paragraph::new(format!(" {}", truncate(empty_msg, (list_area.width as usize).saturating_sub(1))))
+                    .style(empty_style),
+                list_area,
+            );
+        } else {
+            let selected = ui.nav_selected.min(rows.len().saturating_sub(1));
+            let height = list_area.height as usize;
+            let offset = selection_offset(selected, height, rows.len());
+            let width = list_area.width as usize;
+
+            let mut lines = Vec::with_capacity(height);
+            for (idx, row) in rows.iter().enumerate().skip(offset).take(height) {
+                let is_selected = idx == selected && row.is_selectable();
+                let is_active = match row {
+                    NavRow::Chat { conv_key, .. } | NavRow::TeamChannel { conv_key, .. } => {
+                        app.active_conv_key.as_deref() == Some(conv_key.as_str())
+                    }
+                    _ => false,
+                };
+                lines.push(render_nav_row(row, width, is_selected, is_active, app, ui));
+                if row.is_selectable() {
+                    hitmap.add_line(
+                        list_area.x,
+                        list_area.y + lines.len() as u16 - 1,
+                        list_area.width,
+                        HitTarget::NavRow(idx),
+                    );
+                }
+            }
+            frame.render_widget(Paragraph::new(lines).style(sidebar_style), list_area);
+        }
+    }
+
+    if show_loading {
+        let status_y = area.bottom().saturating_sub(1);
+        let status_style = if theme.no_color {
+            theme.muted_style()
+        } else {
+            theme.muted_style().bg(theme.bg_sidebar)
+        };
+        frame.render_widget(
+            Paragraph::new(truncate(" Loading older chats…", area.width as usize)).style(status_style),
+            Rect::new(area.x, status_y, area.width, 1),
+        );
     }
 }
 
-fn draw_footer(
+fn draw_tab_strip(
     frame: &mut Frame,
-    inner: Rect,
+    area: Rect,
     app: &AppState,
     ui: &UiState,
     hitmap: &mut HitMap,
 ) {
     let theme = &ui.theme;
-    let y = inner.y + inner.height - 1;
-    let btn = "[+ 새 채팅]";
-    let hint = if ui.active_nav_tab == TAB_CHATS && app.loading_older_chats {
-        " 이전 채팅 로드 중…"
+    let header_bg = if theme.no_color {
+        Style::default()
     } else {
-        " Ctrl+N"
+        Style::default().bg(theme.bg_header).fg(theme.fg_secondary)
     };
-    let btn_w = UnicodeWidthStr::width(btn) as u16;
-    let btn_style = theme.accent_style().add_modifier(Modifier::BOLD);
-    let mut spans = vec![Span::styled(btn, btn_style)];
-    if inner.width > btn_w + UnicodeWidthStr::width(hint) as u16 + 1 {
-        spans.push(Span::styled(hint, theme.muted_style()));
+    let row_rect = Rect::new(area.x, area.y, area.width, 1);
+    frame.render_widget(Paragraph::new("").style(header_bg), row_rect);
+
+    let unread_chats = app.unread_chat_count();
+    let unread_chans = app.unread_channel_count();
+    let mentions = app.activity_mentions.len();
+
+    let labels = [
+        if unread_chats > 0 {
+            format!(" 1 Chats ({unread_chats}) ")
+        } else {
+            " 1 Chats ".to_string()
+        },
+        if unread_chans > 0 {
+            format!(" 2 Teams ({unread_chans}) ")
+        } else {
+            " 2 Teams ".to_string()
+        },
+        if mentions > 0 {
+            format!(" 3 Act ({mentions}) ")
+        } else {
+            " 3 Act ".to_string()
+        },
+    ];
+
+    let mut x = area.x;
+    for (idx, label) in labels.iter().enumerate() {
+        let avail = area.right().saturating_sub(x) as usize;
+        if avail == 0 {
+            break;
+        }
+        let clipped = truncate(label, avail);
+        let w = UnicodeWidthStr::width(clipped.as_str()) as u16;
+        if w == 0 {
+            break;
+        }
+        let active = ui.active_nav_tab == idx;
+        let style = if active {
+            if theme.no_color {
+                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default()
+                    .fg(theme.accent)
+                    .bg(theme.bg_header)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            }
+        } else {
+            header_bg
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(clipped, style)),
+            Rect::new(x, area.y, w, 1),
+        );
+        hitmap.add_line(x, area.y, w, HitTarget::NavTab(idx));
+        x = x.saturating_add(w);
     }
+}
+
+fn draw_filter_strip(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
+    let theme = &ui.theme;
+    let y = area.y.saturating_add(1);
+    let row_bg = if theme.no_color {
+        Style::default()
+    } else {
+        Style::default().bg(theme.bg_sidebar)
+    };
     frame.render_widget(
-        Paragraph::new(Line::from(spans)),
-        Rect::new(inner.x, y, inner.width, 1),
+        Paragraph::new("").style(row_bg),
+        Rect::new(area.x, y, area.width, 1),
     );
-    hitmap.add_line(
-        inner.x,
-        y,
-        btn_w.min(inner.width),
-        HitTarget::Button(ButtonId::NewChat),
-    );
+
+    let filter_label = if ui.nav_unread_only {
+        "[Unread]"
+    } else {
+        "[All]"
+    };
+    let new_label = "[+New]";
+    let filter_w = UnicodeWidthStr::width(filter_label) as u16;
+    let new_w = UnicodeWidthStr::width(new_label) as u16;
+    let right_w = filter_w + 1 + new_w;
+
+    let left_budget = area.width.saturating_sub(right_w + 1) as usize;
+    let jump_label = if left_budget >= 14 {
+        " Ctrl+K Jump… "
+    } else if left_budget >= 8 {
+        " Ctrl+K "
+    } else {
+        ""
+    };
+
+    if !jump_label.is_empty() {
+        let jw = UnicodeWidthStr::width(jump_label) as u16;
+        let jump_style = if theme.no_color {
+            theme.muted_style()
+        } else {
+            Style::default().fg(theme.fg_muted).bg(theme.bg_sidebar)
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(jump_label, jump_style)),
+            Rect::new(area.x, y, jw, 1),
+        );
+        hitmap.add_line(area.x, y, jw, HitTarget::Button(ButtonId::CommandPalette));
+    }
+
+    if area.width >= right_w {
+        let filter_x = area.right().saturating_sub(right_w);
+        let new_x = area.right().saturating_sub(new_w);
+
+        let filter_style = if ui.nav_unread_only {
+            if theme.no_color {
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(theme.accent)
+                    .bg(theme.bg_selected)
+                    .add_modifier(Modifier::BOLD)
+            }
+        } else if theme.no_color {
+            theme.muted_style()
+        } else {
+            Style::default().fg(theme.fg_muted).bg(theme.bg_sidebar)
+        };
+
+        let new_style = if theme.no_color {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(theme.accent)
+                .bg(theme.bg_sidebar)
+                .add_modifier(Modifier::BOLD)
+        };
+
+        frame.render_widget(
+            Paragraph::new(Span::styled(filter_label, filter_style)),
+            Rect::new(filter_x, y, filter_w, 1),
+        );
+        hitmap.add_line(filter_x, y, filter_w, HitTarget::Button(ButtonId::FilterToggle));
+
+        frame.render_widget(
+            Paragraph::new(Span::styled(new_label, new_style)),
+            Rect::new(new_x, y, new_w, 1),
+        );
+        hitmap.add_line(new_x, y, new_w, HitTarget::Button(ButtonId::NewChat));
+    }
 }
 
 const MARKER_WIDTH: usize = 2;
@@ -446,8 +719,35 @@ fn render_nav_row(
     ui: &UiState,
 ) -> Line<'static> {
     let theme = &ui.theme;
+    let sidebar_bg = if theme.no_color {
+        Style::default()
+    } else {
+        Style::default().bg(theme.bg_sidebar).fg(theme.fg_primary)
+    };
+
+    if let NavRow::SectionHeader { label } = row {
+        let hdr_text = truncate(label, width.saturating_sub(2));
+        let pad = width.saturating_sub(2 + UnicodeWidthStr::width(hdr_text.as_str()));
+        let hdr_style = if theme.no_color {
+            theme.muted_style().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(theme.fg_muted)
+                .bg(theme.bg_sidebar)
+                .add_modifier(Modifier::BOLD)
+        };
+        let mut spans = vec![
+            Span::styled("  ", sidebar_bg),
+            Span::styled(hdr_text, hdr_style),
+        ];
+        if pad > 0 {
+            spans.push(Span::styled(spaces_cow(pad), sidebar_bg));
+        }
+        return Line::from(spans);
+    }
+
     let marker: &'static str = if selected {
-        "▸ "
+        "▎ "
     } else if active {
         "• "
     } else {
@@ -455,14 +755,37 @@ fn render_nav_row(
     };
 
     let base_style = if selected {
-        theme.selection()
+        theme.nav_selection()
     } else if active {
-        theme.accent_style().add_modifier(Modifier::BOLD)
+        if theme.no_color {
+            theme.accent_style().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(theme.accent)
+                .bg(theme.bg_sidebar)
+                .add_modifier(Modifier::BOLD)
+        }
     } else {
-        Style::default().fg(theme.fg)
+        sidebar_bg
+    };
+
+    let marker_style = if selected {
+        if theme.no_color || theme.ansi16_only {
+            base_style
+        } else {
+            Style::default()
+                .fg(theme.accent)
+                .bg(theme.bg_selected)
+                .add_modifier(Modifier::BOLD)
+        }
+    } else if active {
+        base_style
+    } else {
+        sidebar_bg
     };
 
     match row {
+        NavRow::SectionHeader { .. } => unreachable!(),
         NavRow::Chat {
             title,
             kind,
@@ -479,8 +802,8 @@ fn render_nav_row(
                     let (dot, color) = theme.presence_indicator(avail);
                     (Cow::Owned(format!("{dot} ")), color)
                 }
-                ConversationKind::Group => (Cow::Borrowed("[그룹] "), theme.accent),
-                ConversationKind::Meeting => (Cow::Borrowed("[회의] "), theme.reply),
+                ConversationKind::Group => (Cow::Borrowed("[Group] "), theme.accent),
+                ConversationKind::Meeting => (Cow::Borrowed("[Meeting] "), theme.reply),
                 ConversationKind::Channel => (Cow::Borrowed("# "), theme.accent),
             };
             let badge = if *unread > 0 {
@@ -496,9 +819,11 @@ fn render_nav_row(
             let pad = width.saturating_sub(used_fixed + name_used);
 
             let glyph_style = if selected {
-                theme.selection()
-            } else {
+                base_style
+            } else if theme.no_color {
                 Style::default().fg(glyph_color)
+            } else {
+                Style::default().fg(glyph_color).bg(theme.bg_sidebar)
             };
             let name_style = if !selected && *unread > 0 {
                 base_style.add_modifier(Modifier::BOLD)
@@ -506,7 +831,7 @@ fn render_nav_row(
                 base_style
             };
             let mut spans = Vec::with_capacity(5);
-            spans.push(Span::styled(marker, base_style));
+            spans.push(Span::styled(marker, marker_style));
             spans.push(Span::styled(prefix_glyph, glyph_style));
             spans.push(Span::styled(name, name_style));
             if pad > 0 {
@@ -514,10 +839,15 @@ fn render_nav_row(
             }
             if !badge.is_empty() {
                 let badge_style = if selected {
-                    theme.selection()
+                    base_style
+                } else if theme.no_color {
+                    Style::default()
+                        .fg(theme.unread)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                         .fg(theme.unread)
+                        .bg(theme.bg_sidebar)
                         .add_modifier(Modifier::BOLD)
                 };
                 spans.push(Span::styled(badge, badge_style));
@@ -528,23 +858,57 @@ fn render_nav_row(
             display_name,
             collapsed,
             channel_count,
+            unread,
             ..
         } => {
             let arrow = if *collapsed { "▸ " } else { "▾ " };
-            let suffix = format!(" ({channel_count})");
-            let fixed = MARKER_WIDTH + UnicodeWidthStr::width(arrow) + suffix.len();
-            let name = truncate(display_name, width.saturating_sub(fixed).max(4));
-            let style = if selected {
-                theme.selection()
+            let suffix = if *unread > 0 {
+                format!(" ({unread})")
             } else {
-                theme.accent_style().add_modifier(Modifier::BOLD)
+                format!(" ({channel_count})")
             };
-            Line::from(vec![
-                Span::styled(marker, style),
+            let fixed = MARKER_WIDTH + UnicodeWidthStr::width(arrow) + suffix.len();
+            let (name, name_used) =
+                truncate_with_width(display_name, width.saturating_sub(fixed).max(4));
+            let pad = width.saturating_sub(fixed + name_used);
+            let style = if selected {
+                base_style
+            } else if theme.no_color {
+                theme.accent_style().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(theme.accent)
+                    .bg(theme.bg_sidebar)
+                    .add_modifier(Modifier::BOLD)
+            };
+            let suffix_style = if selected {
+                base_style
+            } else if *unread > 0 {
+                if theme.no_color {
+                    Style::default()
+                        .fg(theme.unread)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(theme.unread)
+                        .bg(theme.bg_sidebar)
+                        .add_modifier(Modifier::BOLD)
+                }
+            } else if theme.no_color {
+                theme.muted_style()
+            } else {
+                theme.muted_style().bg(theme.bg_sidebar)
+            };
+            let mut spans = vec![
+                Span::styled(marker, marker_style),
                 Span::styled(arrow, style),
                 Span::styled(name, style),
-                Span::styled(suffix, if selected { style } else { theme.muted_style() }),
-            ])
+            ];
+            if pad > 0 {
+                spans.push(Span::styled(spaces_cow(pad), base_style));
+            }
+            spans.push(Span::styled(suffix, suffix_style));
+            Line::from(spans)
         }
         NavRow::TeamChannel {
             display_name,
@@ -571,26 +935,31 @@ fn render_nav_row(
             } else {
                 base_style
             };
+            let icon_style = if selected {
+                base_style
+            } else if theme.no_color {
+                theme.muted_style()
+            } else {
+                theme.muted_style().bg(theme.bg_sidebar)
+            };
             let mut spans = Vec::with_capacity(5);
-            spans.push(Span::styled(marker, base_style));
-            spans.push(Span::styled(
-                icon,
-                if selected {
-                    base_style
-                } else {
-                    theme.muted_style()
-                },
-            ));
+            spans.push(Span::styled(marker, marker_style));
+            spans.push(Span::styled(icon, icon_style));
             spans.push(Span::styled(name, name_style));
             if pad > 0 {
                 spans.push(Span::styled(spaces_cow(pad), base_style));
             }
             if !badge.is_empty() {
                 let badge_style = if selected {
-                    theme.selection()
+                    base_style
+                } else if theme.no_color {
+                    Style::default()
+                        .fg(theme.unread)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                         .fg(theme.unread)
+                        .bg(theme.bg_sidebar)
                         .add_modifier(Modifier::BOLD)
                 };
                 spans.push(Span::styled(badge, badge_style));
@@ -603,11 +972,17 @@ fn render_nav_row(
             ..
         } => {
             let label = format!("@{author_name}: {preview}");
-            let body = truncate(&label, width.saturating_sub(MARKER_WIDTH));
-            Line::from(vec![
-                Span::styled(marker, base_style),
+            let (body, body_used) =
+                truncate_with_width(&label, width.saturating_sub(MARKER_WIDTH));
+            let pad = width.saturating_sub(MARKER_WIDTH + body_used);
+            let mut spans = vec![
+                Span::styled(marker, marker_style),
                 Span::styled(body, base_style),
-            ])
+            ];
+            if pad > 0 {
+                spans.push(Span::styled(spaces_cow(pad), base_style));
+            }
+            Line::from(spans)
         }
     }
 }
@@ -671,13 +1046,14 @@ mod tests {
     fn three_tabs_map_roundtrip() {
         assert_eq!(TAB_COUNT, 3);
         assert_eq!(TAB_LABELS.len(), TAB_COUNT);
-        assert_eq!(TAB_LABELS[TAB_CHATS], "채팅");
-        assert_eq!(TAB_LABELS[TAB_TEAMS], "팀/채널");
-        assert_eq!(TAB_LABELS[TAB_ACTIVITY], "활동");
+        assert_eq!(TAB_LABELS[TAB_CHATS], "Chats");
+        assert_eq!(TAB_LABELS[TAB_TEAMS], "Teams");
+        assert_eq!(TAB_LABELS[TAB_ACTIVITY], "Activity");
         for i in 0..TAB_COUNT {
             let tab = NavTab::from_index(i);
             assert_eq!(tab.index(), i);
         }
+        assert_eq!(UnicodeWidthStr::width("▎ "), MARKER_WIDTH);
     }
 
     #[test]
@@ -906,7 +1282,29 @@ mod tests {
         app.conversations[0].unread_count = 9;
         let c3 = nav_rows_cached(&app, &ui);
         assert!(!Arc::ptr_eq(&c1, &c3));
-        assert!(matches!(c3.first(), Some(NavRow::Chat { unread: 9, .. })));
+        assert!(matches!(
+            c3.first(),
+            Some(NavRow::SectionHeader { label: "UNREAD" })
+        ));
+        assert!(matches!(c3.get(1), Some(NavRow::Chat { unread: 9, .. })));
+
+        // Pinning and unread filter invalidate cache and match nav_row_count
+        ui.pinned_convs.insert("chat:c2".to_string());
+        let c4 = nav_rows_cached(&app, &ui);
+        assert!(!Arc::ptr_eq(&c3, &c4));
+        assert!(matches!(
+            c4.first(),
+            Some(NavRow::SectionHeader { label: "PINNED" })
+        ));
+        assert_eq!(nav_row_count(&app, &ui), c4.len());
+
+        ui.nav_unread_only = true;
+        let c5 = nav_rows_cached(&app, &ui);
+        assert!(!Arc::ptr_eq(&c4, &c5));
+        assert_eq!(nav_row_count(&app, &ui), c5.len());
+        assert_eq!(c5.len(), 2); // UNREAD header + Alice
+        ui.nav_unread_only = false;
+        ui.pinned_convs.clear();
 
         // TAB_TEAMS: channel unread_count & collapsed_team_ids invalidate
         ui.active_nav_tab = TAB_TEAMS;
@@ -918,9 +1316,19 @@ mod tests {
         let t3 = nav_rows_cached(&app, &ui);
         assert!(!Arc::ptr_eq(&t1, &t3));
         assert!(matches!(
+            t3.first(),
+            Some(NavRow::TeamHeader { unread: 12, .. })
+        ));
+        assert!(matches!(
             t3.get(1),
             Some(NavRow::TeamChannel { unread: 12, .. })
         ));
+
+        ui.nav_unread_only = true;
+        let t_unread = nav_rows_cached(&app, &ui);
+        assert_eq!(nav_row_count(&app, &ui), t_unread.len());
+        assert_eq!(t_unread.len(), 2); // Core header + General
+        ui.nav_unread_only = false;
 
         ui.collapsed_team_ids.insert("t1".to_string());
         let t4 = nav_rows_cached(&app, &ui);

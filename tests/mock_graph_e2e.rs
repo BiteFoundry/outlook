@@ -150,7 +150,7 @@ impl MockState {
 fn mock_teams_payload() -> Vec<Value> {
     vec![json!({
         "id": "team-dev",
-        "displayName": "개발팀",
+        "displayName": "Engineering",
         "description": "Engineering Team"
     })]
 }
@@ -159,13 +159,13 @@ fn mock_channels_payload() -> Vec<Value> {
     vec![
         json!({
             "id": "chan-general",
-            "displayName": "일반",
+            "displayName": "General",
             "description": "General channel",
             "membershipType": "standard"
         }),
         json!({
             "id": "chan-deploy",
-            "displayName": "배포공지",
+            "displayName": "Deployments",
             "description": "Release announcements",
             "membershipType": "standard"
         }),
@@ -179,8 +179,8 @@ fn mock_chats_payload() -> Vec<Value> {
             "chatType": "oneOnOne",
             "lastUpdatedDateTime": "2026-11-15T05:00:00Z",
             "members": [
-                { "userId": "me-user-1", "displayName": "나(테스터)" },
-                { "userId": "peer-kim", "displayName": "김철수" }
+                { "userId": "me-user-1", "displayName": "Me (Tester)" },
+                { "userId": "peer-kim", "displayName": "Alice" }
             ],
             "viewpoint": {
                 "lastMessageReadDateTime": "2026-11-15T04:00:00Z"
@@ -188,19 +188,19 @@ fn mock_chats_payload() -> Vec<Value> {
             "lastMessagePreview": {
                 "id": "seed-1",
                 "createdDateTime": "2026-11-15T05:00:00Z",
-                "from": { "user": { "id": "peer-kim", "displayName": "김철수" } },
-                "body": { "contentType": "html", "content": "<p>안녕하세요</p>" }
+                "from": { "user": { "id": "peer-kim", "displayName": "Alice" } },
+                "body": { "contentType": "html", "content": "<p>Hello</p>" }
             }
         }),
         json!({
             "id": "19:group-sprint@thread.v2",
             "chatType": "group",
-            "topic": "백엔드 스프린트",
+            "topic": "Backend Sprint",
             "lastUpdatedDateTime": "2026-11-15T05:10:00Z",
             "members": [
-                { "userId": "me-user-1", "displayName": "나(테스터)" },
-                { "userId": "peer-kim", "displayName": "김철수" },
-                { "userId": "peer-lee", "displayName": "이영희" }
+                { "userId": "me-user-1", "displayName": "Me (Tester)" },
+                { "userId": "peer-kim", "displayName": "Alice" },
+                { "userId": "peer-lee", "displayName": "Bob" }
             ]
         }),
     ]
@@ -248,7 +248,7 @@ async fn get_me_handler(State(state): State<Arc<MockState>>, headers: HeaderMap)
 
     Json(json!({
         "id": "me-user-1",
-        "displayName": "나(테스터)",
+        "displayName": "Me (Tester)",
         "mail": "tester@contoso.com",
         "userPrincipalName": "tester@contoso.com"
     }))
@@ -298,7 +298,7 @@ async fn post_chat_message_handler(
             .and_then(|v| v.as_str())
             .map(str::to_string),
         from_id: "me-user-1".to_string(),
-        from_name: "나(테스터)".to_string(),
+        from_name: "Me (Tester)".to_string(),
         created_at: "2026-11-15T06:00:00Z".to_string(),
         body_html: payload
             .pointer("/body/content")
@@ -417,7 +417,7 @@ async fn post_channel_message_handler(
             .and_then(|v| v.as_str())
             .map(str::to_string),
         from_id: "me-user-1".to_string(),
-        from_name: "나(테스터)".to_string(),
+        from_name: "Me (Tester)".to_string(),
         created_at: "2026-11-15T06:10:00Z".to_string(),
         body_html: payload
             .pointer("/body/content")
@@ -499,7 +499,7 @@ async fn post_channel_reply_handler(
         reply_to_id: Some(root_id.clone()),
         subject: None,
         from_id: "me-user-1".to_string(),
-        from_name: "나(테스터)".to_string(),
+        from_name: "Me (Tester)".to_string(),
         created_at: "2026-11-15T06:15:00Z".to_string(),
         body_html: payload
             .pointer("/body/content")
@@ -603,7 +603,7 @@ async fn channel_files_folder_handler(
     }
     Json(json!({
         "id": "folder-deploy-1",
-        "name": "배포공지",
+        "name": "Deployments",
         "parentReference": {
             "driveId": "drive-sp-dev"
         }
@@ -769,7 +769,7 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
 
     let me = graph.get_me().await.expect("get_me after auto-refresh");
     assert_eq!(me.id, "me-user-1");
-    assert_eq!(me.display_name, "나(테스터)");
+    assert_eq!(me.display_name, "Me (Tester)");
     assert_eq!(*mock.refresh_calls.read().unwrap(), 1);
     assert_eq!(
         mock.me_auth_headers.read().unwrap().as_slice(),
@@ -794,28 +794,28 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
         .iter()
         .find(|c| c.conv_key == "chat:19:oneonone-peer@unq.gbl.spaces")
         .expect("1:1 chat present");
-    assert_eq!(one_on_one.title, "김철수");
+    assert_eq!(one_on_one.title, "Alice");
     assert_eq!(one_on_one.peer_user_id.as_deref(), Some("peer-kim"));
 
     let group_chat = chats
         .iter()
         .find(|c| c.conv_key == "chat:19:group-sprint@thread.v2")
         .expect("group chat present");
-    assert_eq!(group_chat.title, "백엔드 스프린트");
+    assert_eq!(group_chat.title, "Backend Sprint");
 
     let outgoing_chat_msg = parser::compile_outgoing_markdown(
-        "안녕하세요 @김철수 님! **Kubernetes** 롤아웃 점검 완료했습니다.",
+        "Hello @Alice! Staging **Kubernetes** 롤아웃 completed.",
         None,
         vec![MentionInfo {
             id: 0,
             user_id: "peer-kim".to_string(),
-            display_name: "김철수".to_string(),
+            display_name: "Alice".to_string(),
         }],
         vec![],
         vec![],
         None,
     );
-    assert!(outgoing_chat_msg.body_html.contains("<at id=\"0\">김철수</at>"));
+    assert!(outgoing_chat_msg.body_html.contains("<at id=\"0\">Alice</at>"));
     assert!(outgoing_chat_msg
         .body_html
         .contains("<strong>Kubernetes</strong>"));
@@ -849,7 +849,7 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
     assert_eq!(en_hits[0].msg_id, sent_chat.msg_id);
 
     // -----------------------------------------------------------------------
-    // 3. Team -> Channel -> Thread: resolve "개발팀/배포공지", post with subject,
+    // 3. Team -> Channel -> Thread: resolve "Engineering/Deployments", post with subject,
     //    reply in thread, fetch get_thread, verify reply_count in Storage
     // -----------------------------------------------------------------------
     let teams: Vec<TeamSummary> = graph
@@ -857,13 +857,13 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
         .await
         .expect("list_joined_teams_with_channels");
     assert_eq!(teams.len(), 1);
-    assert_eq!(teams[0].display_name, "개발팀");
+    assert_eq!(teams[0].display_name, "Engineering");
     assert_eq!(teams[0].channels.len(), 2);
     storage.upsert_teams(&teams).expect("upsert teams");
 
     let all_convs = storage.list_conversations().expect("list_conversations");
     let deploy_chan =
-        resolver::resolve_from_slice(&all_convs, "개발팀/배포공지").expect("resolve channel");
+        resolver::resolve_from_slice(&all_convs, "Engineering/Deployments").expect("resolve channel");
     assert_eq!(
         deploy_chan.target,
         ConversationTarget::Channel {
@@ -873,8 +873,8 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
     );
 
     let chan_post = parser::compile_outgoing_markdown(
-        "프로덕션 v2.4.0 배포 시작합니다.",
-        Some("v2.4.0 배포 공지".to_string()),
+        "Starting production v2.4.0 deployment.",
+        Some("v2.4.0 Release Notice".to_string()),
         vec![],
         vec![],
         vec![],
@@ -884,10 +884,10 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
         .send_message(&deploy_chan.target, &chan_post)
         .await
         .expect("send channel root post");
-    assert_eq!(root_msg.subject.as_deref(), Some("v2.4.0 배포 공지"));
+    assert_eq!(root_msg.subject.as_deref(), Some("v2.4.0 Release Notice"));
 
     let chan_reply = parser::compile_outgoing_markdown(
-        "카나리 헬스체크 정상 확인했습니다.",
+        "Canary health check passed.",
         None,
         vec![],
         vec![],
@@ -937,7 +937,7 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
     std::fs::write(&chat_file_path, chat_file_bytes).expect("write chat test file");
 
     let sent_chat_file = graph
-        .send_file(&one_on_one.target, &chat_file_path, Some("<p>채팅 첨부</p>"), None)
+        .send_file(&one_on_one.target, &chat_file_path, Some("<p>Chat attachment</p>"), None)
         .await
         .expect("send_file to chat");
     assert_eq!(sent_chat_file.attachments.len(), 1);
@@ -967,7 +967,7 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
         .send_file(
             &deploy_chan.target,
             &chan_file_path,
-            Some("<p>배포 노트 첨부</p>"),
+            Some("<p>Release notes attached</p>"),
             Some(&root_msg.msg_id),
         )
         .await
@@ -1050,8 +1050,8 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
     let chats_text = list_chats_resp["result"]["content"][0]["text"]
         .as_str()
         .expect("list_chats text");
-    assert!(chats_text.contains("김철수"));
-    assert!(chats_text.contains("백엔드 스프린트"));
+    assert!(chats_text.contains("Alice"));
+    assert!(chats_text.contains("Backend Sprint"));
 
     let get_thread_req = json!({
         "jsonrpc": "2.0",
@@ -1060,7 +1060,7 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
         "params": {
             "name": "get_thread",
             "arguments": {
-                "target": "개발팀/배포공지",
+                "target": "Engineering/Deployments",
                 "root_msg_id": root_msg.msg_id
             }
         }
@@ -1072,8 +1072,8 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
     let thread_text = get_thread_resp["result"]["content"][0]["text"]
         .as_str()
         .expect("get_thread text");
-    assert!(thread_text.contains("v2.4.0 배포 공지"));
-    assert!(thread_text.contains("카나리 헬스체크 정상 확인했습니다."));
+    assert!(thread_text.contains("v2.4.0 Release Notice"));
+    assert!(thread_text.contains("Canary health check passed."));
 
     // delete_message without confirm: true must be rejected
     let delete_missing_confirm = json!({
@@ -1083,7 +1083,7 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
         "params": {
             "name": "delete_message",
             "arguments": {
-                "target": "개발팀/배포공지",
+                "target": "Engineering/Deployments",
                 "msg_id": root_msg.msg_id
             }
         }
@@ -1101,7 +1101,7 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
         "params": {
             "name": "delete_message",
             "arguments": {
-                "target": "개발팀/배포공지",
+                "target": "Engineering/Deployments",
                 "msg_id": root_msg.msg_id,
                 "confirm": false
             }
@@ -1162,7 +1162,7 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|c| c["title"] == "배포공지"));
+        .any(|c| c["title"] == "Deployments"));
 
     let search_res = http
         .get(format!(
@@ -1217,7 +1217,7 @@ fn build_direct_graph_client(
         client_id: cfg.client_id.clone(),
         tenant_id: cfg.tenant_id.clone(),
         user_id: Some("me-user-1".to_string()),
-        user_display_name: Some("나(테스터)".to_string()),
+        user_display_name: Some("Me (Tester)".to_string()),
         user_email: Some("tester@contoso.com".to_string()),
         auth_mode: "pkce".to_string(),
     };
@@ -1245,7 +1245,7 @@ fn mock_graph_message(
         "from": {
             "user": {
                 "id": "peer-kim",
-                "displayName": "김철수"
+                "displayName": "Alice"
             }
         },
         "body": {
@@ -1293,7 +1293,7 @@ async fn e2e_mock_graph_multipage_chat_history_and_sqlite_tiebreak() {
             get(|| async move {
                 Json(json!({
                     "id": "me-user-1",
-                    "displayName": "나(테스터)",
+                    "displayName": "Me (Tester)",
                     "mail": "tester@contoso.com",
                     "userPrincipalName": "tester@contoso.com"
                 }))
@@ -1321,8 +1321,8 @@ async fn e2e_mock_graph_multipage_chat_history_and_sqlite_tiebreak() {
                     if query.contains("$skiptoken=p2") {
                         return Json(json!({
                             "value": [
-                                mock_graph_message("m4", "2026-11-10T10:00:00Z", "메시지4(동일시각)", None, None),
-                                mock_graph_message("m3", "2026-11-10T10:00:00Z", "메시지3(동일시각)", None, None),
+                                mock_graph_message("m4", "2026-11-10T10:00:00Z", "Message 4 (same timestamp)", None, None),
+                                mock_graph_message("m3", "2026-11-10T10:00:00Z", "Message 3 (same timestamp)", None, None),
                             ],
                             "@odata.nextLink": p3_url
                         }))
@@ -1331,16 +1331,16 @@ async fn e2e_mock_graph_multipage_chat_history_and_sqlite_tiebreak() {
                     if query.contains("$skiptoken=p3") {
                         return Json(json!({
                             "value": [
-                                mock_graph_message("m2", "2026-11-10T09:00:00Z", "메시지2", None, None),
-                                mock_graph_message("m1", "2026-11-10T08:00:00Z", "메시지1(최초)", None, None),
+                                mock_graph_message("m2", "2026-11-10T09:00:00Z", "Message 2", None, None),
+                                mock_graph_message("m1", "2026-11-10T08:00:00Z", "Message 1 (oldest)", None, None),
                             ]
                         }))
                         .into_response();
                     }
                     Json(json!({
                         "value": [
-                            mock_graph_message("m6", "2026-11-10T12:00:00Z", "메시지6(최신)", None, None),
-                            mock_graph_message("m5", "2026-11-10T11:00:00Z", "메시지5", None, None),
+                            mock_graph_message("m6", "2026-11-10T12:00:00Z", "Message 6 (latest)", None, None),
+                            mock_graph_message("m5", "2026-11-10T11:00:00Z", "Message 5", None, None),
                         ],
                         "@odata.nextLink": p2_url
                     }))
@@ -1470,7 +1470,7 @@ async fn e2e_mock_graph_channel_expand_replies_pagination_and_chats_orderby_fall
             get(|| async move {
                 Json(json!({
                     "id": "me-user-1",
-                    "displayName": "나(테스터)",
+                    "displayName": "Me (Tester)",
                     "mail": "tester@contoso.com",
                     "userPrincipalName": "tester@contoso.com"
                 }))
@@ -1489,12 +1489,12 @@ async fn e2e_mock_graph_channel_expand_replies_pagination_and_chats_orderby_fall
                                 mock_graph_message(
                                     "root-1",
                                     "2026-11-10T09:00:00Z",
-                                    "이전 채널 루트 1",
+                                    "Older channel root 1",
                                     None,
                                     Some(vec![mock_graph_message(
                                         "reply-1a",
                                         "2026-11-10T09:05:00Z",
-                                        "이전 답글 1a",
+                                        "Older reply 1a",
                                         Some("root-1"),
                                         None,
                                     )]),
@@ -1512,12 +1512,12 @@ async fn e2e_mock_graph_channel_expand_replies_pagination_and_chats_orderby_fall
                             mock_graph_message(
                                 "root-2",
                                 "2026-11-10T12:00:00Z",
-                                "최신 채널 루트 2",
+                                "Latest channel root 2",
                                 None,
                                 Some(vec![mock_graph_message(
                                     "reply-2a",
                                     "2026-11-10T12:05:00Z",
-                                    "최신 답글 2a",
+                                    "Latest reply 2a",
                                     Some("root-2"),
                                     None,
                                 )]),
@@ -1556,11 +1556,11 @@ async fn e2e_mock_graph_channel_expand_replies_pagination_and_chats_orderby_fall
                                 json!({
                                     "id": format!("19:chat-{idx:03}@thread.v2"),
                                     "chatType": "group",
-                                    "topic": format!("채팅방 {idx:03}"),
+                                    "topic": format!("Chat {idx:03}"),
                                     "lastUpdatedDateTime": "2026-11-15T05:00:00Z",
                                     "members": [
-                                        { "userId": "me-user-1", "displayName": "나(테스터)" },
-                                        { "userId": format!("user-{idx}"), "displayName": format!("사용자 {idx}") }
+                                        { "userId": "me-user-1", "displayName": "Me (Tester)" },
+                                        { "userId": format!("user-{idx}"), "displayName": format!("User {idx}") }
                                     ]
                                 })
                             })
@@ -1613,9 +1613,9 @@ async fn e2e_mock_graph_channel_expand_replies_pagination_and_chats_orderby_fall
         .await
         .expect("list_chats(75) with $orderby fallback across 2 pages");
     assert_eq!(chats.len(), 75);
-    assert_eq!(chats[0].title, "채팅방 001");
-    assert_eq!(chats[49].title, "채팅방 050");
-    assert_eq!(chats[74].title, "채팅방 075");
+    assert_eq!(chats[0].title, "Chat 001");
+    assert_eq!(chats[49].title, "Chat 050");
+    assert_eq!(chats[74].title, "Chat 075");
 
     let recorded_chat_queries = chat_queries.read().unwrap();
     assert!(
@@ -1642,7 +1642,7 @@ async fn e2e_mock_graph_restricted_chat_read_basic_token_and_403_diagnostics() {
     let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
     let payload_json = json!({
         "oid": "me-user-1",
-        "name": "나(테스터)",
+        "name": "Me (Tester)",
         "upn": "tester@contoso.com",
         "scp": "User.Read Chat.ReadBasic",
         "exp": 4_102_444_800_i64
@@ -1657,8 +1657,8 @@ async fn e2e_mock_graph_restricted_chat_read_basic_token_and_403_diagnostics() {
     assert!(
         diag.warnings
             .iter()
-            .any(|w| w.contains("Chat.ReadBasic") && w.contains("본문")),
-        "expected clear Korean Chat.ReadBasic warning, got: {:?}",
+            .any(|w| w.contains("Chat.ReadBasic") && w.contains("message bodies")),
+        "expected clear Chat.ReadBasic warning, got: {:?}",
         diag.warnings
     );
 
@@ -1674,7 +1674,7 @@ async fn e2e_mock_graph_restricted_chat_read_basic_token_and_403_diagnostics() {
             get(|| async move {
                 Json(json!({
                     "id": "me-user-1",
-                    "displayName": "나(테스터)",
+                    "displayName": "Me (Tester)",
                     "mail": "tester@contoso.com",
                     "userPrincipalName": "tester@contoso.com"
                 }))
@@ -1714,7 +1714,8 @@ async fn e2e_mock_graph_restricted_chat_read_basic_token_and_403_diagnostics() {
     let explanation = explain_graph_permission_error(&err.to_string(), Some(&restricted_jwt))
         .expect("explain_graph_permission_error should explain 403");
     assert!(
-        explanation.contains("권한 부족 (403)") && explanation.contains("Chat.ReadBasic"),
+        explanation.contains(teams_cli::auth::INSUFFICIENT_PERMISSIONS_PREFIX)
+            && explanation.contains("Chat.ReadBasic"),
         "expected Chat.ReadBasic explanation, got: {explanation}"
     );
 

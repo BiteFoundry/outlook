@@ -1,5 +1,8 @@
 //! Central `Action` enum and single `dispatch(action, app, ui) -> bool` reducer.
 
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
+
 use chrono::Utc;
 use ratatui::layout::Position;
 
@@ -9,7 +12,7 @@ use crate::sync::SyncCommand;
 use super::app::{AppState, Focus, NarrowPane, UiState};
 use super::composer::{self, ReplyPreview};
 use super::hitmap::{ButtonId, HitTarget, MessageScope};
-use super::nav_pane::{self, TAB_CHATS, TAB_COUNT};
+use super::nav_pane::{self, NavRow, TAB_CHATS, TAB_COUNT};
 use super::overlays::context_menu::{ContextMenu, ContextTarget};
 use super::overlays::image_preview::ImagePreviewOverlay;
 use super::overlays::search::SearchOverlay;
@@ -18,6 +21,7 @@ use super::overlays::{Overlay, OverlayKind, OverlayOutcome};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Quit,
+    QuitConfirm,
     Noop,
 
     // Focus & layout
@@ -28,6 +32,8 @@ pub enum Action {
     ToggleAutoThreadPane,
     ToggleNarrowPane,
     ToggleNotify,
+    ToggleDensity,
+    CycleTheme,
     ShowDownloadDir,
 
     // Navigation pane
@@ -35,6 +41,21 @@ pub enum Action {
     SelectNavRow(usize),
     NavFirst,
     NavLast,
+    NavCollapseOrParent,
+    NavExpandOrOpen,
+    TogglePinSelected,
+    ToggleUnreadFilter,
+    JumpNextUnread,
+    JumpPrevUnread,
+    ToggleLastConversation,
+    HistoryBack,
+    HistoryForward,
+    PrevConversation,
+    NextConversation,
+    OpenConversationKey {
+        conv_key: String,
+        focus_composer: bool,
+    },
 
     // Message selection & scrolling
     SelectMessage {
@@ -63,6 +84,7 @@ pub enum Action {
     SendMessage,
     InsertNewline,
     Backspace,
+    DeleteWordBackward,
     DeleteForward,
     Input(char),
     Paste(String),
@@ -163,6 +185,7 @@ pub enum Action {
     // Search, sync & history
     Search(String),
     OpenSearch,
+    OpenSearchWithQuery(String),
     JumpToSearchHit(usize),
     RefreshAll,
     SyncHistory,
@@ -275,6 +298,17 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
 
     match action {
         Action::Quit => unreachable!(),
+        Action::QuitConfirm => {
+            if ui.composer.is_empty() {
+                app.stash_draft(ui);
+                return true;
+            }
+            ui.close_overlays_of(OverlayKind::Confirm);
+            ui.push_overlay(Overlay::confirm(
+                "Discard unsent draft and quit?",
+                Some(Action::Quit),
+            ));
+        }
         Action::Noop => {}
 
         // Focus & layout
@@ -293,9 +327,9 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             app.config.auto_thread_pane = ui.auto_thread_pane;
             let _ = app.config.save();
             ui.info(if ui.auto_thread_pane {
-                "넓은 화면 자동 스레드 패널 켜짐"
+                "Auto thread pane: On"
             } else {
-                "넓은 화면 자동 스레드 패널 꺼짐"
+                "Auto thread pane: Off"
             });
         }
         Action::ToggleNarrowPane => {
@@ -321,19 +355,34 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             app.config.notify = ui.notify;
             let _ = app.config.save();
             ui.info(if ui.notify {
-                "데스크톱 알림 켜짐"
+                "Desktop notifications: On"
             } else {
-                "데스크톱 알림 꺼짐"
+                "Desktop notifications: Off"
             });
         }
+        Action::ToggleDensity => {
+            ui.density = ui.density.toggle();
+            app.config.density = ui.density;
+            let _ = app.config.save();
+            ui.info(format!("Message density: {}", ui.density.label()));
+        }
+        Action::CycleTheme => {
+            ui.theme_preset = ui.theme_preset.next();
+            ui.theme = super::theme::Theme::detect(ui.theme_preset);
+            app.config.theme = ui.theme_preset;
+            let _ = app.config.save();
+            ui.info(format!("Theme: {}", ui.theme_preset.label()));
+        }
         Action::ShowDownloadDir => {
-            ui.info(format!("다운로드 폴더: {}", app.download_dir.display()));
+            ui.info(format!("Downloads folder: {}", app.download_dir.display()));
         }
 
         // Navigation pane
         Action::SelectNavTab(tab) => {
+            ui.show_nav_rail = true;
             ui.active_nav_tab = tab.min(TAB_COUNT - 1);
-            ui.nav_selected = 0;
+            let rows = nav_pane::nav_rows_cached(app, ui);
+            ui.nav_selected = first_selectable_nav_row(&rows).unwrap_or(0);
             ui.narrow_pane = NarrowPane::List;
             ui.set_focus(Focus::Nav);
             app.ensure_tab_domain_activated(ui, ui.active_nav_tab);
@@ -342,16 +391,133 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             app.select_nav_row(ui, idx);
         }
         Action::NavFirst => {
-            let len = nav_pane::nav_row_count(app, ui);
-            if len > 0 {
-                ui.nav_selected = 0;
+            let rows = nav_pane::nav_rows_cached(app, ui);
+            if let Some(first) = first_selectable_nav_row(&rows) {
+                ui.nav_selected = first;
             }
         }
         Action::NavLast => {
-            let len = nav_pane::nav_row_count(app, ui);
-            if len > 0 {
-                ui.nav_selected = len - 1;
+            let rows = nav_pane::nav_rows_cached(app, ui);
+            if let Some(last) = last_selectable_nav_row(&rows) {
+                ui.nav_selected = last;
                 maybe_load_older_chats(app, ui);
+            }
+        }
+        Action::NavCollapseOrParent => {
+            let rows = nav_pane::nav_rows_cached(app, ui);
+            match rows.get(ui.nav_selected) {
+                Some(NavRow::TeamHeader {
+                    team_id,
+                    collapsed: false,
+                    ..
+                }) => {
+                    ui.collapsed_team_ids.insert(team_id.clone());
+                }
+                Some(NavRow::TeamChannel { .. }) => {
+                    if let Some(parent_idx) = rows[..ui.nav_selected]
+                        .iter()
+                        .rposition(|r| matches!(r, NavRow::TeamHeader { .. }))
+                    {
+                        ui.nav_selected = parent_idx;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Action::NavExpandOrOpen => {
+            let rows = nav_pane::nav_rows_cached(app, ui);
+            match rows.get(ui.nav_selected) {
+                Some(NavRow::TeamHeader {
+                    team_id,
+                    collapsed: true,
+                    ..
+                }) => {
+                    ui.collapsed_team_ids.remove(team_id);
+                }
+                Some(
+                    NavRow::Chat { .. }
+                    | NavRow::TeamChannel { .. }
+                    | NavRow::ActivityMention { .. },
+                ) => {
+                    app.select_nav_row(ui, ui.nav_selected);
+                }
+                _ => {}
+            }
+        }
+        Action::TogglePinSelected => {
+            let conv_key = match nav_pane::nav_row_at(app, ui, ui.nav_selected) {
+                Some(NavRow::Chat { conv_key, .. })
+                | Some(NavRow::TeamChannel { conv_key, .. }) => Some(conv_key),
+                _ => None,
+            };
+            if let Some(key) = conv_key {
+                let pinned_now = if ui.pinned_convs.remove(&key) {
+                    false
+                } else {
+                    ui.pinned_convs.insert(key.clone());
+                    true
+                };
+                app.config.pinned_convs = ui.pinned_convs.iter().cloned().collect();
+                app.config.pinned_convs.sort();
+                let _ = app.config.save();
+                if let Some(conv) = app.conversations.iter_mut().find(|c| c.conv_key == key) {
+                    conv.pinned = pinned_now;
+                }
+                ui.info(if pinned_now {
+                    "Pinned conversation"
+                } else {
+                    "Unpinned conversation"
+                });
+            }
+        }
+        Action::ToggleUnreadFilter => {
+            ui.nav_unread_only = !ui.nav_unread_only;
+            let rows = nav_pane::nav_rows_cached(app, ui);
+            ui.nav_selected = first_selectable_nav_row(&rows).unwrap_or(0);
+            ui.info(if ui.nav_unread_only {
+                "Filter: Unread only"
+            } else {
+                "Filter: All conversations"
+            });
+        }
+        Action::JumpNextUnread => {
+            jump_unread(app, ui, true);
+        }
+        Action::JumpPrevUnread => {
+            jump_unread(app, ui, false);
+        }
+        Action::ToggleLastConversation => {
+            if let Some(last_key) = ui.last_conv_key.clone() {
+                if Some(&last_key) != app.active_conv_key.as_ref() {
+                    if let Some(target) = app.target_for_conv_key(&last_key) {
+                        app.select_conversation(ui, target);
+                    }
+                }
+            } else {
+                ui.info("No previous conversation");
+            }
+        }
+        Action::HistoryBack => {
+            app.history_back(ui);
+        }
+        Action::HistoryForward => {
+            app.history_forward(ui);
+        }
+        Action::PrevConversation => {
+            step_active_nav_conversation(app, ui, -1);
+        }
+        Action::NextConversation => {
+            step_active_nav_conversation(app, ui, 1);
+        }
+        Action::OpenConversationKey {
+            conv_key,
+            focus_composer,
+        } => {
+            if let Some(target) = app.target_for_conv_key(&conv_key) {
+                app.select_conversation(ui, target);
+                if !focus_composer {
+                    ui.set_focus(Focus::Chat);
+                }
             }
         }
 
@@ -374,10 +540,36 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         },
         Action::MoveUp => move_selection(app, ui, -1),
         Action::MoveDown => move_selection(app, ui, 1),
-        Action::ScrollUp => scroll_focused_and_autoload(app, ui, -3),
-        Action::ScrollDown => scroll_focused_and_autoload(app, ui, 3),
-        Action::ScrollPageUp => scroll_focused_and_autoload(app, ui, -12),
-        Action::ScrollPageDown => scroll_focused_and_autoload(app, ui, 12),
+        Action::ScrollUp => {
+            if ui.focus() == Focus::Composer {
+                scroll_active_stream_from_composer(app, ui, -3);
+            } else {
+                scroll_focused_and_autoload(app, ui, -3);
+            }
+        }
+        Action::ScrollDown => {
+            if ui.focus() == Focus::Composer {
+                scroll_active_stream_from_composer(app, ui, 3);
+            } else {
+                scroll_focused_and_autoload(app, ui, 3);
+            }
+        }
+        Action::ScrollPageUp => {
+            let half = active_stream_half_page(ui);
+            if ui.focus() == Focus::Composer {
+                scroll_active_stream_from_composer(app, ui, -half);
+            } else {
+                scroll_focused_and_autoload(app, ui, -half);
+            }
+        }
+        Action::ScrollPageDown => {
+            let half = active_stream_half_page(ui);
+            if ui.focus() == Focus::Composer {
+                scroll_active_stream_from_composer(app, ui, half);
+            } else {
+                scroll_focused_and_autoload(app, ui, half);
+            }
+        }
         Action::ScrollTop => match ui.focus() {
             Focus::Nav => {
                 let _ = dispatch(Action::NavFirst, app, ui);
@@ -412,7 +604,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 .as_ref()
                 .is_some_and(ConversationTarget::is_channel);
             if !is_channel || ui.composer_target_thread {
-                ui.info("제목(Subject)은 채널 루트 게시물에서만 사용할 수 있습니다");
+                ui.info("Subject is only available for channel root posts");
             } else {
                 ui.show_subject = !ui.show_subject;
                 ui.composer.subject_focused = ui.show_subject;
@@ -441,6 +633,10 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             ui.composer.backspace();
             ui.composer.reference_mentions(&app.members);
         }
+        Action::DeleteWordBackward => {
+            ui.composer.delete_word_backward();
+            ui.composer.reference_mentions(&app.members);
+        }
         Action::DeleteForward => {
             ui.composer.delete_forward();
             ui.composer.reference_mentions(&app.members);
@@ -464,7 +660,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::ClearPendingImages => {
             ui.composer.clear_pending_images();
-            ui.info("첨부된 인라인 이미지를 모두 비웠습니다");
+            ui.info("Cleared pending inline images");
         }
         Action::Tab => {
             if ui.composer.subject_focused {
@@ -486,8 +682,28 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::CursorLeft => ui.composer.move_left(false),
         Action::CursorRight => ui.composer.move_right(false),
-        Action::CursorUp => ui.composer.move_up(false),
-        Action::CursorDown => ui.composer.move_down(false),
+        Action::CursorUp => {
+            if ui.focus() == Focus::Composer
+                && !ui.composer.popup.is_open()
+                && !ui.composer.subject_focused
+                && ui.composer.has_no_text()
+            {
+                scroll_active_stream_from_composer(app, ui, -3);
+            } else {
+                ui.composer.move_up(false);
+            }
+        }
+        Action::CursorDown => {
+            if ui.focus() == Focus::Composer
+                && !ui.composer.popup.is_open()
+                && !ui.composer.subject_focused
+                && ui.composer.has_no_text()
+            {
+                scroll_active_stream_from_composer(app, ui, 3);
+            } else {
+                ui.composer.move_down(false);
+            }
+        }
         Action::CursorHome => ui.composer.move_home(false),
         Action::CursorEnd => ui.composer.move_end(false),
         Action::CursorDocStart => ui.composer.move_doc_start(false),
@@ -550,12 +766,12 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::ToggleComposerTarget => {
             if app.active_thread.is_some() {
-                app.stash_draft(ui);
+                app.stash_and_reset_draft(ui);
                 ui.composer_target_thread = !ui.composer_target_thread;
                 app.restore_draft(ui);
             } else {
                 ui.composer_target_thread = false;
-                ui.info("열린 스레드가 없어 채널/채팅 본문으로 입력합니다");
+                ui.info("No open thread; composing in main conversation");
             }
         }
         Action::ReplyToSelected => {
@@ -609,7 +825,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 (app.active_conv_key.clone(), app.message_at(scope, msg_index))
             {
                 if !msg.is_me {
-                    ui.info("본인이 작성한 메시지만 삭제할 수 있습니다");
+                    ui.info("You can only delete your own messages");
                     return false;
                 }
                 let parent_msg_id = match scope {
@@ -625,7 +841,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     parent_msg_id,
                 };
                 ui.push_overlay(Overlay::confirm(
-                    format!("이 메시지를 삭제할까요?\n\"{preview}\""),
+                    format!("Delete this message?\n\"{preview}\""),
                     Some(confirm),
                 ));
             }
@@ -704,7 +920,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             {
                 app.download_attachment(ui, MessageScope::Chat, idx, 0);
             } else {
-                ui.info("다운로드할 첨부파일이 없습니다");
+                ui.info("No attachments to download");
             }
         }
         Action::OpenSendFile => {
@@ -727,6 +943,15 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::OpenSearch => {
             open_overlay(OverlayKind::Search, app, ui);
         }
+        Action::OpenSearchWithQuery(query) => {
+            ui.close_overlays_of(OverlayKind::Search);
+            let mut search = SearchOverlay::default();
+            search.query = query.clone();
+            ui.push_overlay(Overlay::Search(search));
+            if !query.trim().is_empty() {
+                app.search_messages(ui, query);
+            }
+        }
         Action::JumpToSearchHit(hit_idx) => {
             if let Some(hit) = app.search_results.get(hit_idx).cloned() {
                 if let Some(target) = ConversationTarget::from_conv_key(&hit.conv_key) {
@@ -744,7 +969,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::RefreshAll => {
             app.sync_ctrl.request(SyncCommand::RefreshConversations);
             app.sync_ctrl.request(SyncCommand::SyncActiveNow);
-            ui.info("Teams 대화를 새로고침합니다...");
+            ui.info("Refreshing Teams conversations...");
         }
         Action::SyncHistory => {
             if matches!(ui.focus(), Focus::Thread) && app.active_thread.is_some() {
@@ -758,18 +983,21 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::MarkActiveRead => {
             if let Some(conv_key) = app.active_conv_key.clone() {
+                let now_ts = Utc::now().to_rfc3339();
                 if let Some(conv) = app.conversations.iter_mut().find(|c| c.conv_key == conv_key) {
                     conv.unread_count = 0;
+                    conv.last_read_at = Some(now_ts.clone());
                 }
-                let now_ts = Utc::now().to_rfc3339();
                 let _ = app.storage.mark_conversation_read(&conv_key, &now_ts);
-                if let Some(ConversationTarget::Chat { chat_id }) = app.active_target.clone() {
-                    let graph = app.graph.clone();
-                    tokio::spawn(async move {
-                        let _ = graph.mark_chat_read(&chat_id).await;
-                    });
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    if let Some(ConversationTarget::Chat { chat_id }) = app.active_target.clone() {
+                        let graph = app.graph.clone();
+                        tokio::spawn(async move {
+                            let _ = graph.mark_chat_read(&chat_id).await;
+                        });
+                    }
                 }
-                ui.info("읽음으로 표시했습니다");
+                ui.info("Marked as read");
             }
         }
 
@@ -851,9 +1079,9 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             app.config.inline_images = ui.inline_images;
             let _ = app.config.save();
             ui.info(if ui.inline_images {
-                "인라인 이미지 미리보기 켜짐"
+                "Inline image previews: On"
             } else {
-                "인라인 이미지 미리보기 꺼짐"
+                "Inline image previews: Off"
             });
         }
         Action::OpenImagePreview => {
@@ -890,7 +1118,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 let dir = app.download_dir.clone();
                 let tx = app.ui_tx.clone();
                 let label = format!(
-                    "이미지 저장: {}",
+                    "Save image: {}",
                     attachment.name.as_deref().unwrap_or(&attachment.id)
                 );
                 ui.tasks.begin(label.clone());
@@ -901,7 +1129,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                                 label,
                                 error: None,
                                 toast: Some((
-                                    format!("저장됨: {}", file.path.display()),
+                                    format!("Saved: {}", file.path.display()),
                                     super::toast::ToastKind::Success,
                                 )),
                             });
@@ -911,7 +1139,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                                 label,
                                 error: Some(err.to_string()),
                                 toast: Some((
-                                    format!("저장 실패: {err}"),
+                                    format!("Save failed: {err}"),
                                     super::toast::ToastKind::Error,
                                 )),
                             });
@@ -957,7 +1185,7 @@ fn open_overlay(kind: OverlayKind, app: &mut AppState, ui: &mut UiState) {
             return;
         }
         OverlayKind::Help => Overlay::help(),
-        OverlayKind::Confirm => Overlay::confirm("확인하시겠습니까?", None),
+        OverlayKind::Confirm => Overlay::confirm("Confirm?", None),
     };
     ui.push_overlay(overlay);
 }
@@ -974,7 +1202,7 @@ fn open_image_preview(app: &mut AppState, ui: &mut UiState) {
         });
 
     let Some(preview) = preview_opt else {
-        ui.info("미리볼 수 있는 이미지 첨부가 없습니다");
+        ui.info("No image attachments to preview");
         return;
     };
 
@@ -1063,16 +1291,187 @@ fn maybe_load_older_chats(app: &mut AppState, ui: &UiState) {
     }
 }
 
+fn first_selectable_nav_row(rows: &[NavRow]) -> Option<usize> {
+    rows.iter().position(NavRow::is_selectable)
+}
+
+fn last_selectable_nav_row(rows: &[NavRow]) -> Option<usize> {
+    rows.iter().rposition(NavRow::is_selectable)
+}
+
+fn step_selectable_nav_row(rows: &[NavRow], start: usize, delta: i32) -> usize {
+    let selectable: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, row)| row.is_selectable().then_some(idx))
+        .collect();
+    if selectable.is_empty() {
+        return 0;
+    }
+    if delta == 0 {
+        return start.min(rows.len().saturating_sub(1));
+    }
+    if delta > 0 {
+        let pos = selectable
+            .iter()
+            .position(|&idx| idx >= start)
+            .unwrap_or(selectable.len() - 1);
+        let steps = if selectable[pos] == start {
+            delta as usize
+        } else {
+            (delta as usize).saturating_sub(1)
+        };
+        selectable[pos.saturating_add(steps).min(selectable.len() - 1)]
+    } else {
+        let pos = selectable.iter().rposition(|&idx| idx <= start).unwrap_or(0);
+        let steps = if selectable[pos] == start {
+            (-delta) as usize
+        } else {
+            ((-delta) as usize).saturating_sub(1)
+        };
+        selectable[pos.saturating_sub(steps)]
+    }
+}
+
 fn move_nav_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
-    let len = nav_pane::nav_row_count(app, ui);
-    if len == 0 {
+    let rows = nav_pane::nav_rows_cached(app, ui);
+    if rows.is_empty() {
         return;
     }
-    let cur = ui.nav_selected.min(len - 1) as i32;
-    let next = (cur + delta).clamp(0, (len - 1) as i32) as usize;
+    let next = step_selectable_nav_row(&rows, ui.nav_selected, delta);
     ui.nav_selected = next;
     if delta > 0 {
         maybe_load_older_chats(app, ui);
+    }
+}
+
+fn jump_unread(app: &mut AppState, ui: &mut UiState, forward: bool) {
+    let mut unread_map: HashSet<String> = HashSet::new();
+    let mut unread_targets: Vec<(String, ConversationTarget)> = Vec::new();
+    for conv in &app.conversations {
+        if conv.unread_count > 0 && unread_map.insert(conv.conv_key.clone()) {
+            unread_targets.push((conv.conv_key.clone(), conv.target.clone()));
+        }
+    }
+    for team in &app.teams {
+        for ch in &team.channels {
+            let key = ch.conv_key();
+            if unread_map.contains(&key) {
+                continue;
+            }
+            if app
+                .conversations
+                .iter()
+                .any(|c| c.conv_key == key && c.unread_count > 0)
+            {
+                unread_map.insert(key);
+                unread_targets.push((ch.conv_key(), ch.target()));
+            }
+        }
+    }
+    if unread_targets.is_empty() {
+        ui.info("No unread conversations");
+        return;
+    }
+    let idx = if let Some(active) = app.active_conv_key.as_deref() {
+        if let Some(pos) = unread_targets.iter().position(|(k, _)| k == active) {
+            if forward {
+                (pos + 1) % unread_targets.len()
+            } else {
+                (pos + unread_targets.len() - 1) % unread_targets.len()
+            }
+        } else if let Some(active_pos) = app.conversations.iter().position(|c| c.conv_key == active)
+        {
+            if forward {
+                app.conversations[active_pos + 1..]
+                    .iter()
+                    .chain(app.conversations[..active_pos].iter())
+                    .find_map(|c| {
+                        unread_targets
+                            .iter()
+                            .position(|(k, _)| k == &c.conv_key)
+                    })
+                    .unwrap_or(0)
+            } else {
+                app.conversations[..active_pos]
+                    .iter()
+                    .rev()
+                    .chain(app.conversations[active_pos + 1..].iter().rev())
+                    .find_map(|c| {
+                        unread_targets
+                            .iter()
+                            .position(|(k, _)| k == &c.conv_key)
+                    })
+                    .unwrap_or(unread_targets.len() - 1)
+            }
+        } else if forward {
+            0
+        } else {
+            unread_targets.len() - 1
+        }
+    } else if forward {
+        0
+    } else {
+        unread_targets.len() - 1
+    };
+
+    let (_, target) = unread_targets[idx].clone();
+    app.select_conversation(ui, target);
+}
+
+fn step_active_nav_conversation(app: &mut AppState, ui: &mut UiState, delta: i32) {
+    let rows = nav_pane::nav_rows_cached(app, ui);
+    let entries: Vec<(usize, String)> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, row)| match row {
+            NavRow::Chat { conv_key, .. } | NavRow::TeamChannel { conv_key, .. } => {
+                Some((idx, conv_key.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    let cur_pos = app
+        .active_conv_key
+        .as_deref()
+        .and_then(|active| entries.iter().position(|(_, k)| k == active))
+        .or_else(|| entries.iter().position(|(idx, _)| *idx == ui.nav_selected));
+    let next_pos = match cur_pos {
+        Some(pos) if delta > 0 => (pos + 1) % entries.len(),
+        Some(pos) => (pos + entries.len() - 1) % entries.len(),
+        None if delta > 0 => 0,
+        None => entries.len() - 1,
+    };
+    let (row_idx, conv_key) = entries[next_pos].clone();
+    ui.nav_selected = row_idx;
+    if let Some(target) = app.target_for_conv_key(&conv_key) {
+        app.select_conversation(ui, target);
+    }
+}
+
+fn active_stream_half_page(ui: &UiState) -> i32 {
+    let h = if ui.thread_drawer_open && ui.composer_target_thread {
+        ui.thread_scroll.area.height
+    } else if matches!(ui.focus(), Focus::Thread) {
+        ui.thread_scroll.area.height
+    } else {
+        ui.chat_scroll.area.height
+    };
+    ((h / 2).max(5)) as i32
+}
+
+fn scroll_active_stream_from_composer(app: &mut AppState, ui: &mut UiState, delta: i32) {
+    if ui.thread_drawer_open && ui.composer_target_thread {
+        if delta < 0 {
+            ui.thread_scroll.scroll_up((-delta) as u16);
+        } else if delta > 0 {
+            ui.thread_scroll.scroll_down(delta as u16);
+        }
+    } else {
+        scroll_chat_with_autoload(app, ui, delta);
     }
 }
 
@@ -1093,13 +1492,8 @@ fn scroll_chat_with_autoload(app: &mut AppState, ui: &mut UiState, delta: i32) {
         ui.chat_scroll.scroll_down(delta as u16);
     }
     let now_at_top = chat_scroll_is_at_top(ui);
-    if delta < 0
-        && (was_at_top || now_at_top)
-        && !app.oldest_reached
-        && !app.loading_older
-        && app.active_conv_key.is_some()
-    {
-        app.load_older_auto(ui);
+    if delta < 0 && (was_at_top || now_at_top) {
+        app.maybe_autoload_older_on_scroll_top(ui);
     }
 }
 
@@ -1111,12 +1505,8 @@ fn move_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
         Focus::Chat => {
             let len = app.messages.len();
             if len == 0 {
-                if delta < 0
-                    && !app.oldest_reached
-                    && !app.loading_older
-                    && app.active_conv_key.is_some()
-                {
-                    app.load_older_auto(ui);
+                if delta < 0 {
+                    app.maybe_autoload_older_on_scroll_top(ui);
                 }
                 return;
             }
@@ -1124,17 +1514,17 @@ fn move_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
             let was_at_first = cur == 0;
             let next = (cur + delta).clamp(0, (len - 1) as i32) as usize;
             ui.chat_scroll.selected_idx = Some(next);
+            let vh = ui.chat_scroll.area.height as usize;
             if delta < 0 && next == 0 {
                 ui.chat_scroll.scroll_up(2);
-                if (was_at_first || chat_scroll_is_at_top(ui))
-                    && !app.oldest_reached
-                    && !app.loading_older
-                    && app.active_conv_key.is_some()
-                {
-                    app.load_older_auto(ui);
+                ui.chat_scroll.ensure_visible(next, vh);
+                if was_at_first || chat_scroll_is_at_top(ui) {
+                    app.maybe_autoload_older_on_scroll_top(ui);
                 }
             } else if delta > 0 && next == len - 1 {
                 ui.chat_scroll.bottom();
+            } else {
+                ui.chat_scroll.ensure_visible(next, vh);
             }
         }
         Focus::Thread => {
@@ -1149,10 +1539,14 @@ fn move_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
             let cur = ui.thread_scroll.selected_idx.unwrap_or(len - 1) as i32;
             let next = (cur + delta).clamp(0, (len - 1) as i32) as usize;
             ui.thread_scroll.selected_idx = Some(next);
+            let vh = ui.thread_scroll.area.height as usize;
             if delta < 0 && next == 0 {
                 ui.thread_scroll.scroll_up(2);
+                ui.thread_scroll.ensure_visible(next, vh);
             } else if delta > 0 && next == len - 1 {
                 ui.thread_scroll.bottom();
+            } else {
+                ui.thread_scroll.ensure_visible(next, vh);
             }
         }
         Focus::Composer | Focus::Overlay => {}
@@ -1179,16 +1573,16 @@ fn handle_mouse_scroll(app: &mut AppState, ui: &mut UiState, delta: i32, column:
     let pos = Position { x: column, y: row };
     if ui.nav_area.contains(pos) {
         move_nav_selection(app, ui, delta);
-    } else if ui.thread_drawer_open && ui.thread_scroll.area.contains(pos) {
+    } else if ui.thread_drawer_open
+        && (ui.thread_scroll.area.contains(pos) || ui.thread_composer_area.contains(pos))
+    {
         if delta < 0 {
             ui.thread_scroll.scroll_up((-delta) as u16);
         } else if delta > 0 {
             ui.thread_scroll.scroll_down(delta as u16);
         }
-    } else if ui.chat_scroll.area.contains(pos) {
-        scroll_chat_with_autoload(app, ui, delta);
     } else {
-        scroll_focused_and_autoload(app, ui, delta);
+        scroll_chat_with_autoload(app, ui, delta);
     }
 }
 
@@ -1242,6 +1636,14 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
                 }
                 return false;
             }
+            Some(HitTarget::Button(ButtonId::ConfirmOk)) => {
+                return dispatch(Action::Activate, app, ui);
+            }
+            Some(HitTarget::Button(ButtonId::ConfirmCancel)) => {
+                ui.close_top_overlay();
+                return false;
+            }
+            Some(HitTarget::OverlayBody) => return false,
             None => {
                 ui.close_top_overlay();
                 return false;
@@ -1251,10 +1653,41 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
     }
 
     if let Some(hit) = target {
+        let now = Instant::now();
+        let is_double_click = matches!(hit, HitTarget::Message { .. })
+            && ui.last_click.is_some_and(|(t, _, _, prev_hit)| {
+                prev_hit == hit && now.duration_since(t) <= Duration::from_millis(400)
+            });
+        if is_double_click {
+            ui.last_click = None;
+            if let HitTarget::Message { scope, msg_index } = hit {
+                return dispatch(Action::ReplyTo { scope, msg_index }, app, ui);
+            }
+        }
+        ui.last_click = Some((now, column, row, hit));
+
+        if hit == HitTarget::ThreadComposer {
+            if !ui.composer_target_thread {
+                app.stash_and_reset_draft(ui);
+                ui.composer_target_thread = true;
+                app.restore_draft(ui);
+            }
+            return dispatch(Action::OpenComposer, app, ui);
+        }
+        if hit == HitTarget::Composer {
+            if ui.thread_drawer_open && ui.term_width >= 120 && ui.composer_target_thread {
+                app.stash_and_reset_draft(ui);
+                ui.composer_target_thread = false;
+                app.restore_draft(ui);
+            }
+            return dispatch(Action::OpenComposer, app, ui);
+        }
+
         let act = action_for_target(hit);
         return dispatch(act, app, ui);
     }
 
+    ui.last_click = None;
     let pos = Position { x: column, y: row };
     if ui.thread_drawer_open && ui.thread_scroll.area.contains(pos) {
         ui.set_focus(Focus::Thread);
@@ -1305,9 +1738,27 @@ fn action_for_target(target: HitTarget) -> Action {
             ButtonId::SubjectToggle => Action::ToggleSubject,
             ButtonId::NarrowToggle => Action::ToggleNarrowPane,
             ButtonId::ImagePreview => Action::OpenImagePreview,
+            ButtonId::CommandPalette => Action::OpenOverlay(OverlayKind::CommandPalette),
+            ButtonId::DensityToggle => Action::ToggleDensity,
+            ButtonId::Help => Action::OpenOverlay(OverlayKind::Help),
+            ButtonId::FilterToggle => Action::ToggleUnreadFilter,
+            ButtonId::ConfirmOk => Action::Activate,
+            ButtonId::ConfirmCancel => Action::CloseOverlay,
+        },
+        HitTarget::InlineAction {
+            scope,
+            msg_index,
+            action,
+        } => match action {
+            super::hitmap::InlineActionKind::Reply => Action::ReplyTo { scope, msg_index },
+            super::hitmap::InlineActionKind::Thread => Action::OpenThread { msg_index },
+            super::hitmap::InlineActionKind::React => Action::OpenReactions { scope, msg_index },
+            super::hitmap::InlineActionKind::More => Action::SelectMessage { scope, msg_index },
         },
         HitTarget::SubjectInput => Action::FocusSubject,
         HitTarget::Composer => Action::OpenComposer,
+        HitTarget::ThreadComposer => Action::OpenComposer,
+        HitTarget::OverlayBody => Action::Noop,
         HitTarget::OverlayItem { index } => Action::OverlaySelect(index),
     }
 }
@@ -1326,7 +1777,9 @@ fn open_context_menu_at(column: u16, row: u16, app: &mut AppState, ui: &mut UiSt
             scope: MessageScope::Chat,
             msg_index,
         },
-        Some(HitTarget::Composer) | Some(HitTarget::SubjectInput) => ContextTarget::Composer,
+        Some(HitTarget::Composer)
+        | Some(HitTarget::ThreadComposer)
+        | Some(HitTarget::SubjectInput) => ContextTarget::Composer,
         _ => ContextTarget::Global,
     };
     ui.close_overlays_of(OverlayKind::ContextMenu);
@@ -1358,13 +1811,13 @@ fn copy_to_clipboard(text: &str, ui: &mut UiState) {
     };
 
     if native_ok {
-        ui.info("클립보드에 복사했습니다");
+        ui.info("Copied to clipboard");
     } else if osc_ok {
-        ui.info("클립보드에 복사했습니다 (OSC 52)");
+        ui.info("Copied to clipboard (OSC 52)");
     } else if let Some(err) = last_err {
-        ui.info(format!("클립보드 복사 실패: {err}"));
+        ui.info(format!("Clipboard copy failed: {err}"));
     } else {
-        ui.info("클립보드 복사 실패: 사용 가능한 클립보드 백엔드가 없습니다");
+        ui.info("Clipboard copy failed: no clipboard backend available");
     }
 }
 
@@ -1403,7 +1856,7 @@ fn paste_clipboard(app: &mut AppState, ui: &mut UiState) {
     }
 
     if !arboard_opened {
-        ui.info("클립보드를 열 수 없습니다");
+        ui.info("Unable to open clipboard");
         return;
     }
 
@@ -1419,10 +1872,10 @@ fn paste_clipboard(app: &mut AppState, ui: &mut UiState) {
                     Some(format!("clipboard-{n}.png")),
                 );
                 ui.set_focus(Focus::Composer);
-                ui.info(format!("클립보드 이미지 첨부 ({width}x{height})"));
+                ui.info(format!("Attached clipboard image ({width}x{height})"));
             }
             Err(err) => {
-                ui.error(format!("이미지 인코딩 실패: {err}"));
+                ui.error(format!("Image encoding failed: {err}"));
             }
         }
     }
@@ -1601,5 +2054,99 @@ mod tests {
         assert!(seq.ends_with('\x07'));
         // 74,994 raw bytes -> 99,992 base64 bytes + 8 bytes framing = 100,000 bytes.
         assert!(seq.len() <= 100_000);
+    }
+
+    fn test_app_and_ui() -> (AppState, UiState) {
+        let cfg = crate::config::AppConfig::default();
+        let auth = crate::auth::AuthManager::new(cfg.clone()).unwrap();
+        let graph = crate::graph::GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = crate::storage::Storage::open_in_memory().unwrap();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sync_ctrl =
+            crate::sync::spawn_sync_engine(cfg.clone(), graph.clone(), storage.clone(), event_tx);
+        let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let ui = UiState::from_config(&cfg);
+        (app, ui)
+    }
+
+    #[tokio::test]
+    async fn composer_scroll_paths_keep_composer_focus() {
+        let (mut app, mut ui) = test_app_and_ui();
+        ui.set_focus(Focus::Composer);
+        ui.chat_scroll.area = ratatui::layout::Rect::new(0, 0, 80, 20);
+        ui.chat_scroll.total_lines = 100;
+
+        // Path 1: PageUp / PageDown
+        dispatch(Action::ScrollPageUp, &mut app, &mut ui);
+        assert_eq!(ui.focus(), Focus::Composer);
+        assert_eq!(ui.chat_scroll.scroll_up, 10);
+        assert!(!ui.chat_scroll.follow_tail);
+
+        dispatch(Action::ScrollPageDown, &mut app, &mut ui);
+        assert_eq!(ui.focus(), Focus::Composer);
+        assert_eq!(ui.chat_scroll.scroll_up, 0);
+        assert!(ui.chat_scroll.follow_tail);
+
+        // Path 2: Ctrl+Up / Ctrl+Down even with multiline text
+        ui.composer.load_text("line1\nline2");
+        dispatch(Action::ScrollUp, &mut app, &mut ui);
+        assert_eq!(ui.focus(), Focus::Composer);
+        assert_eq!(ui.chat_scroll.scroll_up, 3);
+
+        // Path 3: Up/Down when composer has text moves cursor, NOT stream scroll
+        let cursor_before = ui.composer.cursor();
+        dispatch(Action::CursorUp, &mut app, &mut ui);
+        assert!(ui.composer.cursor() < cursor_before);
+        assert_eq!(ui.chat_scroll.scroll_up, 3);
+
+        // Path 3b: Up/Down when composer has NO text scrolls stream, keeping Focus::Composer
+        ui.composer.load_text("");
+        dispatch(Action::CursorUp, &mut app, &mut ui);
+        assert_eq!(ui.focus(), Focus::Composer);
+        assert_eq!(ui.chat_scroll.scroll_up, 6);
+
+        dispatch(Action::CursorDown, &mut app, &mut ui);
+        assert_eq!(ui.focus(), Focus::Composer);
+        assert_eq!(ui.chat_scroll.scroll_up, 3);
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn quit_confirm_opens_modal_when_draft_nonempty_and_overlay_body_blocks_dismiss() {
+        let (mut app, mut ui) = test_app_and_ui();
+        ui.composer.load_text("unsent draft");
+        let should_quit = dispatch(Action::QuitConfirm, &mut app, &mut ui);
+        assert!(!should_quit);
+        assert_eq!(ui.overlays.len(), 1);
+        assert_eq!(ui.overlays[0].kind(), OverlayKind::Confirm);
+
+        ui.hitmap.clear();
+        ui.hitmap.add(
+            ratatui::layout::Rect::new(10, 5, 40, 8),
+            HitTarget::OverlayBody,
+        );
+        // Clicking inside OverlayBody keeps modal open
+        assert!(!dispatch(
+            Action::Click { column: 15, row: 7 },
+            &mut app,
+            &mut ui
+        ));
+        assert_eq!(ui.overlays.len(), 1);
+
+        // Clicking outside closes modal
+        assert!(!dispatch(
+            Action::Click { column: 0, row: 0 },
+            &mut app,
+            &mut ui
+        ));
+        assert!(ui.overlays.is_empty());
+
+        // Empty composer exits immediately on Ctrl+Q
+        ui.composer.load_text("");
+        assert!(dispatch(Action::QuitConfirm, &mut app, &mut ui));
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
     }
 }

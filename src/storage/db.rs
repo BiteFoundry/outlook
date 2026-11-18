@@ -27,7 +27,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
         PRAGMA cache_size = -8000;
         ",
     )
-    .context("SQLite PRAGMA 설정 실패")?;
+    .context("Failed to configure SQLite PRAGMAs")?;
     if !is_memory {
         let _ = conn.execute_batch("PRAGMA mmap_size = 67108864;");
         let user_version: i32 = conn
@@ -66,7 +66,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
                 DROP TABLE IF EXISTS onenote_notebooks;
                 ",
             )
-            .context("레거시 Outlook/OneNote 테이블 정리 실패")?;
+            .context("Failed to drop legacy Outlook/OneNote tables")?;
         }
     }
 
@@ -164,7 +164,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
         );
         ",
     )
-    .context("SQLite 기본 스키마 생성 실패")?;
+    .context("Failed to create base SQLite schema")?;
 
     let messages_trigram = ensure_fts5_table(
         conn,
@@ -198,7 +198,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             SCHEMA_USER_VERSION_UNICODE61
         };
         conn.execute_batch(&format!("PRAGMA user_version = {version};"))
-            .context("SQLite user_version 설정 실패")?;
+            .context("Failed to set SQLite user_version")?;
     }
 
     Ok(messages_trigram)
@@ -215,7 +215,7 @@ pub fn init_reader_connection(conn: &Connection) -> Result<()> {
         PRAGMA cache_size = -4000;
         ",
     )
-    .context("SQLite reader PRAGMA 설정 실패")?;
+    .context("Failed to configure SQLite reader PRAGMAs")?;
     let _ = conn.execute_batch("PRAGMA mmap_size = 67108864;");
     Ok(())
 }
@@ -233,7 +233,7 @@ fn ensure_fts5_table(
 ) -> Result<bool> {
     if conn.execute_batch(trigram_sql).is_err() {
         conn.execute_batch(unicode61_sql)
-            .with_context(|| format!("FTS5 가상 테이블 생성 실패 ({table_name}, unicode61)"))?;
+            .with_context(|| format!("Failed to create FTS5 virtual table ({table_name}, unicode61)"))?;
         return Ok(false);
     }
 
@@ -391,7 +391,7 @@ mod tests {
                     web_url TEXT
                 );
                 INSERT INTO conversations (conv_key, target_json, kind, title)
-                VALUES ('chat:c1', '{\"target_type\":\"chat\",\"chat_id\":\"c1\"}', 'oneOnOne', '홍길동');
+                VALUES ('chat:c1', '{\"target_type\":\"chat\",\"chat_id\":\"c1\"}', 'oneOnOne', 'Alice');
 
                 CREATE TABLE mail_folders (id TEXT PRIMARY KEY);
                 CREATE TABLE mail_messages (id TEXT PRIMARY KEY);
@@ -444,7 +444,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(title, "홍길동");
+            assert_eq!(title, "Alice");
         }
     }
 }

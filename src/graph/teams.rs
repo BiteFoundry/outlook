@@ -814,12 +814,12 @@ mod tests {
     #[test]
     fn test_build_chat_message_payload_auto_inserts_attachment_and_hosted_tags() {
         let outgoing = OutgoingMessage {
-            subject: Some("공지".into()),
-            body_html: "<p>파일 확인 부탁드립니다</p>".into(),
+            subject: Some("Announcement".into()),
+            body_html: "<p>Please check the file</p>".into(),
             mentions: vec![MentionInfo {
                 id: 0,
                 user_id: "u-1".into(),
-                display_name: "홍길동".into(),
+                display_name: "Alice".into(),
             }],
             attachments: vec![UploadedReferenceAttachment {
                 id: "153fa47d-18c9-4179-be08-9879815a9f90".into(),
@@ -842,7 +842,7 @@ mod tests {
         let content = payload["body"]["content"].as_str().unwrap();
         assert!(content.contains("<attachment id=\"153fa47d-18c9-4179-be08-9879815a9f90\"></attachment>"));
         assert!(content.contains("<img src=\"../hostedContents/1/$value\" alt=\"clip.png\">"));
-        assert_eq!(payload["subject"], "공지");
+        assert_eq!(payload["subject"], "Announcement");
         assert_eq!(payload["importance"], "urgent");
         assert_eq!(payload["attachments"][0]["contentType"], "reference");
         assert_eq!(payload["hostedContents"][0]["@microsoft.graph.temporaryId"], "1");

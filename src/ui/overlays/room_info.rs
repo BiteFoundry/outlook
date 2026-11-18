@@ -1,10 +1,10 @@
-//! Room / Channel Info & Members overlay (`Ctrl+U` or `[멤버/정보]`).
+//! Room / Channel Info & Members overlay (`Ctrl+U` or `[Info]`).
 
 use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -15,7 +15,7 @@ use crate::ui::{
     overlays::{attachments, centered_rect, OverlayKind, OverlayOutcome},
 };
 
-pub const BUTTONS: [&str; 4] = ["새로고침", "첨부 목록", "파일 전송", "닫기"];
+pub const BUTTONS: [&str; 4] = ["Refresh", "Attachments", "Send File", "Close"];
 
 #[derive(Debug, Clone, Default)]
 pub struct RoomInfoState {
@@ -56,7 +56,7 @@ impl RoomInfoState {
                 _ => OverlayOutcome::Close,
             },
             Action::CloseOverlay => OverlayOutcome::Close,
-            Action::Quit => OverlayOutcome::NotHandled,
+            Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
             _ => OverlayOutcome::Handled,
         }
     }
@@ -76,10 +76,13 @@ impl RoomInfoState {
             area.height.saturating_sub(4).min(28),
         );
         frame.render_widget(Clear, rect);
+        hitmap.add(rect, HitTarget::OverlayBody);
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
             .title(Line::from(Span::styled(
-                " 멤버 / 대화 정보 · ↑↓ 버튼 · Enter 실행 · Esc 닫기 ",
+                " Room Info & Members · ↑↓ Select · Enter Run · Esc Close ",
                 theme.title(true),
             )))
             .border_style(theme.border_style(true));
@@ -99,28 +102,28 @@ impl RoomInfoState {
                 ]));
                 if let Some(team) = &conv.team_name {
                     lines.push(Line::from(Span::styled(
-                        format!(" 팀: {team}"),
+                        format!(" Team: {team}"),
                         theme.muted_style(),
                     )));
                 }
                 if let Some(topic) = &conv.topic {
                     if !topic.trim().is_empty() {
                         lines.push(Line::from(Span::styled(
-                            format!(" 주제: {topic}"),
+                            format!(" Topic: {topic}"),
                             theme.muted_style(),
                         )));
                     }
                 }
             }
             None => lines.push(Line::from(Span::styled(
-                " 선택된 대화 없음",
+                " No conversation selected",
                 theme.muted_style(),
             ))),
         }
 
         let attachment_rows = attachments::rows(app);
         lines.push(Line::from(Span::styled(
-            format!(" 첨부 {}개", attachment_rows.len()),
+            format!(" {} attachments", attachment_rows.len()),
             theme.accent_style(),
         )));
         lines.push(Line::from(""));
@@ -128,13 +131,13 @@ impl RoomInfoState {
         let buttons_y = inner.y + inner.height.saturating_sub(2);
         let member_room = buttons_y.saturating_sub(inner.y + lines.len() as u16) as usize;
         lines.push(Line::from(Span::styled(
-            format!(" 멤버 {}명", app.members.len()),
+            format!(" {} members", app.members.len()),
             theme.accent_style(),
         )));
         let member_space = member_room.saturating_sub(1);
         if app.members.is_empty() {
             lines.push(Line::from(Span::styled(
-                "  멤버 목록을 불러오는 중이거나 정보가 없습니다",
+                "  No members loaded or unavailable",
                 theme.muted_style(),
             )));
         } else {
@@ -146,7 +149,7 @@ impl RoomInfoState {
                     .map(|p| p.availability.as_str());
                 let (dot, dot_color) = theme.presence_indicator(avail);
                 let me_tag = if member.user_id == app.my_user_id {
-                    " (나)"
+                    " (you)"
                 } else {
                     ""
                 };
@@ -164,7 +167,7 @@ impl RoomInfoState {
             }
             if app.members.len() > member_space && member_space > 0 {
                 lines.push(Line::from(Span::styled(
-                    format!("  …외 {}명", app.members.len() - member_space),
+                    format!("  …and {} more", app.members.len() - member_space),
                     theme.muted_style(),
                 )));
             }

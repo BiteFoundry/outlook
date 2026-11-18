@@ -26,7 +26,7 @@ pub fn key_to_action_for_tab(
         return None;
     }
 
-    if text_input || focus == Focus::Overlay {
+    if text_input {
         if let Some(action) = keymap.resolve_scoped(focus, key) {
             return Some(action);
         }
@@ -37,7 +37,17 @@ pub fn key_to_action_for_tab(
         }
     }
 
-    keymap.resolve_for_tab(focus, active_nav_tab, key)
+    if let Some(action) = keymap.resolve_for_tab(focus, active_nav_tab, key) {
+        return Some(action);
+    }
+
+    if focus == Focus::Overlay && is_plain_text(key) {
+        if let KeyCode::Char(ch) = key.code {
+            return Some(Action::Input(ch));
+        }
+    }
+
+    None
 }
 
 fn is_plain_text(key: KeyEvent) -> bool {
@@ -105,7 +115,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_q_quits_and_t_opens_thread() {
+    fn chat_bare_q_does_not_quit_ctrl_q_confirms_and_t_opens_thread() {
         let keymap = Keymap::default_teams();
         assert_eq!(
             key_to_action(
@@ -114,7 +124,16 @@ mod tests {
                 &keymap,
                 false,
             ),
-            Some(Action::Quit)
+            None
+        );
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                Focus::Chat,
+                &keymap,
+                false,
+            ),
+            Some(Action::QuitConfirm)
         );
         assert_eq!(
             key_to_action(
@@ -128,8 +147,90 @@ mod tests {
     }
 
     #[test]
+    fn non_text_overlay_maps_jk_to_move_and_preserves_overlay_hotkeys() {
+        let keymap = Keymap::default_teams();
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Char('j'), KeyModifiers::NONE),
+                Focus::Overlay,
+                &keymap,
+                false,
+            ),
+            Some(Action::MoveDown)
+        );
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Char('k'), KeyModifiers::NONE),
+                Focus::Overlay,
+                &keymap,
+                false,
+            ),
+            Some(Action::MoveUp)
+        );
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Char('2'), KeyModifiers::NONE),
+                Focus::Overlay,
+                &keymap,
+                false,
+            ),
+            Some(Action::Input('2'))
+        );
+    }
+
+    #[test]
     fn teams_tabs_image_and_history_keys() {
         let keymap = Keymap::default_teams();
+        assert_eq!(
+            key_to_action_for_tab(
+                press(KeyCode::Char('1'), KeyModifiers::NONE),
+                Focus::Nav,
+                0,
+                &keymap,
+                false,
+            ),
+            Some(Action::SelectNavTab(0))
+        );
+        assert_eq!(
+            key_to_action_for_tab(
+                press(KeyCode::Char('2'), KeyModifiers::NONE),
+                Focus::Chat,
+                0,
+                &keymap,
+                false,
+            ),
+            Some(Action::SelectNavTab(1))
+        );
+        assert_eq!(
+            key_to_action_for_tab(
+                press(KeyCode::Char('3'), KeyModifiers::NONE),
+                Focus::Thread,
+                0,
+                &keymap,
+                false,
+            ),
+            Some(Action::SelectNavTab(2))
+        );
+        assert_eq!(
+            key_to_action_for_tab(
+                press(KeyCode::Char('2'), KeyModifiers::NONE),
+                Focus::Composer,
+                0,
+                &keymap,
+                true,
+            ),
+            Some(Action::Input('2'))
+        );
+        assert_eq!(
+            key_to_action_for_tab(
+                press(KeyCode::Char('2'), KeyModifiers::ALT),
+                Focus::Composer,
+                0,
+                &keymap,
+                true,
+            ),
+            Some(Action::SelectNavTab(1))
+        );
         assert_eq!(
             key_to_action_for_tab(
                 press(KeyCode::Char('1'), KeyModifiers::CONTROL),

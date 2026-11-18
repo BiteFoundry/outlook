@@ -191,7 +191,7 @@ fn collect_adaptive_element(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                body_lines.push(format!("[이미지: {alt}]"));
+                body_lines.push(format!("[Image: {alt}]"));
             }
         }
         _ => {

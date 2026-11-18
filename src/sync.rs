@@ -226,21 +226,21 @@ pub fn spawn_sync_engine(
                             fast_shared.record_activity(Instant::now());
                             let focus = focus_rx.borrow_and_update().clone();
                             if let Err(err) = sync_active_focus(&focus, &fast_graph, &fast_storage, &fast_event_tx).await {
-                                let _ = fast_event_tx.send(CoreEvent::SyncError(format!("활성 대화 동기화 실패: {err}")));
+                                let _ = fast_event_tx.send(CoreEvent::SyncError(format!("Failed to sync active conversation: {err}")));
                             }
                         }
                         Some(SyncCommand::SyncChannelHistory { team_id, channel_id }) => {
                             fast_shared.record_activity(Instant::now());
                             let _ = fast_event_tx.send(CoreEvent::SyncStateChanged {
                                 busy: true,
-                                summary: "채널 히스토리 동기화 중...".to_string(),
+                                summary: "Syncing channel history...".to_string(),
                             });
                             if let Err(err) = sync_channel_history(&team_id, &channel_id, &fast_graph, &fast_storage, &fast_event_tx).await {
-                                let _ = fast_event_tx.send(CoreEvent::SyncError(format!("채널 동기화 실패: {err}")));
+                                let _ = fast_event_tx.send(CoreEvent::SyncError(format!("Failed to sync channel: {err}")));
                             }
                             let _ = fast_event_tx.send(CoreEvent::SyncStateChanged {
                                 busy: false,
-                                summary: "동기화 완료".to_string(),
+                                summary: "Synced".to_string(),
                             });
                         }
                         Some(SyncCommand::NotifyUserActivity) => {
@@ -256,7 +256,7 @@ pub fn spawn_sync_engine(
                     fast_shared.record_activity(Instant::now());
                     let focus = focus_rx.borrow_and_update().clone();
                     if let Err(err) = sync_active_focus(&focus, &fast_graph, &fast_storage, &fast_event_tx).await {
-                        let _ = fast_event_tx.send(CoreEvent::SyncError(format!("포커스 대화 동기화 실패: {err}")));
+                        let _ = fast_event_tx.send(CoreEvent::SyncError(format!("Failed to sync focused conversation: {err}")));
                     }
                 }
                 _ = active_tick.tick() => {
@@ -265,7 +265,7 @@ pub fn spawn_sync_engine(
                         let focus = focus_rx.borrow().clone();
                         if focus.target.is_some() {
                             if let Err(err) = sync_active_focus(&focus, &fast_graph, &fast_storage, &fast_event_tx).await {
-                                let _ = fast_event_tx.send(CoreEvent::SyncError(format!("활성 폴링 오류: {err}")));
+                                let _ = fast_event_tx.send(CoreEvent::SyncError(format!("Active poll error: {err}")));
                             }
                         }
                     }
@@ -306,14 +306,14 @@ pub fn spawn_sync_engine(
                         Some(SyncCommand::RefreshConversations) => {
                             let _ = event_tx.send(CoreEvent::SyncStateChanged {
                                 busy: true,
-                                summary: "대화 목록 동기화 중...".to_string(),
+                                summary: "Syncing conversations...".to_string(),
                             });
                             if let Err(err) = refresh_all_conversations(&graph, &storage, &event_tx).await {
-                                let _ = event_tx.send(CoreEvent::SyncError(format!("대화 목록 동기화 실패: {err}")));
+                                let _ = event_tx.send(CoreEvent::SyncError(format!("Failed to sync conversations: {err}")));
                             }
                             let _ = event_tx.send(CoreEvent::SyncStateChanged {
                                 busy: false,
-                                summary: "동기화 완료".to_string(),
+                                summary: "Synced".to_string(),
                             });
                         }
                         Some(_) => {}
@@ -324,7 +324,7 @@ pub fn spawn_sync_engine(
                     maybe_shrink_on_idle(idle, &mut was_idle, &storage);
                     if chat_backoff.on_tick(idle, seq) {
                         if let Err(err) = poll_chats_tier2(&graph, &storage, &event_tx).await {
-                            let _ = event_tx.send(CoreEvent::SyncError(format!("채팅 폴링 오류: {err}")));
+                            let _ = event_tx.send(CoreEvent::SyncError(format!("Chat poll error: {err}")));
                         }
                     }
                 }
@@ -333,7 +333,7 @@ pub fn spawn_sync_engine(
                     maybe_shrink_on_idle(idle, &mut was_idle, &storage);
                     if channel_backoff.on_tick(idle, seq) {
                         if let Err(err) = poll_presences_tier3(&graph, &storage, &event_tx).await {
-                            let _ = event_tx.send(CoreEvent::SyncError(format!("상태 폴링 오류: {err}")));
+                            let _ = event_tx.send(CoreEvent::SyncError(format!("Presence poll error: {err}")));
                         }
                     }
                 }
@@ -725,15 +725,15 @@ mod tests {
             reply_to_preview: None,
             subject: None,
             author_id: Some("u2".to_string()),
-            author_name: "홍길동".to_string(),
+            author_name: "Alice".to_string(),
             is_me: false,
             created_at: created_at.to_string(),
             last_modified_at: None,
             deleted: false,
             importance: "normal".to_string(),
             message_type: "message".to_string(),
-            body_html: "<p>메시지</p>".to_string(),
-            body_plain: "메시지".to_string(),
+            body_html: "<p>message</p>".to_string(),
+            body_plain: "message".to_string(),
             attachments: Vec::new(),
             mentions: Vec::new(),
             reactions: Vec::new(),
@@ -763,14 +763,14 @@ mod tests {
         assert_eq!(dirty, vec!["c1".to_string(), "c3".to_string()]);
 
         let mut msg_other = sample_msg("chat:c1", "m2", "2026-11-15T10:05:00Z");
-        msg_other.body_plain = "새\n메시지".to_string();
-        let cand = build_notification_candidate("chat:c1", "홍길동", &[msg_other.clone()]).unwrap();
-        assert_eq!(cand.sender, "홍길동");
-        assert_eq!(cand.preview, "새 메시지");
+        msg_other.body_plain = "New\nmessage".to_string();
+        let cand = build_notification_candidate("chat:c1", "Alice", &[msg_other.clone()]).unwrap();
+        assert_eq!(cand.sender, "Alice");
+        assert_eq!(cand.preview, "New message");
 
         let mut msg_me = msg_other;
         msg_me.is_me = true;
-        assert!(build_notification_candidate("chat:c1", "홍길동", &[msg_me]).is_none());
+        assert!(build_notification_candidate("chat:c1", "Alice", &[msg_me]).is_none());
     }
 
     #[tokio::test]
@@ -824,7 +824,7 @@ mod tests {
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(200), event_rx.recv()).await {
                 Ok(Some(CoreEvent::SyncStateChanged { summary, .. }))
-                    if summary.contains("대화 목록") =>
+                    if summary.contains("conversations") =>
                 {
                     saw_conv_refresh_state = true;
                     break;
@@ -1036,8 +1036,8 @@ mod tests {
                             "createdDateTime": "2026-11-16T09:00:00Z",
                             "messageType": "message",
                             "importance": "normal",
-                            "from": { "user": { "id": "u2", "displayName": "홍길동" } },
-                            "body": { "contentType": "text", "content": "안녕" }
+                            "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                            "body": { "contentType": "text", "content": "Hello" }
                         }]
                     }))
                 }),
@@ -1051,8 +1051,8 @@ mod tests {
                             "createdDateTime": "2026-11-16T09:05:00Z",
                             "messageType": "message",
                             "importance": "normal",
-                            "from": { "user": { "id": "u2", "displayName": "홍길동" } },
-                            "body": { "contentType": "text", "content": "채널 글" }
+                            "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                            "body": { "contentType": "text", "content": "Channel post" }
                         }]
                     }))
                 }),

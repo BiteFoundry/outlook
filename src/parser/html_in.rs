@@ -270,10 +270,10 @@ pub fn blocks_to_plain(blocks: &[RichBlock]) -> String {
             }
             RichBlock::AttachmentChip { id, name } => {
                 let label = name.as_deref().unwrap_or(id.as_str());
-                parts.push(format!("[첨부: {label}]"));
+                parts.push(format!("[Attachment: {label}]"));
             }
             RichBlock::InlineImageChip { index, .. } => {
-                parts.push(format!("[이미지 #{}]", index + 1));
+                parts.push(format!("[Image #{}]", index + 1));
             }
         }
     }
@@ -367,7 +367,7 @@ pub fn blocks_to_markdown(blocks: &[RichBlock]) -> String {
             }
             RichBlock::AttachmentChip { id, name } => {
                 let label = name.as_deref().unwrap_or(id.as_str());
-                parts.push(format!("[첨부: {label}]"));
+                parts.push(format!("[Attachment: {label}]"));
             }
             RichBlock::InlineImageChip { src, index } => {
                 parts.push(format!("![image-{}]({src})", index + 1));

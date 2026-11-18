@@ -16,15 +16,16 @@ pub mod settings;
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
+    style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
 
 use crate::ui::{
     action::Action,
     app::{AppState, UiState},
-    hitmap::{HitMap, MessageScope},
+    hitmap::{HitMap, HitTarget, MessageScope},
     overlays::{
         attachments::AttachmentsState, command_palette::CommandPalette, confirm::ConfirmDialog,
         context_menu::ContextMenu, image_preview::ImagePreviewOverlay, new_chat::NewChatState,
@@ -159,7 +160,7 @@ impl Overlay {
         Overlay::Confirm(ConfirmDialog::new(message, on_confirm))
     }
 
-    pub fn handle(&mut self, action: &Action, app: &AppState, _ui: &UiState) -> OverlayOutcome {
+    pub fn handle(&mut self, action: &Action, app: &AppState, ui: &UiState) -> OverlayOutcome {
         match self {
             Overlay::ContextMenu(menu) => match action {
                 Action::MoveUp => {
@@ -172,20 +173,18 @@ impl Overlay {
                 }
                 Action::Activate => menu.activate(),
                 Action::CloseOverlay => OverlayOutcome::Close,
-                Action::Input(_) | Action::Backspace | Action::InsertNewline | Action::Paste(_) => {
-                    OverlayOutcome::Handled
-                }
-                _ => OverlayOutcome::NotHandled,
+                Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
+                _ => OverlayOutcome::Handled,
             },
             Overlay::CommandPalette(palette) => match action {
-                Action::Tab => palette.handle(&Action::MoveDown),
-                Action::PrevFocus => palette.handle(&Action::MoveUp),
-                other => palette.handle(other),
+                Action::Tab => palette.handle(&Action::MoveDown, app, ui),
+                Action::PrevFocus => palette.handle(&Action::MoveUp, app, ui),
+                other => palette.handle(other, app, ui),
             },
             Overlay::Settings(settings) => match action {
-                Action::Tab => settings.handle(&Action::MoveDown),
-                Action::PrevFocus => settings.handle(&Action::MoveUp),
-                other => settings.handle(other),
+                Action::Tab => settings.handle(&Action::MoveDown, app),
+                Action::PrevFocus => settings.handle(&Action::MoveUp, app),
+                other => settings.handle(other, app),
             },
             Overlay::Search(search) => search.handle(action, app),
             Overlay::Presence(presence) => presence.handle(action),
@@ -201,7 +200,7 @@ impl Overlay {
             Overlay::ImagePreview(preview) => preview.handle(action),
             Overlay::Help(_) => match action {
                 Action::CloseOverlay | Action::Activate => OverlayOutcome::Close,
-                Action::Quit => OverlayOutcome::NotHandled,
+                Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
                 _ => OverlayOutcome::Handled,
             },
             Overlay::Confirm(dialog) => dialog.handle(action),
@@ -233,18 +232,18 @@ impl Overlay {
     ) {
         match self {
             Overlay::ContextMenu(menu) => menu.draw(frame, area, ui, hitmap),
-            Overlay::CommandPalette(palette) => palette.draw(frame, area, ui, hitmap),
+            Overlay::CommandPalette(palette) => palette.draw(frame, area, app, ui, hitmap),
             Overlay::Settings(settings) => settings.draw(frame, area, app, ui, hitmap),
             Overlay::Search(search) => search.draw(frame, area, app, ui, hitmap),
             Overlay::Presence(presence) => presence.draw(frame, area, app, ui, hitmap),
             Overlay::Reactions(reactions) => reactions.draw(frame, area, app, ui, hitmap),
             Overlay::Attachments(tray) => tray.draw(frame, area, app, ui, hitmap),
-            Overlay::PathInput(input) => input.draw(frame, area, ui),
+            Overlay::PathInput(input) => input.draw(frame, area, ui, hitmap),
             Overlay::NewChat(new_chat) => new_chat.draw(frame, area, app, ui, hitmap),
             Overlay::RoomInfo(info) => info.draw(frame, area, app, ui, hitmap),
             Overlay::ImagePreview(preview) => preview.draw(frame, area, app, ui, hitmap),
-            Overlay::Help(_) => draw_help(frame, area, ui),
-            Overlay::Confirm(dialog) => dialog.draw(frame, area, ui),
+            Overlay::Help(_) => draw_help(frame, area, ui, hitmap),
+            Overlay::Confirm(dialog) => dialog.draw(frame, area, ui, hitmap),
         }
     }
 }
@@ -258,61 +257,70 @@ pub struct HelpOverlay;
 
 const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
     (
-        "탐색 · 탭 전환",
+        "Navigation & Switching",
         &[
-            ("Ctrl+1 / 2 / 3", "채팅 / 팀·채널 / 활동(@멘션)"),
-            ("↑/↓, j/k", "목록·메시지 이동 (상단 자동 이전 로드)"),
-            ("PgUp / PgDn", "페이지 스크롤 (맨 위 도달 시 자동 로드)"),
-            ("Tab / Shift+Tab", "포커스 순환"),
-            ("Enter / Esc", "열기·전송 / 오버레이·스레드 닫기"),
+            ("Ctrl+K", "Omni-Switcher (chats, channels, commands)"),
+            ("1/2/3 · Alt+1..3", "Chats / Teams / Activity (@mentions)"),
+            ("u / U / Alt+u", "Jump to next / previous unread"),
+            ("` / Alt+← / Alt+→", "Last conversation / history back-fwd"),
+            ("Alt+↑ / Alt+↓", "Previous / next conversation in list"),
+            ("←/→ or h/l (Nav)", "Collapse / expand team or open chat"),
+            ("p / f (Nav)", "Pin conversation / filter unread only"),
+            ("Tab / Shift+Tab", "Cycle pane focus"),
         ],
     ),
     (
-        "메시지 · 스레드 · 히스토리",
+        "Messages & Threads",
         &[
-            ("o / u", "이전 메시지 50개 더 불러오기"),
-            ("H / s", "깊은 히스토리 동기화 (150개 / 스레드 200개)"),
-            ("t / +", "채널 스레드 열기 / 반응 추가"),
-            ("v", "선택 이미지 첨부 크게보기 (모달)"),
-            ("r / y / Del", "답장 / 복사 / 삭제(확인)"),
-            ("d / m / 우클릭", "첨부 다운로드 / 컨텍스트 메뉴"),
+            ("↑/↓, j/k", "Select messages / navigate list"),
+            ("PgUp / PgDn", "Scroll history (stays in Composer)"),
+            ("Ctrl+↑ / Ctrl+↓", "Scroll 3 lines from Composer"),
+            ("o / H / s", "Load older (50) / deep history sync"),
+            ("t / + / e", "Open channel thread / add reaction"),
+            ("r / y / Del", "Reply / copy / delete message"),
+            ("v / d / m", "Preview image / download / menu"),
         ],
     ),
     (
-        "입력 · 첨부 · 검색",
+        "Composing & Search",
         &[
-            ("i / Enter", "입력창 포커스 / 전송"),
-            ("Shift+Enter / Ctrl+E", "줄바꿈 / 외부 편집기($EDITOR)"),
-            ("Ctrl+V / Ctrl+S", "이미지 붙여넣기 / 채널 제목 토글"),
-            ("Ctrl+O / Ctrl+T", "파일 전송 / 첨부 파일 목록"),
-            ("Ctrl+F / /", "Teams 메시지 검색"),
-            ("Ctrl+K", "명령 팔레트"),
+            ("i / Enter", "Focus Composer / send message"),
+            ("Shift+Enter / Ctrl+E", "Newline / external $EDITOR"),
+            ("Ctrl+W / Alt+Bksp", "Delete word backward"),
+            ("Ctrl+V / Ctrl+Shift+X", "Paste image / clear pending images"),
+            ("Alt+T / Ctrl+S", "Toggle thread target / channel subject"),
+            ("Ctrl+O / Ctrl+T", "Send file / attachments tray"),
+            ("Ctrl+F / /", "Search messages"),
         ],
     ),
     (
-        "창 · 상태 · 기타",
+        "Window & Preferences",
         &[
-            ("Ctrl+N / Ctrl+U", "새 채팅 만들기 / 멤버·방 정보"),
-            ("Ctrl+P / Ctrl+,", "내 상태(Presence) / 설정"),
-            ("Ctrl+B", "좌측 레일 접기/펼치기"),
-            ("F5 / R", "전체 대화 새로고침"),
-            ("? / q", "도움말 / 종료"),
+            ("Ctrl+D", "Toggle density (Cozy / Compact)"),
+            ("Ctrl+N / Ctrl+U", "New chat / room info & members"),
+            ("Ctrl+P / Ctrl+,", "Set presence / settings"),
+            ("Ctrl+B", "Toggle left navigation rail"),
+            ("F5 / R", "Refresh conversations"),
+            ("? / Ctrl+Q", "Help / quit (confirms unsent draft)"),
         ],
     ),
 ];
 
-fn draw_help(frame: &mut Frame, area: Rect, ui: &UiState) {
+fn draw_help(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
     let theme = &ui.theme;
     let rect = centered_rect(
         area,
-        area.width.saturating_sub(8).min(84),
-        area.height.saturating_sub(4).min(24),
+        area.width.saturating_sub(6).min(96),
+        area.height.saturating_sub(3).min(24),
     );
     frame.render_widget(Clear, rect);
+    hitmap.add(rect, HitTarget::OverlayBody);
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
         .title(Line::from(Span::styled(
-            " Microsoft Teams TUI 도움말 · Esc 닫기 ",
+            " Microsoft Teams TUI Help · Esc Close ",
             theme.title(true),
         )))
         .border_style(theme.border_style(true));
@@ -337,7 +345,7 @@ fn draw_help(frame: &mut Frame, area: Rect, ui: &UiState) {
         )));
         for (key, desc) in entries.iter() {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {key:<20}"), theme.accent_style()),
+                Span::styled(format!("  {key:<21}"), theme.accent_style()),
                 Span::raw(desc.to_string()),
             ]));
         }

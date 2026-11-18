@@ -2,9 +2,9 @@
 
 use ratatui::{
     layout::Rect,
-    style::Modifier,
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -58,10 +58,10 @@ impl ContextMenu {
     pub fn build(target: ContextTarget, anchor: (u16, u16), app: &AppState, ui: &UiState) -> Self {
         let items = match target {
             ContextTarget::NavRow(index) => vec![
-                MenuItem::new("열기", Some("Enter"), Action::SelectNavRow(index)),
-                MenuItem::new("목록 새로고침", Some("F5"), Action::RefreshAll),
+                MenuItem::new("Open", Some("Enter"), Action::SelectNavRow(index)),
+                MenuItem::new("Refresh", Some("F5"), Action::RefreshAll),
                 MenuItem::new(
-                    "새 채팅",
+                    "New Chat",
                     Some("Ctrl+N"),
                     Action::OpenOverlay(OverlayKind::NewChat),
                 ),
@@ -79,29 +79,29 @@ impl ContextMenu {
                 let mut items = Vec::new();
                 if is_channel_root {
                     items.push(MenuItem::new(
-                        "스레드 열기",
+                        "Open Thread",
                         Some("t"),
                         Action::OpenThread { msg_index },
                     ));
                 }
                 items.push(MenuItem::new(
-                    "답장 / 인용",
+                    "Reply / Quote",
                     Some("r"),
                     Action::ReplyTo { scope, msg_index },
                 ));
                 items.push(MenuItem::new(
-                    "반응 추가",
+                    "Add Reaction",
                     Some("+"),
                     Action::OpenReactions { scope, msg_index },
                 ));
                 items.push(MenuItem::new(
-                    "메시지 복사",
+                    "Copy Message",
                     Some("y"),
                     Action::CopyMessage { scope, msg_index },
                 ));
                 if has_attach {
                     items.push(MenuItem::new(
-                        "첨부 저장",
+                        "Download Attachment",
                         Some("d"),
                         Action::DownloadAttachment {
                             scope,
@@ -112,7 +112,7 @@ impl ContextMenu {
                 }
                 if is_me {
                     items.push(MenuItem::new(
-                        "메시지 삭제",
+                        "Delete Message",
                         Some("Del"),
                         Action::RequestDeleteMessage { scope, msg_index },
                     ));
@@ -120,36 +120,41 @@ impl ContextMenu {
                 items
             }
             ContextTarget::Composer => vec![
-                MenuItem::new("전송", Some("Enter"), Action::SendMessage),
-                MenuItem::new("제목 필드 토글", Some("Ctrl+S"), Action::ToggleSubject),
-                MenuItem::new("외부 편집기", Some("Ctrl+E"), Action::OpenExternalEditor),
-                MenuItem::new("답장 취소", Some("Esc"), Action::CancelReply),
-                MenuItem::new("초안/첨부 지우기", None, Action::ClearComposer),
+                MenuItem::new("Send", Some("Enter"), Action::SendMessage),
+                MenuItem::new("Toggle Subject", Some("Ctrl+S"), Action::ToggleSubject),
+                MenuItem::new("External Editor", Some("Ctrl+E"), Action::OpenExternalEditor),
+                MenuItem::new("Cancel Reply", Some("Esc"), Action::CancelReply),
+                MenuItem::new(
+                    "Clear Pending Images",
+                    Some("Ctrl+Shift+X"),
+                    Action::ClearPendingImages,
+                ),
+                MenuItem::new("Clear Draft", None, Action::ClearComposer),
             ],
             ContextTarget::Global => vec![
-                MenuItem::new("검색", Some("Ctrl+F"), Action::OpenSearch),
+                MenuItem::new("Search", Some("Ctrl+F"), Action::OpenSearch),
                 MenuItem::new(
-                    "새 채팅",
+                    "New Chat",
                     Some("Ctrl+N"),
                     Action::OpenOverlay(OverlayKind::NewChat),
                 ),
                 MenuItem::new(
-                    "내 상태 변경",
+                    "Change Presence",
                     Some("Ctrl+P"),
                     Action::OpenOverlay(OverlayKind::Presence),
                 ),
-                MenuItem::new("새로고침", Some("F5"), Action::RefreshAll),
+                MenuItem::new("Refresh", Some("F5"), Action::RefreshAll),
                 MenuItem::new(
-                    "설정",
+                    "Settings",
                     Some("Ctrl+,"),
                     Action::OpenOverlay(OverlayKind::Settings),
                 ),
                 MenuItem::new(
-                    "도움말",
+                    "Help",
                     Some("?"),
                     Action::OpenOverlay(OverlayKind::Help),
                 ),
-                MenuItem::new("종료", Some("q"), Action::Quit),
+                MenuItem::new("Quit", Some("Ctrl+Q"), Action::QuitConfirm),
             ],
         };
 
@@ -201,14 +206,17 @@ impl ContextMenu {
         let rect = anchored_rect(area, self.anchor, width, height);
 
         let title = match self.context {
-            ContextTarget::NavRow(_) => " 대화 메뉴 ",
-            ContextTarget::Message { .. } => " 메시지 메뉴 ",
-            ContextTarget::Composer => " 입력 메뉴 ",
-            ContextTarget::Global => " 메뉴 ",
+            ContextTarget::NavRow(_) => " Conversation Menu ",
+            ContextTarget::Message { .. } => " Message Menu ",
+            ContextTarget::Composer => " Composer Menu ",
+            ContextTarget::Global => " Menu ",
         };
         frame.render_widget(Clear, rect);
+        hitmap.add(rect, HitTarget::OverlayBody);
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
             .title(Line::from(Span::styled(title, theme.title(true))))
             .border_style(theme.border_style(true));
         let inner = block.inner(rect);

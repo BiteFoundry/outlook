@@ -1,9 +1,10 @@
-//! Attachments tray overlay (`Ctrl+T` or `[첨부목록]`).
+//! Attachments tray overlay (`Ctrl+T` or `[Attachments]`).
 
 use ratatui::{
     layout::Rect,
+    style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -58,7 +59,7 @@ pub fn rows_from(messages: &[MessageItem], scope: MessageScope) -> Vec<Attachmen
             let name = att
                 .name
                 .clone()
-                .unwrap_or_else(|| format!("첨부 #{}", attach_index + 1));
+                .unwrap_or_else(|| format!("Attachment #{}", attach_index + 1));
             rows.push(AttachmentRow {
                 scope,
                 msg_index,
@@ -127,7 +128,7 @@ impl AttachmentsState {
                 }
             }
             Action::CloseOverlay => OverlayOutcome::Close,
-            Action::Quit => OverlayOutcome::NotHandled,
+            Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
             _ => OverlayOutcome::Handled,
         }
     }
@@ -147,10 +148,13 @@ impl AttachmentsState {
             area.height.saturating_sub(4).min(22),
         );
         frame.render_widget(Clear, rect);
+        hitmap.add(rect, HitTarget::OverlayBody);
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
             .title(Line::from(Span::styled(
-                " 첨부 목록 · Enter 다운로드 · Esc 닫기 ",
+                " Attachments · Enter Download · Esc Close ",
                 theme.title(true),
             )))
             .border_style(theme.border_style(true));
@@ -165,7 +169,7 @@ impl AttachmentsState {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 format!(
-                    "첨부 {}개 · 선택 {}/{}",
+                    "{} attachments · {}/{}",
                     items.len(),
                     (self.selected + 1).min(total),
                     total
@@ -196,10 +200,10 @@ impl AttachmentsState {
             let style = if selected {
                 theme.selection()
             } else {
-                ratatui::style::Style::default()
+                Style::default()
             };
             let label = if index == 0 {
-                " ＋ 파일 보내기 (Ctrl+O)".to_string()
+                " + Send File (Ctrl+O)".to_string()
             } else {
                 format!(" {}", items[index - 1].label())
             };
@@ -216,7 +220,7 @@ impl AttachmentsState {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 crate::ui::truncate_width(
-                    &format!(" 저장 폴더: {}", app.download_dir.display()),
+                    &format!(" Downloads: {}", app.download_dir.display()),
                     inner.width as usize,
                 ),
                 theme.muted_style(),
@@ -225,7 +229,7 @@ impl AttachmentsState {
         );
         frame.render_widget(
             Paragraph::new(Span::styled(
-                " Enter: 다운로드 · 첫 줄에서 파일 전송",
+                " Enter: download · first row sends file",
                 theme.muted_style(),
             )),
             Rect::new(inner.x, hint_y.saturating_add(1), inner.width, 1),

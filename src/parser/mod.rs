@@ -57,10 +57,10 @@ mod tests {
     #[test]
     fn test_html_to_blocks_plain_and_markdown() {
         let html = r#"
-            <blockquote itemtype="http://schema.skype.com/Reply" itemid="100"><strong>김철수</strong><br>이전 질문입니다</blockquote>
-            <p>안녕하세요 <at id="0">홍길동</at>님, <b>배포</b> <i>일정</i> <s>취소</s> <u>공지</u> <code>v1.2</code> <a href="https://example.com">링크</a> 확인!</p>
-            <h2>체크리스트</h2>
-            <ul><li>빌드 확인</li><li>테스트 통과</li></ul>
+            <blockquote itemtype="http://schema.skype.com/Reply" itemid="100"><strong>Bob</strong><br>Previous question</blockquote>
+            <p>Hello <at id="0">Alice</at>, check <b>deploy</b> <i>schedule</i> <s>cancel</s> <u>notice</u> <code>v1.2</code> <a href="https://example.com">link</a>!</p>
+            <h2>Checklist</h2>
+            <ul><li>Verify build</li><li>Tests passing</li></ul>
             <pre><code class="language-rust">fn main() { println!("hi"); }</code></pre>
             <img src="https://graph.microsoft.com/img1">
             <attachment id="att-1"></attachment>
@@ -78,21 +78,21 @@ mod tests {
                 id: "card-unreferenced".to_string(),
                 content_type: "application/vnd.microsoft.card.adaptive".to_string(),
                 content_url: None,
-                name: Some("배포 알림".to_string()),
+                name: Some("Deploy alert".to_string()),
                 content_json: Some(
                     r#"{
                         "type": "AdaptiveCard",
                         "body": [
-                            {"type": "TextBlock", "text": "릴리즈 요약", "size": "Large", "weight": "Bolder"},
-                            {"type": "FactSet", "facts": [{"title": "환경", "value": "Production"}]},
+                            {"type": "TextBlock", "text": "Release Summary", "size": "Large", "weight": "Bolder"},
+                            {"type": "FactSet", "facts": [{"title": "Environment", "value": "Production"}]},
                             {"type": "ColumnSet", "columns": [
-                                {"type": "Column", "items": [{"type": "TextBlock", "text": "컬럼 A"}]},
-                                {"type": "Column", "items": [{"type": "TextBlock", "text": "컬럼 B"}]}
+                                {"type": "Column", "items": [{"type": "TextBlock", "text": "Column A"}]},
+                                {"type": "Column", "items": [{"type": "TextBlock", "text": "Column B"}]}
                             ]},
-                            {"type": "Container", "items": [{"type": "TextBlock", "text": "정상 배포 완료"}]}
+                            {"type": "Container", "items": [{"type": "TextBlock", "text": "Deployment succeeded"}]}
                         ],
                         "actions": [
-                            {"type": "Action.OpenUrl", "title": "대시보드", "url": "https://dash.example.com"}
+                            {"type": "Action.OpenUrl", "title": "Dashboard", "url": "https://dash.example.com"}
                         ]
                     }"#
                     .to_string(),
@@ -103,7 +103,7 @@ mod tests {
         let mentions = vec![MentionInfo {
             id: 0,
             user_id: "u1".to_string(),
-            display_name: "홍길동".to_string(),
+            display_name: "Alice".to_string(),
         }];
 
         let blocks = parse_message_blocks(html, &attachments, &mentions);
@@ -133,36 +133,39 @@ mod tests {
             ..
         } = &blocks[7]
         {
-            assert_eq!(title.as_deref(), Some("릴리즈 요약"));
-            assert_eq!(facts, &vec![("환경".to_string(), "Production".to_string())]);
+            assert_eq!(title.as_deref(), Some("Release Summary"));
+            assert_eq!(
+                facts,
+                &vec![("Environment".to_string(), "Production".to_string())]
+            );
             assert_eq!(
                 body_lines,
                 &vec![
-                    "컬럼 A".to_string(),
-                    "컬럼 B".to_string(),
-                    "정상 배포 완료".to_string()
+                    "Column A".to_string(),
+                    "Column B".to_string(),
+                    "Deployment succeeded".to_string()
                 ]
             );
             assert_eq!(
                 actions,
-                &vec![("대시보드".to_string(), "https://dash.example.com".to_string())]
+                &vec![("Dashboard".to_string(), "https://dash.example.com".to_string())]
             );
         }
 
         let plain = html_and_cards_to_plain(html, &attachments);
-        assert!(plain.contains("@홍길동"));
-        assert!(plain.contains("릴리즈 요약"));
-        assert!(plain.contains("환경: Production"));
-        assert!(plain.contains("[첨부: spec.pdf]"));
+        assert!(plain.contains("@Alice"));
+        assert!(plain.contains("Release Summary"));
+        assert!(plain.contains("Environment: Production"));
+        assert!(plain.contains("[Attachment: spec.pdf]"));
         assert!(!plain.contains("schema.skype.com"));
 
         let md = html_and_cards_to_markdown(html, &attachments);
-        assert!(md.contains("**배포**"));
-        assert!(md.contains("*일정*"));
-        assert!(md.contains("~~취소~~"));
-        assert!(md.contains("[링크](https://example.com)"));
+        assert!(md.contains("**deploy**"));
+        assert!(md.contains("*schedule*"));
+        assert!(md.contains("~~cancel~~"));
+        assert!(md.contains("[link](https://example.com)"));
         assert!(md.contains("```rust"));
-        assert!(md.contains("## 체크리스트"));
+        assert!(md.contains("## Checklist"));
     }
 
     #[test]
@@ -175,15 +178,15 @@ mod tests {
             content_json: Some(
                 r#"{
                     "@type": "MessageCard",
-                    "title": "CI 빌드 실패",
-                    "summary": "main 브랜치",
+                    "title": "CI build failed",
+                    "summary": "main branch",
                     "sections": [{
                         "activityTitle": "GitHub Actions",
-                        "facts": [{"name": "커밋", "value": "abc1234"}],
-                        "text": "cargo test 실패"
+                        "facts": [{"name": "Commit", "value": "abc1234"}],
+                        "text": "cargo test failed"
                     }],
                     "potentialAction": [{
-                        "name": "로그 보기",
+                        "name": "View logs",
                         "targets": [{"uri": "https://ci.example.com/1"}]
                     }]
                 }"#
@@ -201,13 +204,13 @@ mod tests {
                 body_lines,
                 actions,
             } => {
-                assert_eq!(title.as_deref(), Some("CI 빌드 실패"));
-                assert_eq!(subtitle.as_deref(), Some("main 브랜치"));
-                assert_eq!(facts, &vec![("커밋".to_string(), "abc1234".to_string())]);
-                assert!(body_lines.contains(&"cargo test 실패".to_string()));
+                assert_eq!(title.as_deref(), Some("CI build failed"));
+                assert_eq!(subtitle.as_deref(), Some("main branch"));
+                assert_eq!(facts, &vec![("Commit".to_string(), "abc1234".to_string())]);
+                assert!(body_lines.contains(&"cargo test failed".to_string()));
                 assert_eq!(
                     actions,
-                    &vec![("로그 보기".to_string(), "https://ci.example.com/1".to_string())]
+                    &vec![("View logs".to_string(), "https://ci.example.com/1".to_string())]
                 );
             }
             other => panic!("expected Card, got {other:?}"),
@@ -216,11 +219,11 @@ mod tests {
 
     #[test]
     fn test_compile_outgoing_markdown_escaping_and_features() {
-        let md = "안녕 @홍길동! `<script>alert(1)</script>`\n**굵게** *기울임* ~~취소~~ [문서](https://example.com?a=1&b=2)\n\n> 인용 첫줄\n> 인용 둘줄\n\n```rust\nlet x = 1 < 2;\n```\n\n<raw-html-must-escape>";
+        let md = "Hello @Alice! `<script>alert(1)</script>`\n**bold** *italic* ~~strike~~ [docs](https://example.com?a=1&b=2)\n\n> quote line 1\n> quote line 2\n\n```rust\nlet x = 1 < 2;\n```\n\n<raw-html-must-escape>";
         let mentions = vec![MentionInfo {
             id: 0,
             user_id: "u1".to_string(),
-            display_name: "홍길동".to_string(),
+            display_name: "Alice".to_string(),
         }];
         let attachments = vec![UploadedReferenceAttachment {
             id: "guid-1".to_string(),
@@ -237,13 +240,13 @@ mod tests {
         }];
         let quote = Some(QuotedReply {
             msg_id: "m99".to_string(),
-            author_name: "김<철>수".to_string(),
-            preview_plain: "원본 & 내용".to_string(),
+            author_name: "Bob <Admin>".to_string(),
+            preview_plain: "original & content".to_string(),
         });
 
         let out = compile_outgoing_markdown(
             md,
-            Some("제목".to_string()),
+            Some("Subject".to_string()),
             mentions,
             attachments,
             inline_images,
@@ -252,20 +255,20 @@ mod tests {
 
         assert!(out
             .body_html
-            .starts_with("<blockquote itemtype=\"http://schema.skype.com/Reply\" itemid=\"m99\"><strong>김&lt;철&gt;수</strong><br>원본 &amp; 내용</blockquote>"));
-        assert!(out.body_html.contains("<at id=\"0\">홍길동</at>"));
+            .starts_with("<blockquote itemtype=\"http://schema.skype.com/Reply\" itemid=\"m99\"><strong>Bob &lt;Admin&gt;</strong><br>original &amp; content</blockquote>"));
+        assert!(out.body_html.contains("<at id=\"0\">Alice</at>"));
         assert!(out
             .body_html
             .contains("<code>&lt;script&gt;alert(1)&lt;/script&gt;</code>"));
-        assert!(out.body_html.contains("<strong>굵게</strong>"));
-        assert!(out.body_html.contains("<em>기울임</em>"));
-        assert!(out.body_html.contains("<s>취소</s>"));
+        assert!(out.body_html.contains("<strong>bold</strong>"));
+        assert!(out.body_html.contains("<em>italic</em>"));
+        assert!(out.body_html.contains("<s>strike</s>"));
         assert!(out
             .body_html
-            .contains("<a href=\"https://example.com?a=1&amp;b=2\">문서</a>"));
+            .contains("<a href=\"https://example.com?a=1&amp;b=2\">docs</a>"));
         assert!(out
             .body_html
-            .contains("<blockquote>인용 첫줄<br>인용 둘줄</blockquote>"));
+            .contains("<blockquote>quote line 1<br>quote line 2</blockquote>"));
         assert!(out
             .body_html
             .contains("<pre><code class=\"language-rust\">let x = 1 &lt; 2;</code></pre>"));

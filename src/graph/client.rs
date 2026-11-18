@@ -138,7 +138,7 @@ impl GraphClient {
         let me = self
             .get_me()
             .await
-            .context("현재 사용자 ID(/me)를 확인할 수 없습니다.")?;
+            .context("Failed to determine current user ID (/me).")?;
         if !me.id.trim().is_empty() {
             let _ = self.cached_my_user_id.set(me.id.clone());
         }
@@ -158,9 +158,9 @@ impl GraphClient {
         let resp = self
             .execute_with_retry(Method::GET, &url, RequestBody::Empty, &[], true)
             .await?;
-        let bytes = resp.bytes().await.context("Graph 응답 바디 읽기 실패")?;
+        let bytes = resp.bytes().await.context("Failed to read Graph response body")?;
         serde_json::from_slice(&bytes)
-            .with_context(|| format!("Graph JSON 역직렬화 실패 ({url})"))
+            .with_context(|| format!("Failed to deserialize Graph JSON ({url})"))
     }
 
     pub async fn post_json<B: Serialize + ?Sized, T: DeserializeOwned>(
@@ -173,9 +173,9 @@ impl GraphClient {
         let resp = self
             .execute_with_retry(Method::POST, &url, RequestBody::Json(json_val), &[], true)
             .await?;
-        let bytes = resp.bytes().await.context("Graph 응답 바디 읽기 실패")?;
+        let bytes = resp.bytes().await.context("Failed to read Graph response body")?;
         serde_json::from_slice(&bytes)
-            .with_context(|| format!("Graph JSON 역직렬화 실패 ({url})"))
+            .with_context(|| format!("Failed to deserialize Graph JSON ({url})"))
     }
 
     pub async fn post_json_empty<B: Serialize + ?Sized>(
@@ -235,9 +235,9 @@ impl GraphClient {
                 true,
             )
             .await?;
-        let resp_bytes = resp.bytes().await.context("Graph PUT 응답 바디 읽기 실패")?;
+        let resp_bytes = resp.bytes().await.context("Failed to read Graph PUT response body")?;
         serde_json::from_slice(&resp_bytes)
-            .with_context(|| format!("Graph PUT JSON 역직렬화 실패 ({url})"))
+            .with_context(|| format!("Failed to deserialize Graph PUT JSON ({url})"))
     }
 
     /// Uploads a chunk to a pre-authenticated `createUploadSession` URL without Bearer header.
@@ -283,7 +283,7 @@ impl GraphClient {
         let resp = self
             .execute_with_retry(Method::GET, &url, RequestBody::Empty, &[], true)
             .await?;
-        let bytes = resp.bytes().await.context("Graph 바이너리 응답 읽기 실패")?;
+        let bytes = resp.bytes().await.context("Failed to read Graph binary response")?;
         Ok(bytes.to_vec())
     }
 
@@ -292,7 +292,7 @@ impl GraphClient {
         let resp = self
             .execute_with_retry(Method::GET, &url, RequestBody::Empty, &[], true)
             .await?;
-        resp.text().await.context("Graph 텍스트 응답 읽기 실패")
+        resp.text().await.context("Failed to read Graph text response")
     }
 
     pub async fn post_bytes_json<T: DeserializeOwned>(
@@ -314,9 +314,9 @@ impl GraphClient {
                 true,
             )
             .await?;
-        let resp_bytes = resp.bytes().await.context("Graph POST 응답 바디 읽기 실패")?;
+        let resp_bytes = resp.bytes().await.context("Failed to read Graph POST response body")?;
         serde_json::from_slice(&resp_bytes)
-            .with_context(|| format!("Graph POST JSON 역직렬화 실패 ({url})"))
+            .with_context(|| format!("Failed to deserialize Graph POST JSON ({url})"))
     }
 
     pub async fn patch_bytes_empty(
@@ -395,7 +395,7 @@ impl GraphClient {
             let resp = req
                 .send()
                 .await
-                .with_context(|| format!("Graph HTTP 요청 실패 ({method} {url})"))?;
+                .with_context(|| format!("Graph HTTP request failed ({method} {url})"))?;
             let status = resp.status();
 
             if status == StatusCode::UNAUTHORIZED && use_bearer && !unauthorized_retried {
@@ -424,7 +424,7 @@ impl GraphClient {
             if !status.is_success() {
                 let err_body = resp.text().await.unwrap_or_default();
                 let detail = format_graph_error(status, &err_body);
-                bail!("Graph API 오류 ({method} {url}): {detail}");
+                bail!("{}{method} {url}): {detail}", crate::graph::GRAPH_API_ERROR_PREFIX);
             }
 
             return Ok(resp);
@@ -620,7 +620,7 @@ pub(crate) fn normalize_chat_message(
             if message_type == "systemEventMessage" {
                 "System".to_string()
             } else {
-                "알 수 없음".to_string()
+                "Unknown".to_string()
             }
         });
     let is_me = match (author_id.as_deref(), my_user_id) {
@@ -710,7 +710,7 @@ pub(crate) fn normalize_chat_message(
 
     let mut body_plain = crate::parser::html_and_cards_to_plain(&body_html, &attachments);
     if deleted && body_plain.trim().is_empty() {
-        body_plain = "[삭제된 메시지]".to_string();
+        body_plain = "(deleted message)".to_string();
     } else if message_type == "systemEventMessage"
         && (body_plain.trim().is_empty() || body_html.trim() == "<systemEventMessage/>")
     {
@@ -835,17 +835,17 @@ fn format_system_event(detail: Option<&serde_json::Value>) -> Option<String> {
     let odata_type = val.get("@odata.type").and_then(|v| v.as_str()).unwrap_or("");
     let suffix = odata_type.rsplit('.').next().unwrap_or(odata_type);
     match suffix {
-        "membersAddedEventMessageDetail" => Some("[시스템] 멤버가 추가되었습니다".to_string()),
-        "membersDeletedEventMessageDetail" => Some("[시스템] 멤버가 나갔거나 제거되었습니다".to_string()),
+        "membersAddedEventMessageDetail" => Some("[System] Members added".to_string()),
+        "membersDeletedEventMessageDetail" => Some("[System] Members left or were removed".to_string()),
         "chatRenamedEventMessageDetail" => {
             let name = val
                 .get("chatDisplayName")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if name.is_empty() {
-                Some("[시스템] 채팅방 이름이 변경되었습니다".to_string())
+                Some("[System] Chat renamed".to_string())
             } else {
-                Some(format!("[시스템] 채팅방 이름이 '{name}'(으)로 변경되었습니다"))
+                Some(format!("[System] Chat renamed to '{name}'"))
             }
         }
         "channelRenamedEventMessageDetail" => {
@@ -854,14 +854,14 @@ fn format_system_event(detail: Option<&serde_json::Value>) -> Option<String> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if name.is_empty() {
-                Some("[시스템] 채널 이름이 변경되었습니다".to_string())
+                Some("[System] Channel renamed".to_string())
             } else {
-                Some(format!("[시스템] 채널 이름이 '{name}'(으)로 변경되었습니다"))
+                Some(format!("[System] Channel renamed to '{name}'"))
             }
         }
-        "callStartedEventMessageDetail" => Some("[시스템] 통화/모임이 시작되었습니다".to_string()),
-        "callEndedEventMessageDetail" => Some("[시스템] 통화/모임이 종료되었습니다".to_string()),
-        "teamRenamedEventMessageDetail" => Some("[시스템] 팀 이름이 변경되었습니다".to_string()),
+        "callStartedEventMessageDetail" => Some("[System] Call/meeting started".to_string()),
+        "callEndedEventMessageDetail" => Some("[System] Call/meeting ended".to_string()),
+        "teamRenamedEventMessageDetail" => Some("[System] Team renamed".to_string()),
         _ => None,
     }
 }
@@ -970,23 +970,23 @@ mod tests {
             "subject": "Weekly Sync",
             "importance": "high",
             "from": {
-                "user": { "id": "u-me", "displayName": "홍길동" }
+                "user": { "id": "u-me", "displayName": "Alice" }
             },
             "body": {
                 "contentType": "html",
-                "content": "<blockquote itemtype=\"http://schema.skype.com/Reply\" itemid=\"1700000000\"><strong>김철수</strong><p>원본 메시지</p></blockquote><p>답장입니다</p>"
+                "content": "<blockquote itemtype=\"http://schema.skype.com/Reply\" itemid=\"1700000000\"><strong>Bob</strong><p>Original message</p></blockquote><p>This is a reply</p>"
             },
             "mentions": [
                 {
                     "id": 0,
-                    "mentionText": "김철수",
-                    "mentioned": { "user": { "id": "u-peer", "displayName": "김철수" } }
+                    "mentionText": "Bob",
+                    "mentioned": { "user": { "id": "u-peer", "displayName": "Bob" } }
                 }
             ],
             "reactions": [
-                { "reactionType": "like", "user": { "user": { "id": "u-peer", "displayName": "김철수" } } },
-                { "reactionType": "like", "user": { "user": { "id": "u-me", "displayName": "홍길동" } } },
-                { "reactionType": "heart", "user": { "user": { "id": "u-other", "displayName": "이영희" } } }
+                { "reactionType": "like", "user": { "user": { "id": "u-peer", "displayName": "Bob" } } },
+                { "reactionType": "like", "user": { "user": { "id": "u-me", "displayName": "Alice" } } },
+                { "reactionType": "heart", "user": { "user": { "id": "u-other", "displayName": "Carol" } } }
             ],
             "replies": [{ "id": "r1" }, { "id": "r2" }]
         });
@@ -996,12 +996,12 @@ mod tests {
 
         assert_eq!(item.msg_key, "chat:c1|1700000001");
         assert!(item.is_me);
-        assert_eq!(item.author_name, "홍길동");
+        assert_eq!(item.author_name, "Alice");
         assert_eq!(item.subject.as_deref(), Some("Weekly Sync"));
         assert_eq!(item.importance, "high");
         assert_eq!(item.reply_to_id.as_deref(), Some("1700000000"));
-        assert_eq!(item.reply_to_author.as_deref(), Some("김철수"));
-        assert_eq!(item.reply_to_preview.as_deref(), Some("원본 메시지"));
+        assert_eq!(item.reply_to_author.as_deref(), Some("Bob"));
+        assert_eq!(item.reply_to_preview.as_deref(), Some("Original message"));
         assert_eq!(item.reply_count, 2);
         assert_eq!(item.mentions.len(), 1);
         assert_eq!(item.mentions[0].user_id, "u-peer");
@@ -1010,7 +1010,7 @@ mod tests {
         assert_eq!(item.reactions[0].reaction_type, "like");
         assert_eq!(item.reactions[0].count, 2);
         assert!(item.reactions[0].me_reacted);
-        assert_eq!(item.reactions[0].users, vec!["김철수", "홍길동"]);
+        assert_eq!(item.reactions[0].users, vec!["Bob", "Alice"]);
         assert_eq!(item.reactions[1].reaction_type, "heart");
         assert_eq!(item.reactions[1].count, 1);
         assert!(!item.reactions[1].me_reacted);
@@ -1068,8 +1068,8 @@ mod tests {
                             StatusCode::OK,
                             Json(serde_json::json!({
                                 "id": "u-1",
-                                "displayName": "홍길동",
-                                "mail": "hong@example.com"
+                                "displayName": "Alice",
+                                "mail": "alice@example.com"
                             })),
                         )
                     } else {
@@ -1157,7 +1157,7 @@ mod tests {
         // 401 -> refresh -> retry succeeds
         let me = client.get_me().await.unwrap();
         assert_eq!(me.id, "u-1");
-        assert_eq!(me.display_name, "홍길동");
+        assert_eq!(me.display_name, "Alice");
 
         // 429 -> Retry-After -> retry succeeds
         let val: serde_json::Value = client.get_json("/throttled").await.unwrap();

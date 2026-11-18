@@ -1,17 +1,19 @@
-//! Local file path + caption input overlay (`Ctrl+O` or `[파일전송]`).
+//! Local file path + caption input overlay (`Ctrl+O` or `[Send File]`).
 
 use std::path::{Path, PathBuf};
 
 use ratatui::{
     layout::Rect,
+    style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
 use crate::ui::{
     action::Action,
     app::UiState,
+    hitmap::{HitMap, HitTarget},
     overlays::{centered_rect, OverlayOutcome},
 };
 
@@ -100,18 +102,18 @@ impl PathInputState {
                 let path = self.path.trim().to_string();
                 if path.is_empty() {
                     self.field = 0;
-                    self.error = Some("경로를 입력하세요".to_string());
+                    self.error = Some("Enter a file path".to_string());
                     return OverlayOutcome::Handled;
                 }
                 let expanded = expand_path(&path);
                 if !expanded.exists() {
                     self.field = 0;
-                    self.error = Some(format!("파일이 없습니다: {}", expanded.display()));
+                    self.error = Some(format!("File not found: {}", expanded.display()));
                     return OverlayOutcome::Handled;
                 }
                 if !expanded.is_file() {
                     self.field = 0;
-                    self.error = Some(format!("파일이 아닙니다: {}", expanded.display()));
+                    self.error = Some(format!("Not a file: {}", expanded.display()));
                     return OverlayOutcome::Handled;
                 }
                 let caption = self.caption.trim().to_string();
@@ -121,12 +123,12 @@ impl PathInputState {
                 })
             }
             Action::CloseOverlay => OverlayOutcome::Close,
-            Action::Quit => OverlayOutcome::NotHandled,
+            Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
             _ => OverlayOutcome::Handled,
         }
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect, ui: &UiState) {
+    pub fn draw(&self, frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
         let theme = &ui.theme;
         let rect = centered_rect(
             area,
@@ -134,10 +136,13 @@ impl PathInputState {
             area.height.saturating_sub(4).min(11),
         );
         frame.render_widget(Clear, rect);
+        hitmap.add(rect, HitTarget::OverlayBody);
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
             .title(Line::from(Span::styled(
-                " 파일 보내기 · Tab 필드 · Enter 전송 · Esc 취소 ",
+                " Send File · Tab Field · Enter Send · Esc Cancel ",
                 theme.title(true),
             )))
             .border_style(theme.border_style(true));
@@ -160,7 +165,7 @@ impl PathInputState {
 
         let mut lines = vec![
             Line::from(Span::styled(
-                " 로컬 파일 경로 (~ 는 홈 디렉터리로 확장)",
+                " Local file path (~ expands to home directory)",
                 theme.muted_style(),
             )),
             Line::from(vec![
@@ -170,7 +175,7 @@ impl PathInputState {
             ]),
             Line::from(""),
             Line::from(Span::styled(
-                " 함께 보낼 메시지/캡션 (선택 · Tab 이동)",
+                " Message / caption (optional · Tab to switch)",
                 theme.muted_style(),
             )),
             Line::from(vec![
@@ -181,11 +186,11 @@ impl PathInputState {
         ];
         match &self.error {
             Some(error) => lines.push(Line::from(Span::styled(
-                format!(" 오류: {error}"),
-                ratatui::style::Style::default().fg(theme.error),
+                format!(" Error: {error}"),
+                Style::default().fg(theme.error),
             ))),
             None => lines.push(Line::from(Span::styled(
-                " OneDrive/SharePoint 업로드 후 현재 채팅/채널/스레드로 전송됩니다",
+                " Uploads to OneDrive/SharePoint and sends to active chat/channel/thread",
                 theme.muted_style(),
             ))),
         }

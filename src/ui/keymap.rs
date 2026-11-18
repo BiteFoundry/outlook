@@ -77,6 +77,18 @@ impl Keymap {
             Action::InsertNewline,
         );
         map.bind(Some(Focus::Composer), Backspace, M::NONE, Action::Backspace);
+        map.bind(
+            Some(Focus::Composer),
+            Backspace,
+            M::ALT,
+            Action::DeleteWordBackward,
+        );
+        map.bind(
+            Some(Focus::Composer),
+            Char('w'),
+            M::CONTROL,
+            Action::DeleteWordBackward,
+        );
         map.bind(Some(Focus::Composer), Delete, M::NONE, Action::DeleteForward);
         map.bind(Some(Focus::Composer), Tab, M::NONE, Action::Tab);
         map.bind(Some(Focus::Composer), Esc, M::NONE, Action::ComposerEscape);
@@ -86,6 +98,22 @@ impl Keymap {
             M::CONTROL,
             Action::ToggleSubject,
         );
+        map.bind(
+            Some(Focus::Composer),
+            PageUp,
+            M::NONE,
+            Action::ScrollPageUp,
+        );
+        map.bind(
+            Some(Focus::Composer),
+            PageDown,
+            M::NONE,
+            Action::ScrollPageDown,
+        );
+        map.bind(Some(Focus::Composer), Up, M::CONTROL, Action::ScrollUp);
+        map.bind(Some(Focus::Composer), Down, M::CONTROL, Action::ScrollDown);
+        map.bind(Some(Focus::Composer), PageUp, M::ALT, Action::ScrollUp);
+        map.bind(Some(Focus::Composer), PageDown, M::ALT, Action::ScrollDown);
 
         // Cursor movement
         map.bind(Some(Focus::Composer), Left, M::NONE, Action::CursorLeft);
@@ -130,6 +158,18 @@ impl Keymap {
         // Clipboard / undo / external editor
         map.bind(Some(Focus::Composer), Char('a'), M::CONTROL, Action::SelectAll);
         map.bind(Some(Focus::Composer), Char('c'), M::CONTROL, Action::Copy);
+        map.bind(
+            Some(Focus::Composer),
+            Char('X'),
+            M::CONTROL | M::SHIFT,
+            Action::ClearPendingImages,
+        );
+        map.bind(
+            Some(Focus::Composer),
+            Char('x'),
+            M::CONTROL | M::SHIFT,
+            Action::ClearPendingImages,
+        );
         map.bind(Some(Focus::Composer), Char('x'), M::CONTROL, Action::Cut);
         map.bind(
             Some(Focus::Composer),
@@ -146,7 +186,40 @@ impl Keymap {
             Action::OpenExternalEditor,
         );
 
+        // --- Nav focus structured navigation & triage ---
+        map.bind(Some(Focus::Nav), Left, M::NONE, Action::NavCollapseOrParent);
+        map.bind(
+            Some(Focus::Nav),
+            Char('h'),
+            M::NONE,
+            Action::NavCollapseOrParent,
+        );
+        map.bind(Some(Focus::Nav), Right, M::NONE, Action::NavExpandOrOpen);
+        map.bind(
+            Some(Focus::Nav),
+            Char('l'),
+            M::NONE,
+            Action::NavExpandOrOpen,
+        );
+        map.bind(
+            Some(Focus::Nav),
+            Char('p'),
+            M::NONE,
+            Action::TogglePinSelected,
+        );
+        map.bind(
+            Some(Focus::Nav),
+            Char('f'),
+            M::NONE,
+            Action::ToggleUnreadFilter,
+        );
+
         // --- Chat & Thread focus message actions ---
+        for focus in [Focus::Nav, Focus::Chat, Focus::Thread] {
+            map.bind(Some(focus), Char('1'), M::NONE, Action::SelectNavTab(0));
+            map.bind(Some(focus), Char('2'), M::NONE, Action::SelectNavTab(1));
+            map.bind(Some(focus), Char('3'), M::NONE, Action::SelectNavTab(2));
+        }
         for focus in [Focus::Chat, Focus::Thread] {
             map.bind(Some(focus), Char('y'), M::NONE, Action::CopySelectedMessage);
             map.bind(
@@ -184,7 +257,7 @@ impl Keymap {
 
         // --- Global shortcuts ---
         map.bind(any, Char('c'), M::CONTROL, Action::Quit);
-        map.bind(any, Char('q'), M::NONE, Action::Quit);
+        map.bind(any, Char('q'), M::CONTROL, Action::QuitConfirm);
         map.bind(any, Esc, M::NONE, Action::CloseOverlay);
         map.bind(any, Tab, M::NONE, Action::NextFocus);
         map.bind(any, BackTab, M::SHIFT, Action::PrevFocus);
@@ -196,12 +269,20 @@ impl Keymap {
         map.bind(any, Down, M::NONE, Action::MoveDown);
         map.bind(any, Home, M::NONE, Action::NavFirst);
         map.bind(any, End, M::NONE, Action::NavLast);
-        map.bind(any, Left, M::NONE, Action::ToggleNarrowPane);
-        map.bind(any, Right, M::NONE, Action::ToggleNarrowPane);
         map.bind(any, PageUp, M::NONE, Action::ScrollPageUp);
         map.bind(any, PageDown, M::NONE, Action::ScrollPageDown);
         map.bind(any, Char('o'), M::NONE, Action::LoadOlder);
-        map.bind(any, Char('u'), M::NONE, Action::LoadOlder);
+        map.bind(any, Char('u'), M::NONE, Action::JumpNextUnread);
+        map.bind(any, Char('U'), M::SHIFT, Action::JumpPrevUnread);
+        map.bind(any, Char('u'), M::ALT, Action::JumpNextUnread);
+        map.bind(any, Char('U'), M::ALT | M::SHIFT, Action::JumpPrevUnread);
+        map.bind(any, Char('`'), M::NONE, Action::ToggleLastConversation);
+        map.bind(any, Left, M::ALT, Action::HistoryBack);
+        map.bind(any, Right, M::ALT, Action::HistoryForward);
+        map.bind(any, Up, M::ALT, Action::PrevConversation);
+        map.bind(any, Down, M::ALT, Action::NextConversation);
+        map.bind(any, Char('t'), M::ALT, Action::ToggleComposerTarget);
+        map.bind(any, Char('d'), M::CONTROL, Action::ToggleDensity);
         map.bind(any, Char('H'), M::NONE, Action::SyncHistory);
         map.bind(any, Char('s'), M::NONE, Action::SyncHistory);
         map.bind(any, Char('R'), M::NONE, Action::RefreshAll);
@@ -209,7 +290,10 @@ impl Keymap {
         map.bind(any, Char('d'), M::NONE, Action::DownloadLatest);
         map.bind(any, Char('m'), M::NONE, Action::ContextMenuCurrent);
 
-        // Nav tabs (pure Teams: 0 = 채팅, 1 = 팀/채널, 2 = 활동)
+        // Nav tabs (0 = Chats, 1 = Teams, 2 = Activity)
+        map.bind(any, Char('1'), M::ALT, Action::SelectNavTab(0));
+        map.bind(any, Char('2'), M::ALT, Action::SelectNavTab(1));
+        map.bind(any, Char('3'), M::ALT, Action::SelectNavTab(2));
         map.bind(any, Char('1'), M::CONTROL, Action::SelectNavTab(0));
         map.bind(any, Char('2'), M::CONTROL, Action::SelectNavTab(1));
         map.bind(any, Char('3'), M::CONTROL, Action::SelectNavTab(2));
@@ -319,17 +403,29 @@ impl Keymap {
 }
 
 fn key_matches(expected: Key, actual: KeyEvent) -> bool {
-    if expected.code != actual.code {
-        return false;
-    }
     match expected.code {
-        KeyCode::Char(_) => {
-            actual.modifiers.contains(KeyModifiers::CONTROL)
+        KeyCode::Char(exp_ch) => {
+            let KeyCode::Char(act_ch) = actual.code else {
+                return false;
+            };
+            let mod_ok = actual.modifiers.contains(KeyModifiers::CONTROL)
                 == expected.modifiers.contains(KeyModifiers::CONTROL)
                 && actual.modifiers.contains(KeyModifiers::ALT)
-                    == expected.modifiers.contains(KeyModifiers::ALT)
+                    == expected.modifiers.contains(KeyModifiers::ALT);
+            if !mod_ok {
+                return false;
+            }
+            if expected
+                .modifiers
+                .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            {
+                actual.modifiers.contains(KeyModifiers::SHIFT)
+                    && act_ch.eq_ignore_ascii_case(&exp_ch)
+            } else {
+                act_ch == exp_ch
+            }
         }
-        _ => actual.modifiers == expected.modifiers,
+        _ => expected.code == actual.code && actual.modifiers == expected.modifiers,
     }
 }
 
@@ -382,6 +478,36 @@ mod tests {
     #[test]
     fn teams_tabs_and_history_shortcuts_map_correctly() {
         let map = Keymap::default_teams();
+        for focus in [Focus::Nav, Focus::Chat, Focus::Thread] {
+            assert_eq!(
+                map.resolve(focus, key(KeyCode::Char('1'), KeyModifiers::NONE)),
+                Some(Action::SelectNavTab(0))
+            );
+            assert_eq!(
+                map.resolve(focus, key(KeyCode::Char('2'), KeyModifiers::NONE)),
+                Some(Action::SelectNavTab(1))
+            );
+            assert_eq!(
+                map.resolve(focus, key(KeyCode::Char('3'), KeyModifiers::NONE)),
+                Some(Action::SelectNavTab(2))
+            );
+        }
+        assert_eq!(
+            map.resolve(Focus::Overlay, key(KeyCode::Char('2'), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            map.resolve(Focus::Composer, key(KeyCode::Char('1'), KeyModifiers::ALT)),
+            Some(Action::SelectNavTab(0))
+        );
+        assert_eq!(
+            map.resolve(Focus::Composer, key(KeyCode::Char('2'), KeyModifiers::ALT)),
+            Some(Action::SelectNavTab(1))
+        );
+        assert_eq!(
+            map.resolve(Focus::Composer, key(KeyCode::Char('3'), KeyModifiers::ALT)),
+            Some(Action::SelectNavTab(2))
+        );
         assert_eq!(
             map.resolve(Focus::Nav, key(KeyCode::Char('1'), KeyModifiers::CONTROL)),
             Some(Action::SelectNavTab(0))
@@ -409,6 +535,44 @@ mod tests {
         assert_eq!(
             map.resolve(Focus::Chat, key(KeyCode::PageDown, KeyModifiers::NONE)),
             Some(Action::ScrollPageDown)
+        );
+    }
+
+    #[test]
+    fn bare_q_is_not_quit_and_ctrl_q_is_quit_confirm() {
+        let map = Keymap::default_teams();
+        assert_eq!(
+            map.resolve(Focus::Chat, key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            map.resolve(Focus::Nav, key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            map.resolve(Focus::Chat, key(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            Some(Action::QuitConfirm)
+        );
+        assert_eq!(
+            map.resolve(
+                Focus::Composer,
+                key(KeyCode::Char('q'), KeyModifiers::CONTROL)
+            ),
+            Some(Action::QuitConfirm)
+        );
+        assert_eq!(
+            map.resolve(
+                Focus::Composer,
+                key(KeyCode::Char('x'), KeyModifiers::CONTROL)
+            ),
+            Some(Action::Cut)
+        );
+        assert_eq!(
+            map.resolve(
+                Focus::Composer,
+                key(KeyCode::Char('X'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            ),
+            Some(Action::ClearPendingImages)
         );
     }
 }

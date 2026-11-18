@@ -59,7 +59,7 @@ pub async fn check_or_apply_update_with_api_base(
     force: bool,
 ) -> Result<UpdateCheckResult> {
     let binary_path =
-        std::env::current_exe().context("현재 실행 파일 경로를 확인할 수 없습니다")?;
+        std::env::current_exe().context("Unable to determine current executable path")?;
     let token = discover_github_token(api_base_url).await;
     check_or_apply_update_at(api_base_url, repo, check_only, force, &binary_path, token).await
 }
@@ -76,7 +76,7 @@ async fn check_or_apply_update_at(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()
-        .context("HTTP 클라이언트 생성 실패")?;
+        .context("Failed to create HTTP client")?;
 
     let ua = format!("teams-cli/{current_version}");
     let api_base = api_base_url.trim_end_matches('/');
@@ -93,13 +93,13 @@ async fn check_or_apply_update_at(
     let resp = req
         .send()
         .await
-        .with_context(|| format!("GitHub Release 조회 요청 실패: {release_api_url}"))?;
+        .with_context(|| format!("GitHub Release lookup request failed: {release_api_url}"))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         bail!(
-            "GitHub Release 조회 실패 (HTTP {status}): {}. 비공개 저장소인 경우 TEAMS_GITHUB_TOKEN / GH_TOKEN 또는 `gh auth login`이 필요합니다.",
+            "GitHub Release lookup failed (HTTP {status}): {}. For private repositories, TEAMS_GITHUB_TOKEN / GH_TOKEN or `gh auth login` is required.",
             body.trim()
         );
     }
@@ -107,13 +107,13 @@ async fn check_or_apply_update_at(
     let release: GitHubRelease = resp
         .json()
         .await
-        .context("GitHub Release JSON 파싱 실패")?;
+        .context("Failed to parse GitHub Release JSON")?;
 
     let latest_version = strip_tag_v(&release.tag_name).to_string();
     let current_semver = parse_semver(&current_version)
-        .with_context(|| format!("현재 버전 파싱 실패: {current_version}"))?;
+        .with_context(|| format!("Failed to parse current version: {current_version}"))?;
     let latest_semver = parse_semver(&latest_version)
-        .with_context(|| format!("최신 릴리스 태그 파싱 실패: {}", release.tag_name))?;
+        .with_context(|| format!("Failed to parse latest release tag: {}", release.tag_name))?;
     let update_available = latest_semver > current_semver;
 
     let selected_asset = select_platform_asset(&release.assets, &latest_version);
@@ -135,7 +135,7 @@ async fn check_or_apply_update_at(
 
     let Some(asset) = selected_asset else {
         bail!(
-            "현재 플랫폼({}/{})에 맞는 릴리스 에셋을 찾을 수 없습니다 (릴리스 v{latest_version}).",
+            "No release asset found for current platform ({}/{}) in release v{latest_version}.",
             std::env::consts::OS,
             std::env::consts::ARCH
         );
@@ -150,7 +150,7 @@ async fn check_or_apply_update_at(
     {
         let sums_bytes = download_asset_bytes(&client, sums_asset, &ua, token.as_deref()).await?;
         let sums_text = String::from_utf8(sums_bytes)
-            .context("SHA256SUMS.txt가 올바른 UTF-8 텍스트가 아닙니다")?;
+            .context("SHA256SUMS.txt is not valid UTF-8 text")?;
         verify_sha256_sums(&sums_text, &asset.name, &asset_bytes)?;
     }
 
@@ -217,7 +217,7 @@ async fn download_asset_bytes(
                         .bytes()
                         .await
                         .map(|b| b.to_vec())
-                        .with_context(|| format!("에셋 본문 다운로드 실패: {}", asset.name));
+                        .with_context(|| format!("Failed to download asset body: {}", asset.name));
                 }
             }
         }
@@ -233,16 +233,16 @@ async fn download_asset_bytes(
         let resp = req
             .send()
             .await
-            .with_context(|| format!("에셋 다운로드 요청 실패: {}", asset.name))?;
+            .with_context(|| format!("Asset download request failed: {}", asset.name))?;
         if resp.status().is_success() {
             return resp
                 .bytes()
                 .await
                 .map(|b| b.to_vec())
-                .with_context(|| format!("에셋 본문 다운로드 실패: {}", asset.name));
+                .with_context(|| format!("Failed to download asset body: {}", asset.name));
         }
         let status = resp.status();
-        bail!("에셋 '{}' 다운로드 실패 (HTTP {status})", asset.name);
+        bail!("Failed to download asset '{}' (HTTP {status})", asset.name);
     }
 
     if !asset.url.trim().is_empty() {
@@ -256,19 +256,19 @@ async fn download_asset_bytes(
         let resp = req
             .send()
             .await
-            .with_context(|| format!("에셋 API 다운로드 요청 실패: {}", asset.name))?;
+            .with_context(|| format!("Asset API download request failed: {}", asset.name))?;
         if resp.status().is_success() {
             return resp
                 .bytes()
                 .await
                 .map(|b| b.to_vec())
-                .with_context(|| format!("에셋 본문 다운로드 실패: {}", asset.name));
+                .with_context(|| format!("Failed to download asset body: {}", asset.name));
         }
         let status = resp.status();
-        bail!("에셋 '{}' API 다운로드 실패 (HTTP {status})", asset.name);
+        bail!("Failed to download asset '{}' via API (HTTP {status})", asset.name);
     }
 
-    bail!("에셋 '{}'에 다운로드 URL이 없습니다", asset.name);
+    bail!("Asset '{}' has no download URL", asset.name);
 }
 
 pub(crate) fn parse_semver(version: &str) -> Result<(u64, u64, u64)> {
@@ -282,21 +282,21 @@ pub(crate) fn parse_semver(version: &str) -> Result<(u64, u64, u64)> {
     let major: u64 = parts
         .next()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("major 버전 누락: {version}"))?
+        .ok_or_else(|| anyhow::anyhow!("Missing major version: {version}"))?
         .parse()
-        .with_context(|| format!("잘못된 major 버전: {version}"))?;
+        .with_context(|| format!("Invalid major version: {version}"))?;
     let minor: u64 = parts
         .next()
         .unwrap_or("0")
         .parse()
-        .with_context(|| format!("잘못된 minor 버전: {version}"))?;
+        .with_context(|| format!("Invalid minor version: {version}"))?;
     let patch: u64 = parts
         .next()
         .unwrap_or("0")
         .parse()
-        .with_context(|| format!("잘못된 patch 버전: {version}"))?;
+        .with_context(|| format!("Invalid patch version: {version}"))?;
     if parts.next().is_some() {
-        bail!("잘못된 semver 형식: {version}");
+        bail!("Invalid semver format: {version}");
     }
     Ok((major, minor, patch))
 }
@@ -399,13 +399,13 @@ pub(crate) fn verify_sha256_sums(
     }
 
     let Some(expected) = expected_hex else {
-        bail!("SHA256SUMS.txt에서 '{asset_name}' 체크섬 항목을 찾을 수 없습니다");
+        bail!("Checksum entry for '{asset_name}' not found in SHA256SUMS.txt");
     };
 
     let actual = hex::encode(Sha256::digest(asset_bytes));
     if !actual.eq_ignore_ascii_case(&expected) {
         bail!(
-            "SHA-256 무결성 검증 실패 ({asset_name}): 기대값 {expected}, 실제값 {actual}"
+            "SHA-256 verification failed ({asset_name}): expected {expected}, actual {actual}"
         );
     }
     Ok(())
@@ -417,10 +417,10 @@ fn extract_binary_from_asset(asset_name: &str, asset_bytes: &[u8]) -> Result<Vec
         return Ok(asset_bytes.to_vec());
     }
 
-    let tmp = tempfile::tempdir().context("업데이트 압축 해제용 임시 디렉터리 생성 실패")?;
+    let tmp = tempfile::tempdir().context("Failed to create temporary directory for update extraction")?;
     let archive_path = tmp.path().join(asset_name);
     std::fs::write(&archive_path, asset_bytes)
-        .with_context(|| format!("임시 아카이브 저장 실패: {}", archive_path.display()))?;
+        .with_context(|| format!("Failed to save temporary archive: {}", archive_path.display()))?;
 
     let extract_dir = tmp.path().join("extracted");
     std::fs::create_dir_all(&extract_dir)?;
@@ -432,7 +432,7 @@ fn extract_binary_from_asset(asset_name: &str, asset_bytes: &[u8]) -> Result<Vec
             .arg("-C")
             .arg(&extract_dir)
             .status()
-            .context("`tar -xzf` 실행 실패")?
+            .context("Failed to run `tar -xzf`")?
     } else {
         std::process::Command::new("tar")
             .arg("-xf")
@@ -440,19 +440,19 @@ fn extract_binary_from_asset(asset_name: &str, asset_bytes: &[u8]) -> Result<Vec
             .arg("-C")
             .arg(&extract_dir)
             .status()
-            .context("`tar -xf` 실행 실패")?
+            .context("Failed to run `tar -xf`")?
     };
 
     if !status.success() {
-        bail!("아카이브 압축 해제 실패 ({asset_name}): 종료 코드 {status}");
+        bail!("Failed to extract archive ({asset_name}): exit code {status}");
     }
 
     let target_bin = if cfg!(windows) { "teams.exe" } else { "teams" };
     let found = find_file_recursive(&extract_dir, target_bin).ok_or_else(|| {
-        anyhow::anyhow!("압축 해제된 아카이브({asset_name})에서 '{target_bin}' 실행 파일을 찾을 수 없습니다")
+        anyhow::anyhow!("Executable '{target_bin}' not found in extracted archive ({asset_name})")
     })?;
     std::fs::read(&found)
-        .with_context(|| format!("추출된 바이너리 읽기 실패: {}", found.display()))
+        .with_context(|| format!("Failed to read extracted binary: {}", found.display()))
 }
 
 fn find_file_recursive(dir: &Path, target_name: &str) -> Option<PathBuf> {
@@ -480,14 +480,14 @@ pub(crate) fn replace_executable_at(target_exe: &Path, new_bytes: &[u8]) -> Resu
     let old_path = append_ext_suffix(target_exe, ".old");
 
     std::fs::write(&new_path, new_bytes)
-        .with_context(|| format!("새 바이너리 임시 파일 쓰기 실패: {}", new_path.display()))?;
+        .with_context(|| format!("Failed to write temporary new binary: {}", new_path.display()))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o755);
         std::fs::set_permissions(&new_path, perms)
-            .with_context(|| format!("실행 권한 설정 실패: {}", new_path.display()))?;
+            .with_context(|| format!("Failed to set executable permissions: {}", new_path.display()))?;
     }
 
     if old_path.symlink_metadata().is_ok() {
@@ -500,7 +500,7 @@ pub(crate) fn replace_executable_at(target_exe: &Path, new_bytes: &[u8]) -> Resu
             let _ = std::fs::remove_file(&new_path);
             return Err(err).with_context(|| {
                 format!(
-                    "기존 실행 파일 백업 이동 실패: {} -> {}",
+                    "Failed to move existing executable to backup: {} -> {}",
                     target_exe.display(),
                     old_path.display()
                 )
@@ -515,7 +515,7 @@ pub(crate) fn replace_executable_at(target_exe: &Path, new_bytes: &[u8]) -> Resu
         let _ = std::fs::remove_file(&new_path);
         return Err(err).with_context(|| {
             format!(
-                "새 실행 파일 교체 실패: {} -> {}",
+                "Failed to replace with new executable: {} -> {}",
                 new_path.display(),
                 target_exe.display()
             )
@@ -569,10 +569,10 @@ mod tests {
         verify_sha256_sums(&sums, "teams.exe", payload).unwrap();
 
         let err = verify_sha256_sums(&sums, "teams.exe", b"tampered-bytes").unwrap_err();
-        assert!(err.to_string().contains("무결성 검증 실패"));
+        assert!(err.to_string().contains("SHA-256 verification failed"));
 
         let missing = verify_sha256_sums(&sums, "missing.zip", payload).unwrap_err();
-        assert!(missing.to_string().contains("찾을 수 없습니다"));
+        assert!(missing.to_string().contains("not found in SHA256SUMS.txt"));
     }
 
     #[test]

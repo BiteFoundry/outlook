@@ -883,7 +883,7 @@ fn build_message_preview(msg: &MessageItem) -> String {
         subj.to_string()
     } else if let Some(att) = msg.attachments.first() {
         format!(
-            "[첨부: {}]",
+            "[Attachment: {}]",
             att.name.as_deref().unwrap_or(att.id.as_str())
         )
     } else {

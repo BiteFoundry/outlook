@@ -3,8 +3,9 @@
 
 use ratatui::{
     layout::Rect,
+    style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -81,7 +82,7 @@ impl SearchOverlay {
                 OverlayOutcome::Dispatch(Action::Search(query))
             }
             Action::CloseOverlay => OverlayOutcome::Close,
-            Action::Quit => OverlayOutcome::NotHandled,
+            Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
             _ => OverlayOutcome::Handled,
         }
     }
@@ -101,9 +102,12 @@ impl SearchOverlay {
             area.height.saturating_sub(4).min(22),
         );
         frame.render_widget(Clear, rect);
-        let title = " Teams 메시지 검색 · Enter 이동 · Esc 닫기 ";
+        hitmap.add(rect, HitTarget::OverlayBody);
+        let title = " Search Messages · Enter Jump · Esc Close ";
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
             .title(Line::from(Span::styled(title, theme.title(true))))
             .border_style(theme.border_style(true));
         let inner = block.inner(rect);
@@ -113,7 +117,7 @@ impl SearchOverlay {
         }
 
         let query_line = Line::from(vec![
-            Span::styled("검색어: ", theme.title(true)),
+            Span::styled("Query: ", theme.title(true)),
             Span::raw(self.query.clone()),
             Span::styled("▏", theme.muted_style()),
         ]);
@@ -125,12 +129,12 @@ impl SearchOverlay {
         let len = app.search_results.len();
         let status_y = inner.y.saturating_add(1);
         let status = if app.searching {
-            "검색 중…".to_string()
+            "Searching…".to_string()
         } else if app.search_query.is_empty() {
-            "검색어를 입력하면 로컬 캐시에서 실시간 검색합니다".to_string()
+            "Type to search cached messages in real time".to_string()
         } else {
             format!(
-                "'{}': {}건 · {}/{}",
+                "'{}': {} hits · {}/{}",
                 app.search_query,
                 len,
                 if len == 0 { 0 } else { self.selected + 1 },
@@ -161,11 +165,11 @@ impl SearchOverlay {
             let style = if selected {
                 theme.selection()
             } else {
-                ratatui::style::Style::default()
+                Style::default()
             };
             let hit = &app.search_results[index];
             let thread_tag = if hit.parent_msg_id.is_some() {
-                "[스레드] "
+                "[Thread] "
             } else {
                 ""
             };

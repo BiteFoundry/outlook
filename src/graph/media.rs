@@ -72,9 +72,9 @@ impl GraphClient {
     ) -> Result<UploadedReferenceAttachment> {
         let meta = tokio::fs::metadata(local_path)
             .await
-            .with_context(|| format!("업로드할 파일을 찾을 수 없습니다: {}", local_path.display()))?;
+            .with_context(|| format!("File to upload not found: {}", local_path.display()))?;
         if !meta.is_file() {
-            bail!("일반 파일만 업로드할 수 있습니다: {}", local_path.display());
+            bail!("Only regular files can be uploaded: {}", local_path.display());
         }
         let size = meta.len();
         let file_name = local_path
@@ -82,7 +82,7 @@ impl GraphClient {
             .and_then(|n| n.to_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow!("유효한 파일 이름이 아닙니다: {}", local_path.display()))?
+            .ok_or_else(|| anyhow!("Invalid file name: {}", local_path.display()))?
             .to_string();
         let encoded_name = urlencoding::encode(&file_name);
 
@@ -120,7 +120,7 @@ impl GraphClient {
                     .or(drive_item.web_dav_url)
                     .or(drive_item.web_url)
                     .filter(|s| !s.trim().is_empty())
-                    .ok_or_else(|| anyhow!("업로드된 파일의 공유 URL을 가져오지 못했습니다."))?;
+                    .ok_or_else(|| anyhow!("Failed to obtain share URL for uploaded file."))?;
 
                 Ok(UploadedReferenceAttachment {
                     id: att_id,
@@ -144,7 +144,7 @@ impl GraphClient {
                     .parent_reference
                     .and_then(|p| p.drive_id)
                     .filter(|s| !s.trim().is_empty())
-                    .ok_or_else(|| anyhow!("채널 filesFolder의 driveId가 없습니다."))?;
+                    .ok_or_else(|| anyhow!("Missing driveId on channel filesFolder."))?;
 
                 let content_path = format!(
                     "/drives/{}/items/{}:/{encoded_name}:/content",
@@ -165,7 +165,7 @@ impl GraphClient {
                     .web_dav_url
                     .or(drive_item.web_url)
                     .filter(|s| !s.trim().is_empty())
-                    .ok_or_else(|| anyhow!("업로드된 채널 파일의 webDavUrl/webUrl이 없습니다."))?;
+                    .ok_or_else(|| anyhow!("Missing webDavUrl/webUrl for uploaded channel file."))?;
 
                 Ok(UploadedReferenceAttachment {
                     id: att_id,
@@ -189,7 +189,7 @@ impl GraphClient {
         if size <= SMALL_UPLOAD_LIMIT {
             let bytes = tokio::fs::read(local_path)
                 .await
-                .with_context(|| format!("파일 읽기 실패: {}", local_path.display()))?;
+                .with_context(|| format!("Failed to read file: {}", local_path.display()))?;
             return self
                 .put_bytes(content_path, bytes, Some("application/octet-stream"))
                 .await;
@@ -205,7 +205,7 @@ impl GraphClient {
 
         let mut file = tokio::fs::File::open(local_path)
             .await
-            .with_context(|| format!("대용량 파일 열기 실패: {}", local_path.display()))?;
+            .with_context(|| format!("Failed to open large file: {}", local_path.display()))?;
         let mut offset: u64 = 0;
 
         loop {
@@ -219,7 +219,7 @@ impl GraphClient {
                 filled += n;
             }
             if filled == 0 {
-                bail!("업로드 세션이 완료 응답 없이 EOF에 도달했습니다.");
+                bail!("Upload session reached EOF without a completion response.");
             }
             buf.truncate(filled);
 
@@ -231,11 +231,11 @@ impl GraphClient {
 
             if val.get("id").is_some() {
                 let item: DriveItem = serde_json::from_value(val)
-                    .context("업로드 세션 완료 DriveItem 역직렬화 실패")?;
+                    .context("Failed to deserialize DriveItem on upload session completion")?;
                 return Ok(item);
             }
             if offset >= size {
-                bail!("업로드 완료 후 DriveItem 메타데이터를 받지 못했습니다.");
+                bail!("Did not receive DriveItem metadata after upload completed.");
             }
         }
     }
@@ -277,11 +277,11 @@ impl GraphClient {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow!("첨부파일에 다운로드할 content_url이 없습니다."))?;
+            .ok_or_else(|| anyhow!("Attachment has no content_url to download."))?;
 
         tokio::fs::create_dir_all(dest_dir)
             .await
-            .with_context(|| format!("다운로드 디렉터리 생성 실패: {}", dest_dir.display()))?;
+            .with_context(|| format!("Failed to create download directory: {}", dest_dir.display()))?;
 
         let raw_name = attachment
             .name
@@ -315,7 +315,7 @@ impl GraphClient {
 
         tokio::fs::write(&dest_path, &bytes)
             .await
-            .with_context(|| format!("파일 저장 실패: {}", dest_path.display()))?;
+            .with_context(|| format!("Failed to save file: {}", dest_path.display()))?;
 
         Ok(DownloadedFile {
             path: dest_path,
@@ -337,7 +337,7 @@ impl GraphClient {
             .content_url
             .as_deref()
             .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow!("첨부파일에 다운로드할 content_url이 없습니다."))?;
+            .ok_or_else(|| anyhow!("Attachment has no content_url to download."))?;
         let raw_name = attachment
             .name
             .as_deref()

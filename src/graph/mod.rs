@@ -21,6 +21,9 @@ use crate::{
     models::{ConversationTarget, MemberInfo, MessageItem},
 };
 
+/// Canonical prefix emitted by `GraphClient` HTTP errors; kept as a shared constant for safe parsing.
+pub const GRAPH_API_ERROR_PREFIX: &str = "Graph API error (";
+
 #[derive(Clone)]
 pub struct GraphClient {
     auth: AuthManager,
@@ -214,7 +217,7 @@ fn compare_timestamps(lhs: &str, rhs: &str) -> Ordering {
 fn is_invalid_skiptoken_error(err: &anyhow::Error) -> bool {
     let msg = err.to_string();
     let detail = msg
-        .strip_prefix("Graph API 오류 (")
+        .strip_prefix(GRAPH_API_ERROR_PREFIX)
         .and_then(|rest| rest.split_once("): ").map(|(_, d)| d))
         .unwrap_or(&msg);
     let lower = detail.to_ascii_lowercase();

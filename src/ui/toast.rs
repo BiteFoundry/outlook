@@ -120,8 +120,8 @@ impl TaskStatus {
     pub fn display(&self) -> String {
         match &self.state {
             TaskState::Running => format!("{}…", self.label),
-            TaskState::Done => format!("{} 완료", self.label),
-            TaskState::Failed(err) => format!("{} 실패: {err}", self.label),
+            TaskState::Done => format!("{} done", self.label),
+            TaskState::Failed(err) => format!("{} failed: {err}", self.label),
         }
     }
 

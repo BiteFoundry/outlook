@@ -119,14 +119,14 @@ impl Storage {
     fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>> {
         self.conn
             .lock()
-            .map_err(|_| anyhow::anyhow!("SQLite 연결 잠금 획득 실패 (poisoned mutex)"))
+            .map_err(|_| anyhow::anyhow!("Failed to acquire SQLite connection lock (poisoned mutex)"))
     }
 
     fn read_conn(&self) -> Result<ReadConnGuard<'_>> {
         if let Some(pool) = &self.readers {
             let existing = {
                 let mut guard = pool.lock().map_err(|_| {
-                    anyhow::anyhow!("SQLite reader pool 잠금 획득 실패 (poisoned mutex)")
+                    anyhow::anyhow!("Failed to acquire SQLite reader pool lock (poisoned mutex)")
                 })?;
                 guard.pop()
             };
@@ -358,9 +358,9 @@ mod tests {
         let ch = ChannelSummary {
             id: "ch-1".to_string(),
             team_id: "team-1".to_string(),
-            team_name: "개발팀".to_string(),
-            display_name: "일반".to_string(),
-            description: Some("일반 채널".to_string()),
+            team_name: "Engineering".to_string(),
+            display_name: "General".to_string(),
+            description: Some("General channel".to_string()),
             membership_type: "standard".to_string(),
             web_url: None,
         };
@@ -371,14 +371,14 @@ mod tests {
             target: ch.target(),
             kind: ConversationKind::Channel,
             team_id: Some("team-1".to_string()),
-            team_name: Some("개발팀".to_string()),
-            title: "일반".to_string(),
+            team_name: Some("Engineering".to_string()),
+            title: "General".to_string(),
             topic: None,
             unread_count: 7,
             last_read_at: Some("2026-11-01T00:00:00Z".to_string()),
             last_msg_id: Some("m-10".to_string()),
-            last_msg_author: Some("김철수".to_string()),
-            last_msg_preview: Some("배포 완료".to_string()),
+            last_msg_author: Some("Bob".to_string()),
+            last_msg_preview: Some("Deploy complete".to_string()),
             last_updated_at: Some("2026-11-02T10:00:00Z".to_string()),
             pinned: true,
             peer_user_id: None,
@@ -388,17 +388,17 @@ mod tests {
 
         let team = TeamSummary {
             id: "team-1".to_string(),
-            display_name: "개발팀".to_string(),
-            description: Some("팀 설명".to_string()),
+            display_name: "Engineering".to_string(),
+            description: Some("Team description".to_string()),
             channels: vec![ChannelSummary {
-                display_name: "일반-개명".to_string(),
+                display_name: "General-Renamed".to_string(),
                 ..ch
             }],
         };
         storage.upsert_teams(&[team]).unwrap();
 
         let loaded = storage.get_conversation(&conv_key).unwrap().unwrap();
-        assert_eq!(loaded.title, "일반-개명");
+        assert_eq!(loaded.title, "General-Renamed");
         assert_eq!(loaded.unread_count, 7);
         assert_eq!(loaded.last_msg_id.as_deref(), Some("m-10"));
         assert!(loaded.pinned);
@@ -407,16 +407,16 @@ mod tests {
     #[test]
     fn test_conversation_ordering_and_mark_read() {
         let storage = Storage::open_in_memory().unwrap();
-        let c1 = sample_chat("c1", "가나다", false, Some("2026-11-15T10:00:00Z"));
-        let c2 = sample_chat("c2", "홍길동", true, Some("2026-11-14T10:00:00Z"));
-        let c3 = sample_chat("c3", "박영희", false, Some("2026-11-15T12:00:00Z"));
+        let c1 = sample_chat("c1", "Charlie", false, Some("2026-11-15T10:00:00Z"));
+        let c2 = sample_chat("c2", "Alice", true, Some("2026-11-14T10:00:00Z"));
+        let c3 = sample_chat("c3", "Bob", false, Some("2026-11-15T12:00:00Z"));
         storage.upsert_conversations(&[c1, c2, c3]).unwrap();
 
         let list = storage.list_conversations().unwrap();
         assert_eq!(list.len(), 3);
-        assert_eq!(list[0].title, "홍길동"); // pinned first
-        assert_eq!(list[1].title, "박영희"); // newer timestamp
-        assert_eq!(list[2].title, "가나다");
+        assert_eq!(list[0].title, "Alice"); // pinned first
+        assert_eq!(list[1].title, "Bob"); // newer timestamp
+        assert_eq!(list[2].title, "Charlie");
 
         storage
             .mark_conversation_read("chat:c3", "2026-11-15T12:05:00Z")
@@ -434,13 +434,13 @@ mod tests {
         let storage = Storage::open_in_memory().unwrap();
         let team = TeamSummary {
             id: "t1".to_string(),
-            display_name: "개발팀".to_string(),
+            display_name: "Engineering".to_string(),
             description: None,
             channels: vec![ChannelSummary {
                 id: "ch1".to_string(),
                 team_id: "t1".to_string(),
-                team_name: "개발팀".to_string(),
-                display_name: "배포".to_string(),
+                team_name: "Engineering".to_string(),
+                display_name: "Deploy".to_string(),
                 description: None,
                 membership_type: "standard".to_string(),
                 web_url: None,
@@ -453,17 +453,17 @@ mod tests {
             conv_key,
             "m1",
             None,
-            "김철수",
-            "첫 번째 루트",
-            Some("공지"),
+            "Bob",
+            "First root",
+            Some("Announcement"),
             "2026-11-15T09:00:00Z",
         );
         let r2 = sample_msg(
             conv_key,
             "m2",
             None,
-            "이영희",
-            "두 번째 루트",
+            "Carol",
+            "Second root",
             None,
             "2026-11-15T10:00:00Z",
         );
@@ -471,8 +471,8 @@ mod tests {
             conv_key,
             "m3",
             None,
-            "박민수",
-            "세 번째 루트",
+            "Dave",
+            "Third root",
             None,
             "2026-11-15T11:00:00Z",
         );
@@ -480,8 +480,8 @@ mod tests {
             conv_key,
             "m1-r1",
             Some("m1"),
-            "홍길동",
-            "답글 1",
+            "Alice",
+            "Reply 1",
             None,
             "2026-11-15T11:30:00Z",
         );
@@ -489,8 +489,8 @@ mod tests {
             conv_key,
             "m1-r2",
             Some("m1"),
-            "김철수",
-            "답글 2",
+            "Bob",
+            "Reply 2",
             None,
             "2026-11-15T12:00:00Z",
         );
@@ -523,8 +523,8 @@ mod tests {
         // Conversation last_msg updated from newest reply
         let conv = storage.get_conversation(conv_key).unwrap().unwrap();
         assert_eq!(conv.last_msg_id.as_deref(), Some("m1-r2"));
-        assert_eq!(conv.last_msg_author.as_deref(), Some("김철수"));
-        assert_eq!(conv.last_msg_preview.as_deref(), Some("답글 2"));
+        assert_eq!(conv.last_msg_author.as_deref(), Some("Bob"));
+        assert_eq!(conv.last_msg_preview.as_deref(), Some("Reply 2"));
     }
 
     #[test]
@@ -604,8 +604,8 @@ mod tests {
                 &[MemberInfo {
                     user_id: "u1".to_string(),
                     member_id: Some("mem1".to_string()),
-                    display_name: "홍길동".to_string(),
-                    email: Some("hong@example.com".to_string()),
+                    display_name: "Alice".to_string(),
+                    email: Some("alice@example.com".to_string()),
                     roles: vec!["owner".to_string()],
                     presence: None,
                 }],
@@ -630,15 +630,15 @@ mod tests {
             conv_key,
             "m10",
             None,
-            "김철수",
-            "@홍길동 확인해주세요",
+            "Bob",
+            "@Alice please check",
             None,
             "2026-11-15T12:00:00Z",
         );
         msg.mentions.push(MentionInfo {
             id: 0,
             user_id: "u1".to_string(),
-            display_name: "홍길동".to_string(),
+            display_name: "Alice".to_string(),
         });
         storage.upsert_messages(&[msg]).unwrap();
         let mentions = storage.list_mentions_for_user("u1", 10).unwrap();
@@ -662,12 +662,12 @@ mod tests {
         let db_file = dir.path().join("teams.db");
         {
             let storage = Storage::open(&db_file).unwrap();
-            let chat = sample_chat("c-disk", "디스크방", false, Some("2026-11-15T12:00:00Z"));
+            let chat = sample_chat("c-disk", "Disk Room", false, Some("2026-11-15T12:00:00Z"));
             storage.upsert_conversations(&[chat]).unwrap();
         }
         let reopened = Storage::open(&db_file).unwrap();
         let loaded = reopened.get_conversation("chat:c-disk").unwrap().unwrap();
-        assert_eq!(loaded.title, "디스크방");
+        assert_eq!(loaded.title, "Disk Room");
     }
 
     #[test]
@@ -676,16 +676,16 @@ mod tests {
         let db_file = dir.path().join("teams-concurrent.db");
         let storage = Storage::open(&db_file).unwrap();
 
-        let chat = sample_chat("c-wal", "동시성 테스트방", true, Some("2026-11-15T12:00:00Z"));
+        let chat = sample_chat("c-wal", "Concurrency Test Room", true, Some("2026-11-15T12:00:00Z"));
         let conv_key = chat.conv_key.clone();
         storage.upsert_conversations(&[chat]).unwrap();
         let m1 = sample_msg(
             &conv_key,
             "m1",
             None,
-            "홍길동",
-            "WAL reader pool 동시 읽기 검증 메시지",
-            Some("성능 테스트"),
+            "Alice",
+            "WAL reader pool concurrent read verification message",
+            Some("Performance test"),
             "2026-11-15T12:00:00Z",
         );
         storage.upsert_messages(&[m1]).unwrap();
@@ -698,16 +698,19 @@ mod tests {
                     s.spawn(|| {
                         let convs = storage.list_conversations().unwrap();
                         assert_eq!(convs.len(), 1);
-                        assert_eq!(convs[0].title, "동시성 테스트방");
+                        assert_eq!(convs[0].title, "Concurrency Test Room");
 
                         let roots = storage.list_root_messages(&conv_key, 10, None).unwrap();
                         assert_eq!(roots.len(), 1);
                         assert_eq!(roots[0].msg_id, "m1");
 
                         let msg = storage.get_message(&conv_key, "m1").unwrap().unwrap();
-                        assert_eq!(msg.body_plain, "WAL reader pool 동시 읽기 검증 메시지");
+                        assert_eq!(
+                            msg.body_plain,
+                            "WAL reader pool concurrent read verification message"
+                        );
 
-                        let hits = storage.search_messages("동시 읽기", None, 10).unwrap();
+                        let hits = storage.search_messages("concurrent read", None, 10).unwrap();
                         assert_eq!(hits.len(), 1);
                         assert_eq!(hits[0].msg_id, "m1");
                     });
@@ -723,8 +726,8 @@ mod tests {
             &conv_key,
             "m2",
             None,
-            "김철수",
-            "두 번째 커밋 메시지",
+            "Bob",
+            "Second committed message",
             None,
             "2026-11-15T12:05:00Z",
         );
@@ -737,7 +740,7 @@ mod tests {
     #[test]
     fn test_upsert_messages_idempotency_and_partial_fts_skip() {
         let storage = Storage::open_in_memory().unwrap();
-        let chat = sample_chat("c-idem", "멱등성 테스트", false, None);
+        let chat = sample_chat("c-idem", "Idempotency Test", false, None);
         let conv_key = chat.conv_key.clone();
         storage.upsert_conversations(&[chat]).unwrap();
 
@@ -745,9 +748,9 @@ mod tests {
             &conv_key,
             "m1",
             None,
-            "홍길동",
-            "초기 본문 Kubernetes 배포 안내",
-            Some("배포 공지"),
+            "Alice",
+            "Initial body Kubernetes deployment notice",
+            Some("Deploy notice"),
             "2026-11-15T09:00:00Z",
         );
         assert_eq!(storage.upsert_messages(&[m1.clone()]).unwrap(), 1);
@@ -783,7 +786,7 @@ mod tests {
         );
 
         // 3) Body change updates both messages and messages_fts.
-        m1.body_plain = "수정된 본문 PostgreSQL 점검".to_string();
+        m1.body_plain = "Edited body PostgreSQL check".to_string();
         m1.last_modified_at = Some("2026-11-15T09:05:00Z".to_string());
         storage.upsert_messages(&[m1.clone()]).unwrap();
         assert!(storage.search_messages("Kubernetes", None, 10).unwrap().is_empty());
@@ -804,7 +807,7 @@ mod tests {
     fn test_shrink_memory_in_memory_and_file_backed_with_reader_pool() {
         // 1) In-memory Storage (writer connection only)
         let mem = Storage::open_in_memory().unwrap();
-        let chat = sample_chat("c-mem-shrink", "메모리 축소", false, None);
+        let chat = sample_chat("c-mem-shrink", "Memory Shrink", false, None);
         mem.upsert_conversations(&[chat]).unwrap();
         mem.shrink_memory();
         assert_eq!(mem.list_conversations().unwrap().len(), 1);
@@ -813,15 +816,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_file = dir.path().join("shrink.db");
         let wal = Storage::open(&db_file).unwrap();
-        let wal_chat = sample_chat("c-wal-shrink", "WAL 축소", false, None);
+        let wal_chat = sample_chat("c-wal-shrink", "WAL Shrink", false, None);
         let conv_key = wal_chat.conv_key.clone();
         wal.upsert_conversations(&[wal_chat]).unwrap();
         let msg = sample_msg(
             &conv_key,
             "m1",
             None,
-            "홍길동",
-            "SQLite shrink_memory 테스트 본문",
+            "Alice",
+            "SQLite shrink_memory test body",
             None,
             "2026-11-15T12:00:00Z",
         );
@@ -840,8 +843,8 @@ mod tests {
             &conv_key,
             "m2",
             None,
-            "김철수",
-            "shrink_memory 이후 후속 읽기/쓰기 확인",
+            "Bob",
+            "Verify subsequent read/write after shrink_memory",
             None,
             "2026-11-15T12:05:00Z",
         );
@@ -852,17 +855,17 @@ mod tests {
     #[test]
     fn test_list_older_root_messages_tie_breaking_same_timestamp() {
         let storage = Storage::open_in_memory().unwrap();
-        let chat = sample_chat("c-tie", "동일타임스탬프방", false, None);
+        let chat = sample_chat("c-tie", "Same Timestamp Room", false, None);
         let conv_key = chat.conv_key.clone();
         storage.upsert_conversations(&[chat]).unwrap();
 
         let ts = "2026-11-15T10:00:00Z";
-        let m0 = sample_msg(&conv_key, "m0", None, "김철수", "이전", None, "2026-11-15T09:59:59Z");
-        let m1 = sample_msg(&conv_key, "m1", None, "김철수", "첫째", None, ts);
-        let m2 = sample_msg(&conv_key, "m2", None, "이영희", "둘째", None, ts);
-        let m3 = sample_msg(&conv_key, "m3", None, "박민수", "셋째", None, ts);
+        let m0 = sample_msg(&conv_key, "m0", None, "Bob", "earlier", None, "2026-11-15T09:59:59Z");
+        let m1 = sample_msg(&conv_key, "m1", None, "Bob", "first", None, ts);
+        let m2 = sample_msg(&conv_key, "m2", None, "Carol", "second", None, ts);
+        let m3 = sample_msg(&conv_key, "m3", None, "Dave", "third", None, ts);
         // Thread reply with the same timestamp must not appear in root queries
-        let reply = sample_msg(&conv_key, "m2-r1", Some("m2"), "홍길동", "답글", None, ts);
+        let reply = sample_msg(&conv_key, "m2-r1", Some("m2"), "Alice", "reply", None, ts);
         storage.upsert_messages(&[m3, m1, m0, m2, reply]).unwrap();
 
         // Newest 2 root messages in chronological order -> ["m2", "m3"]

@@ -79,11 +79,11 @@ pub fn decode_and_render_halfblocks(
 ) -> Result<RenderedTerminalImage> {
     let guessed = image::guess_format(bytes).ok();
     let format_label = format_label_for(guessed);
-    let dyn_img = image::load_from_memory(bytes).context("이미지 디코딩 실패")?;
+    let dyn_img = image::load_from_memory(bytes).context("Failed to decode image")?;
     let rgba = dyn_img.to_rgba8();
     let (width_px, height_px) = rgba.dimensions();
     if width_px == 0 || height_px == 0 {
-        bail!("이미지 크기가 0x0입니다");
+        bail!("Image dimensions are 0x0");
     }
 
     let clamped_cols = max_cols.max(4);
@@ -181,7 +181,7 @@ fn render_ansi_stdout_with_protocol(
             let png_bytes = if matches!(image::guess_format(bytes), Ok(ImageFormat::Png)) {
                 bytes.to_vec()
             } else {
-                let dyn_img = image::load_from_memory(bytes).context("이미지 디코딩 실패")?;
+                let dyn_img = image::load_from_memory(bytes).context("Failed to decode image")?;
                 encode_png(&dyn_img)?
             };
             let b64 = B64_STANDARD.encode(&png_bytes);
@@ -284,7 +284,7 @@ fn blend_over_bg(px: Rgba<u8>, bg: (u8, u8, u8)) -> (u8, u8, u8) {
 fn encode_png(img: &DynamicImage) -> Result<Vec<u8>> {
     let mut buf = Cursor::new(Vec::new());
     img.write_to(&mut buf, ImageFormat::Png)
-        .context("PNG 인코딩 실패")?;
+        .context("Failed to encode PNG")?;
     Ok(buf.into_inner())
 }
 

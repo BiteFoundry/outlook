@@ -218,14 +218,14 @@ impl AuthManager {
 
                 if tok.is_expired_soon(0) {
                     bail!(
-                        "토큰 만료 (exp: {}, auth_mode={}) — 토큰을 갱신한 뒤 재시도하세요. (자동 갱신: TEAMS_TOKEN_FILE + TEAMS_TOKEN_REFRESH_CMD 설정 지원)",
+                        "Token expired (exp: {}, auth_mode={}) — refresh your token and retry. (Auto-refresh supported via TEAMS_TOKEN_FILE + TEAMS_TOKEN_REFRESH_CMD)",
                         format_local_exp(tok.expires_at),
                         tok.auth_mode
                     );
                 }
                 if tok.is_expired_soon(300) && !EXPIRY_SOON_WARNED.swap(true, Ordering::Relaxed) {
                     eprintln!(
-                        "경고: 토큰 만료 임박 (exp: {}) — 곧 갱신이 필요합니다.",
+                        "Warning: token expiring soon (exp: {}) — refresh recommended.",
                         format_local_exp(tok.expires_at)
                     );
                 }
@@ -263,7 +263,7 @@ impl AuthManager {
             let tok = read_external_token_file(&token_path, &self.config)?;
             if tok.is_expired_soon(0) {
                 bail!(
-                    "토큰 만료 (exp: {}, auth_mode={}) — 토큰을 갱신한 뒤 재시도하세요. (자동 갱신: TEAMS_TOKEN_FILE + TEAMS_TOKEN_REFRESH_CMD 설정 지원)",
+                    "Token expired (exp: {}, auth_mode={}) — refresh your token and retry. (Auto-refresh supported via TEAMS_TOKEN_FILE + TEAMS_TOKEN_REFRESH_CMD)",
                     format_local_exp(tok.expires_at),
                     tok.auth_mode
                 );
@@ -276,7 +276,7 @@ impl AuthManager {
             *guard = Some(reloaded.clone());
             return Ok(reloaded.access_token);
         }
-        bail!("로그인이 필요합니다. 먼저 `teams login` 을 실행하세요.")
+        bail!("Not logged in. Run 'teams login' first.")
     }
 
     async fn try_hot_reload_from_disk(
@@ -415,7 +415,7 @@ impl AuthManager {
             return self.run_external_refresh_cmd(current.as_ref()).await;
         }
         if env_access_token(&self.config).is_some() {
-            bail!("TEAMS_ACCESS_TOKEN 환경 변수 토큰은 자동 갱신할 수 없습니다. (TEAMS_TOKEN_REFRESH_CMD 미설정)");
+            bail!("TEAMS_ACCESS_TOKEN environment variable token cannot be auto-refreshed (TEAMS_TOKEN_REFRESH_CMD is not set).");
         }
         if let Some(path) = self.config.resolved_token_file() {
             return read_external_token_file(&path, &self.config);
@@ -438,12 +438,12 @@ impl AuthManager {
             }
             let refreshed = self.run_external_refresh_cmd(current.as_ref()).await?;
             if refreshed.access_token == failed_access_token {
-                bail!("외부 토큰 갱신 후에도 거부된 토큰과 동일한 토큰이 반환되었습니다.");
+                bail!("External token refresh returned the same rejected token.");
             }
             return Ok(refreshed);
         }
         if env_access_token(&self.config).is_some() {
-            bail!("TEAMS_ACCESS_TOKEN 환경 변수 토큰은 자동 갱신할 수 없습니다.");
+            bail!("TEAMS_ACCESS_TOKEN environment variable token cannot be auto-refreshed.");
         }
         if let Some(path) = self.config.resolved_token_file() {
             if let Ok(disk_tok) = read_external_token_file(&path, &self.config) {
@@ -451,7 +451,7 @@ impl AuthManager {
                     return Ok(disk_tok);
                 }
             }
-            bail!("외부 토큰 파일이 만료되었거나 거부되었습니다. 토큰을 갱신하거나 TEAMS_TOKEN_REFRESH_CMD를 설정하세요.");
+            bail!("External token file is expired or was rejected. Refresh your token or set TEAMS_TOKEN_REFRESH_CMD.");
         }
         let mut guard = self.tokens.write().await;
         if let Some(current) = guard.as_ref() {
@@ -559,7 +559,7 @@ impl AuthManager {
 
                 if new_tok.is_expired_soon(0) {
                     bail!(
-                        "외부 토큰 갱신 실패 (exp: {}): 갱신 후에도 토큰이 이미 만료되어 있습니다.",
+                        "External token refresh failed (exp: {}): token is still expired after refresh.",
                         format_local_exp(new_tok.expires_at)
                     );
                 }
@@ -573,7 +573,7 @@ impl AuthManager {
         let current = guard
             .as_ref()
             .cloned()
-            .ok_or_else(|| anyhow!("저장된 토큰이 없습니다. 먼저 `teams login` 을 실행하세요."))?;
+            .ok_or_else(|| anyhow!("No stored token found. Run 'teams login' first."))?;
 
         let token_url = self.token_endpoint(&current.tenant_id);
         let scope = self.config.effective_scopes().join(" ");
@@ -593,7 +593,7 @@ impl AuthManager {
             self.post_token_form(&token_url, &params).await?
         } else if current.auth_mode == "client_credentials" {
             let secret = env_client_secret().ok_or_else(|| {
-                anyhow!("client_credentials 토큰 갱신을 위해 TEAMS_CLIENT_SECRET 환경 변수가 필요합니다.")
+                anyhow!("TEAMS_CLIENT_SECRET environment variable is required to refresh client_credentials token.")
             })?;
             let params = [
                 ("client_id", current.client_id.as_str()),
@@ -603,7 +603,7 @@ impl AuthManager {
             ];
             self.post_token_form(&token_url, &params).await?
         } else {
-            bail!("토큰을 갱신할 수 없습니다 (refresh_token 없음). 다시 `teams login` 을 실행하세요.");
+            bail!("Cannot refresh token (no refresh_token). Run 'teams login' again.");
         };
 
         let expires_in = token_resp.expires_in.unwrap_or(3600).max(60);
@@ -670,19 +670,19 @@ impl AuthManager {
             .form(&[("client_id", client_id), ("scope", scope.as_str())])
             .send()
             .await
-            .context("Device Code 요청 전송 실패")?;
+            .context("Failed to send Device Code request")?;
 
         let status = res.status();
         let body_text = res.text().await.unwrap_or_default();
         if !status.is_success() {
-            bail!("Device Code 시작 실패 ({}): {}", status, body_text);
+            bail!("Failed to start Device Code flow ({}): {}", status, body_text);
         }
         let dc: DeviceCodeResponse =
-            serde_json::from_str(&body_text).context("Device Code 응답 파싱 실패")?;
+            serde_json::from_str(&body_text).context("Failed to parse Device Code response")?;
 
-        eprintln!("\n[Microsoft Teams 로그인 - Device Code]");
+        eprintln!("\n[Microsoft Teams Login - Device Code]");
         eprintln!(
-            "브라우저에서 다음 주소를 열고 코드를 입력하세요 / Open URL and enter code:"
+            "Open the following URL in your browser and enter the code:"
         );
         eprintln!("  URL : {}", dc.verification_uri);
         eprintln!("  Code: {}", dc.user_code);
@@ -701,7 +701,7 @@ impl AuthManager {
 
         loop {
             if tokio::time::Instant::now() >= deadline {
-                bail!("Device Code 인증 시간이 만료되었습니다. 다시 시도하세요.");
+                bail!("Device Code authentication timed out. Please try again.");
             }
             tokio::time::sleep(Duration::from_secs(interval_secs)).await;
 
@@ -715,13 +715,13 @@ impl AuthManager {
                 ])
                 .send()
                 .await
-                .context("Device Code 토큰 폴링 실패")?;
+                .context("Failed to poll Device Code token")?;
 
             let poll_status = poll_res.status();
             let poll_text = poll_res.text().await.unwrap_or_default();
             if poll_status.is_success() {
                 let tok: TokenResponse =
-                    serde_json::from_str(&poll_text).context("토큰 응답 파싱 실패")?;
+                    serde_json::from_str(&poll_text).context("Failed to parse token response")?;
                 let expires_in = tok.expires_in.unwrap_or(3600).max(60);
                 return Ok(StoredTokens {
                     access_token: tok.access_token,
@@ -749,14 +749,14 @@ impl AuthManager {
                     continue;
                 }
                 "expired_token" => {
-                    bail!("Device Code가 만료되었습니다. 다시 시도하세요.");
+                    bail!("Device Code has expired. Please try again.");
                 }
                 "authorization_declined" | "access_denied" => {
-                    bail!("사용자가 인증을 거부했습니다.");
+                    bail!("Authentication was declined by the user.");
                 }
                 other => {
                     let desc = err_body.error_description.unwrap_or_default();
-                    bail!("Device Code 인증 오류 ({other}): {desc}");
+                    bail!("Device Code authentication error ({other}): {desc}");
                 }
             }
         }
@@ -775,13 +775,13 @@ impl AuthManager {
         let bind_port = preferred_port.unwrap_or(0);
         let listener = TcpListener::bind(("127.0.0.1", bind_port))
             .await
-            .with_context(|| format!("로컬 콜백 포트(127.0.0.1:{bind_port}) 바인딩 실패"))?;
+            .with_context(|| format!("Failed to bind local callback port (127.0.0.1:{bind_port})"))?;
         let actual_port = listener.local_addr()?.port();
         let redirect_uri = format!("http://localhost:{actual_port}");
         let scope = self.config.effective_scopes().join(" ");
 
         let mut auth_url = Url::parse(&self.authorize_endpoint(tenant_id))
-            .context("authorize URL 생성 실패")?;
+            .context("Failed to build authorize URL")?;
         auth_url
             .query_pairs_mut()
             .append_pair("client_id", client_id)
@@ -793,8 +793,8 @@ impl AuthManager {
             .append_pair("code_challenge", &code_challenge)
             .append_pair("code_challenge_method", "S256");
 
-        eprintln!("\n[Microsoft Teams 로그인 - 브라우저 인증 (PKCE)]");
-        eprintln!("브라우저가 자동으로 열리지 않으면 아래 URL을 복사해 여세요:");
+        eprintln!("\n[Microsoft Teams Login - Browser Auth (PKCE)]");
+        eprintln!("If the browser does not open automatically, copy and open the URL below:");
         eprintln!("{}\n", auth_url.as_str());
 
         if should_open_browser() {
@@ -806,7 +806,7 @@ impl AuthManager {
             accept_pkce_callback(&listener, &expected_state),
         )
         .await
-        .map_err(|_| anyhow!("브라우저 로그인 콜백 대기 시간이 초과되었습니다 (5분)."))??;
+        .map_err(|_| anyhow!("Timed out waiting for browser login callback (5 minutes)."))??;
 
         let token_url = self.token_endpoint(tenant_id);
         let params = [
@@ -868,17 +868,17 @@ impl AuthManager {
         let res = req
             .send()
             .await
-            .context("OAuth 토큰 요청 전송 실패")?;
+            .context("Failed to send OAuth token request")?;
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
         if !status.is_success() {
             if let Ok(err) = serde_json::from_str::<OAuthErrorResponse>(&text) {
                 let desc = err.error_description.unwrap_or_default();
-                bail!("OAuth 토큰 오류 ({} - {}): {}", status, err.error, desc);
+                bail!("OAuth token error ({} - {}): {}", status, err.error, desc);
             }
-            bail!("OAuth 토큰 오류 ({}): {}", status, text);
+            bail!("OAuth token error ({}): {}", status, text);
         }
-        serde_json::from_str::<TokenResponse>(&text).context("OAuth 토큰 JSON 파싱 실패")
+        serde_json::from_str::<TokenResponse>(&text).context("Failed to parse OAuth token JSON")
     }
 
     pub async fn update_identity(
@@ -1023,12 +1023,12 @@ pub(crate) fn load_tokens_from_path(path: &Path) -> Result<Option<StoredTokens>>
         return Ok(None);
     }
     let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("자격 증명 파일 읽기 실패: {}", path.display()))?;
+        .with_context(|| format!("Failed to read credential file: {}", path.display()))?;
     if raw.trim().is_empty() {
         return Ok(None);
     }
     let parsed: StoredTokens = serde_json::from_str(&raw)
-        .with_context(|| format!("자격 증명 파일 파싱 실패: {}", path.display()))?;
+        .with_context(|| format!("Failed to parse credential file: {}", path.display()))?;
     Ok(Some(parsed))
 }
 
@@ -1046,7 +1046,7 @@ pub(crate) fn save_tokens_to_path(tokens: &StoredTokens, path: &Path) -> Result<
 pub(crate) fn delete_tokens_at_path(path: &Path) -> Result<()> {
     if path.exists() {
         std::fs::remove_file(path)
-            .with_context(|| format!("자격 증명 파일 삭제 실패: {}", path.display()))?;
+            .with_context(|| format!("Failed to delete credential file: {}", path.display()))?;
     }
     Ok(())
 }
@@ -1068,7 +1068,7 @@ fn build_auth_http_client() -> Result<reqwest::Client> {
         .user_agent(concat!("teams-cli/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
         .build()
-        .context("HTTP 클라이언트 초기화 실패")
+        .context("Failed to initialize HTTP client")
 }
 
 fn is_truthy_env(val: Option<&str>) -> bool {
@@ -1293,16 +1293,16 @@ pub fn diagnose_access_token_scopes(access_token: &str) -> TokenScopeDiagnostics
     if has_scope_claims {
         if chat_read_basic_only {
             warnings.push(
-                "현재 토큰에 `Chat.ReadBasic` 권한만 있고 `Chat.Read` / `Chat.ReadWrite`가 없어 대화 메시지 본문 및 이전 메시지 조회가 제한됩니다.".to_string(),
+                "Current token only has `Chat.ReadBasic` without `Chat.Read` / `Chat.ReadWrite`; reading message bodies and older history is restricted.".to_string(),
             );
         } else if !can_read_chats {
             warnings.push(
-                "현재 토큰에 `Chat.Read` 또는 `Chat.ReadWrite` 권한이 없어 1:1/그룹 채팅 메시지 조회가 거부될 수 있습니다.".to_string(),
+                "Current token lacks `Chat.Read` or `Chat.ReadWrite`; reading 1:1 or group chat messages may be denied.".to_string(),
             );
         }
         if !can_read_channels {
             warnings.push(
-                "현재 토큰에 `ChannelMessage.Read.All` 권한이 없어 팀 채널 메시지/과거 기록 조회가 제한될 수 있습니다.".to_string(),
+                "Current token lacks `ChannelMessage.Read.All`; reading channel messages and history may be restricted.".to_string(),
             );
         }
     }
@@ -1344,7 +1344,7 @@ fn contains_http_403_token(s: &str) -> bool {
     false
 }
 
-/// Converts a raw Graph 403 / insufficient-privileges error into an actionable Korean explanation with token scope context.
+/// Converts a raw Graph 403 / insufficient-privileges error into an actionable English explanation with token scope context.
 pub fn explain_graph_permission_error(err_msg: &str, access_token: Option<&str>) -> Option<String> {
     let detail = err_msg
         .split_once("): ")
@@ -1363,13 +1363,16 @@ pub fn explain_graph_permission_error(err_msg: &str, access_token: Option<&str>)
     if let Some(tok) = access_token {
         let diag = diagnose_access_token_scopes(tok);
         if let Some(first) = diag.warnings.first() {
-            return Some(format!("권한 부족 (403): {first}"));
+            return Some(format!("{INSUFFICIENT_PERMISSIONS_PREFIX} {first}"));
         }
     }
-    Some(
-        "권한 부족 (403): 현재 토큰에 메시지 조회 권한(`Chat.Read` / `ChannelMessage.Read.All`)이 없거나 접근이 제한된 대화입니다.".to_string(),
-    )
+    Some(format!(
+        "{INSUFFICIENT_PERMISSIONS_PREFIX} current token lacks message read scopes (`Chat.Read` / `ChannelMessage.Read.All`) or access to this conversation is restricted."
+    ))
 }
+
+/// Canonical prefix emitted by `explain_graph_permission_error` for 403 Graph errors.
+pub const INSUFFICIENT_PERMISSIONS_PREFIX: &str = "Insufficient Graph permissions (403):";
 
 fn strip_bearer_prefix(raw: &str) -> &str {
     let trimmed = raw.trim();
@@ -1545,15 +1548,15 @@ fn parse_external_token_str(
 ) -> Result<StoredTokens> {
     let cleaned = raw.trim_start_matches('\u{feff}').trim();
     if cleaned.is_empty() {
-        bail!("토큰 파일이 비어 있습니다: {source_label}");
+        bail!("Token file is empty: {source_label}");
     }
 
     if cleaned.starts_with('{') {
         let val: serde_json::Value = serde_json::from_str(cleaned)
-            .with_context(|| format!("외부 토큰 JSON 파싱 실패: {source_label}"))?;
+            .with_context(|| format!("Failed to parse external token JSON: {source_label}"))?;
         let raw_token = json_non_empty_str(&val, &["access_token", "accessToken", "token"])
             .ok_or_else(|| {
-                anyhow!("외부 토큰 JSON에 access_token/accessToken/token 필드가 없습니다: {source_label}")
+                anyhow!("External token JSON is missing access_token/accessToken/token field: {source_label}")
             })?;
         let refresh_token = json_non_empty_str(&val, &["refresh_token", "refreshToken"]);
         let claims_exp = parse_jwt_claims(&raw_token).and_then(|c| c.exp);
@@ -1598,10 +1601,10 @@ fn parse_external_token_str(
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
-        .ok_or_else(|| anyhow!("토큰 파일이 비어 있습니다: {source_label}"))?;
+        .ok_or_else(|| anyhow!("Token file is empty: {source_label}"))?;
     let token = strip_bearer_prefix(first_line);
     if token.is_empty() {
-        bail!("토큰 파일이 비어 있습니다: {source_label}");
+        bail!("Token file is empty: {source_label}");
     }
     Ok(stored_tokens_from_jwt(
         token,
@@ -1617,7 +1620,7 @@ fn parse_external_token_str(
 /// from `path`, normalizing BOM, optional `Bearer ` prefix, and JWT claims.
 pub fn read_external_token_file(path: &Path, config: &AppConfig) -> Result<StoredTokens> {
     let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("외부 토큰 파일 읽기 실패: {}", path.display()))?;
+        .with_context(|| format!("Failed to read external token file: {}", path.display()))?;
     parse_external_token_str(&raw, "token_file", config, &path.display().to_string())
 }
 
@@ -1645,10 +1648,10 @@ async fn execute_external_refresh_shell(cmd_str: &str, token_file: Option<&Path>
 
     let child = cmd
         .spawn()
-        .with_context(|| format!("외부 토큰 갱신 명령 실행 실패: {cmd_str}"))?;
+        .with_context(|| format!("Failed to execute external token refresh command: {cmd_str}"))?;
     let output = tokio::time::timeout(EXTERNAL_REFRESH_TIMEOUT, child.wait_with_output())
         .await
-        .map_err(|_| anyhow!("외부 토큰 갱신 명령 시간 초과 (60초)"))??;
+        .map_err(|_| anyhow!("External token refresh command timed out (60s)"))??;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     if !output.status.success() {
@@ -1679,18 +1682,18 @@ fn fallback_or_bail_refresh_error(
         if !cur.is_expired_soon(0) {
             if !REFRESH_CMD_WARNED.swap(true, Ordering::Relaxed) {
                 eprintln!(
-                    "경고: 외부 토큰 갱신 명령 실패 ({err}); 기존 토큰 만료 시각({})까지 계속 사용합니다.",
+                    "Warning: external token refresh command failed ({err}); continuing with existing token until expiration ({}).",
                     format_local_exp(cur.expires_at)
                 );
             }
             return Ok(cur.clone());
         }
         bail!(
-            "외부 토큰 갱신 실패 (exp: {}): {err}",
+            "External token refresh failed (exp: {}): {err}",
             format_local_exp(cur.expires_at)
         );
     }
-    bail!("외부 토큰 갱신 실패 (exp: 없음): {err}");
+    bail!("External token refresh failed (exp: none): {err}");
 }
 
 fn format_local_exp(ts: i64) -> String {
@@ -1703,7 +1706,7 @@ fn format_local_exp(ts: i64) -> String {
 
 async fn accept_pkce_callback(listener: &TcpListener, expected_state: &str) -> Result<String> {
     loop {
-        let (mut socket, _) = listener.accept().await.context("콜백 연결 수락 실패")?;
+        let (mut socket, _) = listener.accept().await.context("Failed to accept callback connection")?;
 
         let mut buf = Vec::with_capacity(4096);
         let mut chunk = [0u8; 2048];
@@ -1749,12 +1752,12 @@ async fn accept_pkce_callback(listener: &TcpListener, expected_state: &str) -> R
                 .cloned()
                 .unwrap_or_default();
             let html = format!(
-                "<!doctype html><html><body style=\"font-family:sans-serif;padding:2rem\"><h2>로그인 실패</h2><p>{}: {}</p></body></html>",
+                "<!doctype html><html><body style=\"font-family:sans-serif;padding:2rem\"><h2>Login Failed</h2><p>{}: {}</p></body></html>",
                 html_escape(err),
                 html_escape(&desc)
             );
             let _ = write_http_response(&mut socket, "400 Bad Request", &html).await;
-            bail!("브라우저 OAuth 인증 실패 ({err}): {desc}");
+            bail!("Browser OAuth authentication failed ({err}): {desc}");
         }
 
         let state = params.get("state").map(String::as_str).unwrap_or("");
@@ -1762,10 +1765,10 @@ async fn accept_pkce_callback(listener: &TcpListener, expected_state: &str) -> R
             let _ = write_http_response(
                 &mut socket,
                 "400 Bad Request",
-                "<!doctype html><html><body style=\"font-family:sans-serif;padding:2rem\"><h2>State mismatch</h2><p>보안 검증(state)이 일치하지 않습니다.</p></body></html>",
+                "<!doctype html><html><body style=\"font-family:sans-serif;padding:2rem\"><h2>State mismatch</h2><p>Security verification (state) did not match.</p></body></html>",
             )
             .await;
-            bail!("OAuth state 값이 일치하지 않습니다.");
+            bail!("OAuth state mismatch.");
         }
 
         let code = match params.get("code").filter(|s| !s.is_empty()) {
@@ -1774,20 +1777,20 @@ async fn accept_pkce_callback(listener: &TcpListener, expected_state: &str) -> R
                 let _ = write_http_response(
                     &mut socket,
                     "400 Bad Request",
-                    "<!doctype html><html><body style=\"font-family:sans-serif;padding:2rem\"><h2>Missing code</h2><p>인증 코드가 누락되었습니다.</p></body></html>",
+                    "<!doctype html><html><body style=\"font-family:sans-serif;padding:2rem\"><h2>Missing code</h2><p>Authorization code is missing.</p></body></html>",
                 )
                 .await;
-                bail!("OAuth 콜백에 authorization code가 없습니다.");
+                bail!("OAuth callback is missing authorization code.");
             }
         };
 
         let success_html = r#"<!doctype html>
-<html lang="ko">
+<html lang="en">
 <head><meta charset="utf-8"><title>Teams CLI Login</title></head>
 <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#f5f5f7;color:#1d1d1f">
   <div style="background:#fff;padding:2.5rem 3rem;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.08);text-align:center">
-    <h1 style="margin:0 0 .5rem;color:#464eb8">Microsoft Teams CLI 로그인 완료</h1>
-    <p style="margin:0;color:#555">인증이 성공적으로 완료되었습니다. 이 창을 닫고 터미널로 돌아가세요.</p>
+    <h1 style="margin:0 0 .5rem;color:#464eb8">Microsoft Teams CLI Login Complete</h1>
+    <p style="margin:0;color:#555">Authentication succeeded. You can close this window and return to the terminal.</p>
   </div>
 </body>
 </html>"#;
@@ -1901,8 +1904,8 @@ mod tests {
             client_id: "client-123".into(),
             tenant_id: "tenant-456".into(),
             user_id: Some("user-1".into()),
-            user_display_name: Some("홍길동".into()),
-            user_email: Some("hong@example.com".into()),
+            user_display_name: Some("Alice".into()),
+            user_email: Some("alice@example.com".into()),
             auth_mode: "pkce".into(),
         };
 
@@ -2209,8 +2212,8 @@ mod tests {
         let payload = serde_json::json!({
             "exp": exp,
             "oid": "oid-user-123?>",
-            "name": "김철수",
-            "upn": "chulsoo@contoso.com",
+            "name": "Bob",
+            "upn": "bob@contoso.com",
             "tid": "tenant-abc",
             "appid": "app-xyz"
         });
@@ -2221,8 +2224,8 @@ mod tests {
             let claims = parse_jwt_claims(tok).expect("claims must parse");
             assert_eq!(claims.exp, Some(exp));
             assert_eq!(claims.user_id.as_deref(), Some("oid-user-123?>"));
-            assert_eq!(claims.user_display_name.as_deref(), Some("김철수"));
-            assert_eq!(claims.user_email.as_deref(), Some("chulsoo@contoso.com"));
+            assert_eq!(claims.user_display_name.as_deref(), Some("Bob"));
+            assert_eq!(claims.user_email.as_deref(), Some("bob@contoso.com"));
             assert_eq!(claims.tenant_id.as_deref(), Some("tenant-abc"));
             assert_eq!(claims.client_id.as_deref(), Some("app-xyz"));
         }
@@ -2296,7 +2299,7 @@ mod tests {
         let empty_path = dir.path().join("empty");
         std::fs::write(&empty_path, "\u{feff}   \n").unwrap();
         let err = read_external_token_file(&empty_path, &cfg).unwrap_err();
-        assert!(err.to_string().contains("비어 있습니다"));
+        assert!(err.to_string().contains("Token file is empty"));
     }
 
     #[tokio::test]
@@ -2420,7 +2423,7 @@ mod tests {
         std::fs::write(&token_path, &expired_jwt).unwrap();
         let err = mgr.valid_access_token().await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("외부 토큰 갱신 실패"), "unexpected error: {msg}");
+        assert!(msg.contains("External token refresh failed"), "unexpected error: {msg}");
         assert!(msg.contains("exp:"), "missing exp in error: {msg}");
     }
 
@@ -2441,7 +2444,7 @@ mod tests {
         let err_file = mgr_file.valid_access_token().await.unwrap_err();
         let msg_file = err_file.to_string();
         assert!(
-            msg_file.contains("토큰 만료 (exp:") && msg_file.contains("auth_mode=token_file"),
+            msg_file.contains("Token expired (exp:") && msg_file.contains("auth_mode=token_file"),
             "unexpected token_file error: {msg_file}"
         );
 
@@ -2452,7 +2455,7 @@ mod tests {
         let err_env = mgr_env.valid_access_token().await.unwrap_err();
         let msg_env = err_env.to_string();
         assert!(
-            msg_env.contains("토큰 만료 (exp:") && msg_env.contains("auth_mode=env_token"),
+            msg_env.contains("Token expired (exp:") && msg_env.contains("auth_mode=env_token"),
             "unexpected env_token error: {msg_env}"
         );
     }
@@ -2636,7 +2639,7 @@ mod tests {
         );
 
         let explained_basic = explain_graph_permission_error(
-            "Graph API 오류 (GET https://graph.microsoft.com/v1.0/chats/c1/messages): 403 Forbidden [Forbidden] Missing scope",
+            "Graph API error (GET https://graph.microsoft.com/v1.0/chats/c1/messages): 403 Forbidden [Forbidden] Missing scope",
             Some(&basic_jwt),
         )
         .expect("403 must be explained");
@@ -2644,7 +2647,7 @@ mod tests {
         assert!(explained_basic.contains("Chat.ReadBasic"));
 
         let explained_full = explain_graph_permission_error(
-            "Graph API 오류 (GET https://graph.microsoft.com/v1.0/chats/c1/messages): 403 Forbidden",
+            "Graph API error (GET https://graph.microsoft.com/v1.0/chats/c1/messages): 403 Forbidden",
             Some(&full_jwt),
         )
         .expect("403 with full token falls back to generic explanation");
@@ -2653,7 +2656,7 @@ mod tests {
 
         assert_eq!(
             explain_graph_permission_error(
-                "Graph HTTP 요청 실패 (GET http://127.0.0.1:40312/v1.0/chats/c1/messages): connection refused",
+                "Graph HTTP request failed (GET http://127.0.0.1:40312/v1.0/chats/c1/messages): connection refused",
                 Some(&basic_jwt),
             ),
             None
