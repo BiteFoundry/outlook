@@ -5,8 +5,10 @@ pub mod command_palette;
 pub mod confirm;
 pub mod context_menu;
 pub mod event_form;
+pub mod file_picker;
 pub mod folder_picker;
 pub mod image_preview;
+pub mod links;
 pub mod mail_compose;
 pub mod path_input;
 pub mod quick_input;
@@ -27,9 +29,9 @@ use crate::ui::{
     hitmap::{HitMap, HitTarget},
     overlays::{
         attachments::AttachmentsState, command_palette::CommandPalette, confirm::ConfirmDialog,
-        context_menu::ContextMenu, event_form::EventFormOverlay,
+        context_menu::ContextMenu, event_form::EventFormOverlay, file_picker::FilePickerOverlay,
         folder_picker::FolderPickerOverlay, image_preview::ImagePreviewOverlay,
-        mail_compose::MailComposeOverlay, path_input::PathInputState,
+        links::LinkExtractorOverlay, mail_compose::MailComposeOverlay, path_input::PathInputState,
         quick_input::QuickInputOverlay, search::SearchOverlay, settings::SettingsState,
     },
 };
@@ -42,6 +44,8 @@ pub enum OverlayKind {
     Search,
     Attachments,
     PathInput,
+    FilePicker,
+    Links,
     MailCompose,
     EventForm,
     FolderPicker,
@@ -68,6 +72,8 @@ pub enum Overlay {
     Search(SearchOverlay),
     Attachments(AttachmentsState),
     PathInput(PathInputState),
+    FilePicker(FilePickerOverlay),
+    Links(LinkExtractorOverlay),
     MailCompose(MailComposeOverlay),
     EventForm(EventFormOverlay),
     FolderPicker(FolderPickerOverlay),
@@ -86,6 +92,8 @@ impl Overlay {
             Overlay::Search(_) => OverlayKind::Search,
             Overlay::Attachments(_) => OverlayKind::Attachments,
             Overlay::PathInput(_) => OverlayKind::PathInput,
+            Overlay::FilePicker(_) => OverlayKind::FilePicker,
+            Overlay::Links(_) => OverlayKind::Links,
             Overlay::MailCompose(_) => OverlayKind::MailCompose,
             Overlay::EventForm(_) => OverlayKind::EventForm,
             Overlay::FolderPicker(_) => OverlayKind::FolderPicker,
@@ -101,6 +109,7 @@ impl Overlay {
             Overlay::Search(_)
             | Overlay::CommandPalette(_)
             | Overlay::PathInput(_)
+            | Overlay::FilePicker(_)
             | Overlay::FolderPicker(_)
             | Overlay::QuickInput(_) => true,
             Overlay::MailCompose(c) => c.field <= 4,
@@ -131,6 +140,14 @@ impl Overlay {
 
     pub fn path_input() -> Self {
         Overlay::PathInput(PathInputState::new())
+    }
+
+    pub fn file_picker() -> Self {
+        Overlay::FilePicker(FilePickerOverlay::new())
+    }
+
+    pub fn links(overlay: LinkExtractorOverlay) -> Self {
+        Overlay::Links(overlay)
     }
 
     pub fn mail_compose(compose: MailComposeOverlay) -> Self {
@@ -186,6 +203,8 @@ impl Overlay {
             Overlay::Search(search) => search.handle(action, app),
             Overlay::Attachments(tray) => tray.handle(action, app),
             Overlay::PathInput(input) => input.handle(action),
+            Overlay::FilePicker(picker) => picker.handle(action),
+            Overlay::Links(links) => links.handle(action),
             Overlay::MailCompose(compose) => compose.handle(action, app),
             Overlay::EventForm(form) => form.handle(action),
             Overlay::FolderPicker(picker) => picker.handle(action, app),
@@ -209,6 +228,8 @@ impl Overlay {
             Overlay::Settings(settings) => settings.select(index),
             Overlay::Search(search) => search.select(index),
             Overlay::Attachments(tray) => tray.select(index),
+            Overlay::FilePicker(picker) => picker.select(index),
+            Overlay::Links(links) => links.select(index),
             Overlay::MailCompose(compose) => compose.select_field(index),
             Overlay::EventForm(form) => form.select(index),
             Overlay::FolderPicker(picker) => picker.select(index),
@@ -251,6 +272,14 @@ impl Overlay {
             }
             Overlay::PathInput(input) => {
                 input.draw(frame, area, ui, hitmap);
+                None
+            }
+            Overlay::FilePicker(picker) => {
+                picker.draw(frame, area, ui, hitmap);
+                None
+            }
+            Overlay::Links(links) => {
+                links.draw(frame, area, ui, hitmap);
                 None
             }
             Overlay::MailCompose(compose) => compose.draw(frame, area, app, ui, hitmap),
@@ -309,7 +338,8 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
             ("c", "Compose new email"),
             ("r / R / f", "Reply / Reply All / Forward"),
             ("e / Del / #", "Archive / Delete email"),
-            ("u / g", "Toggle Read/Unread / Toggle Flag"),
+            ("u (List / Read) / g", "Toggle Read/Unread (List) / Links (Read) / Flag"),
+            ("h", "Toggle inline (https://...) hrefs on links"),
             ("m", "Move email to folder"),
             ("t / F / U", "Thread grouping / Focused / Unread filter"),
             ("z / v / Alt+v", "Toggle quoted reply / HD image preview"),
@@ -321,8 +351,8 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
         &[
             ("Ctrl+Enter / Alt+Enter", "Send email"),
             ("Tab / Enter (To/Cc/Bcc)", "Insert autocomplete contact chip"),
-            ("Ctrl+V", "Paste text or clipboard screenshot (cid:)"),
-            ("Ctrl+A", "Attach local file"),
+            ("Ctrl+V", "Paste text or clipboard image as PNG"),
+            ("Ctrl+F / Ctrl+A", "Browse & attach file (z for zoxide jump)"),
             ("Ctrl+E", "Edit body in external $EDITOR"),
             ("Ctrl+S", "Save draft (Esc auto-stashes locally)"),
         ],

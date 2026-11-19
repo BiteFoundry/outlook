@@ -58,6 +58,7 @@ impl Keymap {
         map.bind(Some(Focus::Overlay), Char('j'), M::CONTROL, Action::InsertNewline);
         map.bind(Some(Focus::Overlay), Char('s'), M::CONTROL, Action::SaveDraft);
         map.bind(Some(Focus::Overlay), Char('a'), M::CONTROL, Action::OpenAttachPicker);
+        map.bind(Some(Focus::Overlay), Char('f'), M::CONTROL, Action::OpenFilePicker);
         map.bind(Some(Focus::Overlay), Char('e'), M::CONTROL, Action::OpenExternalEditor);
         map.bind(Some(Focus::Overlay), Char('v'), M::CONTROL, Action::PasteClipboard);
         map.bind(Some(Focus::Overlay), Char('z'), M::CONTROL, Action::Undo);
@@ -100,7 +101,12 @@ impl Keymap {
             map.bind(Some(focus), Delete, M::NONE, Action::DeleteItem);
             map.bind(Some(focus), Char('#'), M::NONE, Action::DeleteItem);
             map.bind(Some(focus), Char('#'), M::SHIFT, Action::DeleteItem);
-            map.bind(Some(focus), Char('u'), M::NONE, Action::MailToggleRead);
+            if focus == Focus::List {
+                map.bind(Some(focus), Char('u'), M::NONE, Action::MailToggleRead);
+            } else {
+                map.bind(Some(focus), Char('u'), M::NONE, Action::OpenLinkExtractor);
+            }
+            map.bind(Some(focus), Char('h'), M::NONE, Action::ToggleShowLinkUrls);
             map.bind(Some(focus), Char('g'), M::NONE, Action::MailToggleFlag);
             map.bind(Some(focus), Char('m'), M::NONE, Action::OpenFolderPicker);
             map.bind(Some(focus), Char('d'), M::NONE, Action::DownloadLatestAttachment);
@@ -218,9 +224,19 @@ impl Keymap {
     pub fn resolve_for_tab(
         &self,
         focus: Focus,
-        _active_nav_tab: usize,
+        active_nav_tab: usize,
         key: KeyEvent,
     ) -> Option<Action> {
+        if key.kind == KeyEventKind::Press
+            && focus == Focus::List
+            && active_nav_tab != 0
+            && key.code == KeyCode::Char('u')
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return Some(Action::OpenLinkExtractor);
+        }
         self.resolve_with(focus, key, true)
     }
 
@@ -334,6 +350,26 @@ mod tests {
         assert_eq!(
             map.resolve(Focus::Overlay, key(KeyCode::Enter, KeyModifiers::CONTROL)),
             Some(Action::OverlaySubmit)
+        );
+        assert_eq!(
+            map.resolve(Focus::Reader, key(KeyCode::Char('u'), KeyModifiers::NONE)),
+            Some(Action::OpenLinkExtractor)
+        );
+        assert_eq!(
+            map.resolve_for_tab(
+                Focus::List,
+                1,
+                key(KeyCode::Char('u'), KeyModifiers::NONE)
+            ),
+            Some(Action::OpenLinkExtractor)
+        );
+        assert_eq!(
+            map.resolve(Focus::Reader, key(KeyCode::Char('h'), KeyModifiers::NONE)),
+            Some(Action::ToggleShowLinkUrls)
+        );
+        assert_eq!(
+            map.resolve(Focus::Overlay, key(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+            Some(Action::OpenFilePicker)
         );
     }
 }

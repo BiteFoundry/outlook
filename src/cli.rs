@@ -2714,14 +2714,11 @@ async fn cmd_mail_download(
     if json_out {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "message_id": mail.id,
-                "attachment_id": att.id,
-                "path": downloaded.path,
-                "file_name": downloaded.file_name,
-                "bytes_written": downloaded.bytes_written,
-            }))?
+            serde_json::to_string_pretty(&format_downloaded_attachment_json(
+                &mail.id,
+                att,
+                &downloaded,
+            ))?
         );
     } else {
         println!(
@@ -3781,6 +3778,58 @@ pub(crate) fn image_mime_for_path(path: &Path) -> Option<&'static str> {
         "bmp" => Some("image/bmp"),
         _ => None,
     }
+}
+
+pub(crate) fn resolved_abs_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+pub(crate) fn resolve_attachment_mime_type(content_type: &str, file_name: &str) -> String {
+    let ct = content_type.trim();
+    if !ct.is_empty() && !ct.eq_ignore_ascii_case("application/octet-stream") {
+        return ct.to_string();
+    }
+    if let Some(inferred) = image_mime_for_path(Path::new(file_name)) {
+        return inferred.to_string();
+    }
+    if Path::new(file_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+    {
+        return "application/pdf".to_string();
+    }
+    if ct.is_empty() {
+        "application/octet-stream".to_string()
+    } else {
+        ct.to_string()
+    }
+}
+
+pub(crate) fn format_downloaded_attachment_json(
+    message_id: &str,
+    selected: &MailAttachment,
+    downloaded: &crate::models::DownloadedFile,
+) -> serde_json::Value {
+    let abs_path = resolved_abs_path(&downloaded.path);
+    let mime_type = resolve_attachment_mime_type(&selected.content_type, &downloaded.file_name);
+    let is_image = img_preview::is_image_mime_or_name(&mime_type, Some(&downloaded.file_name));
+    json!({
+        "ok": true,
+        "message_id": message_id,
+        "attachment_id": selected.id,
+        "path": abs_path.to_string_lossy(),
+        "file_name": downloaded.file_name,
+        "mime_type": mime_type,
+        "size_bytes": downloaded.bytes_written,
+        "is_image": is_image,
+    })
 }
 
 pub(crate) fn select_mail_attachment<'a>(

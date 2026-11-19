@@ -1,7 +1,7 @@
 //! Central `Action` enum and single `dispatch(action, app, ui) -> bool` reducer.
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::NaiveDate;
 
@@ -16,6 +16,7 @@ use super::hitmap::{ButtonId, HitTarget};
 use super::nav_pane::{NavRow, TAB_CALENDAR, TAB_COUNT, TAB_MAIL, TAB_TASKS};
 use super::overlays::context_menu::{ContextMenu, ContextTarget};
 use super::overlays::image_preview::ImagePreviewOverlay;
+use super::overlays::links::LinkExtractorOverlay;
 use super::overlays::mail_compose::{MailComposeMode, MailComposeOverlay};
 use super::overlays::quick_input::QuickInputOverlay;
 use super::overlays::search::SearchOverlay;
@@ -87,6 +88,10 @@ pub enum Action {
         attach_index: usize,
     },
     OpenActiveLink,
+    OpenLinkExtractor,
+    ToggleShowLinkUrls,
+    OpenUrl(String),
+    CopyUrlToClipboard(String),
     LoadOlderMail,
 
     // Mail compose & overlay text editing
@@ -104,6 +109,7 @@ pub enum Action {
     SaveMailDraft,
     StashMailDraft(Box<MailComposeOverlay>),
     OpenAttachPicker,
+    OpenFilePicker,
     AttachComposeFile(PathBuf),
     OpenExternalEditor,
     PasteClipboard,
@@ -525,6 +531,39 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 ui.info("No meeting or web link on selected item");
             }
         }
+        Action::OpenLinkExtractor => {
+            let overlay = match ui.active_nav_tab {
+                TAB_MAIL => app.active_mail().map(LinkExtractorOverlay::from_mail),
+                TAB_CALENDAR => app.active_event().map(LinkExtractorOverlay::from_event),
+                _ => None,
+            };
+            match overlay {
+                Some(ov) if !ov.links.is_empty() => {
+                    ui.close_overlays_of(OverlayKind::Links);
+                    ui.push_overlay(Overlay::links(ov));
+                }
+                Some(_) => ui.info("No URLs found in selected item"),
+                None => ui.info("Select an email or calendar event to extract links"),
+            }
+        }
+        Action::ToggleShowLinkUrls => {
+            ui.show_link_urls = !ui.show_link_urls;
+            ui.info(if ui.show_link_urls {
+                "Inline link URLs (href): Shown"
+            } else {
+                "Inline link URLs (href): Hidden"
+            });
+        }
+        Action::OpenUrl(url) => match open::that(&url) {
+            Ok(()) => ui.info(format!("Opened URL: {url}")),
+            Err(e) => ui.error(format!("Failed to open URL: {e}")),
+        },
+        Action::CopyUrlToClipboard(url) => match arboard::Clipboard::new()
+            .and_then(|mut cb| cb.set_text(url.clone()))
+        {
+            Ok(()) => ui.success(format!("Copied URL: {url}")),
+            Err(e) => ui.error(format!("Clipboard copy failed: {e}")),
+        },
         Action::LoadOlderMail => {
             app.maybe_autoload_older_mail();
         }
@@ -561,10 +600,24 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             app.stash_compose_draft(&compose);
         }
         Action::AttachComposeFile(path) => {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file")
+                .to_string();
             if let Some(Overlay::MailCompose(ref mut compose)) = ui.overlays.last_mut() {
                 compose.attach_file(path);
-                ui.info("Attached file to draft");
+                ui.info(format!("Attached file: {name}"));
+            } else {
+                let mut compose = MailComposeOverlay::new();
+                compose.attach_file(path);
+                ui.push_overlay(Overlay::mail_compose(compose));
+                ui.info(format!("Attached file to new draft: {name}"));
             }
+        }
+        Action::OpenFilePicker => {
+            ui.close_overlays_of(OverlayKind::FilePicker);
+            ui.push_overlay(Overlay::file_picker());
         }
         Action::OpenExternalEditor => {
             if matches!(ui.overlays.last(), Some(Overlay::MailCompose(_))) {
@@ -709,6 +762,10 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 OverlayKind::Search => ui.push_overlay(Overlay::search()),
                 OverlayKind::Attachments => ui.push_overlay(Overlay::attachments()),
                 OverlayKind::PathInput => ui.push_overlay(Overlay::path_input()),
+                OverlayKind::FilePicker => ui.push_overlay(Overlay::file_picker()),
+                OverlayKind::Links => {
+                    let _ = dispatch(Action::OpenLinkExtractor, app, ui);
+                }
                 OverlayKind::MailCompose => {
                     let _ = dispatch(Action::OpenMailCompose, app, ui);
                 }
@@ -1376,10 +1433,17 @@ fn paste_clipboard(app: &mut AppState, ui: &mut UiState) {
             let width = img.width as u32;
             let height = img.height as u32;
             let rgba = img.bytes.into_owned();
+            let unix_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
             if tokio::runtime::Handle::try_current().is_ok() {
                 let tx = app.ui_tx.clone();
+                let temp_dir = std::env::temp_dir();
                 tokio::task::spawn_blocking(move || {
-                    if let Ok(png_bytes) = composer::encode_rgba_to_png(width, height, rgba) {
+                    if let Ok((path, png_bytes)) = composer::save_clipboard_rgba_to_temp_png(
+                        &temp_dir, unix_ms, width, height, rgba,
+                    ) {
                         let preview = img_preview::decode_and_render_halfblocks(
                             &png_bytes,
                             24,
@@ -1388,9 +1452,10 @@ fn paste_clipboard(app: &mut AppState, ui: &mut UiState) {
                         )
                         .ok();
                         let _ = tx.send(UiMsg::ClipboardImageEncoded {
+                            unix_ms,
+                            path,
                             width,
                             height,
-                            png_bytes,
                             preview,
                         });
                     }

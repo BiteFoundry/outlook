@@ -394,8 +394,8 @@ impl MailComposeOverlay {
         match action {
             Action::OverlaySubmit => self.submit(),
             Action::SaveDraft => OverlayOutcome::Dispatch(Action::SaveMailDraft),
-            Action::OpenAttachPicker => {
-                OverlayOutcome::Dispatch(Action::OpenOverlay(OverlayKind::PathInput))
+            Action::OpenAttachPicker | Action::OpenFilePicker => {
+                OverlayOutcome::Dispatch(Action::OpenOverlay(OverlayKind::FilePicker))
             }
             Action::OpenExternalEditor => OverlayOutcome::NotHandled,
             Action::PasteClipboard => OverlayOutcome::NotHandled,
@@ -566,7 +566,7 @@ impl MailComposeOverlay {
     fn activate_button(&mut self) -> OverlayOutcome {
         match self.button_idx {
             0 => self.submit(),
-            1 => OverlayOutcome::Dispatch(Action::OpenOverlay(OverlayKind::PathInput)),
+            1 => OverlayOutcome::Dispatch(Action::OpenOverlay(OverlayKind::FilePicker)),
             2 => OverlayOutcome::Dispatch(Action::SaveMailDraft),
             _ => OverlayOutcome::CloseAndDispatch(Action::StashMailDraft(Box::new(self.clone()))),
         }
@@ -699,7 +699,7 @@ impl MailComposeOverlay {
         // Hairline separator above Body
         if y < inner.bottom().saturating_sub(2) {
             let rule_prefix = if self.field == 4 {
-                "─ Body (Markdown · Ctrl+V paste image · Ctrl+E $EDITOR) "
+                "─ Body (Markdown · Ctrl+V paste image · Ctrl+F attach · Ctrl+E $EDITOR) "
             } else {
                 "─ Body (Markdown) "
             };
@@ -766,7 +766,7 @@ impl MailComposeOverlay {
         if y < inner.bottom() {
             let btn_specs = [
                 (" [Send (Ctrl+Enter)] ", ButtonId::ComposeSend),
-                (" [+ Attach (Ctrl+A)] ", ButtonId::ComposeAttach),
+                (" [+ Attach (Ctrl+F)] ", ButtonId::ComposeAttach),
                 (" [Save Draft (Ctrl+S)] ", ButtonId::ComposeSaveDraft),
                 (" [Cancel (Esc)] ", ButtonId::ComposeCancel),
             ];

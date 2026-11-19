@@ -3,7 +3,8 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::Cursor;
+use std::io::{Cursor, IsTerminal, Write as _};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64_STANDARD, Engine as _};
@@ -77,9 +78,20 @@ impl Default for TerminalGraphicsCaps {
     fn default() -> Self {
         Self {
             protocol: TerminalImageProtocol::Halfblock,
-            cell_px: (8, 16),
+            cell_px: default_fallback_cell_px(),
             cell_px_exact: false,
         }
+    }
+}
+
+fn default_fallback_cell_px() -> (u16, u16) {
+    #[cfg(windows)]
+    {
+        (10, 20)
+    }
+    #[cfg(not(windows))]
+    {
+        (8, 16)
     }
 }
 
@@ -127,6 +139,401 @@ pub fn detect_graphics_caps(pref: ImageProtocolPreference) -> TerminalGraphicsCa
         cell_px,
         cell_px_exact,
     }
+}
+
+/// Timeout-bounded (~80ms) active terminal graphics & cell-pixel probing.
+///
+/// Must be called once on TUI startup while raw mode is active (before `EventStream` starts reading stdin).
+/// Queries:
+/// - `CSI 16 t` (`\x1b[6;<h>;<w>t`) for exact cell pixel dimensions
+/// - `CSI 14 t` (`\x1b[4;<h>;<w>t`) window pixel dimensions fallback
+/// - Kitty Graphics query (`a=q`) and DA1 (`\x1b[c`) for Sixel (`;4`) when `pref == Auto` and env detection
+///   did not already identify a pixel protocol.
+pub fn probe_terminal_graphics_caps(pref: ImageProtocolPreference) -> TerminalGraphicsCaps {
+    let mut caps = detect_graphics_caps(pref);
+
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return caps;
+    }
+
+    let get_env = |k: &str| std::env::var(k).ok();
+    let is_mux = non_empty_env(&get_env, "TMUX").is_some() || non_empty_env(&get_env, "STY").is_some();
+    let has_env_override = non_empty_env(&get_env, "OUTLOOK_IMAGE_PROTOCOL")
+        .or_else(|| non_empty_env(&get_env, "TEAMS_IMAGE_PROTOCOL"))
+        .and_then(|raw| ImageProtocolPreference::parse_str(&raw))
+        .is_some_and(|p| p != ImageProtocolPreference::Auto);
+
+    let need_cell_px = !caps.cell_px_exact;
+    let need_proto = pref == ImageProtocolPreference::Auto
+        && !has_env_override
+        && !is_mux
+        && caps.protocol == TerminalImageProtocol::Halfblock;
+
+    if !need_cell_px && !need_proto {
+        return caps;
+    }
+
+    let mut query = String::with_capacity(96);
+    if need_cell_px {
+        query.push_str("\x1b[16t\x1b[14t");
+    }
+    if need_proto {
+        query.push_str("\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\");
+    }
+    // Always end with DA1 sentinel so responsive terminals let us exit the probe loop immediately.
+    query.push_str("\x1b[c");
+
+    let mut stdout = std::io::stdout();
+    if stdout.write_all(query.as_bytes()).is_err() || stdout.flush().is_err() {
+        return caps;
+    }
+
+    let reply = read_terminal_probe_reply(Duration::from_millis(80));
+    if reply.is_empty() {
+        return caps;
+    }
+
+    if need_cell_px {
+        if let Some(px) = parse_csi_cell_size_reply(&reply) {
+            caps.cell_px = px;
+            caps.cell_px_exact = true;
+        } else if let Ok((cols, rows)) = crossterm::terminal::size() {
+            if let Some(px) = parse_csi_win_size_reply(&reply, cols, rows) {
+                caps.cell_px = px;
+                caps.cell_px_exact = true;
+            }
+        }
+    }
+
+    if need_proto {
+        if parse_kitty_query_ok(&reply) {
+            caps.protocol = TerminalImageProtocol::Kitty;
+        } else if parse_da1_has_sixel(&reply) {
+            caps.protocol = TerminalImageProtocol::Sixel;
+        }
+    }
+
+    caps
+}
+
+/// Parses a `CSI 16 t` terminal reply (`\x1b[6;<height>;<width>t`) into `(cell_width_px, cell_height_px)`.
+pub fn parse_csi_cell_size_reply(buf: &[u8]) -> Option<(u16, u16)> {
+    let mut i = 0;
+    while i + 4 < buf.len() {
+        if buf[i] == 0x1b && buf[i + 1] == b'[' && buf[i + 2] == b'6' && buf[i + 3] == b';' {
+            let start = i + 4;
+            if let Some(rel_end) = buf[start..].iter().position(|&b| b == b't') {
+                if let Ok(body) = std::str::from_utf8(&buf[start..start + rel_end]) {
+                    if let Some((h_str, w_str)) = body.split_once(';') {
+                        if let (Ok(h), Ok(w)) =
+                            (h_str.trim().parse::<u32>(), w_str.trim().parse::<u32>())
+                        {
+                            if w > 0 && h > 0 {
+                                return Some((w.clamp(4, 64) as u16, h.clamp(8, 128) as u16));
+                            }
+                        }
+                    }
+                }
+                i = start + rel_end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parses a `CSI 14 t` terminal reply (`\x1b[4;<win_h>;<win_w>t`) and divides by `(cols, rows)`
+/// into `(cell_width_px, cell_height_px)`.
+pub fn parse_csi_win_size_reply(buf: &[u8], cols: u16, rows: u16) -> Option<(u16, u16)> {
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    let mut i = 0;
+    while i + 4 < buf.len() {
+        if buf[i] == 0x1b && buf[i + 1] == b'[' && buf[i + 2] == b'4' && buf[i + 3] == b';' {
+            let start = i + 4;
+            if let Some(rel_end) = buf[start..].iter().position(|&b| b == b't') {
+                if let Ok(body) = std::str::from_utf8(&buf[start..start + rel_end]) {
+                    if let Some((h_str, w_str)) = body.split_once(';') {
+                        if let (Ok(win_h), Ok(win_w)) =
+                            (h_str.trim().parse::<u32>(), w_str.trim().parse::<u32>())
+                        {
+                            if win_w > 0 && win_h > 0 {
+                                let cw = (win_w / cols as u32).clamp(4, 64) as u16;
+                                let ch = (win_h / rows as u32).clamp(8, 128) as u16;
+                                return Some((cw, ch));
+                            }
+                        }
+                    }
+                }
+                i = start + rel_end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Returns `true` if `buf` contains a positive Kitty Graphics query response (`\x1b_Gi=31...;OK\x1b\\`).
+pub fn parse_kitty_query_ok(buf: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < buf.len() {
+        if buf[i] == 0x1b && buf[i + 1] == b'_' && buf[i + 2] == b'G' {
+            let start = i + 3;
+            let mut end = start;
+            let mut found_term = false;
+            while end < buf.len() {
+                if buf[end] == 0x07 {
+                    found_term = true;
+                    break;
+                }
+                if buf[end] == 0x1b && end + 1 < buf.len() && buf[end + 1] == b'\\' {
+                    found_term = true;
+                    break;
+                }
+                end += 1;
+            }
+            if found_term {
+                if let Ok(body) = std::str::from_utf8(&buf[start..end]) {
+                    if let Some((ctrl, payload)) = body.split_once(';') {
+                        let has_id = ctrl.split(',').any(|tok| tok.trim() == "i=31");
+                        if has_id && payload.trim() == "OK" {
+                            return true;
+                        }
+                    }
+                }
+                i = end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Returns `true` if `buf` contains a Primary Device Attributes (DA1) reply advertising Sixel (`;4`).
+pub fn parse_da1_has_sixel(buf: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < buf.len() {
+        if buf[i] == 0x1b && buf[i + 1] == b'[' && buf[i + 2] == b'?' {
+            let start = i + 3;
+            let mut end = start;
+            while end < buf.len() && (buf[end].is_ascii_digit() || buf[end] == b';') {
+                end += 1;
+            }
+            if end < buf.len() && buf[end] == b'c' {
+                if let Ok(params) = std::str::from_utf8(&buf[start..end]) {
+                    if params.split(';').skip(1).any(|p| p == "4") {
+                        return true;
+                    }
+                }
+                i = end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn da1_reply_complete(buf: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < buf.len() {
+        if buf[i] == 0x1b && buf[i + 1] == b'[' && buf[i + 2] == b'?' {
+            let mut end = i + 3;
+            while end < buf.len() && (buf[end].is_ascii_digit() || buf[end] == b';') {
+                end += 1;
+            }
+            if end < buf.len() && buf[end] == b'c' {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+#[cfg(unix)]
+fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
+    use std::os::fd::AsRawFd;
+
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+    const POLLIN: i16 = 0x0001;
+
+    extern "C" {
+        fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32;
+        fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    }
+
+    let fd = std::io::stdin().as_raw_fd();
+    let deadline = Instant::now() + timeout;
+    let mut out = Vec::with_capacity(256);
+    let mut chunk = [0u8; 256];
+
+    while out.len() < 4096 {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        let wait_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        if wait_ms <= 0 {
+            break;
+        }
+        let mut pfd = PollFd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { poll(&mut pfd, 1, wait_ms) };
+        if rc <= 0 || (pfd.revents & POLLIN) == 0 {
+            break;
+        }
+        let n = unsafe { read(fd, chunk.as_mut_ptr(), chunk.len()) };
+        if n <= 0 {
+            break;
+        }
+        out.extend_from_slice(&chunk[..n as usize]);
+        if da1_reply_complete(&out) {
+            break;
+        }
+    }
+
+    out
+}
+
+#[cfg(windows)]
+fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
+    const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6; // -10i32 as u32
+    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+    const WAIT_OBJECT_0: u32 = 0x0000_0000;
+    const KEY_EVENT: u16 = 0x0001;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct KeyEventRecord {
+        b_key_down: i32,
+        w_repeat_count: u16,
+        w_virtual_key_code: u16,
+        w_virtual_scan_code: u16,
+        u_char: u16,
+        dw_control_key_state: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    union InputEventUnion {
+        key_event: KeyEventRecord,
+        _pad: [u32; 4],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct InputRecord {
+        event_type: u16,
+        _padding: u16,
+        event: InputEventUnion,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(n_std_handle: u32) -> isize;
+        fn GetConsoleMode(h_console_handle: isize, lp_mode: *mut u32) -> i32;
+        fn SetConsoleMode(h_console_handle: isize, dw_mode: u32) -> i32;
+        fn WaitForSingleObject(h_handle: isize, dw_milliseconds: u32) -> u32;
+        fn GetNumberOfConsoleInputEvents(h_console_input: isize, lpc_number_of_events: *mut u32) -> i32;
+        fn ReadConsoleInputW(
+            h_console_input: isize,
+            lp_buffer: *mut InputRecord,
+            n_length: u32,
+            lp_number_of_events_read: *mut u32,
+        ) -> i32;
+    }
+
+    struct ModeRestore {
+        handle: isize,
+        prev_mode: u32,
+    }
+    impl Drop for ModeRestore {
+        fn drop(&mut self) {
+            unsafe {
+                SetConsoleMode(self.handle, self.prev_mode);
+            }
+        }
+    }
+
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if handle == 0 || handle == -1 {
+        return Vec::new();
+    }
+
+    let mut prev_mode = 0u32;
+    if unsafe { GetConsoleMode(handle, &mut prev_mode) } == 0 {
+        return Vec::new();
+    }
+
+    let _restore = if (prev_mode & ENABLE_VIRTUAL_TERMINAL_INPUT) == 0 {
+        let _ = unsafe { SetConsoleMode(handle, prev_mode | ENABLE_VIRTUAL_TERMINAL_INPUT) };
+        Some(ModeRestore { handle, prev_mode })
+    } else {
+        None
+    };
+
+    let deadline = Instant::now() + timeout;
+    let mut out = Vec::with_capacity(256);
+    let mut records = [InputRecord {
+        event_type: 0,
+        _padding: 0,
+        event: InputEventUnion { _pad: [0; 4] },
+    }; 64];
+
+    while out.len() < 4096 {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        let wait_ms = remaining.as_millis().min(u32::MAX as u128) as u32;
+        if wait_ms == 0 {
+            break;
+        }
+        let wait_res = unsafe { WaitForSingleObject(handle, wait_ms) };
+        if wait_res != WAIT_OBJECT_0 {
+            break;
+        }
+        let mut avail = 0u32;
+        if unsafe { GetNumberOfConsoleInputEvents(handle, &mut avail) } == 0 || avail == 0 {
+            break;
+        }
+        let to_read = (avail as usize).min(records.len()) as u32;
+        let mut read_count = 0u32;
+        if unsafe { ReadConsoleInputW(handle, records.as_mut_ptr(), to_read, &mut read_count) } == 0
+            || read_count == 0
+        {
+            break;
+        }
+        for rec in &records[..read_count as usize] {
+            if rec.event_type == KEY_EVENT {
+                let ke = unsafe { rec.event.key_event };
+                if ke.b_key_down != 0 && ke.u_char != 0 && ke.u_char <= 0x7f {
+                    out.push(ke.u_char as u8);
+                }
+            }
+        }
+        if da1_reply_complete(&out) {
+            break;
+        }
+    }
+
+    out
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_terminal_probe_reply(_timeout: Duration) -> Vec<u8> {
+    Vec::new()
 }
 
 /// Pure protocol resolver taking an environment variable map (for deterministic testing and diagnostics).
@@ -249,7 +656,7 @@ fn detect_cell_pixel_size() -> ((u16, u16), bool) {
             return ((cw, ch), true);
         }
     }
-    ((8, 16), false)
+    (default_fallback_cell_px(), false)
 }
 
 fn resolve_cell_pixel_size_with<F>(get_env: F) -> Option<(u16, u16)>
@@ -317,7 +724,7 @@ pub fn decode_and_render_halfblocks(
 
     let (target_w, target_h) = compute_target_dims(width_px, height_px, max_cols, max_rows);
 
-    let resized = image::imageops::resize(&rgba, target_w, target_h, FilterType::Triangle);
+    let resized = image::imageops::resize(&rgba, target_w, target_h, FilterType::Lanczos3);
     let mut lines = Vec::with_capacity((target_h / 2) as usize);
 
     for y in (0..target_h).step_by(2) {
@@ -402,9 +809,8 @@ pub fn decode_and_render_for_protocol(
             {
                 bytes
             } else {
-                let resized =
-                    dyn_img.resize_exact(target_px_w, target_px_h, FilterType::CatmullRom);
-                png_owned = encode_png(&resized)?;
+                let bounded = fit_within_max_bounds(&dyn_img, MAX_PIXEL_WIDTH, MAX_PIXEL_HEIGHT);
+                png_owned = encode_png(&bounded)?;
                 &png_owned
             };
             encode_kitty_tui_payload(png_bytes, occ_cols, occ_rows)
@@ -423,9 +829,8 @@ pub fn decode_and_render_for_protocol(
             {
                 bytes
             } else {
-                let resized =
-                    dyn_img.resize_exact(target_px_w, target_px_h, FilterType::CatmullRom);
-                encoded_owned = encode_png(&resized)?;
+                let bounded = fit_within_max_bounds(&dyn_img, MAX_PIXEL_WIDTH, MAX_PIXEL_HEIGHT);
+                encoded_owned = encode_png(&bounded)?;
                 &encoded_owned
             };
             let b64 = B64_STANDARD.encode(raw_bytes);
@@ -438,7 +843,7 @@ pub fn decode_and_render_for_protocol(
             let resized = if width_px == target_px_w && height_px == target_px_h {
                 rgba
             } else {
-                image::imageops::resize(&rgba, target_px_w, target_px_h, FilterType::CatmullRom)
+                image::imageops::resize(&rgba, target_px_w, target_px_h, FilterType::Lanczos3)
             };
             let mut flat_rgba = Vec::with_capacity((target_px_w * target_px_h * 4) as usize);
             for px in resized.pixels() {
@@ -460,6 +865,17 @@ pub fn decode_and_render_for_protocol(
         lines: Vec::new(),
         pixel_payload: Some(payload),
     })
+}
+
+fn fit_within_max_bounds(img: &DynamicImage, max_w: u32, max_h: u32) -> DynamicImage {
+    let (w, h) = (img.width(), img.height());
+    if w <= max_w && h <= max_h {
+        return img.clone();
+    }
+    let scale = (max_w as f64 / w as f64).min(max_h as f64 / h as f64);
+    let nw = ((w as f64 * scale).round() as u32).clamp(1, max_w);
+    let nh = ((h as f64 * scale).round() as u32).clamp(1, max_h);
+    img.resize_exact(nw, nh, FilterType::Lanczos3)
 }
 
 fn encode_kitty_tui_payload(png_bytes: &[u8], occ_cols: u16, occ_rows: u16) -> String {
@@ -548,7 +964,7 @@ pub fn encode_sixel_rgba(flat_rgba: &[u8], width: u32, height: u32) -> String {
         return String::from("\x1bP0;1;q\"1;1;0;0\x1b\\");
     }
 
-    let (palette, indexed) = quantize_rgba_to_256(flat_rgba, w * h);
+    let (palette, indexed) = quantize_rgba_to_256(flat_rgba, w, h);
     let mut out = String::with_capacity(w * h / 2 + palette.len() * 16 + 32);
     let _ = write!(out, "\x1bP0;1;q\"1;1;{width};{height}");
 
@@ -642,7 +1058,12 @@ struct ColorBucket {
     sum_b: u64,
 }
 
-fn quantize_rgba_to_256(flat_rgba: &[u8], pixel_count: usize) -> (Vec<(u8, u8, u8)>, Vec<u8>) {
+fn quantize_rgba_to_256(
+    flat_rgba: &[u8],
+    width: usize,
+    height: usize,
+) -> (Vec<(u8, u8, u8)>, Vec<u8>) {
+    let pixel_count = width.saturating_mul(height);
     // Fast lossless path when the image uses <= 256 distinct RGB colors.
     let mut exact_map: HashMap<u32, u8> = HashMap::with_capacity(256);
     let mut exact_palette: Vec<(u8, u8, u8)> = Vec::with_capacity(256);
@@ -795,31 +1216,73 @@ fn quantize_rgba_to_256(flat_rgba: &[u8], pixel_count: usize) -> (Vec<(u8, u8, u
     let mut lookup_cache: HashMap<u32, u8> = HashMap::with_capacity(2048);
     let mut used = vec![false; raw_palette.len()];
 
-    for px in flat_rgba.chunks_exact(4).take(pixel_count) {
-        let key = ((px[0] as u32) << 16) | ((px[1] as u32) << 8) | (px[2] as u32);
-        let idx = if let Some(&cached) = lookup_cache.get(&key) {
-            cached
-        } else {
-            let mut best_idx = 0u8;
-            let mut best_dist = i32::MAX;
-            for (pi, &(pr, pg, pb)) in raw_palette.iter().enumerate() {
-                let dr = px[0] as i32 - pr as i32;
-                let dg = px[1] as i32 - pg as i32;
-                let db = px[2] as i32 - pb as i32;
-                let dist = dr * dr + dg * dg + db * db;
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_idx = pi as u8;
-                    if dist == 0 {
-                        break;
+    // Floyd-Steinberg error diffusion (7/16, 3/16, 5/16, 1/16) with edge & channel clamping
+    // so screenshots and photographs avoid blocky color banding in 256-color Sixel output.
+    let mut err_curr = vec![[0i32; 3]; width];
+    let mut err_next = vec![[0i32; 3]; width];
+
+    for y in 0..height {
+        let row_base = y * width;
+        for x in 0..width {
+            let off = (row_base + x) * 4;
+            let r = (flat_rgba[off] as i32 + (err_curr[x][0] / 16)).clamp(0, 255) as u8;
+            let g = (flat_rgba[off + 1] as i32 + (err_curr[x][1] / 16)).clamp(0, 255) as u8;
+            let b = (flat_rgba[off + 2] as i32 + (err_curr[x][2] / 16)).clamp(0, 255) as u8;
+
+            let key = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+            let idx = if let Some(&cached) = lookup_cache.get(&key) {
+                cached
+            } else {
+                let mut best_idx = 0u8;
+                let mut best_dist = i32::MAX;
+                for (pi, &(pr, pg, pb)) in raw_palette.iter().enumerate() {
+                    let dr = r as i32 - pr as i32;
+                    let dg = g as i32 - pg as i32;
+                    let db = b as i32 - pb as i32;
+                    let dist = dr * dr + dg * dg + db * db;
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_idx = pi as u8;
+                        if dist == 0 {
+                            break;
+                        }
                     }
                 }
+                lookup_cache.insert(key, best_idx);
+                best_idx
+            };
+
+            used[idx as usize] = true;
+            indexed.push(idx);
+
+            let (pr, pg, pb) = raw_palette[idx as usize];
+            let er = r as i32 - pr as i32;
+            let eg = g as i32 - pg as i32;
+            let eb = b as i32 - pb as i32;
+
+            if x + 1 < width {
+                err_curr[x + 1][0] += er * 7;
+                err_curr[x + 1][1] += eg * 7;
+                err_curr[x + 1][2] += eb * 7;
             }
-            lookup_cache.insert(key, best_idx);
-            best_idx
-        };
-        used[idx as usize] = true;
-        indexed.push(idx);
+            if y + 1 < height {
+                if x > 0 {
+                    err_next[x - 1][0] += er * 3;
+                    err_next[x - 1][1] += eg * 3;
+                    err_next[x - 1][2] += eb * 3;
+                }
+                err_next[x][0] += er * 5;
+                err_next[x][1] += eg * 5;
+                err_next[x][2] += eb * 5;
+                if x + 1 < width {
+                    err_next[x + 1][0] += er;
+                    err_next[x + 1][1] += eg;
+                    err_next[x + 1][2] += eb;
+                }
+            }
+        }
+        std::mem::swap(&mut err_curr, &mut err_next);
+        err_next.fill([0, 0, 0]);
     }
 
     // Compact palette so every emitted `#idx;2;...` entry is actually referenced.
@@ -882,10 +1345,8 @@ fn render_ansi_stdout_with_caps(
             {
                 bytes
             } else {
-                let (tw, th, _, _) =
-                    compute_pixel_fit(width_px, height_px, max_cols, max_rows, caps.cell_px);
-                let resized = dyn_img.resize_exact(tw, th, FilterType::CatmullRom);
-                encoded_owned = encode_png(&resized)?;
+                let bounded = fit_within_max_bounds(&dyn_img, MAX_PIXEL_WIDTH, MAX_PIXEL_HEIGHT);
+                encoded_owned = encode_png(&bounded)?;
                 &encoded_owned
             };
             let b64 = B64_STANDARD.encode(raw_bytes);
@@ -908,10 +1369,8 @@ fn render_ansi_stdout_with_caps(
             {
                 bytes
             } else {
-                let (tw, th, _, _) =
-                    compute_pixel_fit(width_px, height_px, max_cols, max_rows, caps.cell_px);
-                let resized = dyn_img.resize_exact(tw, th, FilterType::CatmullRom);
-                png_owned = encode_png(&resized)?;
+                let bounded = fit_within_max_bounds(&dyn_img, MAX_PIXEL_WIDTH, MAX_PIXEL_HEIGHT);
+                png_owned = encode_png(&bounded)?;
                 &png_owned
             };
             let b64 = B64_STANDARD.encode(png_bytes);
@@ -1418,5 +1877,113 @@ mod tests {
             resolve_cell_pixel_size_with(|k| cell_env.get(k).map(|v| (*v).to_string())),
             Some((12, 24))
         );
+    }
+
+    #[test]
+    fn test_terminal_probe_reply_parsers() {
+        // CSI 16 t: height;width -> (width, height)
+        assert_eq!(
+            parse_csi_cell_size_reply(b"\x1b[6;24;12t"),
+            Some((12, 24))
+        );
+        assert_eq!(
+            parse_csi_cell_size_reply(b"noise\x1b[6;20;10t\x1b[?62;4c"),
+            Some((10, 20))
+        );
+        assert_eq!(parse_csi_cell_size_reply(b"\x1b[6;0;10t"), None);
+        assert_eq!(parse_csi_cell_size_reply(b"\x1b[4;1080;1920t"), None);
+        // Extreme values clamp cleanly
+        assert_eq!(
+            parse_csi_cell_size_reply(b"\x1b[6;500;200t"),
+            Some((64, 128))
+        );
+
+        // CSI 14 t: window height;width divided by (cols, rows)
+        assert_eq!(
+            parse_csi_win_size_reply(b"\x1b[4;960;1920t", 160, 40),
+            Some((12, 24))
+        );
+        assert_eq!(
+            parse_csi_win_size_reply(b"prefix\x1b[4;800;1200t\x1b[?64;4c", 120, 40),
+            Some((10, 20))
+        );
+        assert_eq!(parse_csi_win_size_reply(b"\x1b[4;800;1200t", 0, 40), None);
+        assert_eq!(parse_csi_win_size_reply(b"\x1b[4;0;1200t", 120, 40), None);
+
+        // Kitty Graphics query OK
+        assert!(parse_kitty_query_ok(b"\x1b_Gi=31;OK\x1b\\"));
+        assert!(parse_kitty_query_ok(b"\x1b[6;20;10t\x1b_Gi=31,s=1;OK\x07\x1b[?62c"));
+        assert!(!parse_kitty_query_ok(b"\x1b_Gi=31;ENOENT:not found\x1b\\"));
+        assert!(!parse_kitty_query_ok(b"\x1b_Gi=99;OK\x1b\\"));
+        assert!(!parse_kitty_query_ok(b"\x1b[?62;4c"));
+
+        // DA1 Sixel attribute `;4`
+        assert!(parse_da1_has_sixel(b"\x1b[?62;1;4;6;9;15;22c"));
+        assert!(parse_da1_has_sixel(b"\x1b[6;20;10t\x1b[?64;4c"));
+        assert!(!parse_da1_has_sixel(b"\x1b[?64;1;6;14;22c"));
+        assert!(!parse_da1_has_sixel(b"\x1b[?4;1;6c"));
+        assert!(!parse_da1_has_sixel(b""));
+    }
+
+    #[test]
+    fn test_kitty_preserves_full_resolution_for_jpeg_instead_of_cell_downscale() {
+        let rgb = image::ImageBuffer::from_fn(640, 480, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+        });
+        let dyn_img = DynamicImage::ImageRgb8(rgb);
+        let mut jpeg_buf = Cursor::new(Vec::new());
+        dyn_img.write_to(&mut jpeg_buf, ImageFormat::Jpeg).unwrap();
+        let jpeg_bytes = jpeg_buf.into_inner();
+
+        // Small TUI box (20x10 cells with 8x16 cell_px = 160x160 box),
+        // yet Kitty must preserve full 640x480 resolution so the terminal GPU scales crisply.
+        let caps = TerminalGraphicsCaps {
+            protocol: TerminalImageProtocol::Kitty,
+            cell_px: (8, 16),
+            cell_px_exact: true,
+        };
+        let rendered =
+            decode_and_render_for_protocol(&jpeg_bytes, 20, 10, (0, 0, 0), caps).unwrap();
+        let payload = rendered.pixel_payload.as_deref().unwrap();
+
+        // Reassemble base64 chunks from Kitty APC frames
+        let mut b64 = String::new();
+        for frame in payload.split("\x1b\\") {
+            if let Some((_, chunk)) = frame.split_once(';') {
+                b64.push_str(chunk);
+            }
+        }
+        let decoded_png = B64_STANDARD.decode(&b64).unwrap();
+        let decoded_img = image::load_from_memory(&decoded_png).unwrap();
+        assert_eq!(decoded_img.width(), 640);
+        assert_eq!(decoded_img.height(), 480);
+    }
+
+    #[test]
+    fn test_sixel_floyd_steinberg_dithering_smooth_gradient_and_edge_dims() {
+        // 32x16 smooth gradient (>256 unique RGB colors) exercises Floyd-Steinberg diffusion
+        let mut flat = Vec::with_capacity(32 * 16 * 4);
+        for y in 0..16u32 {
+            for x in 0..32u32 {
+                flat.extend_from_slice(&[
+                    (x * 8) as u8,
+                    (y * 16) as u8,
+                    ((x * 5 + y * 9) % 256) as u8,
+                    255,
+                ]);
+            }
+        }
+        let (palette, indexed) = quantize_rgba_to_256(&flat, 32, 16);
+        assert!(palette.len() <= 256 && palette.len() > 32);
+        assert_eq!(indexed.len(), 32 * 16);
+        assert!(indexed.iter().all(|&i| (i as usize) < palette.len()));
+
+        // Edge dimensions: 1x1, 1x8, 8x1 must never panic during error diffusion
+        for (w, h) in [(1usize, 1usize), (1, 8), (8, 1)] {
+            let buf = vec![128u8; w * h * 4];
+            let s = encode_sixel_rgba(&buf, w as u32, h as u32);
+            assert!(s.starts_with("\x1bP0;1;q\"1;1;"));
+            assert!(s.ends_with("\x1b\\"));
+        }
     }
 }

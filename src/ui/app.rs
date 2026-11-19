@@ -172,9 +172,10 @@ pub enum UiMsg {
     TodoTaskUpdated(TodoTask),
     TodoTaskDeleted(String),
     ClipboardImageEncoded {
+        unix_ms: u128,
+        path: PathBuf,
         width: u32,
         height: u32,
-        png_bytes: Vec<u8>,
         preview: Option<RenderedTerminalImage>,
     },
     ImageDecoded {
@@ -241,6 +242,7 @@ pub struct UiState {
     pub focused_only: bool,
     pub mail_unread_only: bool,
     pub inline_images: bool,
+    pub show_link_urls: bool,
     pub medium_reader_fullscreen: bool,
     pub narrow_pane: NarrowPane,
     pub editor_requested: bool,
@@ -291,6 +293,7 @@ impl UiState {
             focused_only: false,
             mail_unread_only: false,
             inline_images: true,
+            show_link_urls: false,
             medium_reader_fullscreen: false,
             narrow_pane: NarrowPane::List,
             editor_requested: false,
@@ -2548,24 +2551,34 @@ impl AppState {
                 self.todo_tasks.retain(|t| t.id != task_id);
             }
             UiMsg::ClipboardImageEncoded {
+                unix_ms,
+                path,
                 width,
                 height,
-                png_bytes,
                 preview,
             } => {
                 if let Some(Overlay::MailCompose(ref mut compose)) = ui.overlays.last_mut() {
-                    let n = compose.body.pending_images.len() + 1;
-                    let cid = compose.body.stage_inline_image_with_preview(
-                        png_bytes,
-                        "image/png",
-                        Some(format!("screenshot-{n}.png")),
-                        preview,
-                    );
+                    let file_name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("outlook-pasted.png")
+                        .to_string();
+                    compose.attach_file(path);
+                    compose.body.pending_preview = preview;
+                    let prefix = if compose.body.has_no_text()
+                        || compose.body.text().ends_with(['\n', ' '])
+                    {
+                        ""
+                    } else {
+                        " "
+                    };
                     compose
                         .body
-                        .insert_str(&format!("\n![screenshot ({width}x{height})](cid:{cid})\n"));
+                        .insert_str(&format!("{prefix}[Image {unix_ms}]"));
                     compose.field = 4;
-                    ui.success(format!("Attached inline screenshot ({width}x{height})"));
+                    ui.success(format!(
+                        "Attached clipboard image: {file_name} ({width}x{height})"
+                    ));
                 }
             }
             UiMsg::ImageDecoded {

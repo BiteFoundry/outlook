@@ -523,6 +523,21 @@ pub fn encode_rgba_to_png(width: u32, height: u32, rgba: Vec<u8>) -> Result<Vec<
     Ok(out)
 }
 
+/// Encodes raw clipboard RGBA8 pixels to PNG and writes them to `<temp_dir>/outlook-pasted-<unix_ms>.png`.
+pub fn save_clipboard_rgba_to_temp_png(
+    temp_dir: &std::path::Path,
+    unix_ms: u128,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+) -> Result<(std::path::PathBuf, Vec<u8>), String> {
+    let png_bytes = encode_rgba_to_png(width, height, rgba)?;
+    let path = temp_dir.join(format!("outlook-pasted-{unix_ms}.png"));
+    std::fs::write(&path, &png_bytes)
+        .map_err(|err| format!("Failed to save clipboard image to {}: {err}", path.display()))?;
+    Ok((path, png_bytes))
+}
+
 fn push_line_spans(
     lines: &mut Vec<Line<'static>>,
     text: &str,
@@ -906,6 +921,18 @@ mod tests {
             encode_rgba_to_png(0, 2, vec![]),
             Err("Clipboard has 0x0 image data".to_string())
         );
+
+        let dir = tempfile::tempdir().unwrap();
+        let (path, saved_bytes) =
+            save_clipboard_rgba_to_temp_png(dir.path(), 1_732_000_000_123, 2, 2, vec![255; 16])
+                .unwrap();
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("outlook-pasted-1732000000123.png")
+        );
+        assert!(path.is_file());
+        assert_eq!(std::fs::read(&path).unwrap(), saved_bytes);
+        assert!(saved_bytes.starts_with(b"\x89PNG"));
     }
 
     #[test]

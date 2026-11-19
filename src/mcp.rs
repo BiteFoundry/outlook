@@ -590,18 +590,28 @@ async fn call_tool(
             let message_id = args.required_str("message_id")?;
             let attachment_index = args.optional_usize("attachment_index")?;
             let attachment = args.optional_str("attachment")?;
+            let offline = args.optional_bool("offline")?.unwrap_or(false);
             let output_dir = args
                 .optional_str("output_dir")?
                 .map(PathBuf::from)
                 .unwrap_or_else(|| config.resolved_download_dir());
 
-            let mail =
-                map_graph_result(graph, graph.get_mail_message(&message_id).await).await?;
-            let mail_clone = mail.clone();
-            let _ = with_storage(storage, move |s| {
-                s.upsert_mail_messages(std::slice::from_ref(&mail_clone))
-            })
-            .await;
+            let mail = if offline {
+                let id_owned = message_id.clone();
+                with_storage(storage, move |s| s.get_mail_message(&id_owned))
+                    .await
+                    .map_err(format_error)?
+                    .ok_or_else(|| format!("mail message not found in cache: {message_id}"))?
+            } else {
+                let fetched =
+                    map_graph_result(graph, graph.get_mail_message(&message_id).await).await?;
+                let fetched_clone = fetched.clone();
+                let _ = with_storage(storage, move |s| {
+                    s.upsert_mail_messages(std::slice::from_ref(&fetched_clone))
+                })
+                .await;
+                fetched
+            };
 
             let selected =
                 cli::select_mail_attachment(&mail, attachment_index, attachment.as_deref())
@@ -614,20 +624,11 @@ async fn call_tool(
             )
             .await?;
 
-            Ok(json!({
-                "ok": true,
-                "attachment": {
-                    "id": selected.id,
-                    "name": selected.name,
-                    "content_type": selected.content_type,
-                    "size": selected.size,
-                },
-                "file": {
-                    "path": downloaded.path,
-                    "file_name": downloaded.file_name,
-                    "bytes_written": downloaded.bytes_written,
-                }
-            }))
+            Ok(cli::format_downloaded_attachment_json(
+                &message_id,
+                selected,
+                &downloaded,
+            ))
         }
 
         "search_mail" => {
@@ -1200,14 +1201,15 @@ pub fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "download_attachment",
-            "description": "Download an email attachment to disk.",
+            "description": "Download an Outlook email attachment or inline screenshot to disk and return structured JSON { ok, path, file_name, mime_type, size_bytes, is_image } so multimodal AI agents can read media directly from disk.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "message_id": { "type": "string" },
-                    "attachment_index": { "type": "integer", "minimum": 0 },
-                    "attachment": { "type": "string", "description": "Attachment ID, name, or index" },
-                    "output_dir": { "type": "string" }
+                    "message_id": { "type": "string", "description": "Outlook message ID" },
+                    "attachment_index": { "type": "integer", "minimum": 0, "description": "0-based attachment index (defaults to first image or first attachment)" },
+                    "attachment": { "type": "string", "description": "Attachment ID, filename, or 0-based index" },
+                    "output_dir": { "type": "string", "description": "Target directory on disk (defaults to configured download_dir)" },
+                    "offline": { "type": "boolean", "description": "Read cached message metadata/inline bytes from SQLite without Graph API call" }
                 },
                 "required": ["message_id"]
             }
@@ -1434,6 +1436,7 @@ pub fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             args.optional_usize("attachment_index")?;
             args.optional_str("attachment")?;
             args.optional_str("output_dir")?;
+            args.optional_bool("offline")?;
             Ok(())
         }
         "search_mail" => {
@@ -2037,5 +2040,134 @@ mod tests {
             BoundedLine::Eof => {}
             _ => panic!("expected Eof"),
         }
+    }
+
+    #[tokio::test]
+    async fn download_attachment_returns_structured_agent_media_json() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use crate::models::MailAttachment;
+
+        let (cfg, graph, storage) = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let png_bytes = crate::ui::composer::encode_rgba_to_png(2, 2, vec![255; 16]).unwrap();
+        let pdf_bytes = b"%PDF-1.4\nhello\n".to_vec();
+
+        storage
+            .upsert_mail_messages(&[MailMessage {
+                id: "msg-media".to_string(),
+                internet_message_id: None,
+                conversation_id: Some("conv-media".to_string()),
+                folder_id: Some("inbox".to_string()),
+                subject: "Architecture Screenshot".to_string(),
+                from: None,
+                to_recipients: Vec::new(),
+                cc_recipients: Vec::new(),
+                bcc_recipients: Vec::new(),
+                reply_to: Vec::new(),
+                received_at: "2026-11-19T12:00:00Z".to_string(),
+                sent_at: None,
+                is_read: true,
+                is_draft: false,
+                flagged: false,
+                importance: "normal".to_string(),
+                inference_classification: None,
+                has_attachments: true,
+                body_loaded: true,
+                preview: "Attached screenshot".to_string(),
+                body_html: "<p>Attached screenshot</p>".to_string(),
+                body_plain: "Attached screenshot".to_string(),
+                attachments: vec![
+                    MailAttachment {
+                        id: "att-img".to_string(),
+                        name: "diagram.png".to_string(),
+                        content_type: "image/png".to_string(),
+                        size: png_bytes.len() as u64,
+                        is_inline: false,
+                        content_id: None,
+                        content_bytes_b64: Some(B64.encode(&png_bytes)),
+                    },
+                    MailAttachment {
+                        id: "att-pdf".to_string(),
+                        name: "spec.pdf".to_string(),
+                        content_type: "application/octet-stream".to_string(),
+                        size: pdf_bytes.len() as u64,
+                        is_inline: false,
+                        content_id: None,
+                        content_bytes_b64: Some(B64.encode(&pdf_bytes)),
+                    },
+                ],
+                meeting_request: None,
+                web_link: None,
+            }])
+            .unwrap();
+
+        // Image attachment download
+        let resp = handle_rpc_line(
+            &cfg,
+            &graph,
+            &storage,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 31,
+                "method": "tools/call",
+                "params": {
+                    "name": "download_attachment",
+                    "arguments": {
+                        "message_id": "msg-media",
+                        "attachment": "diagram.png",
+                        "output_dir": tmp.path().to_string_lossy(),
+                        "offline": true
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], false, "{resp}");
+        let payload: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["file_name"], "diagram.png");
+        assert_eq!(payload["mime_type"], "image/png");
+        assert_eq!(payload["size_bytes"], png_bytes.len() as u64);
+        assert_eq!(payload["is_image"], true);
+        let saved_path = PathBuf::from(payload["path"].as_str().unwrap());
+        assert!(saved_path.is_absolute());
+        assert_eq!(std::fs::read(&saved_path).unwrap(), png_bytes);
+
+        // Non-image PDF attachment download (infers mime_type from extension when octet-stream)
+        let resp_pdf = handle_rpc_line(
+            &cfg,
+            &graph,
+            &storage,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 32,
+                "method": "tools/call",
+                "params": {
+                    "name": "download_attachment",
+                    "arguments": {
+                        "message_id": "msg-media",
+                        "attachment_index": 1,
+                        "output_dir": tmp.path().to_string_lossy(),
+                        "offline": true
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp_pdf["result"]["isError"], false, "{resp_pdf}");
+        let pdf_payload: Value =
+            serde_json::from_str(resp_pdf["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(pdf_payload["ok"], true);
+        assert_eq!(pdf_payload["file_name"], "spec.pdf");
+        assert_eq!(pdf_payload["mime_type"], "application/pdf");
+        assert_eq!(pdf_payload["size_bytes"], pdf_bytes.len() as u64);
+        assert_eq!(pdf_payload["is_image"], false);
+        assert!(PathBuf::from(pdf_payload["path"].as_str().unwrap()).is_absolute());
     }
 }

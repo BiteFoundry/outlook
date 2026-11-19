@@ -672,6 +672,7 @@ pub fn draw_reader(
         &app.expanded_thread_ids,
         &app.expanded_quoted_ids,
         ui.inline_images,
+        ui.show_link_urls,
         app.image_cache_gen,
         width,
         &ui.theme,
@@ -686,7 +687,7 @@ pub fn draw_reader(
             } else {
                 None
             };
-            let built: Arc<[RenderedLine]> = Arc::from(build_reader_lines(
+            let built: Arc<[RenderedLine]> = Arc::from(build_reader_lines_with_opts(
                 &thread_msgs,
                 &app.expanded_thread_ids,
                 &app.expanded_quoted_ids,
@@ -694,6 +695,7 @@ pub fn draw_reader(
                 width,
                 thumbs,
                 (thumb_cols, thumb_rows),
+                ui.show_link_urls,
             ));
             MAIL_READER_CACHE.with(|c| c.borrow_mut().insert(sig, Arc::clone(&built)));
             built
@@ -770,11 +772,13 @@ fn draw_reader_toolbar(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_reader_sig(
     thread_msgs: &[MailMessage],
     expanded_threads: &std::collections::HashSet<String>,
     expanded_quoted: &std::collections::HashSet<String>,
     inline_images: bool,
+    show_link_urls: bool,
     image_cache_gen: u64,
     width: usize,
     theme: &Theme,
@@ -799,6 +803,7 @@ fn compute_reader_sig(
         }
     }
     h.write_hash(&inline_images);
+    h.write_hash(&show_link_urls);
     h.write_hash(&image_cache_gen);
     h.write_hash(&width);
     hash_theme_sig(&mut h, theme);
@@ -813,6 +818,29 @@ pub fn build_reader_lines(
     width: usize,
     image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
     thumb_dims: (u16, u16),
+) -> Vec<RenderedLine> {
+    build_reader_lines_with_opts(
+        thread_msgs,
+        expanded_threads,
+        expanded_quoted,
+        theme,
+        width,
+        image_cache,
+        thumb_dims,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_reader_lines_with_opts(
+    thread_msgs: &[MailMessage],
+    expanded_threads: &std::collections::HashSet<String>,
+    expanded_quoted: &std::collections::HashSet<String>,
+    theme: &Theme,
+    width: usize,
+    image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
+    thumb_dims: (u16, u16),
+    show_link_urls: bool,
 ) -> Vec<RenderedLine> {
     let mut out = Vec::new();
     let total = thread_msgs.len();
@@ -1003,6 +1031,7 @@ pub fn build_reader_lines(
                 theme,
                 image_cache,
                 thumb_dims,
+                show_link_urls,
             );
             let has_visible_body = !blocks.is_empty()
                 && body_lines.iter().any(|l| {
@@ -1142,6 +1171,7 @@ fn render_email_blocks(
     theme: &Theme,
     image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
     thumb_dims: (u16, u16),
+    show_link_urls: bool,
 ) {
     let indent_w = UnicodeWidthStr::width(indent);
     let body_w = width.saturating_sub(indent_w + 1).max(8);
@@ -1149,7 +1179,7 @@ fn render_email_blocks(
     for block in blocks {
         match block {
             RichBlock::Paragraph(spans) => {
-                for line_spans in wrap_rich_spans(spans, body_w, theme) {
+                for line_spans in wrap_rich_spans(spans, body_w, theme, show_link_urls) {
                     let mut full = vec![Span::raw(indent.to_string())];
                     full.extend(line_spans);
                     out.push(RenderedLine::plain(Line::from(full)));
@@ -1161,10 +1191,14 @@ fn render_email_blocks(
                     2 => "## ",
                     _ => "### ",
                 };
-                for (i, line_spans) in
-                    wrap_rich_spans(spans, body_w.saturating_sub(prefix.len()), theme)
-                        .into_iter()
-                        .enumerate()
+                for (i, line_spans) in wrap_rich_spans(
+                    spans,
+                    body_w.saturating_sub(prefix.len()),
+                    theme,
+                    show_link_urls,
+                )
+                .into_iter()
+                .enumerate()
                 {
                     let mut full = vec![Span::styled(
                         if i == 0 {
@@ -1184,7 +1218,9 @@ fn render_email_blocks(
                 }
             }
             RichBlock::Quote(spans) => {
-                for line_spans in wrap_rich_spans(spans, body_w.saturating_sub(2), theme) {
+                for line_spans in
+                    wrap_rich_spans(spans, body_w.saturating_sub(2), theme, show_link_urls)
+                {
                     let mut full = vec![
                         Span::raw(indent.to_string()),
                         Span::styled("│ ", theme.quote_style()),
@@ -1198,7 +1234,7 @@ fn render_email_blocks(
             RichBlock::BulletList(items) => {
                 for item in items {
                     for (i, line_spans) in
-                        wrap_rich_spans(item, body_w.saturating_sub(2), theme)
+                        wrap_rich_spans(item, body_w.saturating_sub(2), theme, show_link_urls)
                             .into_iter()
                             .enumerate()
                     {
@@ -1273,7 +1309,7 @@ fn render_email_blocks(
                 out.push(RenderedLine::plain(Line::from(bot)));
             }
             RichBlock::Table { headers, rows } => {
-                render_table_block(out, headers, rows, indent, body_w, theme);
+                render_table_block(out, headers, rows, indent, body_w, theme, show_link_urls);
             }
             RichBlock::Divider => {
                 out.push(RenderedLine::plain(Line::from(Span::styled(
@@ -1390,6 +1426,7 @@ fn render_email_blocks(
                         theme,
                         None,
                         thumb_dims,
+                        show_link_urls,
                     );
                 }
             }
@@ -1397,6 +1434,7 @@ fn render_email_blocks(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_table_block(
     out: &mut Vec<RenderedLine>,
     headers: &[Vec<RichSpan>],
@@ -1404,6 +1442,7 @@ fn render_table_block(
     indent: &str,
     body_w: usize,
     theme: &Theme,
+    show_link_urls: bool,
 ) {
     let cols = headers
         .len()
@@ -1413,13 +1452,22 @@ fn render_table_block(
     }
 
     let cell_text = |spans: &[RichSpan]| -> String {
-        spans
-            .iter()
-            .map(|s| s.text.as_str())
-            .collect::<String>()
-            .replace(['\n', '\r'], " ")
-            .trim()
-            .to_string()
+        let mut s = String::new();
+        for (i, sp) in spans.iter().enumerate() {
+            s.push_str(&sp.text);
+            if show_link_urls {
+                if let Some(ref url) = sp.style.link_url {
+                    let next_same = spans
+                        .get(i + 1)
+                        .and_then(|n| n.style.link_url.as_deref())
+                        == Some(url.as_str());
+                    if !next_same && should_append_inline_href(&sp.text, url) {
+                        s.push_str(&format!(" ({url})"));
+                    }
+                }
+            }
+        }
+        s.replace(['\n', '\r'], " ").trim().to_string()
     };
 
     let mut col_widths = vec![3usize; cols];
@@ -1529,13 +1577,86 @@ fn resolve_mail_attachment_index(
     fallback_idx.min(attachments.len().saturating_sub(1))
 }
 
-fn wrap_rich_spans(rich: &[RichSpan], width: usize, theme: &Theme) -> Vec<Vec<Span<'static>>> {
+fn should_append_inline_href(label: &str, url: &str) -> bool {
+    let u = url.trim();
+    if u.is_empty() {
+        return false;
+    }
+    let lower_u = u.to_ascii_lowercase();
+    if !(lower_u.starts_with("https://") || lower_u.starts_with("http://")) {
+        return false;
+    }
+    let t = label.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let lower_t = t.to_ascii_lowercase();
+    !(lower_t == lower_u
+        || lower_t.trim_end_matches('/') == lower_u.trim_end_matches('/')
+        || lower_t.contains(&lower_u))
+}
+
+fn push_wrapped_text(
+    text: &str,
+    style: Style,
+    limit: usize,
+    lines: &mut Vec<Vec<Span<'static>>>,
+    current: &mut Vec<Span<'static>>,
+    used: &mut usize,
+) {
+    let mut buf = String::new();
+    for ch in text.chars() {
+        if ch == '\n' {
+            if !buf.is_empty() {
+                current.push(Span::styled(std::mem::take(&mut buf), style));
+            }
+            lines.push(std::mem::take(current));
+            *used = 0;
+            continue;
+        }
+        if ch == '\t' {
+            for _ in 0..4 {
+                if *used + 1 > limit && (*used > 0 || !buf.is_empty()) {
+                    if !buf.is_empty() {
+                        current.push(Span::styled(std::mem::take(&mut buf), style));
+                    }
+                    lines.push(std::mem::take(current));
+                    *used = 0;
+                }
+                buf.push(' ');
+                *used += 1;
+            }
+            continue;
+        }
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if *used + cw > limit && (*used > 0 || !buf.is_empty()) {
+            if !buf.is_empty() {
+                current.push(Span::styled(std::mem::take(&mut buf), style));
+            }
+            lines.push(std::mem::take(current));
+            *used = 0;
+        }
+        buf.push(ch);
+        *used += cw;
+    }
+    if !buf.is_empty() {
+        current.push(Span::styled(buf, style));
+    }
+}
+
+fn wrap_rich_spans(
+    rich: &[RichSpan],
+    width: usize,
+    theme: &Theme,
+    show_link_urls: bool,
+) -> Vec<Vec<Span<'static>>> {
     let limit = width.max(1);
     let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
+    let mut active_link_label = String::new();
 
-    for piece in rich {
+    for (idx, piece) in rich.iter().enumerate() {
         let mut style = Style::default();
         if piece.style.bold {
             style = style.add_modifier(Modifier::BOLD);
@@ -1556,45 +1677,41 @@ fn wrap_rich_spans(rich: &[RichSpan], width: usize, theme: &Theme) -> Vec<Vec<Sp
             style = style
                 .fg(theme.accent)
                 .add_modifier(Modifier::UNDERLINED);
+            active_link_label.push_str(&piece.text);
+        } else {
+            active_link_label.clear();
         }
 
-        let mut buf = String::new();
-        for ch in piece.text.chars() {
-            if ch == '\n' {
-                if !buf.is_empty() {
-                    current.push(Span::styled(std::mem::take(&mut buf), style));
-                }
-                lines.push(std::mem::take(&mut current));
-                used = 0;
-                continue;
-            }
-            if ch == '\t' {
-                for _ in 0..4 {
-                    if used + 1 > limit && (used > 0 || !buf.is_empty()) {
-                        if !buf.is_empty() {
-                            current.push(Span::styled(std::mem::take(&mut buf), style));
-                        }
-                        lines.push(std::mem::take(&mut current));
-                        used = 0;
+        push_wrapped_text(
+            &piece.text,
+            style,
+            limit,
+            &mut lines,
+            &mut current,
+            &mut used,
+        );
+
+        if show_link_urls {
+            if let Some(ref url) = piece.style.link_url {
+                let next_same = rich
+                    .get(idx + 1)
+                    .and_then(|n| n.style.link_url.as_deref())
+                    == Some(url.as_str());
+                if !next_same {
+                    if should_append_inline_href(&active_link_label, url) {
+                        let suffix = format!(" ({})", url.trim());
+                        push_wrapped_text(
+                            &suffix,
+                            theme.muted_style(),
+                            limit,
+                            &mut lines,
+                            &mut current,
+                            &mut used,
+                        );
                     }
-                    buf.push(' ');
-                    used += 1;
+                    active_link_label.clear();
                 }
-                continue;
             }
-            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if used + cw > limit && (used > 0 || !buf.is_empty()) {
-                if !buf.is_empty() {
-                    current.push(Span::styled(std::mem::take(&mut buf), style));
-                }
-                lines.push(std::mem::take(&mut current));
-                used = 0;
-            }
-            buf.push(ch);
-            used += cw;
-        }
-        if !buf.is_empty() {
-            current.push(Span::styled(buf, style));
         }
     }
 
@@ -1859,6 +1976,7 @@ mod tests {
             "  ",
             40,
             &theme,
+            false,
         );
         assert!(table_out.len() >= 4);
     }
@@ -2001,5 +2119,48 @@ mod tests {
             .collect();
         assert!(inbox_str.contains("Alice"));
         assert!(!inbox_str.contains("To: Bob"));
+    }
+
+    #[test]
+    fn show_link_urls_toggle_appends_href_for_named_links_without_duplicating_bare_urls() {
+        let html = r#"<p>See <a href="https://docs.example.com/q4">Q4 Report</a> and <a href="https://bare.example.com">https://bare.example.com</a></p>"#;
+        let mut msg = sample_mail("m-href", "c-href", html);
+        msg.meeting_request = None;
+        let theme = Theme::default();
+        let expanded = std::collections::HashSet::new();
+
+        let hidden = build_reader_lines_with_opts(
+            &[msg.clone()],
+            &expanded,
+            &expanded,
+            &theme,
+            100,
+            None,
+            (24, 8),
+            false,
+        );
+        let hidden_text = lines_to_text(&hidden);
+        assert!(hidden_text.contains("Q4 Report"));
+        assert!(!hidden_text.contains("(https://docs.example.com/q4)"));
+
+        let shown = build_reader_lines_with_opts(
+            &[msg],
+            &expanded,
+            &expanded,
+            &theme,
+            100,
+            None,
+            (24, 8),
+            true,
+        );
+        let shown_text = lines_to_text(&shown);
+        assert!(
+            shown_text.contains("Q4 Report (https://docs.example.com/q4)"),
+            "expected inline href on named link, got:\n{shown_text}"
+        );
+        assert!(
+            !shown_text.contains("(https://bare.example.com)"),
+            "bare URL should not be duplicated in parens, got:\n{shown_text}"
+        );
     }
 }
