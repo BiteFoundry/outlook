@@ -1964,6 +1964,39 @@ fn describe_keyring_status(
 // Mail commands
 // ---------------------------------------------------------------------------
 
+fn format_mail_folders_lines(folders: &[MailFolder]) -> Vec<String> {
+    let paths = crate::ui::nav_pane::folder_display_paths(folders);
+    let mut ordered: Vec<(&MailFolder, String)> = folders
+        .iter()
+        .map(|f| {
+            let path = paths
+                .get(&f.id)
+                .cloned()
+                .unwrap_or_else(|| f.display_name.clone());
+            (f, path)
+        })
+        .collect();
+    ordered.sort_by(|a, b| {
+        a.1.to_ascii_lowercase()
+            .cmp(&b.1.to_ascii_lowercase())
+            .then_with(|| a.0.id.cmp(&b.0.id))
+    });
+    ordered
+        .into_iter()
+        .map(|(f, path)| {
+            let wk = f
+                .well_known_name
+                .as_deref()
+                .map(|w| format!(" [{w}]"))
+                .unwrap_or_default();
+            format!(
+                "{path}{wk}  unread={}/{}  ({})",
+                f.unread_item_count, f.total_item_count, f.id
+            )
+        })
+        .collect()
+}
+
 fn print_mail_folders_output(folders: &[MailFolder], json_out: bool) -> Result<()> {
     if json_out {
         println!(
@@ -1973,16 +2006,8 @@ fn print_mail_folders_output(folders: &[MailFolder], json_out: bool) -> Result<(
     } else if folders.is_empty() {
         println!("No mail folders found.");
     } else {
-        for f in folders {
-            let wk = f
-                .well_known_name
-                .as_deref()
-                .map(|w| format!(" [{w}]"))
-                .unwrap_or_default();
-            println!(
-                "{}{}  unread={}/{}  ({})",
-                f.display_name, wk, f.unread_item_count, f.total_item_count, f.id
-            );
+        for line in format_mail_folders_lines(folders) {
+            println!("{line}");
         }
     }
     Ok(())
@@ -4291,5 +4316,32 @@ mod tests {
         delete_gate(false, false, Some("YES")).unwrap();
         assert!(delete_gate(false, false, Some("no")).is_err());
         assert!(delete_gate(false, false, None).is_err());
+    }
+
+    #[test]
+    fn format_mail_folders_lines_uses_hierarchical_paths() {
+        let folders = vec![
+            MailFolder {
+                id: "f-inbox".into(),
+                display_name: "Inbox".into(),
+                well_known_name: Some("inbox".into()),
+                parent_folder_id: None,
+                child_folder_count: 1,
+                unread_item_count: 2,
+                total_item_count: 10,
+            },
+            MailFolder {
+                id: "f-proj".into(),
+                display_name: "Projects".into(),
+                well_known_name: None,
+                parent_folder_id: Some("f-inbox".into()),
+                child_folder_count: 0,
+                unread_item_count: 1,
+                total_item_count: 4,
+            },
+        ];
+        let lines = format_mail_folders_lines(&folders);
+        assert_eq!(lines[0], "Inbox [inbox]  unread=2/10  (f-inbox)");
+        assert_eq!(lines[1], "Inbox / Projects  unread=1/4  (f-proj)");
     }
 }

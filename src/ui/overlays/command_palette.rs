@@ -97,6 +97,7 @@ fn folder_items(app: &AppState) -> Vec<PaletteItem> {
         },
     ];
 
+    let paths = crate::ui::nav_pane::folder_display_paths(&app.mail_folders);
     for folder in &app.mail_folders {
         let unread_bonus = if folder.unread_item_count > 0 { 180 } else { 80 };
         let shortcut = if folder.unread_item_count > 0 {
@@ -104,12 +105,19 @@ fn folder_items(app: &AppState) -> Vec<PaletteItem> {
         } else {
             "Folder".to_string()
         };
+        let path = paths
+            .get(&folder.id)
+            .map(String::as_str)
+            .unwrap_or(folder.display_name.as_str());
+        let search_alias = match folder.well_known_name.as_deref() {
+            Some(wk) if !wk.eq_ignore_ascii_case(&folder.display_name) => {
+                format!("{wk} {}", folder.display_name)
+            }
+            _ => folder.display_name.clone(),
+        };
         items.push(PaletteItem {
-            label: format!("Folder: {}", folder.display_name),
-            search_alias: folder
-                .well_known_name
-                .clone()
-                .unwrap_or_else(|| folder.display_name.clone()),
+            label: format!("Folder: {path}"),
+            search_alias,
             shortcut,
             action: Action::SelectMailFolder(folder.id.clone()),
             base_priority: unread_bonus,
@@ -504,7 +512,7 @@ mod tests {
 
     #[tokio::test]
     async fn filters_folders_contacts_commands_and_search() {
-        let (app, ui) = make_palette_app();
+        let (mut app, ui) = make_palette_app();
         let mut palette = CommandPalette::new();
 
         palette.query = ">theme".to_string();
@@ -523,6 +531,30 @@ mod tests {
         assert!(res
             .iter()
             .any(|i| matches!(i.action, Action::SelectMailFolder(ref id) if id == "f-inbox")));
+
+        palette.query = "#2026".to_string();
+        app.mail_folders.push(MailFolder {
+            id: "f-proj".into(),
+            display_name: "Projects".into(),
+            well_known_name: None,
+            parent_folder_id: Some("f-inbox".into()),
+            child_folder_count: 1,
+            unread_item_count: 0,
+            total_item_count: 5,
+        });
+        app.mail_folders.push(MailFolder {
+            id: "f-2026".into(),
+            display_name: "2026".into(),
+            well_known_name: None,
+            parent_folder_id: Some("f-proj".into()),
+            child_folder_count: 0,
+            unread_item_count: 1,
+            total_item_count: 2,
+        });
+        let sub_res = palette.filtered(&app, &ui);
+        assert!(sub_res
+            .iter()
+            .any(|i| i.label == "Folder: Inbox / Projects / 2026"));
 
         palette.query = "@alice".to_string();
         let res = palette.filtered(&app, &ui);

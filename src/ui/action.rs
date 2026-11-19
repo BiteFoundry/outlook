@@ -661,23 +661,36 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::JumpToSearchHit(idx) => {
             if let Some(hit) = app.search_results.get(idx).cloned() {
                 ui.active_nav_tab = TAB_MAIL;
-                if let Some(fid) = hit.folder_id.clone() {
+                let stored_msg = app.storage.get_mail_message(&hit.id).ok().flatten();
+                let target_folder = hit
+                    .folder_id
+                    .clone()
+                    .or_else(|| stored_msg.as_ref().and_then(|m| m.folder_id.clone()));
+                if let Some(fid) = target_folder {
                     app.select_mail_folder(ui, fid);
+                } else {
+                    app.pinned_mail = None;
                 }
-                if let Ok(Some(msg)) = app.storage.get_mail_message(&hit.id) {
+                let mut needs_hydrate = true;
+                if let Some(msg) = stored_msg {
+                    needs_hydrate = !msg.body_loaded;
+                    if ui.focused_only && !msg.is_focused() {
+                        ui.focused_only = false;
+                    }
+                    app.pinned_mail = Some(msg.clone());
                     if !app.mail_messages.iter().any(|m| m.id == msg.id) {
                         app.mail_messages.insert(0, msg);
                     }
                 }
                 app.active_mail_id = Some(hit.id.clone());
-                let rows = app.visible_mail_rows(ui);
-                if let Some(pos) = rows.iter().position(|r| {
-                    r.thread_msg_indices
-                        .iter()
-                        .any(|&i| app.mail_messages[i].id == hit.id)
-                }) {
-                    app.select_mail_row(ui, pos);
+                app.push_focus_to_sync();
+                if needs_hydrate {
+                    app.sync_ctrl.request(SyncCommand::HydrateMessage {
+                        message_id: hit.id.clone(),
+                    });
                 }
+                app.sync_mail_list_selection_to_active(ui);
+                ui.mail_read_scroll.offset = 0;
                 ui.set_focus(Focus::Reader);
             }
         }

@@ -1,7 +1,10 @@
 //! Microsoft Graph v1.0 Outlook Mail operations (`/me/mailFolders`, `/me/messages`, `/me/sendMail`,
 //! drafts, inline `cid:` images, attachments, remote search, and delta sync).
 
-use std::path::Path;
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::Path,
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -10,7 +13,7 @@ use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
 use super::{
-    client::{BatchSubRequest, GraphDeltaPage, GraphListPage},
+    client::{BatchSubRequest, BatchSubResponse, GraphDeltaPage, GraphListPage},
     media::{
         deduplicate_dest_path, extension_for_content_type, guess_mime_type,
         is_auth_or_forbidden_error, maybe_refine_image_extension, sanitize_filename,
@@ -25,6 +28,17 @@ use crate::models::{
 
 const MAIL_SMALL_ATTACHMENT_LIMIT: u64 = 3 * 1024 * 1024; // 3 MiB
 const MAIL_UPLOAD_CHUNK_SIZE: usize = 3_276_800; // 3.2 MiB
+const MAX_FOLDER_DEPTH: usize = 6;
+const DELTA_MAX_PAGES: usize = 4;
+const SEARCH_MAX_PAGES: usize = 2;
+const WELL_KNOWN_FOLDER_NAMES: [&str; 6] = [
+    "inbox",
+    "sentitems",
+    "drafts",
+    "archive",
+    "deleteditems",
+    "junkemail",
+];
 
 const MAIL_HEADER_SELECT_FIELDS: &str = "id,internetMessageId,conversationId,parentFolderId,subject,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,isRead,isDraft,flag,importance,inferenceClassification,hasAttachments,bodyPreview,webLink";
 const MAIL_FULL_SELECT_FIELDS: &str = "id,internetMessageId,conversationId,parentFolderId,subject,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,isRead,isDraft,flag,importance,inferenceClassification,hasAttachments,bodyPreview,body,webLink";
@@ -287,6 +301,44 @@ struct GraphMailFolder {
     total_item_count: i32,
 }
 
+impl GraphMailFolder {
+    fn into_mail_folder(
+        self,
+        derive_well_known: bool,
+        fallback_parent_id: Option<&str>,
+    ) -> MailFolder {
+        let display_name = self
+            .display_name
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| self.id.clone());
+        let well_known_name = self
+            .well_known_name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                if derive_well_known {
+                    derive_well_known_folder_name(&display_name)
+                        .or_else(|| derive_well_known_folder_name(&self.id))
+                } else {
+                    None
+                }
+            });
+        let parent_folder_id = self
+            .parent_folder_id
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| fallback_parent_id.map(str::to_string));
+        MailFolder {
+            id: self.id,
+            display_name,
+            well_known_name,
+            parent_folder_id,
+            child_folder_count: self.child_folder_count,
+            unread_item_count: self.unread_item_count,
+            total_item_count: self.total_item_count,
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct GraphMailFlag {
     #[serde(rename = "flagStatus", default)]
@@ -543,39 +595,196 @@ struct StagedFile<'a> {
 
 impl GraphClient {
     /// Lists visible Outlook mail folders (`/me/mailFolders?$top=100&includeHiddenFolders=false`),
-    /// following `@odata.nextLink`.
+    /// resolves missing localized well-known folder mappings via a single best-effort `$batch`,
+    /// and recursively fetches child folders (`childFolderCount > 0`) up to depth 6.
     pub async fn list_mail_folders(&self) -> Result<Vec<MailFolder>> {
         let mut next_url =
             Some("/me/mailFolders?$top=100&includeHiddenFolders=false".to_string());
         let mut folders = Vec::new();
+        let mut seen_ids = HashSet::new();
 
         while let Some(url) = next_url {
             let page: GraphListPage<GraphMailFolder> = self.get_json(&url).await?;
             for raw in page.value {
-                let display_name = raw
-                    .display_name
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| raw.id.clone());
-                let well_known_name = raw
-                    .well_known_name
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| derive_well_known_folder_name(&display_name))
-                    .or_else(|| derive_well_known_folder_name(&raw.id));
-                folders.push(MailFolder {
-                    id: raw.id,
-                    display_name,
-                    well_known_name,
-                    parent_folder_id: raw.parent_folder_id.filter(|s| !s.trim().is_empty()),
-                    child_folder_count: raw.child_folder_count,
-                    unread_item_count: raw.unread_item_count,
-                    total_item_count: raw.total_item_count,
-                });
+                let folder = raw.into_mail_folder(true, None);
+                if seen_ids.insert(folder.id.clone()) {
+                    folders.push(folder);
+                }
             }
             next_url = page.next_link;
         }
 
+        // In Microsoft Graph v1.0, `/me/mailFolders` omits `wellKnownName`. Resolve any missing
+        // well-known folders via one best-effort `$batch` call so localized mailboxes map Sent/etc.
+        let missing_wk: Vec<&str> = WELL_KNOWN_FOLDER_NAMES
+            .iter()
+            .copied()
+            .filter(|wk| {
+                !folders.iter().any(|f| {
+                    f.well_known_name
+                        .as_deref()
+                        .is_some_and(|w| w.eq_ignore_ascii_case(wk))
+                })
+            })
+            .collect();
+
+        if !missing_wk.is_empty() {
+            let wk_requests: Vec<BatchSubRequest> = missing_wk
+                .iter()
+                .enumerate()
+                .map(|(idx, wk)| BatchSubRequest {
+                    id: idx.to_string(),
+                    method: "GET".to_string(),
+                    url: format!(
+                        "/me/mailFolders/{wk}?$select=id,displayName,parentFolderId,childFolderCount,unreadItemCount,totalItemCount"
+                    ),
+                    body: None,
+                    headers: None,
+                })
+                .collect();
+
+            if let Ok(responses) = self.batch(&wk_requests).await {
+                for resp in responses {
+                    if resp.status != 200 {
+                        continue;
+                    }
+                    let Ok(idx) = resp.id.parse::<usize>() else {
+                        continue;
+                    };
+                    let Some(&wk) = missing_wk.get(idx) else {
+                        continue;
+                    };
+                    let Ok(raw) = serde_json::from_value::<GraphMailFolder>(resp.body) else {
+                        continue;
+                    };
+                    if let Some(existing) = folders.iter_mut().find(|f| f.id == raw.id) {
+                        existing.well_known_name = Some(wk.to_string());
+                    } else {
+                        let mut folder = raw.into_mail_folder(true, None);
+                        folder.well_known_name = Some(wk.to_string());
+                        if seen_ids.insert(folder.id.clone()) {
+                            folders.push(folder);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Recursively fetch child folders per tree level up to MAX_FOLDER_DEPTH (6).
+        let mut expanded_ids = HashSet::new();
+        let mut frontier: Vec<String> = folders
+            .iter()
+            .filter(|f| f.child_folder_count > 0)
+            .map(|f| f.id.clone())
+            .collect();
+
+        for _depth in 0..MAX_FOLDER_DEPTH {
+            frontier.retain(|id| expanded_ids.insert(id.clone()));
+            if frontier.is_empty() {
+                break;
+            }
+
+            let requests: Vec<BatchSubRequest> = frontier
+                .iter()
+                .enumerate()
+                .map(|(idx, folder_id)| BatchSubRequest {
+                    id: idx.to_string(),
+                    method: "GET".to_string(),
+                    url: format!(
+                        "/me/mailFolders/{}/childFolders?$top=100&includeHiddenFolders=false",
+                        urlencoding::encode(folder_id)
+                    ),
+                    body: None,
+                    headers: None,
+                })
+                .collect();
+
+            let mut next_frontier = Vec::new();
+            match self.batch(&requests).await {
+                Ok(responses) => {
+                    let mut ordered: BTreeMap<usize, BatchSubResponse> = BTreeMap::new();
+                    for resp in responses {
+                        if let Ok(idx) = resp.id.parse::<usize>() {
+                            ordered.insert(idx, resp);
+                        }
+                    }
+                    for (idx, resp) in ordered {
+                        if !(200..300).contains(&resp.status) {
+                            continue;
+                        }
+                        let Some(parent_id) = frontier.get(idx) else {
+                            continue;
+                        };
+                        let Ok(page) =
+                            serde_json::from_value::<GraphListPage<GraphMailFolder>>(resp.body)
+                        else {
+                            continue;
+                        };
+                        self.collect_child_folder_page(
+                            page,
+                            parent_id,
+                            &mut seen_ids,
+                            &mut folders,
+                            &mut next_frontier,
+                        )
+                        .await;
+                    }
+                }
+                Err(err) if is_batch_fallback_status(&err) => {
+                    for parent_id in &frontier {
+                        let url = format!(
+                            "/me/mailFolders/{}/childFolders?$top=100&includeHiddenFolders=false",
+                            urlencoding::encode(parent_id)
+                        );
+                        if let Ok(page) = self.get_json::<GraphListPage<GraphMailFolder>>(&url).await
+                        {
+                            self.collect_child_folder_page(
+                                page,
+                                parent_id,
+                                &mut seen_ids,
+                                &mut folders,
+                                &mut next_frontier,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+
+            frontier = next_frontier;
+        }
+
         Ok(folders)
+    }
+
+    async fn collect_child_folder_page(
+        &self,
+        initial_page: GraphListPage<GraphMailFolder>,
+        parent_id: &str,
+        seen_ids: &mut HashSet<String>,
+        folders: &mut Vec<MailFolder>,
+        next_frontier: &mut Vec<String>,
+    ) {
+        let mut page = initial_page;
+        loop {
+            for raw in page.value {
+                let folder = raw.into_mail_folder(false, Some(parent_id));
+                if seen_ids.insert(folder.id.clone()) {
+                    if folder.child_folder_count > 0 {
+                        next_frontier.push(folder.id.clone());
+                    }
+                    folders.push(folder);
+                }
+            }
+            let Some(next_url) = page.next_link else {
+                break;
+            };
+            match self.get_json::<GraphListPage<GraphMailFolder>>(&next_url).await {
+                Ok(next_page) => page = next_page,
+                Err(_) => break,
+            }
+        }
     }
 
     /// Lists up to `top` mail messages in `folder_id` (or `"all"` for `/me/messages`).
@@ -691,8 +900,13 @@ impl GraphClient {
         let mut upserted = Vec::new();
         let mut removed_ids = Vec::new();
         let mut new_delta_link = None;
+        let mut pages = 0usize;
 
         while let Some(url) = next_url {
+            if pages >= DELTA_MAX_PAGES {
+                break;
+            }
+            pages += 1;
             let page: GraphDeltaPage<serde_json::Value> =
                 self.get_json_with_headers(&url, &headers).await?;
             for val in page.value {
@@ -1240,15 +1454,20 @@ impl GraphClient {
         }
         let escaped = q.replace('\\', "\\\\").replace('"', "\\\"");
         let search_val = format!("\"{escaped}\"");
-        let top = limit.min(100);
+        let top = limit.min(50);
         let mut next_url = Some(format!(
             "/me/messages?$search={}&$top={top}&$select={MAIL_HEADER_SELECT_FIELDS}",
             urlencoding::encode(&search_val)
         ));
         let mut messages = Vec::new();
         let headers = [("ConsistencyLevel", "eventual")];
+        let mut pages = 0usize;
 
         while let Some(url) = next_url {
+            if pages >= SEARCH_MAX_PAGES {
+                break;
+            }
+            pages += 1;
             let page: GraphListPage<GraphMailMessage> =
                 self.get_json_with_headers(&url, &headers).await?;
             for raw in page.value {
@@ -1370,15 +1589,30 @@ fn build_inline_image_attachments_json(inline_images: &[InlineImageUpload]) -> V
         .collect()
 }
 
+fn is_batch_fallback_status(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    let detail = msg
+        .split_once("): ")
+        .map(|(_, tail)| tail)
+        .unwrap_or(msg.as_str());
+    detail.contains("404") || detail.contains("405")
+}
+
 fn derive_well_known_folder_name(name: &str) -> Option<String> {
     let normalized = name.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "inbox" => Some("inbox".to_string()),
-        "sentitems" | "sent items" | "sent" => Some("sentitems".to_string()),
-        "drafts" => Some("drafts".to_string()),
-        "archive" => Some("archive".to_string()),
-        "deleteditems" | "deleted items" | "trash" => Some("deleteditems".to_string()),
-        "junkemail" | "junk email" | "junk" => Some("junkemail".to_string()),
+        "inbox" | "받은 편지함" | "받은편지함" => Some("inbox".to_string()),
+        "sentitems" | "sent items" | "sent" | "보낸 편지함" | "보낸편지함" => {
+            Some("sentitems".to_string())
+        }
+        "drafts" | "임시 보관함" | "임시보관함" => Some("drafts".to_string()),
+        "archive" | "보관함" => Some("archive".to_string()),
+        "deleteditems" | "deleted items" | "trash" | "지운 편지함" | "지운편지함" => {
+            Some("deleteditems".to_string())
+        }
+        "junkemail" | "junk email" | "junk" | "정크 메일" | "정크메일" => {
+            Some("junkemail".to_string())
+        }
         _ => None,
     }
 }
@@ -2134,5 +2368,159 @@ pub(crate) mod tests {
         assert_eq!(batch.len(), 2);
         assert!(batch[0].body_loaded);
         assert_eq!(batch[0].body_plain, "hydrated");
+    }
+
+    #[tokio::test]
+    async fn test_list_mail_folders_recursive_subfolders_and_localized_well_known() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct ServerState {
+            base_url: Arc<Mutex<String>>,
+            delta_pages: Arc<AtomicUsize>,
+            search_pages: Arc<AtomicUsize>,
+        }
+        let state = ServerState {
+            base_url: Arc::new(Mutex::new(String::new())),
+            delta_pages: Arc::new(AtomicUsize::new(0)),
+            search_pages: Arc::new(AtomicUsize::new(0)),
+        };
+        let state_ref = state.clone();
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/mailFolders",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [
+                            { "id": "f-inbox", "displayName": "받은 편지함", "childFolderCount": 1, "unreadItemCount": 2, "totalItemCount": 10 },
+                            { "id": "f-sent", "displayName": "보낸 편지함", "childFolderCount": 0, "unreadItemCount": 0, "totalItemCount": 5 },
+                            { "id": "f-drafts", "displayName": "임시 보관함", "childFolderCount": 0, "unreadItemCount": 0, "totalItemCount": 1 },
+                            { "id": "f-deleted", "displayName": "지운 편지함", "childFolderCount": 0, "unreadItemCount": 0, "totalItemCount": 0 },
+                            { "id": "f-junk", "displayName": "Спам", "childFolderCount": 0, "unreadItemCount": 0, "totalItemCount": 0 }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/f-projects/childFolders",
+                get(|Query(params): Query<HashMap<String, String>>| async move {
+                    assert_eq!(params.get("page").map(String::as_str), Some("2"));
+                    Json(serde_json::json!({
+                        "value": [
+                            { "id": "f-2026-p2", "displayName": "2026-Q2", "parentFolderId": "f-projects", "childFolderCount": 0, "unreadItemCount": 0, "totalItemCount": 1 }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/$batch",
+                post(|State(st): State<ServerState>, Json(payload): Json<serde_json::Value>| async move {
+                    let base = st.base_url.lock().unwrap().clone();
+                    let reqs = payload["requests"].as_array().cloned().unwrap_or_default();
+                    let responses: Vec<serde_json::Value> = reqs
+                        .into_iter()
+                        .map(|r| {
+                            let req_id = r["id"].as_str().unwrap_or_default().to_string();
+                            let url = r["url"].as_str().unwrap_or_default().to_string();
+                            if url.starts_with("/me/mailFolders/junkemail") {
+                                serde_json::json!({
+                                    "id": req_id,
+                                    "status": 200,
+                                    "body": { "id": "f-junk", "displayName": "Спам", "childFolderCount": 0, "unreadItemCount": 0, "totalItemCount": 0 }
+                                })
+                            } else if url.starts_with("/me/mailFolders/archive") {
+                                serde_json::json!({
+                                    "id": req_id,
+                                    "status": 200,
+                                    "body": { "id": "f-archive", "displayName": "보관 폴더", "childFolderCount": 0, "unreadItemCount": 0, "totalItemCount": 3 }
+                                })
+                            } else if url.starts_with("/me/mailFolders/f-inbox/childFolders") {
+                                serde_json::json!({
+                                    "id": req_id,
+                                    "status": 200,
+                                    "body": {
+                                        "value": [
+                                            { "id": "f-projects", "displayName": "Projects", "parentFolderId": "f-inbox", "childFolderCount": 1, "unreadItemCount": 1, "totalItemCount": 4 }
+                                        ]
+                                    }
+                                })
+                            } else if url.starts_with("/me/mailFolders/f-projects/childFolders") {
+                                serde_json::json!({
+                                    "id": req_id,
+                                    "status": 200,
+                                    "body": {
+                                        "value": [
+                                            { "id": "f-2026", "displayName": "2026", "parentFolderId": "f-projects", "childFolderCount": 0, "unreadItemCount": 0, "totalItemCount": 2 }
+                                        ],
+                                        "@odata.nextLink": format!("{base}/v1.0/me/mailFolders/f-projects/childFolders?page=2")
+                                    }
+                                })
+                            } else {
+                                serde_json::json!({ "id": req_id, "status": 404, "body": {} })
+                            }
+                        })
+                        .collect();
+                    Json(serde_json::json!({ "responses": responses }))
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/inbox/messages/delta",
+                get(|State(st): State<ServerState>| async move {
+                    let page = st.delta_pages.fetch_add(1, Ordering::SeqCst) + 1;
+                    let base = st.base_url.lock().unwrap().clone();
+                    Json(serde_json::json!({
+                        "value": [{ "id": format!("d-{page}"), "subject": "Delta item" }],
+                        "@odata.nextLink": format!("{base}/v1.0/me/mailFolders/inbox/messages/delta?page={}", page + 1)
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/messages",
+                get(|State(st): State<ServerState>, Query(params): Query<HashMap<String, String>>| async move {
+                    let page = st.search_pages.fetch_add(1, Ordering::SeqCst) + 1;
+                    if page == 1 {
+                        assert_eq!(params.get("$top").map(String::as_str), Some("50"));
+                    }
+                    let base = st.base_url.lock().unwrap().clone();
+                    Json(serde_json::json!({
+                        "value": [{ "id": format!("s-{page}"), "subject": "Hit" }],
+                        "@odata.nextLink": format!("{base}/v1.0/me/messages?page={}", page + 1)
+                    }))
+                }),
+            )
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        *state_ref.base_url.lock().unwrap() = format!("http://{addr}");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = test_graph_client(&format!("http://{addr}/v1.0"));
+        let folders = client.list_mail_folders().await.unwrap();
+
+        let by_id: HashMap<String, MailFolder> =
+            folders.into_iter().map(|f| (f.id.clone(), f)).collect();
+        assert_eq!(by_id["f-inbox"].well_known_name.as_deref(), Some("inbox"));
+        assert_eq!(by_id["f-sent"].well_known_name.as_deref(), Some("sentitems"));
+        assert_eq!(by_id["f-drafts"].well_known_name.as_deref(), Some("drafts"));
+        assert_eq!(by_id["f-deleted"].well_known_name.as_deref(), Some("deleteditems"));
+        assert_eq!(by_id["f-junk"].well_known_name.as_deref(), Some("junkemail"));
+        assert_eq!(by_id["f-archive"].well_known_name.as_deref(), Some("archive"));
+        assert_eq!(by_id["f-projects"].parent_folder_id.as_deref(), Some("f-inbox"));
+        assert_eq!(by_id["f-2026"].parent_folder_id.as_deref(), Some("f-projects"));
+        assert_eq!(by_id["f-2026-p2"].parent_folder_id.as_deref(), Some("f-projects"));
+        assert_eq!(by_id.len(), 9);
+
+        let (delta_msgs, _, delta_link) = client.delta_mail_messages("inbox", None, 50).await.unwrap();
+        assert_eq!(state_ref.delta_pages.load(Ordering::SeqCst), DELTA_MAX_PAGES);
+        assert_eq!(delta_msgs.len(), DELTA_MAX_PAGES);
+        assert!(delta_link.is_none());
+
+        let search_hits = client.search_mail_remote("budget", 100).await.unwrap();
+        assert_eq!(state_ref.search_pages.load(Ordering::SeqCst), SEARCH_MAX_PAGES);
+        assert_eq!(search_hits.len(), SEARCH_MAX_PAGES);
     }
 }

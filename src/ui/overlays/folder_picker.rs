@@ -1,5 +1,7 @@
 //! Fuzzy-searchable Move to Folder modal (`m` in Mail view).
 
+use std::collections::HashMap;
+
 use ratatui::{
     layout::Rect,
     style::Style,
@@ -14,6 +16,7 @@ use crate::{
         action::Action,
         app::{AppState, UiState},
         hitmap::{HitMap, HitTarget},
+        nav_pane::folder_display_paths,
         overlays::{centered_rect, OverlayOutcome},
     },
 };
@@ -35,6 +38,15 @@ impl FolderPickerOverlay {
     }
 
     pub fn filtered<'a>(&self, folders: &'a [MailFolder]) -> Vec<&'a MailFolder> {
+        let paths = folder_display_paths(folders);
+        self.filtered_with_paths(folders, &paths)
+    }
+
+    fn filtered_with_paths<'a>(
+        &self,
+        folders: &'a [MailFolder],
+        paths: &HashMap<String, String>,
+    ) -> Vec<&'a MailFolder> {
         let q = self.query.trim().to_lowercase();
         let mut out: Vec<&'a MailFolder> = folders
             .iter()
@@ -43,19 +55,40 @@ impl FolderPickerOverlay {
                     return true;
                 }
                 let name = f.display_name.to_lowercase();
+                let path = paths
+                    .get(&f.id)
+                    .map(|p| p.to_lowercase())
+                    .unwrap_or_else(|| name.clone());
                 let wk = f
                     .well_known_name
                     .as_deref()
                     .unwrap_or("")
                     .to_lowercase();
-                name.contains(&q) || wk.contains(&q) || fuzzy_matches(&name, &q)
+                path.contains(&q)
+                    || name.contains(&q)
+                    || wk.contains(&q)
+                    || fuzzy_matches(&path, &q)
+                    || fuzzy_matches(&name, &q)
             })
             .collect();
         out.sort_by(|a, b| {
-            let a_exact = !q.is_empty() && a.display_name.to_lowercase().starts_with(&q);
-            let b_exact = !q.is_empty() && b.display_name.to_lowercase().starts_with(&q);
+            let a_path = paths
+                .get(&a.id)
+                .map(String::as_str)
+                .unwrap_or(a.display_name.as_str());
+            let b_path = paths
+                .get(&b.id)
+                .map(String::as_str)
+                .unwrap_or(b.display_name.as_str());
+            let a_exact = !q.is_empty()
+                && (a.display_name.to_lowercase().starts_with(&q)
+                    || a_path.to_lowercase().starts_with(&q));
+            let b_exact = !q.is_empty()
+                && (b.display_name.to_lowercase().starts_with(&q)
+                    || b_path.to_lowercase().starts_with(&q));
             b_exact
                 .cmp(&a_exact)
+                .then_with(|| a_path.to_lowercase().cmp(&b_path.to_lowercase()))
                 .then_with(|| a.display_name.cmp(&b.display_name))
         });
         out
@@ -66,7 +99,8 @@ impl FolderPickerOverlay {
     }
 
     pub fn handle(&mut self, action: &Action, app: &AppState) -> OverlayOutcome {
-        let matches = self.filtered(&app.mail_folders);
+        let paths = folder_display_paths(&app.mail_folders);
+        let matches = self.filtered_with_paths(&app.mail_folders, &paths);
         match action {
             Action::Input(ch) => {
                 self.query.push(*ch);
@@ -100,10 +134,14 @@ impl FolderPickerOverlay {
             Action::Activate | Action::OverlaySubmit => {
                 let idx = self.selected.min(matches.len().saturating_sub(1));
                 if let Some(folder) = matches.get(idx) {
+                    let destination_name = paths
+                        .get(&folder.id)
+                        .cloned()
+                        .unwrap_or_else(|| folder.display_name.clone());
                     OverlayOutcome::CloseAndDispatch(Action::MoveMailToFolder {
                         message_ids: self.message_ids.clone(),
                         destination_folder_id: folder.id.clone(),
-                        destination_name: folder.display_name.clone(),
+                        destination_name,
                     })
                 } else {
                     OverlayOutcome::Handled
@@ -164,7 +202,8 @@ impl FolderPickerOverlay {
             return;
         }
 
-        let matches = self.filtered(&app.mail_folders);
+        let paths = folder_display_paths(&app.mail_folders);
+        let matches = self.filtered_with_paths(&app.mail_folders, &paths);
         if matches.is_empty() {
             frame.render_widget(
                 Paragraph::new(Span::styled(" No matching folders", theme.muted_style())),
@@ -194,8 +233,12 @@ impl FolderPickerOverlay {
             } else {
                 String::new()
             };
+            let path = paths
+                .get(&folder.id)
+                .map(String::as_str)
+                .unwrap_or(folder.display_name.as_str());
             let label = crate::ui::truncate_width(
-                &format!(" {}{}", folder.display_name, badge),
+                &format!(" {}{}", path, badge),
                 inner.width as usize,
             );
             frame.render_widget(
@@ -221,4 +264,52 @@ fn fuzzy_matches(haystack: &str, needle: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filters_and_formats_hierarchical_subfolder_paths() {
+        let folders = vec![
+            MailFolder {
+                id: "f-inbox".into(),
+                display_name: "Inbox".into(),
+                well_known_name: Some("inbox".into()),
+                parent_folder_id: None,
+                child_folder_count: 1,
+                unread_item_count: 2,
+                total_item_count: 10,
+            },
+            MailFolder {
+                id: "f-proj".into(),
+                display_name: "Projects".into(),
+                well_known_name: None,
+                parent_folder_id: Some("f-inbox".into()),
+                child_folder_count: 1,
+                unread_item_count: 0,
+                total_item_count: 4,
+            },
+            MailFolder {
+                id: "f-2026".into(),
+                display_name: "2026".into(),
+                well_known_name: None,
+                parent_folder_id: Some("f-proj".into()),
+                child_folder_count: 0,
+                unread_item_count: 1,
+                total_item_count: 1,
+            },
+        ];
+
+        let picker = FolderPickerOverlay {
+            message_ids: vec!["m1".into()],
+            query: "inbox / projects".into(),
+            selected: 0,
+        };
+        let filtered = picker.filtered(&folders);
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].id, "f-proj");
+        assert_eq!(filtered[1].id, "f-2026");
+    }
 }

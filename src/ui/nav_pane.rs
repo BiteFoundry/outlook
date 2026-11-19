@@ -5,7 +5,7 @@
 //! - Tab 1 (`Calendar`): Compact Mini Month Calendar Grid (today + `•` event days) + Quick Range Jumpers
 //! - Tab 2 (`Tasks`): Microsoft To Do lists + `n` to create list
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use ratatui::{
@@ -17,9 +17,12 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::ui::{
-    app::{AppState, CalendarRangeFilter, Focus, UiState},
-    hitmap::{ButtonId, HitMap, HitTarget},
+use crate::{
+    models::MailFolder,
+    ui::{
+        app::{AppState, CalendarRangeFilter, Focus, UiState},
+        hitmap::{ButtonId, HitMap, HitTarget},
+    },
 };
 
 pub const TAB_MAIL: usize = 0;
@@ -40,6 +43,7 @@ pub enum NavRow {
         display_name: String,
         unread: i32,
         is_virtual: bool,
+        depth: u8,
     },
     CalendarRange {
         label: &'static str,
@@ -79,12 +83,12 @@ pub fn nav_row_at(app: &AppState, ui: &UiState, index: usize) -> Option<NavRow> 
     build_nav_rows(app, ui).into_iter().nth(index)
 }
 
-fn find_folder_by_wellknown<'a>(
-    app: &'a AppState,
+pub(crate) fn find_folder_by_wellknown<'a>(
+    folders: &'a [MailFolder],
     well_known: &str,
     fallback_names: &[&str],
-) -> Option<&'a crate::models::MailFolder> {
-    app.mail_folders
+) -> Option<&'a MailFolder> {
+    folders
         .iter()
         .find(|f| {
             f.well_known_name
@@ -92,7 +96,7 @@ fn find_folder_by_wellknown<'a>(
                 .is_some_and(|wk| wk.eq_ignore_ascii_case(well_known))
         })
         .or_else(|| {
-            app.mail_folders.iter().find(|f| {
+            folders.iter().find(|f| {
                 fallback_names
                     .iter()
                     .any(|n| f.display_name.eq_ignore_ascii_case(n))
@@ -100,21 +104,105 @@ fn find_folder_by_wellknown<'a>(
         })
 }
 
+/// Builds a map of `folder_id -> "Parent / Child / Leaf"` full hierarchical display paths.
+pub(crate) fn folder_display_paths(folders: &[MailFolder]) -> HashMap<String, String> {
+    let by_id: HashMap<&str, &MailFolder> = folders.iter().map(|f| (f.id.as_str(), f)).collect();
+    let mut out = HashMap::with_capacity(folders.len());
+    for folder in folders {
+        let mut parts = vec![folder.display_name.as_str()];
+        let mut visited = HashSet::new();
+        visited.insert(folder.id.as_str());
+        let mut cur_parent = folder.parent_folder_id.as_deref();
+        for _ in 0..32 {
+            let Some(pid) = cur_parent.map(str::trim).filter(|s| !s.is_empty()) else {
+                break;
+            };
+            if !visited.insert(pid) {
+                break;
+            }
+            let Some(parent) = by_id.get(pid) else {
+                break;
+            };
+            parts.push(parent.display_name.as_str());
+            cur_parent = parent.parent_folder_id.as_deref();
+        }
+        parts.reverse();
+        out.insert(folder.id.clone(), parts.join(" / "));
+    }
+    out
+}
+
+fn append_descendants(
+    parent_id: &str,
+    depth: u8,
+    children_map: &HashMap<String, Vec<&MailFolder>>,
+    shown_ids: &mut HashSet<String>,
+    rows: &mut Vec<NavRow>,
+) {
+    let Some(children) = children_map.get(parent_id) else {
+        return;
+    };
+    for child in children {
+        if !shown_ids.insert(child.id.clone()) {
+            continue;
+        }
+        rows.push(NavRow::MailFolder {
+            folder_id: child.id.clone(),
+            display_name: child.display_name.clone(),
+            unread: child.unread_item_count,
+            is_virtual: false,
+            depth,
+        });
+        append_descendants(
+            &child.id,
+            depth.saturating_add(1),
+            children_map,
+            shown_ids,
+            rows,
+        );
+    }
+}
+
 fn build_mail_nav_rows(app: &AppState) -> Vec<NavRow> {
     let mut rows = Vec::new();
     let mut shown_ids: HashSet<String> = HashSet::new();
 
+    let mut children_map: HashMap<String, Vec<&MailFolder>> = HashMap::new();
+    for folder in &app.mail_folders {
+        if let Some(ref pid) = folder.parent_folder_id {
+            let trimmed = pid.trim();
+            if !trimmed.is_empty() && trimmed != folder.id {
+                children_map
+                    .entry(trimmed.to_string())
+                    .or_default()
+                    .push(folder);
+            }
+        }
+    }
+    for children in children_map.values_mut() {
+        children.sort_by(|a, b| {
+            a.display_name
+                .to_ascii_lowercase()
+                .cmp(&b.display_name.to_ascii_lowercase())
+                .then_with(|| a.display_name.cmp(&b.display_name))
+        });
+    }
+
     rows.push(NavRow::SectionHeader { label: "FAVORITES" });
 
-    // 1. Inbox
-    if let Some(inbox) = find_folder_by_wellknown(app, "inbox", &["Inbox"]) {
+    // 1. Inbox + recursive subfolders
+    if let Some(inbox) =
+        find_folder_by_wellknown(&app.mail_folders, "inbox", &["Inbox", "받은 편지함"])
+    {
         shown_ids.insert(inbox.id.clone());
         rows.push(NavRow::MailFolder {
             folder_id: inbox.id.clone(),
             display_name: "Inbox".to_string(),
             unread: inbox.unread_item_count,
             is_virtual: false,
+            depth: 0,
         });
+        append_descendants(&inbox.id, 1, &children_map, &mut shown_ids, &mut rows);
     } else {
         shown_ids.insert("inbox".to_string());
         rows.push(NavRow::MailFolder {
@@ -122,6 +210,7 @@ fn build_mail_nav_rows(app: &AppState) -> Vec<NavRow> {
             display_name: "Inbox".to_string(),
             unread: app.unread_inbox_count(),
             is_virtual: false,
+            depth: 0,
         });
     }
 
@@ -136,6 +225,7 @@ fn build_mail_nav_rows(app: &AppState) -> Vec<NavRow> {
         display_name: "Unread".to_string(),
         unread: unread_total,
         is_virtual: true,
+        depth: 0,
     });
     let flagged_total = app
         .mail_messages
@@ -147,23 +237,25 @@ fn build_mail_nav_rows(app: &AppState) -> Vec<NavRow> {
         display_name: "Flagged".to_string(),
         unread: flagged_total,
         is_virtual: true,
+        depth: 0,
     });
 
     // 3. Well-known folders
     let well_known_specs: [(&str, &str, &[&str]); 4] = [
-        ("drafts", "Drafts", &["Drafts"]),
-        ("sentitems", "Sent", &["Sent Items", "Sent"]),
-        ("archive", "Archive", &["Archive"]),
-        ("deleteditems", "Trash", &["Deleted Items", "Trash"]),
+        ("drafts", "Drafts", &["Drafts", "임시 보관함"]),
+        ("sentitems", "Sent", &["Sent Items", "Sent", "보낸 편지함"]),
+        ("archive", "Archive", &["Archive", "보관함"]),
+        ("deleteditems", "Trash", &["Deleted Items", "Trash", "지운 편지함"]),
     ];
     for (wk_id, label, aliases) in well_known_specs {
-        if let Some(folder) = find_folder_by_wellknown(app, wk_id, aliases) {
+        if let Some(folder) = find_folder_by_wellknown(&app.mail_folders, wk_id, aliases) {
             shown_ids.insert(folder.id.clone());
             rows.push(NavRow::MailFolder {
                 folder_id: folder.id.clone(),
                 display_name: label.to_string(),
                 unread: folder.unread_item_count,
                 is_virtual: false,
+                depth: 0,
             });
         } else {
             shown_ids.insert(wk_id.to_string());
@@ -172,6 +264,7 @@ fn build_mail_nav_rows(app: &AppState) -> Vec<NavRow> {
                 display_name: label.to_string(),
                 unread: 0,
                 is_virtual: false,
+                depth: 0,
             });
         }
     }
@@ -185,31 +278,71 @@ fn build_mail_nav_rows(app: &AppState) -> Vec<NavRow> {
                     display_name: folder.display_name.clone(),
                     unread: folder.unread_item_count,
                     is_virtual: false,
+                    depth: 0,
                 });
             }
         }
     }
 
-    // 5. Custom folders
-    let mut custom: Vec<&crate::models::MailFolder> = app
+    // 5. Custom folders (hierarchical tree)
+    let unshown: Vec<&MailFolder> = app
         .mail_folders
         .iter()
         .filter(|f| !shown_ids.contains(&f.id))
         .collect();
-    custom.sort_by(|a, b| {
-        a.display_name
-            .to_ascii_lowercase()
-            .cmp(&b.display_name.to_ascii_lowercase())
-    });
-    if !custom.is_empty() {
+    if !unshown.is_empty() {
         rows.push(NavRow::SectionHeader { label: "FOLDERS" });
-        for f in custom {
+        let unshown_ids: HashSet<&str> = unshown.iter().map(|f| f.id.as_str()).collect();
+        let mut roots: Vec<&MailFolder> = unshown
+            .iter()
+            .copied()
+            .filter(|f| {
+                let Some(pid) = f.parent_folder_id.as_deref().map(str::trim) else {
+                    return true;
+                };
+                pid.is_empty() || pid == f.id || !unshown_ids.contains(pid)
+            })
+            .collect();
+        roots.sort_by(|a, b| {
+            a.display_name
+                .to_ascii_lowercase()
+                .cmp(&b.display_name.to_ascii_lowercase())
+                .then_with(|| a.display_name.cmp(&b.display_name))
+        });
+        for root in roots {
+            if !shown_ids.insert(root.id.clone()) {
+                continue;
+            }
             rows.push(NavRow::MailFolder {
-                folder_id: f.id.clone(),
-                display_name: f.display_name.clone(),
-                unread: f.unread_item_count,
+                folder_id: root.id.clone(),
+                display_name: root.display_name.clone(),
+                unread: root.unread_item_count,
                 is_virtual: false,
+                depth: 0,
             });
+            append_descendants(&root.id, 1, &children_map, &mut shown_ids, &mut rows);
+        }
+        // Safety sweep for any disconnected cyclic folders
+        let mut remaining: Vec<&MailFolder> = unshown
+            .into_iter()
+            .filter(|f| !shown_ids.contains(&f.id))
+            .collect();
+        remaining.sort_by(|a, b| {
+            a.display_name
+                .to_ascii_lowercase()
+                .cmp(&b.display_name.to_ascii_lowercase())
+        });
+        for f in remaining {
+            if shown_ids.insert(f.id.clone()) {
+                rows.push(NavRow::MailFolder {
+                    folder_id: f.id.clone(),
+                    display_name: f.display_name.clone(),
+                    unread: f.unread_item_count,
+                    is_virtual: false,
+                    depth: 0,
+                });
+                append_descendants(&f.id, 1, &children_map, &mut shown_ids, &mut rows);
+            }
         }
     }
 
@@ -682,8 +815,18 @@ fn render_nav_row(
             display_name,
             unread,
             is_virtual,
+            depth,
         } => {
-            let icon = if folder_id.eq_ignore_ascii_case("inbox") {
+            let indent = if *depth > 0 {
+                "  ".repeat(*depth as usize)
+            } else {
+                String::new()
+            };
+            let icon = if *depth > 0 {
+                "↳ "
+            } else if folder_id.eq_ignore_ascii_case("inbox")
+                || display_name.eq_ignore_ascii_case("Inbox")
+            {
                 "📥 "
             } else if folder_id == VIRTUAL_UNREAD_FOLDER {
                 "● "
@@ -707,11 +850,12 @@ fn render_nav_row(
             };
             let prefix = if is_active { "▎" } else { " " };
             let badge_w = UnicodeWidthStr::width(badge.as_str());
+            let indent_w = UnicodeWidthStr::width(indent.as_str());
             let icon_w = UnicodeWidthStr::width(icon);
-            let label_max = width.saturating_sub(1 + icon_w + badge_w + 1);
+            let label_max = width.saturating_sub(1 + indent_w + icon_w + badge_w);
             let title = truncate(display_name, label_max);
             let title_w = UnicodeWidthStr::width(title.as_str());
-            let pad = width.saturating_sub(1 + icon_w + title_w + badge_w);
+            let pad = width.saturating_sub(1 + indent_w + icon_w + title_w + badge_w);
 
             let row_style = if is_selected {
                 theme.nav_selection()
@@ -737,7 +881,10 @@ fn render_nav_row(
             };
 
             Line::from(vec![
-                Span::styled(format!("{prefix}{icon}{title}{}", " ".repeat(pad)), row_style),
+                Span::styled(
+                    format!("{prefix}{indent}{icon}{title}{}", " ".repeat(pad)),
+                    row_style,
+                ),
                 Span::styled(badge, badge_style),
             ])
         }
@@ -814,4 +961,136 @@ fn truncate(text: &str, width: usize) -> String {
         used += w;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        auth::AuthManager,
+        config::AppConfig,
+        graph::GraphClient,
+        storage::Storage,
+        sync::{FocusTarget, SyncController},
+    };
+    use tokio::sync::{mpsc, watch};
+
+    fn make_nav_app() -> (AppState, UiState) {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _) = watch::channel(FocusTarget::default());
+        let (cmd_tx, _) = mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+        let (ui_tx, _) = mpsc::unbounded_channel();
+        let app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let ui = UiState::from_config(&cfg);
+        (app, ui)
+    }
+
+    fn folder(
+        id: &str,
+        name: &str,
+        wk: Option<&str>,
+        parent: Option<&str>,
+        unread: i32,
+    ) -> MailFolder {
+        MailFolder {
+            id: id.into(),
+            display_name: name.into(),
+            well_known_name: wk.map(str::to_string),
+            parent_folder_id: parent.map(str::to_string),
+            child_folder_count: 0,
+            unread_item_count: unread,
+            total_item_count: unread + 5,
+        }
+    }
+
+    #[test]
+    fn inbox_subfolders_render_indented_without_duplicating_and_korean_sent_maps() {
+        let (mut app, ui) = make_nav_app();
+        app.mail_folders = vec![
+            folder("f-inbox", "받은 편지함", None, Some("msgfolderroot"), 4),
+            folder("f-proj", "Projects", None, Some("f-inbox"), 2),
+            folder("f-2026", "2026", None, Some("f-proj"), 1),
+            folder("f-sent", "보낸 편지함", None, Some("msgfolderroot"), 0),
+            folder("f-drafts", "임시 보관함", None, Some("msgfolderroot"), 0),
+            folder("f-arch", "보관함", None, Some("msgfolderroot"), 0),
+            folder("f-trash", "지운 편지함", None, Some("msgfolderroot"), 0),
+            folder("f-custom", "Clients", None, Some("msgfolderroot"), 3),
+            folder("f-custom-child", "Acme", None, Some("f-custom"), 1),
+        ];
+
+        let rows = build_mail_nav_rows(&app);
+
+        // Find Inbox and verify Projects (depth 1) & 2026 (depth 2) are immediately beneath it.
+        let inbox_pos = rows
+            .iter()
+            .position(|r| matches!(r, NavRow::MailFolder { folder_id, .. } if folder_id == "f-inbox"))
+            .expect("Inbox row missing");
+        assert_eq!(
+            rows[inbox_pos],
+            NavRow::MailFolder {
+                folder_id: "f-inbox".into(),
+                display_name: "Inbox".into(),
+                unread: 4,
+                is_virtual: false,
+                depth: 0,
+            }
+        );
+        assert_eq!(
+            rows[inbox_pos + 1],
+            NavRow::MailFolder {
+                folder_id: "f-proj".into(),
+                display_name: "Projects".into(),
+                unread: 2,
+                is_virtual: false,
+                depth: 1,
+            }
+        );
+        assert_eq!(
+            rows[inbox_pos + 2],
+            NavRow::MailFolder {
+                folder_id: "f-2026".into(),
+                display_name: "2026".into(),
+                unread: 1,
+                is_virtual: false,
+                depth: 2,
+            }
+        );
+
+        // Korean "보낸 편지함" maps to Sent in FAVORITES and does not duplicate under FOLDERS.
+        assert!(rows.iter().any(|r| matches!(
+            r,
+            NavRow::MailFolder { folder_id, display_name, depth: 0, .. }
+            if folder_id == "f-sent" && display_name == "Sent"
+        )));
+
+        let folders_header_pos = rows
+            .iter()
+            .position(|r| matches!(r, NavRow::SectionHeader { label: "FOLDERS" }))
+            .expect("FOLDERS section missing");
+        let under_folders: Vec<&NavRow> = rows[folders_header_pos + 1..].iter().collect();
+        assert_eq!(under_folders.len(), 2);
+        assert!(matches!(
+            under_folders[0],
+            NavRow::MailFolder { folder_id, depth: 0, .. } if folder_id == "f-custom"
+        ));
+        assert!(matches!(
+            under_folders[1],
+            NavRow::MailFolder { folder_id, depth: 1, .. } if folder_id == "f-custom-child"
+        ));
+
+        // Verify indented rendering with right-aligned unread count.
+        let line = render_nav_row(&rows[inbox_pos + 1], 24, false, false, &ui);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(rendered.starts_with("   ↳ Projects"));
+        assert!(rendered.ends_with(" 2"));
+        assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 24);
+
+        // Verify hierarchical display paths helper.
+        let paths = folder_display_paths(&app.mail_folders);
+        assert_eq!(paths.get("f-2026").map(String::as_str), Some("받은 편지함 / Projects / 2026"));
+    }
 }

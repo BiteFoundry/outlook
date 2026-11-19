@@ -234,6 +234,7 @@ fn parse_message_blocks_uncached(
     }
 
     ctx.finalize_quoted_history();
+    unwrap_sole_quoted_history(&mut ctx.blocks);
 
     ctx.in_quoted_history = false;
     for att in attachments {
@@ -735,44 +736,101 @@ impl ParserContext {
     }
 
     fn linearize_table(&mut self, table_el: ElementRef<'_>, style: &TextStyleFlags) {
-        let mut walked_any_cell = false;
         for child in table_el.children() {
-            let Some(child_el) = ElementRef::wrap(child) else {
-                continue;
-            };
-            match child_el.value().name() {
-                "thead" | "tbody" | "tfoot" => {
-                    for row_node in child_el.children() {
-                        if let Some(row_el) = ElementRef::wrap(row_node) {
-                            if row_el.value().name() == "tr" {
-                                self.linearize_table_row(row_el, style);
-                                walked_any_cell = true;
+            match child.value() {
+                Node::Text(text) => {
+                    self.push_inline_text(text.text.as_ref(), style);
+                }
+                Node::Element(_) => {
+                    let Some(child_el) = ElementRef::wrap(child) else {
+                        continue;
+                    };
+                    let el = child_el.value();
+                    if is_ignored_noise_tag(el.name()) || has_display_none(el) {
+                        continue;
+                    }
+                    if !self.in_quoted_history && is_quoted_history_boundary(child_el) {
+                        self.flush_paragraph();
+                        self.in_quoted_history = true;
+                    }
+                    match el.name() {
+                        "thead" | "tbody" | "tfoot" => {
+                            for row_node in child_el.children() {
+                                match row_node.value() {
+                                    Node::Text(text) => {
+                                        self.push_inline_text(text.text.as_ref(), style);
+                                    }
+                                    Node::Element(_) => {
+                                        if let Some(row_el) = ElementRef::wrap(row_node) {
+                                            let rel = row_el.value();
+                                            if is_ignored_noise_tag(rel.name())
+                                                || has_display_none(rel)
+                                            {
+                                                continue;
+                                            }
+                                            if !self.in_quoted_history
+                                                && is_quoted_history_boundary(row_el)
+                                            {
+                                                self.flush_paragraph();
+                                                self.in_quoted_history = true;
+                                            }
+                                            if rel.name() == "tr" {
+                                                self.linearize_table_row(row_el, style);
+                                            } else {
+                                                self.handle_element(row_el, style);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
+                        "tr" => {
+                            self.linearize_table_row(child_el, style);
+                        }
+                        "caption" => {
+                            self.flush_paragraph();
+                            self.walk_children(child_el, style);
+                            self.flush_paragraph();
+                        }
+                        _ => {
+                            self.handle_element(child_el, style);
+                        }
                     }
-                }
-                "tr" => {
-                    self.linearize_table_row(child_el, style);
-                    walked_any_cell = true;
                 }
                 _ => {}
             }
         }
-        if !walked_any_cell {
-            self.walk_children(table_el, style);
-            self.flush_paragraph();
-        }
+        self.flush_paragraph();
     }
 
     fn linearize_table_row(&mut self, row_el: ElementRef<'_>, style: &TextStyleFlags) {
         for cell_node in row_el.children() {
-            let Some(cell_el) = ElementRef::wrap(cell_node) else {
-                continue;
-            };
-            if matches!(cell_el.value().name(), "td" | "th") && !has_display_none(cell_el.value()) {
-                self.flush_paragraph();
-                self.walk_children(cell_el, style);
-                self.flush_paragraph();
+            match cell_node.value() {
+                Node::Text(text) => {
+                    self.push_inline_text(text.text.as_ref(), style);
+                }
+                Node::Element(_) => {
+                    let Some(cell_el) = ElementRef::wrap(cell_node) else {
+                        continue;
+                    };
+                    let cel = cell_el.value();
+                    if is_ignored_noise_tag(cel.name()) || has_display_none(cel) {
+                        continue;
+                    }
+                    if !self.in_quoted_history && is_quoted_history_boundary(cell_el) {
+                        self.flush_paragraph();
+                        self.in_quoted_history = true;
+                    }
+                    if matches!(cel.name(), "td" | "th") {
+                        self.flush_paragraph();
+                        self.walk_children(cell_el, style);
+                        self.flush_paragraph();
+                    } else {
+                        self.handle_element(cell_el, style);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -826,7 +884,7 @@ impl ParserContext {
                     if tag == "th" {
                         th_count += 1;
                     }
-                    let cell_spans = trim_spans(self.collect_inline_spans(cell_el, style));
+                    let cell_spans = trim_spans(self.collect_quote_spans(cell_el, style));
                     cells.push(cell_spans);
                 }
             }
@@ -855,23 +913,29 @@ impl ParserContext {
     fn finalize_quoted_history(&mut self) {
         if !self.quoted_blocks.is_empty() {
             let quoted = std::mem::take(&mut self.quoted_blocks);
-            let line_count = count_blocks_lines(&quoted);
-            self.blocks.push(RichBlock::QuotedHistory {
-                line_count,
-                blocks: quoted,
-            });
-            return;
-        }
-
-        // Check for trailing quote chains or plain-text Outlook/Gmail reply headers at the end of `self.blocks`.
-        if let Some(split_idx) = find_trailing_quoted_split_index(&self.blocks) {
-            let quoted = self.blocks.split_off(split_idx);
-            if !quoted.is_empty() {
+            if has_visible_content(&self.blocks) {
                 let line_count = count_blocks_lines(&quoted);
                 self.blocks.push(RichBlock::QuotedHistory {
                     line_count,
                     blocks: quoted,
                 });
+            } else {
+                self.blocks.extend(quoted);
+            }
+            return;
+        }
+
+        // Check for trailing quote chains or plain-text Outlook/Gmail reply headers at the end of `self.blocks`.
+        if let Some(split_idx) = find_trailing_quoted_split_index(&self.blocks) {
+            if has_visible_content(&self.blocks[..split_idx]) {
+                let quoted = self.blocks.split_off(split_idx);
+                if !quoted.is_empty() {
+                    let line_count = count_blocks_lines(&quoted);
+                    self.blocks.push(RichBlock::QuotedHistory {
+                        line_count,
+                        blocks: quoted,
+                    });
+                }
             }
         }
     }
@@ -1034,6 +1098,41 @@ fn count_blocks_lines(blocks: &[RichBlock]) -> usize {
     plain.lines().count().max(blocks.len()).max(1)
 }
 
+fn block_has_visible_content(block: &RichBlock) -> bool {
+    match block {
+        RichBlock::Paragraph(spans)
+        | RichBlock::Heading { spans, .. }
+        | RichBlock::Quote(spans) => !spans_are_blank(spans),
+        RichBlock::CodeBlock { code, .. } => !code.trim().is_empty(),
+        RichBlock::BulletList(items) => items.iter().any(|item| !spans_are_blank(item)),
+        RichBlock::Table { headers, rows } => !headers.is_empty() || !rows.is_empty(),
+        RichBlock::AttachmentChip { .. } | RichBlock::InlineImageChip { .. } => true,
+        RichBlock::Divider | RichBlock::QuotedHistory { .. } => false,
+    }
+}
+
+fn has_visible_content(blocks: &[RichBlock]) -> bool {
+    blocks.iter().any(block_has_visible_content)
+}
+
+fn unwrap_sole_quoted_history(blocks: &mut Vec<RichBlock>) {
+    while !has_visible_content(blocks)
+        && blocks
+            .iter()
+            .any(|b| matches!(b, RichBlock::QuotedHistory { .. }))
+    {
+        let prev = std::mem::take(blocks);
+        for b in prev {
+            match b {
+                RichBlock::QuotedHistory { blocks: inner, .. } => {
+                    blocks.extend(inner);
+                }
+                other => blocks.push(other),
+            }
+        }
+    }
+}
+
 fn find_trailing_quoted_split_index(blocks: &[RichBlock]) -> Option<usize> {
     if blocks.is_empty() {
         return None;
@@ -1044,15 +1143,13 @@ fn find_trailing_quoted_split_index(blocks: &[RichBlock]) -> Option<usize> {
         if let RichBlock::Paragraph(spans) = block {
             let text = spans_to_plain(spans);
             let trimmed = text.trim();
-            if trimmed.starts_with("-----Original Message-----")
-                || (trimmed.contains("From:") && (trimmed.contains("Sent:") || trimmed.contains("Date:")))
-            {
-                // Avoid folding if it's the very first block and there's nothing before it?
-                // Even if an email starts with a forwarded block, folding after non-empty lead or >0 blocks is good;
-                // require either idx > 0 or >= 2 blocks so a 1-line "From: HR" greeting isn't folded.
-                if idx > 0 || blocks.len() >= 2 {
-                    return Some(idx);
-                }
+            let is_en_hdr = trimmed.starts_with("-----Original Message-----")
+                || (trimmed.contains("From:")
+                    && (trimmed.contains("Sent:") || trimmed.contains("Date:")));
+            let is_ko_hdr = trimmed.contains("보낸 사람:")
+                && (trimmed.contains("보낸 날짜:") || trimmed.contains("제목:"));
+            if (is_en_hdr || is_ko_hdr) && has_visible_content(&blocks[..idx]) {
+                return Some(idx);
             }
         }
     }
@@ -1117,11 +1214,13 @@ fn is_quoted_history_boundary(el_ref: ElementRef<'_>) -> bool {
                 tail_text.push_str(t.text.as_ref());
             }
         }
-        if tail_text.contains("From:")
+        let has_en_hdr = tail_text.contains("From:")
             && (tail_text.contains("Sent:")
                 || tail_text.contains("Date:")
-                || tail_text.contains("Subject:"))
-        {
+                || tail_text.contains("Subject:"));
+        let has_ko_hdr = tail_text.contains("보낸 사람:")
+            && (tail_text.contains("보낸 날짜:") || tail_text.contains("제목:"));
+        if has_en_hdr || has_ko_hdr {
             return true;
         }
     }
@@ -1208,12 +1307,48 @@ fn has_nested_table(table_el: ElementRef<'_>) -> bool {
     })
 }
 
+fn row_has_th_or_block_td(row_el: ElementRef<'_>, has_th: &mut bool, has_block_td: &mut bool) {
+    for cell in row_el.children().filter_map(ElementRef::wrap) {
+        match cell.value().name() {
+            "th" => *has_th = true,
+            "td" => {
+                if cell.descendants().skip(1).any(|desc| {
+                    ElementRef::wrap(desc).is_some_and(|el| {
+                        matches!(
+                            el.value().name(),
+                            "div"
+                                | "p"
+                                | "ul"
+                                | "ol"
+                                | "blockquote"
+                                | "pre"
+                                | "h1"
+                                | "h2"
+                                | "h3"
+                                | "h4"
+                                | "h5"
+                                | "h6"
+                                | "hr"
+                                | "table"
+                        )
+                    })
+                }) {
+                    *has_block_td = true;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn should_linearize_table(table_el: ElementRef<'_>) -> bool {
     if is_presentation_role(table_el.value()) || has_nested_table(table_el) {
         return true;
     }
 
     let mut max_cols = 0usize;
+    let mut has_th_or_thead = false;
+    let mut has_block_td = false;
     for child in table_el.children() {
         let Some(child_el) = ElementRef::wrap(child) else {
             continue;
@@ -1223,23 +1358,28 @@ fn should_linearize_table(table_el: ElementRef<'_>) -> bool {
         }
         match child_el.value().name() {
             "thead" | "tbody" | "tfoot" => {
+                if child_el.value().name() == "thead" {
+                    has_th_or_thead = true;
+                }
                 for row_el in child_el.children().filter_map(ElementRef::wrap) {
                     if row_el.value().name() == "tr" {
                         if is_presentation_role(row_el.value()) {
                             return true;
                         }
                         max_cols = max_cols.max(count_row_columns(row_el));
+                        row_has_th_or_block_td(row_el, &mut has_th_or_thead, &mut has_block_td);
                     }
                 }
             }
             "tr" => {
                 max_cols = max_cols.max(count_row_columns(child_el));
+                row_has_th_or_block_td(child_el, &mut has_th_or_thead, &mut has_block_td);
             }
             _ => {}
         }
     }
 
-    max_cols <= 1
+    max_cols <= 1 || (!has_th_or_thead && has_block_td)
 }
 
 fn count_row_columns(row_el: ElementRef<'_>) -> usize {
@@ -1648,5 +1788,79 @@ mod tests {
             }
             other => panic!("expected QuotedHistory, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unwraps_quoted_history_when_no_visible_body_precedes_it() {
+        let fwd_div_only = r#"
+            <div id="divRplyFwdMsg">
+                <b>From:</b> Alice &lt;alice@example.com&gt;<br>
+                <b>Sent:</b> Monday, Nov 18, 2026<br>
+            </div>
+            <div><p>Forwarded corporate message body</p></div>
+        "#;
+        let blocks = parse_message_blocks(fwd_div_only, &[]);
+        assert!(
+            !blocks
+                .iter()
+                .any(|b| matches!(b, RichBlock::QuotedHistory { .. })),
+            "expected sole QuotedHistory to unwrap, got {blocks:?}"
+        );
+        let plain = blocks_to_plain(&blocks);
+        assert!(plain.contains("From: Alice"));
+        assert!(plain.contains("Forwarded corporate message body"));
+
+        let ko_fwd = r#"
+            <hr tabindex="-1">
+            <p>보낸 사람: 김철수<br>보낸 날짜: 2026-11-18<br>제목: 공유 드립니다</p>
+            <p>본문 내용이 숨겨지면 안 됩니다.</p>
+        "#;
+        let ko_blocks = parse_message_blocks(ko_fwd, &[]);
+        assert!(
+            !ko_blocks
+                .iter()
+                .any(|b| matches!(b, RichBlock::QuotedHistory { .. })),
+            "expected Korean forwarded body not to collapse into QuotedHistory: {ko_blocks:?}"
+        );
+        let ko_plain = blocks_to_plain(&ko_blocks);
+        assert!(ko_plain.contains("보낸 사람: 김철수"));
+        assert!(ko_plain.contains("본문 내용이 숨겨지면 안 됩니다."));
+
+        let gmail_only = r#"<blockquote class="gmail_quote"><p>Entire reply wrapped in blockquote</p></blockquote>"#;
+        let gblocks = parse_message_blocks(gmail_only, &[]);
+        assert!(
+            !gblocks
+                .iter()
+                .any(|b| matches!(b, RichBlock::QuotedHistory { .. })),
+            "expected blockquote-only body to be visible: {gblocks:?}"
+        );
+        assert!(blocks_to_plain(&gblocks).contains("Entire reply wrapped in blockquote"));
+    }
+
+    #[test]
+    fn deeply_nested_corporate_layout_tables_preserve_all_text() {
+        let html = r#"
+            <table width="100%">
+                <tr><td>
+                    <table width="600">
+                        <tr>
+                            <td width="20"> </td>
+                            <td>
+                                <div><h3>Notice</h3></div>
+                                <table>
+                                    <tr><td>
+                                        <p>Deeply nested corporate content</p>
+                                    </td></tr>
+                                </table>
+                            </td>
+                        </tr>
+                    </table>
+                </td></tr>
+            </table>
+        "#;
+        let blocks = parse_message_blocks(html, &[]);
+        let plain = blocks_to_plain(&blocks);
+        assert!(plain.contains("Notice"));
+        assert!(plain.contains("Deeply nested corporate content"));
     }
 }

@@ -286,6 +286,7 @@ pub fn draw_list(
 
     let list_focused = ui.focus() == Focus::List;
     let width = list_area.width as usize;
+    let is_sent_or_drafts = is_sent_or_drafts_folder(app);
 
     let mut y = list_area.y;
     for (row_idx, row) in rows.iter().enumerate().skip(skip).take(vis_rows) {
@@ -310,14 +311,30 @@ pub fn draw_list(
         };
 
         if row_height == 2 && y + 1 < list_area.bottom() {
-            let l1 = format_cozy_row_line1(msg, row, width, theme, bg_style, is_selected && list_focused);
+            let l1 = format_cozy_row_line1(
+                msg,
+                row,
+                width,
+                theme,
+                bg_style,
+                is_selected && list_focused,
+                is_sent_or_drafts,
+            );
             let l2 = format_cozy_row_line2(msg, row, width, theme, bg_style);
             let rect = Rect::new(list_area.x, y, list_area.width, 2);
             frame.render_widget(Paragraph::new(vec![l1, l2]).style(bg_style), rect);
             hitmap.add(rect, HitTarget::ListItem(row_idx));
             y = y.saturating_add(2);
         } else {
-            let l1 = format_compact_row(msg, row, width, theme, bg_style, is_selected && list_focused);
+            let l1 = format_compact_row(
+                msg,
+                row,
+                width,
+                theme,
+                bg_style,
+                is_selected && list_focused,
+                is_sent_or_drafts,
+            );
             let rect = Rect::new(list_area.x, y, list_area.width, 1);
             frame.render_widget(Paragraph::new(l1).style(bg_style), rect);
             hitmap.add(rect, HitTarget::ListItem(row_idx));
@@ -398,6 +415,33 @@ fn draw_list_header(
     }
 }
 
+fn is_sent_or_drafts_folder(app: &AppState) -> bool {
+    if app.active_folder_id.eq_ignore_ascii_case("sentitems")
+        || app.active_folder_id.eq_ignore_ascii_case("drafts")
+    {
+        return true;
+    }
+    app.mail_folders
+        .iter()
+        .find(|f| f.id == app.active_folder_id)
+        .and_then(|f| f.well_known_name.as_deref())
+        .is_some_and(|w| {
+            w.eq_ignore_ascii_case("sentitems") || w.eq_ignore_ascii_case("drafts")
+        })
+}
+
+fn format_row_correspondent(msg: &MailMessage, is_sent_or_drafts: bool) -> String {
+    if is_sent_or_drafts || msg.is_draft {
+        if let Some(first) = msg.to_recipients.first() {
+            let recip = first.short_display();
+            if !recip.trim().is_empty() {
+                return format!("To: {recip}");
+            }
+        }
+    }
+    msg.from_short()
+}
+
 fn format_cozy_row_line1(
     msg: &MailMessage,
     row: &MailListRow,
@@ -405,6 +449,7 @@ fn format_cozy_row_line1(
     theme: &Theme,
     bg_style: Style,
     is_sel_focused: bool,
+    is_sent_or_drafts: bool,
 ) -> Line<'static> {
     let gutter = if is_sel_focused { "▎" } else { " " };
     let dot = if row.unread_count > 0 { "● " } else { "  " };
@@ -418,7 +463,7 @@ fn format_cozy_row_line1(
 
     let time = format_short_time(&msg.received_at);
     let time_w = UnicodeWidthStr::width(time.as_str());
-    let sender = msg.from_short();
+    let sender = format_row_correspondent(msg, is_sent_or_drafts);
     let max_sender = width.saturating_sub(3 + time_w + 2);
     let sender_trunc = truncate(&sender, max_sender);
     let sender_w = UnicodeWidthStr::width(sender_trunc.as_str());
@@ -494,6 +539,7 @@ fn format_compact_row(
     theme: &Theme,
     bg_style: Style,
     is_sel_focused: bool,
+    is_sent_or_drafts: bool,
 ) -> Line<'static> {
     let gutter = if is_sel_focused { "▎" } else { " " };
     let dot = if row.unread_count > 0 { "● " } else { "  " };
@@ -512,8 +558,10 @@ fn format_compact_row(
     let right = format!("{flag_badge}{thread_badge} {time} ");
     let right_w = UnicodeWidthStr::width(right.as_str());
 
-    let sender = truncate(&msg.from_short(), 12);
-    let sender_padded = format!("{sender:<12}");
+    let correspondent = format_row_correspondent(msg, is_sent_or_drafts);
+    let sender = truncate(&correspondent, 12);
+    let sender_w = UnicodeWidthStr::width(sender.as_str());
+    let sender_padded = format!("{sender}{}", " ".repeat(12usize.saturating_sub(sender_w)));
     let subj_max = width.saturating_sub(3 + 12 + 3 + right_w);
     let subj = truncate(msg.effective_subject(), subj_max);
     let used = 3 + UnicodeWidthStr::width(sender_padded.as_str()) + 3 + UnicodeWidthStr::width(subj.as_str()) + right_w;
@@ -924,14 +972,16 @@ pub fn build_reader_lines(
         ))));
 
         // Body content
-        if !msg.body_loaded && msg.body_html.trim().is_empty() && msg.body_plain.trim().is_empty() {
-            if !msg.preview.trim().is_empty() {
-                for line_str in msg.preview.lines() {
-                    out.push(RenderedLine::plain(Line::from(vec![
-                        Span::raw("  "),
-                        Span::raw(truncate(line_str, width.saturating_sub(4))),
-                    ])));
-                }
+        let body_wrap_w = width.saturating_sub(4).max(1);
+        if !msg.body_loaded && msg.body_html.trim().is_empty() {
+            let preview_text = if !msg.preview.trim().is_empty() {
+                msg.preview.as_str()
+            } else {
+                msg.body_plain.as_str()
+            };
+            if !preview_text.trim().is_empty() {
+                render_wrapped_plain_lines(&mut out, preview_text, body_wrap_w);
+                out.push(RenderedLine::plain(Line::default()));
             }
             out.push(RenderedLine::plain(Line::from(Span::styled(
                 "  Loading full message…",
@@ -940,8 +990,9 @@ pub fn build_reader_lines(
         } else if !msg.body_html.trim().is_empty() {
             let blocks = parser::parse_message_blocks_arc(&msg.body_html, &msg.attachments);
             let quote_expanded = expanded_quoted.contains(&msg.id);
+            let mut body_lines = Vec::new();
             render_email_blocks(
-                &mut out,
+                &mut body_lines,
                 &blocks,
                 msg,
                 t_pos,
@@ -953,18 +1004,30 @@ pub fn build_reader_lines(
                 image_cache,
                 thumb_dims,
             );
+            let has_visible_body = !blocks.is_empty()
+                && body_lines.iter().any(|l| {
+                    l.line
+                        .spans
+                        .iter()
+                        .any(|s| !s.content.trim().is_empty())
+                });
+            if has_visible_body {
+                out.extend(body_lines);
+            } else {
+                let fallback = if msg.body_plain.trim().is_empty() {
+                    msg.preview.as_str()
+                } else {
+                    msg.body_plain.as_str()
+                };
+                render_wrapped_plain_lines(&mut out, fallback, body_wrap_w);
+            }
         } else {
             let plain = if msg.body_plain.trim().is_empty() {
                 msg.preview.as_str()
             } else {
                 msg.body_plain.as_str()
             };
-            for line_str in plain.lines() {
-                out.push(RenderedLine::plain(Line::from(vec![
-                    Span::raw("  "),
-                    Span::raw(truncate(line_str, width.saturating_sub(4))),
-                ])));
-            }
+            render_wrapped_plain_lines(&mut out, plain, body_wrap_w);
         }
     }
 
@@ -1584,6 +1647,91 @@ pub fn truncate(text: &str, width: usize) -> String {
     out
 }
 
+/// Wraps a single plain-text line to at most `max_width` display columns,
+/// preferring word boundaries when available and splitting long CJK/URL runs cleanly.
+pub fn wrap_plain_text_line(line: &str, max_width: usize) -> Vec<String> {
+    let limit = max_width.max(1);
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    let mut last_break: Option<usize> = None;
+    let mut saw_non_ws = false;
+
+    for raw_ch in line.chars() {
+        if raw_ch == '\r' {
+            continue;
+        }
+        let repeat_count = if raw_ch == '\t' { 4 } else { 1 };
+        let ch = if raw_ch == '\t' { ' ' } else { raw_ch };
+
+        for _ in 0..repeat_count {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            let is_ws = ch.is_whitespace();
+
+            if cur_w + cw > limit && !cur.is_empty() {
+                if is_ws {
+                    if saw_non_ws {
+                        out.push(cur.trim_end().to_string());
+                        cur.clear();
+                        cur_w = 0;
+                        last_break = None;
+                        saw_non_ws = false;
+                        continue;
+                    }
+                    out.push(std::mem::take(&mut cur));
+                    cur_w = 0;
+                    last_break = None;
+                } else if let Some(break_idx) = last_break {
+                    let prefix = cur[..break_idx].trim_end().to_string();
+                    let remainder = cur[break_idx..].trim_start().to_string();
+                    out.push(prefix);
+                    cur = remainder;
+                    cur_w = UnicodeWidthStr::width(cur.as_str());
+                    last_break = None;
+                    saw_non_ws = !cur.is_empty();
+                    if !cur.is_empty() && cur_w + cw > limit {
+                        out.push(std::mem::take(&mut cur));
+                        cur_w = 0;
+                        saw_non_ws = false;
+                    }
+                } else {
+                    out.push(std::mem::take(&mut cur));
+                    cur_w = 0;
+                    last_break = None;
+                    saw_non_ws = false;
+                }
+            }
+
+            if is_ws {
+                if saw_non_ws {
+                    last_break = Some(cur.len());
+                }
+            } else {
+                saw_non_ws = true;
+            }
+            cur.push(ch);
+            cur_w += cw;
+        }
+    }
+
+    if !cur.is_empty() || out.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn render_wrapped_plain_lines(out: &mut Vec<RenderedLine>, text: &str, max_width: usize) {
+    let wrap_w = max_width.max(1);
+    for line_str in text.lines() {
+        for wrapped in wrap_plain_text_line(line_str, wrap_w) {
+            out.push(RenderedLine::plain(Line::from(vec![
+                Span::raw("  "),
+                Span::raw(wrapped),
+            ])));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1713,5 +1861,145 @@ mod tests {
             &theme,
         );
         assert!(table_out.len() >= 4);
+    }
+
+    fn lines_to_text(lines: &[RenderedLine]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                l.line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn unhydrated_message_wraps_preview_and_shows_loading_indicator() {
+        let mut msg = sample_mail("m-unhydrated", "c-unhydrated", "");
+        msg.body_loaded = false;
+        msg.meeting_request = None;
+        msg.preview = "This is a long preview snippet from header-only sync that should wrap cleanly across lines rather than getting truncated.".into();
+        msg.body_plain = msg.preview.clone();
+
+        let theme = Theme::default();
+        let expanded = std::collections::HashSet::new();
+        let lines = build_reader_lines(&[msg], &expanded, &expanded, &theme, 44, None, (24, 8));
+        let rendered = lines_to_text(&lines);
+
+        assert!(rendered.contains("This is a long preview snippet"));
+        assert!(rendered.contains("rather than getting"));
+        assert!(rendered.contains("truncated."));
+        assert!(rendered.contains("Loading full message…"));
+    }
+
+    #[test]
+    fn plain_text_body_wraps_long_ascii_and_cjk_without_truncation() {
+        let ascii = "Please review https://example.com/very/long/path/to/the/quarterly/report and share feedback.";
+        let wrapped_ascii = wrap_plain_text_line(ascii, 24);
+        assert!(wrapped_ascii.len() >= 4);
+        assert_eq!(wrapped_ascii[0], "Please review");
+        assert!(wrapped_ascii.concat().contains("quarterly/report"));
+        assert!(wrapped_ascii.last().unwrap().contains("feedback."));
+        for w in &wrapped_ascii {
+            assert!(UnicodeWidthStr::width(w.as_str()) <= 24);
+        }
+
+        let korean = "안녕하세요반갑습니다오늘오후세시에회의가있으니참석부탁드립니다감사합니다";
+        let wrapped_ko = wrap_plain_text_line(korean, 16);
+        assert!(wrapped_ko.len() >= 4);
+        assert_eq!(wrapped_ko.concat(), korean);
+        for w in &wrapped_ko {
+            assert!(UnicodeWidthStr::width(w.as_str()) <= 16);
+        }
+
+        let mut msg = sample_mail("m-plain", "c-plain", "");
+        msg.body_loaded = true;
+        msg.meeting_request = None;
+        msg.body_plain = format!("{ascii}\n{korean}");
+        let theme = Theme::default();
+        let expanded = std::collections::HashSet::new();
+        let lines = build_reader_lines(&[msg], &expanded, &expanded, &theme, 32, None, (24, 8));
+        let rendered = lines_to_text(&lines);
+
+        let body_lines: Vec<&str> = rendered
+            .lines()
+            .skip_while(|l| !l.contains('─'))
+            .skip(1)
+            .collect();
+        for line in &body_lines {
+            assert!(
+                UnicodeWidthStr::width(*line) <= 32,
+                "rendered body line exceeded width 32: {line:?}"
+            );
+        }
+        let cjk_lines: Vec<&str> = body_lines
+            .iter()
+            .copied()
+            .filter(|l| l.chars().any(|c| ('\u{AC00}'..='\u{D7AF}').contains(&c)))
+            .collect();
+        assert!(
+            cjk_lines.len() >= 2,
+            "expected CJK run to wrap across multiple lines, got: {cjk_lines:?}"
+        );
+        let joined_body: String = body_lines.iter().map(|l| l.trim()).collect();
+        let joined_cjk: String = cjk_lines.iter().map(|l| l.trim()).collect();
+
+        assert!(rendered.contains("share feedback."));
+        assert!(joined_body.contains("참석부탁드립니다감사합니다"));
+        assert_eq!(joined_cjk, korean);
+    }
+
+    #[test]
+    fn html_body_falls_back_to_plain_when_blocks_are_empty_or_hidden() {
+        let mut msg = sample_mail(
+            "m-empty-html",
+            "c-empty-html",
+            r#"<div style="display:none">Hidden preheader</div>"#,
+        );
+        msg.meeting_request = None;
+        msg.body_plain = "Fallback plain body text must still render.".into();
+
+        let theme = Theme::default();
+        let expanded = std::collections::HashSet::new();
+        let lines = build_reader_lines(&[msg], &expanded, &expanded, &theme, 50, None, (24, 8));
+        let rendered = lines_to_text(&lines);
+
+        assert!(rendered.contains("Fallback plain body text must still render."));
+    }
+
+    #[test]
+    fn sent_and_drafts_rows_display_to_recipient_with_fallback() {
+        let msg = sample_mail("m-sent", "c-sent", "<p>Hi</p>");
+        let row = MailListRow {
+            primary_msg_idx: 0,
+            thread_msg_indices: vec![0],
+            count: 1,
+            unread_count: 0,
+            any_flagged: false,
+            any_attachments: false,
+        };
+        let theme = Theme::default();
+        let cozy = format_cozy_row_line1(&msg, &row, 60, &theme, Style::default(), false, true);
+        let cozy_str: String = cozy.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(cozy_str.contains("To: Bob"), "cozy row was: {cozy_str:?}");
+
+        let compact = format_compact_row(&msg, &row, 60, &theme, Style::default(), false, true);
+        let compact_str: String = compact.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(compact_str.contains("To: Bob"), "compact row was: {compact_str:?}");
+
+        // Non-sent folder falls back to sender
+        let inbox_cozy =
+            format_cozy_row_line1(&msg, &row, 60, &theme, Style::default(), false, false);
+        let inbox_str: String = inbox_cozy
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(inbox_str.contains("Alice"));
+        assert!(!inbox_str.contains("To: Bob"));
     }
 }

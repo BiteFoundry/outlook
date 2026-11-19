@@ -1632,7 +1632,7 @@ async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
         .await
         .unwrap();
     assert_eq!(openapi["openapi"], "3.1.0");
-    assert_eq!(openapi["info"]["version"], "0.1.0");
+    assert_eq!(openapi["info"]["version"], env!("CARGO_PKG_VERSION"));
     assert!(openapi["paths"]["/v1/mail/folders"].is_object());
     assert!(openapi["paths"]["/v1/mail/messages"].is_object());
     assert!(openapi["paths"]["/v1/calendar/events"].is_object());
@@ -1714,7 +1714,7 @@ async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
     .await
     .unwrap();
     assert_eq!(init_resp["result"]["serverInfo"]["name"], "outlook");
-    assert_eq!(init_resp["result"]["serverInfo"]["version"], "0.1.0");
+    assert_eq!(init_resp["result"]["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
 
     assert!(mcp::handle_rpc_line(
         &cfg,

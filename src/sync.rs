@@ -381,10 +381,11 @@ fn pick_default_todo_list(lists: &[TodoList]) -> Option<&TodoList> {
 /// Best-effort per optional capability so missing scopes never abort bootstrap.
 pub async fn bootstrap_outlook(graph: &GraphClient, storage: &Storage) -> Result<()> {
     let (start_iso, end_iso) = default_calendar_window();
-    let (me_res, folders_res, inbox_res, events_res, contacts_res, lists_res) = tokio::join!(
+    let (me_res, folders_res, inbox_res, sent_res, events_res, contacts_res, lists_res) = tokio::join!(
         graph.get_me(),
         graph.list_mail_folders(),
         graph.list_mail_messages("inbox", 50, true),
+        graph.list_mail_messages("sentitems", 30, true),
         graph.list_calendar_view(&start_iso, &end_iso, 100),
         graph.list_contacts(100),
         graph.list_todo_lists(),
@@ -403,6 +404,16 @@ pub async fn bootstrap_outlook(graph: &GraphClient, storage: &Storage) -> Result
             Ok(())
         })
         .await?;
+    }
+
+    if let Ok(sent_msgs) = sent_res {
+        if !sent_msgs.is_empty() {
+            let _ = run_storage(storage, move |st| {
+                st.upsert_mail_messages(&sent_msgs)?;
+                Ok(())
+            })
+            .await;
+        }
     }
 
     if let Ok(events) = events_res {
@@ -452,6 +463,8 @@ pub fn spawn_sync_engine(
     let fast_event_tx = event_tx.clone();
     let mut fast_shutdown_rx = shutdown_rx.clone();
     let fast_shared = Arc::clone(&shared);
+    let in_flight_hydrations: Arc<std::sync::Mutex<HashSet<String>>> =
+        Arc::new(std::sync::Mutex::new(HashSet::new()));
     tokio::spawn(async move {
         let mut active_tick = time::interval(Duration::from_millis(active_ms));
         active_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -498,19 +511,15 @@ pub fn spawn_sync_engine(
                         Some(SyncCommand::HydrateMessage { message_id }) => {
                             fast_shared.record_activity(Instant::now());
                             fast_shared.clear_auth_pause();
-                            match hydrate_message_if_needed(&message_id, true, &fast_graph, &fast_storage, &fast_event_tx).await {
-                                Ok(()) => emit_recovered_if_needed(&mut active_err_backoff, &fast_event_tx),
-                                Err(err) => {
-                                    handle_quiet_mail_error(
-                                        &err,
-                                        None,
-                                        &fast_shared,
-                                        &mut restricted_folders,
-                                        &mut active_err_backoff,
-                                        &fast_event_tx,
-                                    );
-                                }
-                            }
+                            spawn_hydrate_message(
+                                message_id,
+                                true,
+                                &fast_graph,
+                                &fast_storage,
+                                &fast_event_tx,
+                                &fast_shared,
+                                &in_flight_hydrations,
+                            );
                         }
                         Some(SyncCommand::SyncFolder { folder_id }) => {
                             fast_shared.record_activity(Instant::now());
@@ -581,14 +590,15 @@ pub fn spawn_sync_engine(
 
                     if !fast_shared.is_auth_paused(now) {
                         if let (true, Some(mid)) = (msg_changed, focus.active_message_id.as_deref()) {
-                            let _ = hydrate_message_if_needed(
-                                mid,
+                            spawn_hydrate_message(
+                                mid.to_string(),
                                 false,
                                 &fast_graph,
                                 &fast_storage,
                                 &fast_event_tx,
-                            )
-                            .await;
+                                &fast_shared,
+                                &in_flight_hydrations,
+                            );
                         }
                         if let (true, Some(fid)) = (folder_changed, focus.active_folder_id.as_deref()) {
                             if !restricted_folders.contains(fid) {
@@ -893,6 +903,58 @@ fn handle_quiet_mail_error(
     }
 }
 
+struct InFlightHydrationGuard {
+    key: String,
+    set: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+impl Drop for InFlightHydrationGuard {
+    fn drop(&mut self) {
+        let mut guard = self.set.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove(&self.key);
+    }
+}
+
+fn spawn_hydrate_message(
+    message_id: String,
+    force: bool,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    shared: &Arc<SyncSharedState>,
+    in_flight: &Arc<std::sync::Mutex<HashSet<String>>>,
+) {
+    let trimmed = message_id.trim().to_string();
+    if trimmed.is_empty() {
+        return;
+    }
+    {
+        let mut guard = in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if !guard.insert(trimmed.clone()) {
+            return;
+        }
+    }
+
+    let graph = graph.clone();
+    let storage = storage.clone();
+    let event_tx = event_tx.clone();
+    let shared = Arc::clone(shared);
+    let in_flight = Arc::clone(in_flight);
+    tokio::spawn(async move {
+        let _guard = InFlightHydrationGuard {
+            key: trimmed.clone(),
+            set: in_flight,
+        };
+        if let Err(err) =
+            hydrate_message_if_needed(&trimmed, force, &graph, &storage, &event_tx).await
+        {
+            if classify_sync_error(&err) == SyncErrorKind::Unauthorized401 {
+                shared.pause_auth(Instant::now(), Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS));
+            }
+        }
+    });
+}
+
 async fn hydrate_message_if_needed(
     message_id: &str,
     force: bool,
@@ -1041,6 +1103,62 @@ async fn load_older_mail_page(
     Ok(())
 }
 
+async fn sync_mail_folder_via_page(
+    folder_id: &str,
+    had_initial: bool,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    is_periodic: bool,
+) -> Result<()> {
+    let (page_msgs, next_link) = graph
+        .list_mail_messages_page(folder_id, 50, None, true)
+        .await?;
+    let fid_clone = folder_id.to_string();
+    let hist_scope = format!("mail_history:{folder_id}");
+    let delta_scope = format!("mail_delta:{folder_id}");
+    let (changed_rows, notify_candidate, stored_msgs) = run_storage(storage, move |st| {
+        let notify = if had_initial {
+            find_new_unread_mail_candidate(&fid_clone, st, &page_msgs)
+        } else {
+            None
+        };
+        let changed = st.upsert_mail_messages(&page_msgs)?;
+        if st.get_sync_cursor(&hist_scope)?.is_none() {
+            st.upsert_sync_cursor(&SyncCursor {
+                scope_key: hist_scope,
+                delta_link: None,
+                history_next_link: next_link.or_else(|| Some(HISTORY_EOF_MARKER.to_string())),
+                last_synced_at: chrono::Utc::now().to_rfc3339(),
+            })?;
+        }
+        if st.get_sync_cursor(&delta_scope)?.is_none() {
+            st.upsert_sync_cursor(&SyncCursor {
+                scope_key: delta_scope,
+                delta_link: None,
+                history_next_link: None,
+                last_synced_at: chrono::Utc::now().to_rfc3339(),
+            })?;
+        }
+        let list = if changed > 0 || !is_periodic {
+            st.list_mail_messages(Some(&fid_clone), false, false, false, 100)?
+        } else {
+            Vec::new()
+        };
+        Ok((changed, notify, list))
+    })
+    .await?;
+
+    if !is_periodic || changed_rows > 0 {
+        let _ = event_tx.send(CoreEvent::MailMessagesUpdated {
+            folder_id: folder_id.to_string(),
+            messages: stored_msgs,
+            notify_candidate,
+        });
+    }
+    Ok(())
+}
+
 async fn sync_mail_folder(
     folder_id: &str,
     graph: &GraphClient,
@@ -1059,12 +1177,28 @@ async fn sync_mail_folder(
     .await?;
 
     let had_initial = prev_cursor.is_some() || existing_count > 0;
-    let delta_res = graph
-        .delta_mail_messages(
+    let existing_delta_link = prev_cursor
+        .as_ref()
+        .and_then(|c| c.delta_link.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    // Initial folder load (and any refresh without an active delta token) uses fast single-page
+    // listing instead of unbounded `/messages/delta`, avoiding Lane 1 starvation on large mailboxes.
+    let Some(delta_link) = existing_delta_link else {
+        return sync_mail_folder_via_page(
             folder_id,
-            prev_cursor.as_ref().and_then(|c| c.delta_link.as_deref()),
-            50,
+            had_initial,
+            graph,
+            storage,
+            event_tx,
+            is_periodic,
         )
+        .await;
+    };
+
+    let delta_res = graph
+        .delta_mail_messages(folder_id, Some(delta_link), 50)
         .await;
 
     let (incoming, deleted_ids, new_delta_link) = match delta_res {
@@ -1085,46 +1219,27 @@ async fn sync_mail_folder(
             })
             .await;
 
-            let (page_msgs, next_link) = graph
-                .list_mail_messages_page(folder_id, 50, None, true)
-                .await?;
-            let fid_clone = folder_id.to_string();
-            let hist_scope = format!("mail_history:{folder_id}");
-            let (changed_rows, notify_candidate, stored_msgs) = run_storage(storage, move |st| {
-                let notify = if had_initial {
-                    find_new_unread_mail_candidate(&fid_clone, st, &page_msgs)
-                } else {
-                    None
-                };
-                let changed = st.upsert_mail_messages(&page_msgs)?;
-                if st.get_sync_cursor(&hist_scope)?.is_none() {
-                    st.upsert_sync_cursor(&SyncCursor {
-                        scope_key: hist_scope,
-                        delta_link: None,
-                        history_next_link: next_link.or_else(|| Some(HISTORY_EOF_MARKER.to_string())),
-                        last_synced_at: chrono::Utc::now().to_rfc3339(),
-                    })?;
-                }
-                let list = st.list_mail_messages(Some(&fid_clone), false, false, false, 100)?;
-                Ok((changed, notify, list))
-            })
-            .await?;
-
-            if !is_periodic || changed_rows > 0 {
-                let _ = event_tx.send(CoreEvent::MailMessagesUpdated {
-                    folder_id: folder_id.to_string(),
-                    messages: stored_msgs,
-                    notify_candidate,
-                });
-            }
-            return Ok(());
+            return sync_mail_folder_via_page(
+                folder_id,
+                had_initial,
+                graph,
+                storage,
+                event_tx,
+                is_periodic,
+            )
+            .await;
         }
         Err(err) => return Err(err),
     };
 
     let fid_clone = folder_id.to_string();
-    let effective_delta = new_delta_link
-        .or_else(|| prev_cursor.as_ref().and_then(|c| c.delta_link.clone()));
+    let effective_delta = new_delta_link.or_else(|| {
+        if incoming.is_empty() && deleted_ids.is_empty() {
+            prev_cursor.as_ref().and_then(|c| c.delta_link.clone())
+        } else {
+            None
+        }
+    });
     let hist_link = prev_cursor.and_then(|c| c.history_next_link);
     let had_deleted = !deleted_ids.is_empty();
 
@@ -1820,6 +1935,7 @@ mod tests {
         let fail_mode = Arc::new(AtomicBool::new(true));
         let fail_c1 = Arc::clone(&fail_mode);
         let fail_c2 = Arc::clone(&fail_mode);
+        let fail_c3 = Arc::clone(&fail_mode);
 
         let app = Router::new()
             .route(
@@ -1845,6 +1961,25 @@ mod tests {
                                         "totalItemCount": 0
                                     }]
                                 })),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/inbox/messages",
+                get(move || {
+                    let should_fail = fail_c3.load(Ordering::SeqCst);
+                    async move {
+                        if should_fail {
+                            (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(serde_json::json!({ "error": { "code": "ServiceUnavailable", "message": "busy" } })),
+                            )
+                        } else {
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({ "value": [] })),
                             )
                         }
                     }
@@ -1993,5 +2128,245 @@ mod tests {
         let cand = find_new_unread_mail_candidate("inbox", &storage, &incoming).unwrap();
         assert_eq!(cand.item_id, "m-new");
         assert_eq!(cand.subject, "Alert");
+    }
+
+    #[tokio::test]
+    async fn test_sync_mail_folder_initial_uses_fast_page_without_delta() {
+        use axum::{routing::get, Json, Router};
+        use std::sync::atomic::AtomicUsize;
+
+        let delta_hits = Arc::new(AtomicUsize::new(0));
+        let delta_hits_c = Arc::clone(&delta_hits);
+        let page_hits = Arc::new(AtomicUsize::new(0));
+        let page_hits_c = Arc::clone(&page_hits);
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/mailFolders/inbox/messages",
+                get(move || {
+                    page_hits_c.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        Json(serde_json::json!({
+                            "value": [
+                                {
+                                    "id": "m1",
+                                    "parentFolderId": "inbox",
+                                    "subject": "Fast Page 1",
+                                    "receivedDateTime": "2026-11-18T10:00:00Z",
+                                    "isRead": false,
+                                    "bodyPreview": "Preview 1"
+                                },
+                                {
+                                    "id": "m2",
+                                    "parentFolderId": "inbox",
+                                    "subject": "Fast Page 2",
+                                    "receivedDateTime": "2026-11-18T09:00:00Z",
+                                    "isRead": true,
+                                    "bodyPreview": "Preview 2"
+                                }
+                            ],
+                            "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$skip=50"
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/inbox/messages/delta",
+                get(move || {
+                    delta_hits_c.fetch_add(1, Ordering::SeqCst);
+                    async { Json(serde_json::json!({ "value": [] })) }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = mock_client(format!("http://{addr}/v1.0"));
+        let storage = Storage::open_in_memory().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        sync_mail_folder("inbox", &client, &storage, &event_tx, false)
+            .await
+            .unwrap();
+
+        assert_eq!(delta_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(page_hits.load(Ordering::SeqCst), 1);
+
+        let hist_cursor = storage
+            .get_sync_cursor("mail_history:inbox")
+            .unwrap()
+            .expect("history cursor stored");
+        assert_eq!(
+            hist_cursor.history_next_link.as_deref(),
+            Some("https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$skip=50")
+        );
+
+        let ev = event_rx.try_recv().expect("MailMessagesUpdated emitted");
+        match ev {
+            CoreEvent::MailMessagesUpdated {
+                folder_id,
+                messages,
+                ..
+            } => {
+                assert_eq!(folder_id, "inbox");
+                assert_eq!(messages.len(), 2);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_hydrate_message_emits_body_loaded_and_coalesces() {
+        use axum::{extract::Path as AxumPath, routing::get, Json, Router};
+        use std::sync::atomic::AtomicUsize;
+
+        let msg_hits = Arc::new(AtomicUsize::new(0));
+        let msg_hits_c = Arc::clone(&msg_hits);
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/mailFolders/inbox/messages",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    Json(serde_json::json!({ "value": [] }))
+                }),
+            )
+            .route(
+                "/v1.0/me/messages/{id}",
+                get(move |AxumPath(id): AxumPath<String>| {
+                    let hits = Arc::clone(&msg_hits_c);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        Json(serde_json::json!({
+                            "id": id,
+                            "parentFolderId": "inbox",
+                            "subject": "Hydrated Subject",
+                            "receivedDateTime": "2026-11-18T11:00:00Z",
+                            "bodyPreview": "Preview",
+                            "body": { "contentType": "html", "content": "<p>Full concurrent body</p>" }
+                        }))
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = mock_client(format!("http://{addr}/v1.0"));
+        let storage = Storage::open_in_memory().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        let ctrl = spawn_sync_engine(AppConfig::default(), client, storage.clone(), event_tx);
+        ctrl.request(SyncCommand::SyncFolder {
+            folder_id: "inbox".to_string(),
+        });
+        ctrl.request(SyncCommand::HydrateMessage {
+            message_id: "msg-1".to_string(),
+        });
+        ctrl.request(SyncCommand::HydrateMessage {
+            message_id: "msg-1".to_string(),
+        });
+        ctrl.set_focus(FocusTarget {
+            active_folder_id: None,
+            active_message_id: Some("msg-1".to_string()),
+            active_todo_list_id: None,
+        });
+
+        let hydrated = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(ev) = event_rx.recv().await {
+                if let CoreEvent::MailMessageHydrated(msg) = ev {
+                    return msg;
+                }
+            }
+            panic!("channel closed without MailMessageHydrated");
+        })
+        .await
+        .expect("timed out waiting for hydration");
+
+        assert_eq!(hydrated.id, "msg-1");
+        assert!(hydrated.body_loaded);
+        assert!(hydrated.body_plain.contains("Full concurrent body"));
+        assert_eq!(msg_hits.load(Ordering::SeqCst), 1);
+
+        ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_outlook_fetches_sentitems() {
+        use axum::{routing::get, Json, Router};
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "id": "u1",
+                        "displayName": "Tester",
+                        "mail": "me@example.com"
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [
+                            { "id": "fld-inbox", "displayName": "받은 편지함", "childFolderCount": 0 },
+                            { "id": "fld-sent", "displayName": "보낸 편지함", "childFolderCount": 0 }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/inbox/messages",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [{
+                            "id": "in-1",
+                            "parentFolderId": "fld-inbox",
+                            "subject": "Inbox Mail",
+                            "receivedDateTime": "2026-11-18T10:00:00Z",
+                            "isRead": true
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/sentitems/messages",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [{
+                            "id": "sent-1",
+                            "parentFolderId": "fld-sent",
+                            "subject": "Sent Mail",
+                            "receivedDateTime": "2026-11-18T09:00:00Z",
+                            "isRead": true
+                        }]
+                    }))
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = mock_client(format!("http://{addr}/v1.0"));
+        let storage = Storage::open_in_memory().unwrap();
+        bootstrap_outlook(&client, &storage).await.unwrap();
+
+        let sent_msgs = storage
+            .list_mail_messages(Some("sentitems"), false, false, false, 10)
+            .unwrap();
+        assert_eq!(sent_msgs.len(), 1);
+        assert_eq!(sent_msgs[0].id, "sent-1");
     }
 }

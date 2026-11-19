@@ -2,7 +2,10 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use std::time::Instant;
 
 use base64::{engine::general_purpose::STANDARD as B64_STANDARD, Engine as _};
@@ -25,7 +28,9 @@ use crate::sync::{FocusTarget, SyncCommand, SyncController};
 
 use super::hitmap::{HitMap, HitTarget};
 use super::keymap::Keymap;
-use super::nav_pane::{TAB_MAIL, VIRTUAL_FLAGGED_FOLDER, VIRTUAL_UNREAD_FOLDER};
+use super::nav_pane::{
+    find_folder_by_wellknown, TAB_MAIL, VIRTUAL_FLAGGED_FOLDER, VIRTUAL_UNREAD_FOLDER,
+};
 use super::notification;
 use super::overlays::image_preview::PreviewTarget;
 use super::overlays::mail_compose::{MailComposeMode, MailComposeOverlay};
@@ -147,6 +152,10 @@ pub enum UiMsg {
     RemoteSearchResults {
         query: String,
         messages: Vec<MailMessage>,
+    },
+    RemoteSearchFailed {
+        query: String,
+        error: String,
     },
     CalendarEventCreated(CalendarEvent),
     CalendarEventDeleted(String),
@@ -392,6 +401,12 @@ pub struct AppState {
     pub searching: bool,
     pub search_query: String,
     pub search_results: Vec<MailSearchHit>,
+    pub search_generation: u64,
+    pub search_gen_atomic: Arc<AtomicU64>,
+    pub search_remote_inflight: bool,
+    pub search_remote_done: bool,
+    pub search_error: Option<String>,
+    pub pinned_mail: Option<MailMessage>,
     pub scope_warned: bool,
     pub image_cache: HashMap<String, RenderedTerminalImage>,
     pub image_cache_order: VecDeque<String>,
@@ -452,6 +467,12 @@ impl AppState {
             searching: false,
             search_query: String::new(),
             search_results: Vec::new(),
+            search_generation: 0,
+            search_gen_atomic: Arc::new(AtomicU64::new(0)),
+            search_remote_inflight: false,
+            search_remote_done: false,
+            search_error: None,
+            pinned_mail: None,
             scope_warned: false,
             image_cache: HashMap::new(),
             image_cache_order: VecDeque::new(),
@@ -470,11 +491,9 @@ impl AppState {
     pub fn load_cached_initial(&mut self) {
         if let Ok(folders) = self.storage.list_mail_folders() {
             self.mail_folders = folders;
-            if let Some(inbox) = self.mail_folders.iter().find(|f| {
-                f.well_known_name
-                    .as_deref()
-                    .is_some_and(|w| w.eq_ignore_ascii_case("inbox"))
-            }) {
+            if let Some(inbox) =
+                find_folder_by_wellknown(&self.mail_folders, "inbox", &["Inbox", "받은 편지함"])
+            {
                 self.active_folder_id = inbox.id.clone();
             }
         }
@@ -517,13 +536,7 @@ impl AppState {
     }
 
     pub fn unread_inbox_count(&self) -> i32 {
-        self.mail_folders
-            .iter()
-            .find(|f| {
-                f.well_known_name
-                    .as_deref()
-                    .is_some_and(|w| w.eq_ignore_ascii_case("inbox"))
-            })
+        find_folder_by_wellknown(&self.mail_folders, "inbox", &["Inbox", "받은 편지함"])
             .map(|f| f.unread_item_count.max(0))
             .unwrap_or_else(|| {
                 self.mail_messages
@@ -629,12 +642,57 @@ impl AppState {
 
     pub fn active_mail(&self) -> Option<&MailMessage> {
         let id = self.active_mail_id.as_deref()?;
-        self.mail_messages.iter().find(|m| m.id == id)
+        self.mail_messages
+            .iter()
+            .find(|m| m.id == id)
+            .or_else(|| self.pinned_mail.as_ref().filter(|m| m.id == id))
     }
 
     pub fn active_mail_mut(&mut self) -> Option<&mut MailMessage> {
         let id = self.active_mail_id.as_deref()?.to_string();
-        self.mail_messages.iter_mut().find(|m| m.id == id)
+        if let Some(idx) = self.mail_messages.iter().position(|m| m.id == id) {
+            return Some(&mut self.mail_messages[idx]);
+        }
+        self.pinned_mail.as_mut().filter(|m| m.id == id)
+    }
+
+    fn find_inbox_folder_id(&self) -> Option<String> {
+        find_folder_by_wellknown(&self.mail_folders, "inbox", &["Inbox", "받은 편지함"])
+            .map(|f| f.id.clone())
+    }
+
+    fn preserve_pinned_mail_in_list(&mut self) {
+        if let Some(ref pinned) = self.pinned_mail {
+            if self.active_mail_id.as_deref() == Some(pinned.id.as_str())
+                && !self.mail_messages.iter().any(|m| m.id == pinned.id)
+            {
+                self.mail_messages.push(pinned.clone());
+            }
+        }
+    }
+
+    fn hydrate_active_mail_if_needed(&self) {
+        if let Some(active) = self.active_mail() {
+            if !active.body_loaded {
+                self.sync_ctrl.request(SyncCommand::HydrateMessage {
+                    message_id: active.id.clone(),
+                });
+            }
+        }
+    }
+
+    pub(crate) fn sync_mail_list_selection_to_active(&self, ui: &mut UiState) {
+        let Some(ref active_id) = self.active_mail_id else {
+            return;
+        };
+        let rows = self.visible_mail_rows(ui);
+        if let Some(pos) = rows.iter().position(|r| {
+            r.thread_msg_indices
+                .iter()
+                .any(|&i| self.mail_messages[i].id == *active_id)
+        }) {
+            ui.mail_list_scroll.selected_idx = Some(pos);
+        }
     }
 
     pub fn visible_calendar_events(&self, ui: &UiState) -> Vec<CalendarEvent> {
@@ -706,15 +764,10 @@ impl AppState {
             let read_st = storage.clone();
             let (folders, msgs, events, contacts, lists, tasks) = tokio::task::spawn_blocking(move || {
                 let folders = read_st.list_mail_folders().unwrap_or_default();
-                let inbox_id = folders
-                    .iter()
-                    .find(|f| {
-                        f.well_known_name
-                            .as_deref()
-                            .is_some_and(|w| w.eq_ignore_ascii_case("inbox"))
-                    })
-                    .map(|f| f.id.clone())
-                    .unwrap_or_else(|| "inbox".to_string());
+                let inbox_id =
+                    find_folder_by_wellknown(&folders, "inbox", &["Inbox", "받은 편지함"])
+                        .map(|f| f.id.clone())
+                        .unwrap_or_else(|| "inbox".to_string());
                 let msgs = read_st
                     .list_mail_messages(Some(&inbox_id), false, false, false, 150)
                     .unwrap_or_default();
@@ -797,6 +850,7 @@ impl AppState {
 
     pub fn select_mail_folder(&mut self, ui: &mut UiState, folder_id: String) {
         self.active_folder_id = folder_id.clone();
+        self.pinned_mail = None;
         self.mail_oldest_reached = false;
         self.loading_older_mail = false;
         ui.mail_list_scroll = ScrollState::default();
@@ -856,6 +910,13 @@ impl AppState {
         ui.mail_read_scroll.offset = 0;
 
         if let Some(msg) = self.mail_messages.get(rows[clamped].primary_msg_idx).cloned() {
+            if self
+                .pinned_mail
+                .as_ref()
+                .is_some_and(|p| p.id != msg.id)
+            {
+                self.pinned_mail = None;
+            }
             self.active_mail_id = Some(msg.id.clone());
             self.push_focus_to_sync();
             if !msg.body_loaded {
@@ -942,20 +1003,16 @@ impl AppState {
         let Some(id) = self.active_mail_id.clone() else {
             return;
         };
-        let archive_id = self
-            .mail_folders
-            .iter()
-            .find(|f| {
-                f.well_known_name
-                    .as_deref()
-                    .is_some_and(|w| w.eq_ignore_ascii_case("archive"))
-            })
+        let archive_id = find_folder_by_wellknown(&self.mail_folders, "archive", &["Archive", "보관함"])
             .map(|f| f.id.clone())
             .unwrap_or_else(|| "archive".to_string());
 
         let prev_sel = ui.mail_list_scroll.selected_idx.unwrap_or(0);
         if self.active_folder_id != archive_id {
             self.mail_messages.retain(|m| m.id != id);
+            if self.pinned_mail.as_ref().is_some_and(|p| p.id == id) {
+                self.pinned_mail = None;
+            }
         }
         let _ = self.storage.move_mail_folder_local(&id, &archive_id);
         self.reselect_after_removal(ui, prev_sel);
@@ -989,21 +1046,21 @@ impl AppState {
         let Some(id) = self.active_mail_id.clone() else {
             return;
         };
-        let trash_id = self
-            .mail_folders
-            .iter()
-            .find(|f| {
-                f.well_known_name
-                    .as_deref()
-                    .is_some_and(|w| w.eq_ignore_ascii_case("deleteditems"))
-            })
-            .map(|f| f.id.clone())
-            .unwrap_or_else(|| "deleteditems".to_string());
+        let trash_id = find_folder_by_wellknown(
+            &self.mail_folders,
+            "deleteditems",
+            &["Deleted Items", "Trash", "지운 편지함"],
+        )
+        .map(|f| f.id.clone())
+        .unwrap_or_else(|| "deleteditems".to_string());
         let in_trash = self.active_folder_id == trash_id
             || self.active_folder_id.eq_ignore_ascii_case("deleteditems");
 
         let prev_sel = ui.mail_list_scroll.selected_idx.unwrap_or(0);
         self.mail_messages.retain(|m| m.id != id);
+        if self.pinned_mail.as_ref().is_some_and(|p| p.id == id) {
+            self.pinned_mail = None;
+        }
         if in_trash {
             let _ = self.storage.delete_mail_messages_by_ids(std::slice::from_ref(&id));
         } else {
@@ -1045,6 +1102,13 @@ impl AppState {
             let id_set: HashSet<&str> = message_ids.iter().map(String::as_str).collect();
             self.mail_messages
                 .retain(|m| !id_set.contains(m.id.as_str()));
+            if self
+                .pinned_mail
+                .as_ref()
+                .is_some_and(|p| id_set.contains(p.id.as_str()))
+            {
+                self.pinned_mail = None;
+            }
         }
         for id in &message_ids {
             let _ = self
@@ -1290,12 +1354,19 @@ impl AppState {
 
     pub fn search_local_mail(&mut self, ui: &mut UiState, query: String) {
         self.search_query = query.clone();
-        if query.trim().is_empty() {
+        self.search_generation = self.search_generation.wrapping_add(1);
+        let generation = self.search_generation;
+        self.search_gen_atomic.store(generation, Ordering::SeqCst);
+        self.search_remote_inflight = false;
+        self.search_remote_done = false;
+        self.search_error = None;
+
+        let trimmed_len = query.trim().chars().count();
+        if trimmed_len == 0 {
             self.search_results.clear();
             self.searching = false;
             return;
         }
-        self.searching = true;
         if tokio::runtime::Handle::try_current().is_err() {
             self.search_results = self
                 .storage
@@ -1304,39 +1375,112 @@ impl AppState {
             self.searching = false;
             return;
         }
+
+        self.searching = true;
+        self.search_remote_inflight = trimmed_len >= 2;
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
+        let local_query = query.clone();
         let task_label = "Search mail".to_string();
         ui.tasks.begin(task_label.clone());
         tokio::spawn(async move {
-            let q = query.clone();
+            let q = local_query.clone();
             let hits = tokio::task::spawn_blocking(move || {
                 storage.search_mail(&q, None, 100).unwrap_or_default()
             })
             .await
             .unwrap_or_default();
-            let _ = tx.send(UiMsg::SearchResults { query, hits });
+            let _ = tx.send(UiMsg::SearchResults {
+                query: local_query,
+                hits,
+            });
             let _ = tx.send(UiMsg::TaskDone {
                 label: task_label,
                 error: None,
                 toast: None,
             });
         });
+
+        if trimmed_len >= 2 {
+            let graph = self.graph.clone();
+            let storage = self.storage.clone();
+            let tx = self.ui_tx.clone();
+            let gen_atomic = Arc::clone(&self.search_gen_atomic);
+            let remote_query = query;
+            let remote_label = "Remote mail search".to_string();
+            ui.tasks.begin(remote_label.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+                if gen_atomic.load(Ordering::SeqCst) != generation {
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: remote_label,
+                        error: None,
+                        toast: None,
+                    });
+                    return;
+                }
+                match graph.search_mail_remote(&remote_query, 50).await {
+                    Ok(messages) => {
+                        let st = storage.clone();
+                        let to_store = messages.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _ = st.upsert_mail_messages(&to_store);
+                        })
+                        .await;
+                        if gen_atomic.load(Ordering::SeqCst) == generation {
+                            let _ = tx.send(UiMsg::RemoteSearchResults {
+                                query: remote_query,
+                                messages,
+                            });
+                        }
+                        let _ = tx.send(UiMsg::TaskDone {
+                            label: remote_label,
+                            error: None,
+                            toast: None,
+                        });
+                    }
+                    Err(err) => {
+                        let err_msg = err.to_string();
+                        if gen_atomic.load(Ordering::SeqCst) == generation {
+                            let _ = tx.send(UiMsg::RemoteSearchFailed {
+                                query: remote_query,
+                                error: err_msg.clone(),
+                            });
+                        }
+                        let _ = tx.send(UiMsg::TaskDone {
+                            label: remote_label,
+                            error: Some(err_msg),
+                            toast: None,
+                        });
+                    }
+                }
+            });
+        }
     }
 
     pub fn search_remote_mail(&mut self, ui: &mut UiState, query: String) {
         self.search_query = query.clone();
+        self.search_generation = self.search_generation.wrapping_add(1);
+        let generation = self.search_generation;
+        self.search_gen_atomic.store(generation, Ordering::SeqCst);
+        self.search_remote_done = false;
+        self.search_error = None;
+
         if query.trim().is_empty() || tokio::runtime::Handle::try_current().is_err() {
+            self.searching = false;
+            self.search_remote_inflight = false;
             return;
         }
         self.searching = true;
+        self.search_remote_inflight = true;
         let graph = self.graph.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
+        let gen_atomic = Arc::clone(&self.search_gen_atomic);
         let task_label = "Remote mail search".to_string();
         ui.tasks.begin(task_label.clone());
         tokio::spawn(async move {
-            match graph.search_mail_remote(&query, 40).await {
+            match graph.search_mail_remote(&query, 50).await {
                 Ok(messages) => {
                     let st = storage.clone();
                     let to_store = messages.clone();
@@ -1344,7 +1488,9 @@ impl AppState {
                         let _ = st.upsert_mail_messages(&to_store);
                     })
                     .await;
-                    let _ = tx.send(UiMsg::RemoteSearchResults { query, messages });
+                    if gen_atomic.load(Ordering::SeqCst) == generation {
+                        let _ = tx.send(UiMsg::RemoteSearchResults { query, messages });
+                    }
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: None,
@@ -1352,10 +1498,17 @@ impl AppState {
                     });
                 }
                 Err(err) => {
+                    let err_msg = err.to_string();
+                    if gen_atomic.load(Ordering::SeqCst) == generation {
+                        let _ = tx.send(UiMsg::RemoteSearchFailed {
+                            query,
+                            error: err_msg.clone(),
+                        });
+                    }
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("Search failed: {err}"), ToastKind::Error)),
+                        error: Some(err_msg.clone()),
+                        toast: Some((format!("Search failed: {err_msg}"), ToastKind::Error)),
                     });
                 }
             }
@@ -2056,6 +2209,32 @@ impl AppState {
             CoreEvent::MailFoldersUpdated(folders) => {
                 ui.poll_retrying = false;
                 self.mail_folders = folders;
+                if self.active_folder_id.eq_ignore_ascii_case("inbox") {
+                    if let Some(inbox_id) = self.find_inbox_folder_id() {
+                        if inbox_id != self.active_folder_id {
+                            self.active_folder_id = inbox_id.clone();
+                            if let Ok(loaded) = self.storage.list_mail_messages(
+                                Some(&inbox_id),
+                                false,
+                                false,
+                                false,
+                                150,
+                            ) {
+                                if !loaded.is_empty() {
+                                    self.mail_messages = loaded;
+                                    self.preserve_pinned_mail_in_list();
+                                }
+                            }
+                            if self.active_mail().is_none() {
+                                self.select_first_visible_mail(ui);
+                            } else {
+                                self.hydrate_active_mail_if_needed();
+                            }
+                            self.sync_mail_list_selection_to_active(ui);
+                            self.push_focus_to_sync();
+                        }
+                    }
+                }
             }
             CoreEvent::MailMessagesUpdated {
                 folder_id,
@@ -2081,21 +2260,36 @@ impl AppState {
                     } else if !messages.is_empty() {
                         self.mail_messages = messages;
                     }
-                    if self.active_mail_id.is_none() {
+                    self.preserve_pinned_mail_in_list();
+                    if self.active_mail().is_none() {
                         self.select_first_visible_mail(ui);
+                    } else {
+                        self.hydrate_active_mail_if_needed();
                     }
+                    self.sync_mail_list_selection_to_active(ui);
                 }
                 if let Some(candidate) = notify_candidate {
                     self.maybe_notify(ui, &candidate);
                 }
             }
             CoreEvent::MailMessageHydrated(hydrated) => {
+                let hydrated = *hydrated;
+                let mut found_in_list = false;
                 if let Some(existing) = self
                     .mail_messages
                     .iter_mut()
                     .find(|m| m.id == hydrated.id)
                 {
-                    *existing = *hydrated;
+                    *existing = hydrated.clone();
+                    found_in_list = true;
+                }
+                if let Some(ref mut pinned) = self.pinned_mail {
+                    if pinned.id == hydrated.id {
+                        *pinned = hydrated.clone();
+                    }
+                }
+                if !found_in_list && self.active_mail_id.as_deref() == Some(hydrated.id.as_str()) {
+                    self.mail_messages.insert(0, hydrated);
                 }
             }
             CoreEvent::CalendarEventsUpdated(events) => {
@@ -2163,17 +2357,30 @@ impl AppState {
                 }
                 if !mail_folders.is_empty() {
                     self.mail_folders = mail_folders;
-                    if let Some(inbox) = self.mail_folders.iter().find(|f| {
-                        f.well_known_name
-                            .as_deref()
-                            .is_some_and(|w| w.eq_ignore_ascii_case("inbox"))
-                    }) {
-                        self.active_folder_id = inbox.id.clone();
+                    if self.active_folder_id.eq_ignore_ascii_case("inbox") {
+                        if let Some(inbox_id) = self.find_inbox_folder_id() {
+                            self.active_folder_id = inbox_id;
+                        }
                     }
                 }
                 if !mail_messages.is_empty() {
                     self.mail_messages = mail_messages;
+                } else if self.mail_messages.is_empty()
+                    && !self.active_folder_id.eq_ignore_ascii_case("inbox")
+                {
+                    if let Ok(loaded) = self.storage.list_mail_messages(
+                        Some(&self.active_folder_id),
+                        false,
+                        false,
+                        false,
+                        150,
+                    ) {
+                        if !loaded.is_empty() {
+                            self.mail_messages = loaded;
+                        }
+                    }
                 }
+                self.preserve_pinned_mail_in_list();
                 if !calendar_events.is_empty() {
                     self.calendar_events = calendar_events;
                     if self.active_event_id.is_none() {
@@ -2203,9 +2410,12 @@ impl AppState {
                 self.syncing = false;
                 self.sync_summary = "Synced".to_string();
                 self.emit_scope_warning_once(ui, scope_warning);
-                if self.active_mail_id.is_none() {
+                if self.active_mail().is_none() {
                     self.select_first_visible_mail(ui);
+                } else {
+                    self.hydrate_active_mail_if_needed();
                 }
+                self.sync_mail_list_selection_to_active(ui);
                 self.push_focus_to_sync();
             }
             UiMsg::FolderMessagesLoaded {
@@ -2215,9 +2425,13 @@ impl AppState {
                 if self.active_folder_id == folder_id {
                     self.loading_mail = false;
                     self.mail_messages = messages;
-                    if self.active_mail_id.is_none() {
+                    self.preserve_pinned_mail_in_list();
+                    if self.active_mail().is_none() {
                         self.select_first_visible_mail(ui);
+                    } else {
+                        self.hydrate_active_mail_if_needed();
                     }
+                    self.sync_mail_list_selection_to_active(ui);
                 }
             }
             UiMsg::MailSent { .. }
@@ -2226,14 +2440,34 @@ impl AppState {
             | UiMsg::MailDeleted { .. }
             | UiMsg::AttachmentDownloaded(_) => {}
             UiMsg::SearchResults { query, hits } => {
-                if self.search_query == query {
-                    self.searching = false;
-                    self.search_results = hits;
+                if self.search_query.trim() == query.trim() {
+                    if !self.search_remote_inflight {
+                        self.searching = false;
+                    }
+                    if !self.search_remote_done {
+                        self.search_results = hits;
+                    } else {
+                        let mut seen: HashSet<String> =
+                            self.search_results.iter().map(|h| h.id.clone()).collect();
+                        for hit in hits {
+                            if seen.insert(hit.id.clone()) {
+                                self.search_results.push(hit);
+                            }
+                        }
+                        self.search_results.sort_by(|a, b| {
+                            b.received_at
+                                .cmp(&a.received_at)
+                                .then_with(|| a.id.cmp(&b.id))
+                        });
+                    }
                 }
             }
             UiMsg::RemoteSearchResults { query, messages } => {
-                if self.search_query == query {
+                if self.search_query.trim() == query.trim() {
                     self.searching = false;
+                    self.search_remote_inflight = false;
+                    self.search_remote_done = true;
+                    self.search_error = None;
                     let mut seen: HashSet<String> =
                         self.search_results.iter().map(|h| h.id.clone()).collect();
                     for m in messages {
@@ -2256,6 +2490,19 @@ impl AppState {
                             });
                         }
                     }
+                    self.search_results.sort_by(|a, b| {
+                        b.received_at
+                            .cmp(&a.received_at)
+                            .then_with(|| a.id.cmp(&b.id))
+                    });
+                }
+            }
+            UiMsg::RemoteSearchFailed { query, error } => {
+                if self.search_query.trim() == query.trim() {
+                    self.searching = false;
+                    self.search_remote_inflight = false;
+                    self.search_remote_done = false;
+                    self.search_error = Some(error);
                 }
             }
             UiMsg::CalendarEventCreated(created) => {
@@ -2530,5 +2777,218 @@ mod tests {
         assert!(!app.todo_tasks[0].is_completed());
 
         app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[test]
+    fn jump_to_search_hit_preserves_pinned_mail_across_updates_and_triggers_hydration() {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _) = tokio::sync::watch::channel(FocusTarget::default());
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+        let (ui_tx, _) = mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+        ui.focused_only = true;
+
+        let recent = make_mail("m-recent", "conv-r", "2026-11-19T10:00:00Z", true, false);
+        let mut older = make_mail("m-old", "conv-old", "2024-06-01T00:00:00Z", false, false);
+        older.folder_id = Some("f-inbox".into());
+        older.inference_classification = Some("other".into());
+        older.body_loaded = false;
+        older.body_plain.clear();
+        older.body_html.clear();
+
+        app.storage
+            .upsert_mail_messages(&[recent.clone(), older.clone()])
+            .unwrap();
+        app.search_query = "old".into();
+        app.search_results = vec![MailSearchHit {
+            id: "m-old".into(),
+            conversation_id: Some("conv-old".into()),
+            folder_id: Some("f-inbox".into()),
+            subject: older.subject.clone(),
+            from_display: "Alice".into(),
+            received_at: older.received_at.clone(),
+            snippet: "Hello".into(),
+            has_attachments: false,
+            is_read: false,
+            flagged: false,
+        }];
+
+        let _ = crate::ui::action::dispatch(
+            crate::ui::action::Action::JumpToSearchHit(0),
+            &mut app,
+            &mut ui,
+        );
+
+        assert!(!ui.focused_only, "JumpToSearchHit must unhide Other mail");
+        assert_eq!(app.active_mail_id.as_deref(), Some("m-old"));
+        assert_eq!(
+            app.pinned_mail.as_ref().map(|m| m.id.as_str()),
+            Some("m-old")
+        );
+
+        let mut saw_hydrate_old = false;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if matches!(cmd, SyncCommand::HydrateMessage { ref message_id } if message_id == "m-old")
+            {
+                saw_hydrate_old = true;
+            }
+        }
+        assert!(saw_hydrate_old, "JumpToSearchHit must request hydration");
+
+        // Simulate folder sync replacing list without older hit -> pinned_mail must survive!
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::FolderMessagesLoaded {
+                folder_id: "f-inbox".into(),
+                messages: vec![recent.clone()],
+            },
+        );
+        assert_eq!(app.active_mail().map(|m| m.id.as_str()), Some("m-old"));
+        assert!(app.mail_messages.iter().any(|m| m.id == "m-old"));
+
+        // Simulate MailMessagesUpdated after older is deleted from top-N storage -> still preserved via pinned_mail!
+        app.storage
+            .delete_mail_messages_by_ids(&["m-old".into()])
+            .unwrap();
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::MailMessagesUpdated {
+                folder_id: "f-inbox".into(),
+                messages: vec![recent],
+                notify_candidate: None,
+            },
+        );
+        assert_eq!(app.active_mail().map(|m| m.id.as_str()), Some("m-old"));
+        assert!(app.mail_messages.iter().any(|m| m.id == "m-old"));
+
+        // Hydrating the pinned older message updates both mail_messages and pinned_mail.
+        let mut hydrated = older.clone();
+        hydrated.body_loaded = true;
+        hydrated.body_plain = "Full older body".into();
+        app.handle_core_event(&mut ui, CoreEvent::MailMessageHydrated(Box::new(hydrated)));
+        assert_eq!(
+            app.active_mail().map(|m| (m.body_loaded, m.body_plain.as_str())),
+            Some((true, "Full older body"))
+        );
+        assert_eq!(
+            app.pinned_mail
+                .as_ref()
+                .map(|m| (m.body_loaded, m.body_plain.as_str())),
+            Some((true, "Full older body"))
+        );
+    }
+
+    #[test]
+    fn bootstrap_and_folders_updated_resolve_inbox_and_hydrate_cached_active_mail() {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _) = tokio::sync::watch::channel(FocusTarget::default());
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+        let (ui_tx, _) = mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+
+        let mut cached = make_mail("m-cached", "conv-c", "2026-11-19T09:00:00Z", false, false);
+        cached.folder_id = Some("f-inbox-real".into());
+        cached.body_loaded = false;
+        app.mail_messages = vec![cached.clone()];
+        app.active_mail_id = Some("m-cached".into());
+        app.storage.upsert_mail_messages(&[cached.clone()]).unwrap();
+
+        let inbox_folder = MailFolder {
+            id: "f-inbox-real".into(),
+            display_name: "받은 편지함".into(),
+            well_known_name: Some("inbox".into()),
+            parent_folder_id: None,
+            child_folder_count: 0,
+            unread_item_count: 1,
+            total_item_count: 1,
+        };
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::MailFoldersUpdated(vec![inbox_folder]),
+        );
+
+        assert_eq!(app.active_folder_id, "f-inbox-real");
+        let mut hydrated_req = false;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if matches!(cmd, SyncCommand::HydrateMessage { ref message_id } if message_id == "m-cached")
+            {
+                hydrated_req = true;
+            }
+        }
+        assert!(
+            hydrated_req,
+            "unhydrated active_mail_id must be hydrated when Inbox resolves"
+        );
+    }
+
+    #[test]
+    fn remote_search_results_merge_sort_and_failed_clears_searching() {
+        let (mut app, mut ui) = {
+            let cfg = AppConfig::default();
+            let auth = AuthManager::new(cfg.clone()).unwrap();
+            let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+            let storage = Storage::open_in_memory().unwrap();
+            let (focus_tx, _) = tokio::sync::watch::channel(FocusTarget::default());
+            let (cmd_tx, _) = mpsc::unbounded_channel();
+            let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+            let (ui_tx, _) = mpsc::unbounded_channel();
+            (
+                AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx),
+                UiState::from_config(&cfg),
+            )
+        };
+
+        app.search_query = "invoice".into();
+        app.searching = true;
+        app.search_results = vec![MailSearchHit {
+            id: "m1".into(),
+            conversation_id: None,
+            folder_id: Some("f1".into()),
+            subject: "Local invoice".into(),
+            from_display: "Bob".into(),
+            received_at: "2026-11-10T00:00:00Z".into(),
+            snippet: "local".into(),
+            has_attachments: false,
+            is_read: true,
+            flagged: false,
+        }];
+
+        let dup_local = make_mail("m1", "c1", "2026-11-10T00:00:00Z", true, false);
+        let newer_remote = make_mail("m2", "c2", "2026-11-19T00:00:00Z", false, true);
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::RemoteSearchResults {
+                query: "invoice".into(),
+                messages: vec![dup_local, newer_remote],
+            },
+        );
+        assert!(!app.searching);
+        assert!(app.search_remote_done);
+        assert!(app.search_error.is_none());
+        assert_eq!(app.search_results.len(), 2);
+        assert_eq!(app.search_results[0].id, "m2");
+        assert_eq!(app.search_results[1].id, "m1");
+
+        app.searching = true;
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::RemoteSearchFailed {
+                query: "invoice".into(),
+                error: "timeout".into(),
+            },
+        );
+        assert!(!app.searching);
+        assert!(!app.search_remote_done);
+        assert_eq!(app.search_error.as_deref(), Some("timeout"));
     }
 }
