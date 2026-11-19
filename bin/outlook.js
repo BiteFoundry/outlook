@@ -25,7 +25,7 @@ function formatLinuxGlibcHint() {
     'Prebuilt Linux binaries target GLIBC >= 2.28 (AlmaLinux 8 / RHEL 8 / Rocky Linux 8 / Ubuntu 20.04+ / Debian 10+).',
     'If you are on an older glibc distribution (such as CentOS 7 with GLIBC < 2.28) or Alpine/musl,',
     'build from source with Cargo instead:',
-    '  cargo install --git https://github.com/shinick-dev/outlook --locked',
+    '  cargo install --git https://github.com/BiteFoundry/outlook --locked',
     'or clone the repository and run:',
     '  cargo build --release',
   ].join('\n');
@@ -34,7 +34,7 @@ function formatLinuxGlibcHint() {
 const platform = process.platform;
 const arch = process.arch;
 const platformKey = `${platform}-${arch}`;
-const packageName = `@shinick/outlook-${platformKey}`;
+const packageName = `@bitefoundry/outlook-${platformKey}`;
 const binaryName = platform === 'win32' ? 'outlook.exe' : 'outlook';
 
 let packageDir = null;
@@ -56,9 +56,9 @@ if (!binaryPath || !fs.existsSync(binaryPath)) {
     `Supported platforms: ${SUPPORTED.join(', ')}`,
     '',
     'Try one of:',
-    '  npm install -g @shinick/outlook --include=optional',
-    '  npm install @shinick/outlook --include=optional',
-    '  npx --yes @shinick/outlook',
+    '  npm install -g @bitefoundry/outlook --include=optional',
+    '  npm install @bitefoundry/outlook --include=optional',
+    '  npx --yes @bitefoundry/outlook',
     '',
     'If you are on an unsupported platform (for example Alpine/musl Linux),',
     'build from source with Cargo:',

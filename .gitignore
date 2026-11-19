@@ -6,8 +6,8 @@
 node_modules/
 npm-debug.log*
 *.tgz
-npm/*/bin/teams
-npm/*/bin/teams.exe
+npm/*/bin/outlook
+npm/*/bin/outlook.exe
 
 # local release staging
 /dist-release/

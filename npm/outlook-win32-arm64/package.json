@@ -1,10 +1,10 @@
 {
-  "name": "@shinick/outlook-win32-arm64",
-  "version": "0.1.2",
+  "name": "@bitefoundry/outlook-win32-arm64",
+  "version": "0.1.0",
   "description": "Prebuilt outlook binary for Windows arm64",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/shinick-dev/outlook.git",
+    "url": "git+https://github.com/BiteFoundry/outlook.git",
     "directory": "npm/outlook-win32-arm64"
   },
   "license": "MIT",

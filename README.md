@@ -4,7 +4,7 @@
 
 **Blazing-fast Microsoft Outlook terminal client & AI agent toolkit — Mail, Calendar, To Do, and Contacts in one native Rust binary.**
 
-[![npm version](https://img.shields.io/npm/v/%40shinick%2Foutlook?color=7aa2f7&label=%40shinick%2Foutlook&logo=npm)](https://www.npmjs.com/package/@shinick/outlook)
+[![npm version](https://img.shields.io/npm/v/%40bitefoundry%2Foutlook?color=7aa2f7&label=%40bitefoundry%2Foutlook&logo=npm)](https://www.npmjs.com/package/@bitefoundry/outlook)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-565f89)](docs/NPM.md)
 [![Built with Rust & Ratatui](https://img.shields.io/badge/Rust-Ratatui-e0af68?logo=rust&logoColor=white)](https://ratatui.rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-9ece6a)](LICENSE)
@@ -32,16 +32,16 @@
 
 ```bash
 # 1. Install globally via npm (links prebuilt native binary, zero Node runtime overhead)
-npm i -g @shinick/outlook
+npm i -g @bitefoundry/outlook
 
-# 2. Authenticate with Microsoft Entra ID (or automatically reuse your @shinick/teams M365 session!)
+# 2. Authenticate with Microsoft Entra ID (or automatically reuse your @bitefoundry/teams M365 session!)
 outlook login
 
 # 3. Launch the interactive TUI
 outlook
 ```
 
-> **Shared M365 Session & Token Brokers:** When `share_m365_auth = true` (default), `outlook` seamlessly reuses or upgrades an existing `@shinick/teams` session without a second browser login. Also supports `--device-code`, `OUTLOOK_ACCESS_TOKEN`, `OUTLOOK_TOKEN_FILE`, `OUTLOOK_TOKEN_REFRESH_CMD` (`az account get-access-token`), and custom Entra ID apps. Run `outlook whoami` or `outlook doctor --online` for JWT scope diagnostics, and `outlook update` for one-click SHA-256 verified self-updates.
+> **Shared M365 Session & Token Brokers:** When `share_m365_auth = true` (default), `outlook` seamlessly reuses or upgrades an existing `@bitefoundry/teams` session without a second browser login. Also supports `--device-code`, `OUTLOOK_ACCESS_TOKEN`, `OUTLOOK_TOKEN_FILE`, `OUTLOOK_TOKEN_REFRESH_CMD` (`az account get-access-token`), and custom Entra ID apps. Run `outlook whoami` or `outlook doctor --online` for JWT scope diagnostics, and `outlook update` for one-click SHA-256 verified self-updates.
 
 ---
 
@@ -125,16 +125,16 @@ Full tool schemas & client setups: **[docs/MCP.md](docs/MCP.md)** · **[docs/NPM
 
 ---
 
-## `@shinick` Enterprise Terminal Suite
+## `@bitefoundry` Enterprise Terminal Suite
 
 | Package | Command | Domain | Interfaces |
 | --- | --- | --- | --- |
-| [`@shinick/teams`](https://github.com/shinick-dev/teams) | `teams` | Microsoft Teams (Chats, Channels, Threads, Presence) | TUI · CLI · HTTP · MCP |
-| **`@shinick/outlook`** *(this repo)* | `outlook` | Microsoft Outlook (Mail, Calendar, To Do, Contacts) | TUI · CLI · HTTP · MCP |
-| [`@shinick/onenote`](https://github.com/shinick-dev/onenote) | `onenote` | Microsoft OneNote (Notebooks, Sections, Pages) | TUI · CLI · HTTP · MCP |
-| [`@shinick/sharepoint`](https://github.com/shinick-dev/sharepoint) | `sharepoint` | SharePoint & OneDrive (Sites, Drives, Lists, Files) | TUI · CLI · HTTP · MCP |
-| [`@shinick/atlassian`](https://github.com/shinick-dev/atlassian) | `atlassian` | Jira & Confluence (Issues, Boards, Sprints, Wiki) | TUI · CLI · HTTP · MCP |
-| [`@shinick/notion`](https://github.com/shinick-dev/notion) | `notion` | Notion (Pages, Databases, Blocks, Comments) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/teams`](https://github.com/BiteFoundry/teams) | `teams` | Microsoft Teams (Chats, Channels, Threads, Presence) | TUI · CLI · HTTP · MCP |
+| **`@bitefoundry/outlook`** *(this repo)* | `outlook` | Microsoft Outlook (Mail, Calendar, To Do, Contacts) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/onenote`](https://github.com/BiteFoundry/onenote) | `onenote` | Microsoft OneNote (Notebooks, Sections, Pages) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/sharepoint`](https://github.com/BiteFoundry/sharepoint) | `sharepoint` | SharePoint & OneDrive (Sites, Drives, Lists, Files) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/atlassian`](https://github.com/BiteFoundry/atlassian) | `atlassian` | Jira & Confluence (Issues, Boards, Sprints, Wiki) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/notion`](https://github.com/BiteFoundry/notion) | `notion` | Notion (Pages, Databases, Blocks, Comments) | TUI · CLI · HTTP · MCP |
 
 ---
 

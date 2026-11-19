@@ -1,10 +1,10 @@
 {
-  "name": "@shinick/outlook-darwin-x64",
-  "version": "0.1.2",
+  "name": "@bitefoundry/outlook-darwin-x64",
+  "version": "0.1.0",
   "description": "Prebuilt outlook binary for macOS x64",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/shinick-dev/outlook.git",
+    "url": "git+https://github.com/BiteFoundry/outlook.git",
     "directory": "npm/outlook-darwin-x64"
   },
   "license": "MIT",

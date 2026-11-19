@@ -2132,7 +2132,7 @@ dependencies = [
 
 [[package]]
 name = "outlook-cli"
-version = "0.1.2"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",

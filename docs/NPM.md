@@ -1,27 +1,27 @@
 # npm distribution
 
-`@shinick/outlook` is distributed on npm as a small JavaScript launcher plus one
+`@bitefoundry/outlook` is distributed on npm as a small JavaScript launcher plus one
 optional dependency per platform. The launcher resolves the prebuilt Rust binary
 and execs it directly (with `scripts/postinstall.mjs` linking the native binary
 into `bin/` and Windows shims for zero-Node-startup execution), so there is no
 compiler, Node native addon, or network download during install.
 
 The Rust crate is named `outlook-cli` and produces the pure **Microsoft Outlook**
-binary (`outlook` / `outlook.exe`). The npm package is scoped as `@shinick/outlook`
+binary (`outlook` / `outlook.exe`). The npm package is scoped as `@bitefoundry/outlook`
 and installs the **`outlook`** command.
 
 ## Install and run
 
 ```sh
 # one-off
-npx @shinick/outlook --version
+npx @bitefoundry/outlook --version
 
 # global install (installs `outlook`)
-npm install -g @shinick/outlook
+npm install -g @bitefoundry/outlook
 outlook --version
 
 # project-local
-npm install @shinick/outlook
+npm install @bitefoundry/outlook
 npx outlook mail list
 ```
 
@@ -44,20 +44,20 @@ with zero Graph round-trips while the daemon is warm:
 
 | npm package                     | OS      | CPU   | Rust target                         |
 | ------------------------------- | ------- | ----- | ----------------------------------- |
-| `@shinick/outlook-win32-x64`    | Windows | x64   | `x86_64-pc-windows-msvc`            |
-| `@shinick/outlook-win32-arm64`  | Windows | arm64 | `aarch64-pc-windows-msvc`           |
-| `@shinick/outlook-darwin-x64`   | macOS   | x64   | `x86_64-apple-darwin`               |
-| `@shinick/outlook-darwin-arm64` | macOS   | arm64 | `aarch64-apple-darwin`              |
-| `@shinick/outlook-linux-x64`    | Linux   | x64   | `x86_64-unknown-linux-gnu` (2.28)   |
-| `@shinick/outlook-linux-arm64`  | Linux   | arm64 | `aarch64-unknown-linux-gnu` (2.28)  |
+| `@bitefoundry/outlook-win32-x64`    | Windows | x64   | `x86_64-pc-windows-msvc`            |
+| `@bitefoundry/outlook-win32-arm64`  | Windows | arm64 | `aarch64-pc-windows-msvc`           |
+| `@bitefoundry/outlook-darwin-x64`   | macOS   | x64   | `x86_64-apple-darwin`               |
+| `@bitefoundry/outlook-darwin-arm64` | macOS   | arm64 | `aarch64-apple-darwin`              |
+| `@bitefoundry/outlook-linux-x64`    | Linux   | x64   | `x86_64-unknown-linux-gnu` (2.28)   |
+| `@bitefoundry/outlook-linux-arm64`  | Linux   | arm64 | `aarch64-unknown-linux-gnu` (2.28)  |
 
 Linux packages are cross-compiled in CI with `cargo-zigbuild` against **GLIBC 2.28** (`*.2.28`) and verified with `scripts/verify-glibc.mjs` plus an `almalinux:8` container smoke test, so prebuilt binaries run out of the box on **AlmaLinux 8 / RHEL 8+ / Rocky Linux 8+ / Ubuntu 20.04+ / Debian 10+**. Older glibc distributions (e.g., CentOS 7 with `GLIBC < 2.28`) and Alpine/musl Linux should build from source with Cargo (`cargo build --release`).
 
 ## How resolution works
 
-`bin/outlook.js` looks up `@shinick/outlook-<platform>-<arch>` through
+`bin/outlook.js` looks up `@bitefoundry/outlook-<platform>-<arch>` through
 `require.resolve`, then executes
-`node_modules/@shinick/outlook-<platform>-<arch>/bin/outlook` (or `outlook.exe` on
+`node_modules/@bitefoundry/outlook-<platform>-<arch>/bin/outlook` (or `outlook.exe` on
 Windows) with `stdio: 'inherit'`. On `npm install`, `scripts/postinstall.mjs`
 additionally replaces `bin/outlook.js` (Unix) or rewrites `.bin/outlook[.cmd|.ps1]`
 (Windows) to invoke the native Rust executable directly without spawning Node.
@@ -69,7 +69,7 @@ platforms and the `--include=optional` hint instead of a stack trace.
 ## Layout
 
 ```
-package.json                  # @shinick/outlook launcher package (bin: outlook)
+package.json                  # @bitefoundry/outlook launcher package (bin: outlook)
 bin/outlook.js                # outlook launcher
 scripts/postinstall.mjs       # zero-Node native binary linker on npm install
 outlook / outlook.cmd         # repo-local Outlook launchers
@@ -112,7 +112,7 @@ Publishing is automated by `.github/workflows/release.yml`, which is triggered
 by pushing a `v*` tag (or manually via `workflow_dispatch`).
 
 1. Add a repository secret `NPM_TOKEN` (an npm automation token with publish
-   rights for the `@shinick/outlook` packages).
+   rights for the `@bitefoundry/outlook` packages).
 2. Bump the version in `Cargo.toml`, run `node scripts/sync-version.mjs`,
    commit, and push `v<version>`.
 3. The workflow builds six targets, stages binaries into the platform
@@ -208,15 +208,15 @@ token_refresh_mins = 5
 | `OUTLOOK_CLI_CACHE_SECS` | CLI read cache TTL in seconds (default `0`; `--cached` / `--fast` forces cache-first reads) |
 | `OUTLOOK_AUTO_DAEMON` | Auto-start/attach to the background sync daemon (`1` / `true`, or `config.toml`: `auto_daemon = true`, default `false`) |
 | `OUTLOOK_IMAGE_PROTOCOL` | Terminal image protocol override (`auto`, `kitty`, `iterm2`, `sixel`, `halfblock`) |
-| `OUTLOOK_GITHUB_REPO` | Override GitHub `owner/repo` used by `outlook update` (default `shinick-dev/outlook`) |
+| `OUTLOOK_GITHUB_REPO` | Override GitHub `owner/repo` used by `outlook update` (default `BiteFoundry/outlook`) |
 | `OUTLOOK_GITHUB_TOKEN` | GitHub token for private release checks in `outlook update` |
 
 ## Troubleshooting
 
 - **`no prebuilt binary found for <platform>-<arch>`** — the optional
   dependency was skipped. Reinstall with
-  `npm install -g @shinick/outlook --include=optional` or
-  `npm install @shinick/outlook --include=optional`. Check that your npm config
+  `npm install -g @bitefoundry/outlook --include=optional` or
+  `npm install @bitefoundry/outlook --include=optional`. Check that your npm config
   does not set `omit=optional`.
 - **`EBADPLATFORM` / package skipped** — npm installs only the matching
   `os`/`cpu` package. Cross-installing (for example x64 Node on ARM Windows via
@@ -226,11 +226,11 @@ token_refresh_mins = 5
 - **macOS Gatekeeper** — npm-installed binaries are not notarized. If macOS
   blocks execution, allow the binary in System Settings → Privacy & Security, or
   build from source.
-- **Corporate proxy/firewall** — `npx @shinick/outlook` performs a registry
+- **Corporate proxy/firewall** — `npx @bitefoundry/outlook` performs a registry
   download each time unless cached; use a global install for offline-friendly
   use.
 - **Verify the binary** —
-  `node -p "require.resolve('@shinick/outlook-win32-x64/package.json')"`
+  `node -p "require.resolve('@bitefoundry/outlook-win32-x64/package.json')"`
   (adjust for your platform) shows which platform package npm selected.
 - **Tag push did not publish** — check the publish job log; a tag/version
   mismatch or a missing `NPM_TOKEN` fails the job before any publish.

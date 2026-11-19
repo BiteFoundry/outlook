@@ -1813,14 +1813,14 @@ async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
     let ver_asset_clone = versioned_asset.clone();
     let gh_base_clone = gh_base_check.clone();
     let gh_app_check = Router::new().route(
-        "/repos/shinick-dev/outlook/releases/latest",
+        "/repos/BiteFoundry/outlook/releases/latest",
         get(move || {
             let asset_name = ver_asset_clone.clone();
             let base = gh_base_clone.clone();
             async move {
                 Json(json!({
                     "tag_name": "v0.2.0",
-                    "html_url": format!("{base}/shinick-dev/outlook/releases/tag/v0.2.0"),
+                    "html_url": format!("{base}/BiteFoundry/outlook/releases/tag/v0.2.0"),
                     "assets": [
                         {
                             "name": asset_name,
@@ -1843,7 +1843,7 @@ async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
 
     let check_res = updater::check_or_apply_update_with_api_base(
         &gh_base_check,
-        "shinick-dev/outlook",
+        "BiteFoundry/outlook",
         true,
         false,
     )
@@ -1867,7 +1867,7 @@ async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
     };
     let gh_app_apply = Router::new()
         .route(
-            "/repos/shinick-dev/outlook/releases/latest",
+            "/repos/BiteFoundry/outlook/releases/latest",
             get(|State(st): State<MockGhState>| async move {
                 let mut assets = vec![json!({
                     "name": st.asset_name,
@@ -1883,7 +1883,7 @@ async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
                 }
                 Json(json!({
                     "tag_name": "v0.2.0",
-                    "html_url": format!("{}/shinick-dev/outlook/releases/tag/v0.2.0", st.base_url),
+                    "html_url": format!("{}/BiteFoundry/outlook/releases/tag/v0.2.0", st.base_url),
                     "assets": assets
                 }))
             }),
@@ -1915,7 +1915,7 @@ async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
     // Missing SHA256SUMS.txt -> refused
     let err_missing = updater::check_or_apply_update_at(
         &gh_base_apply,
-        "shinick-dev/outlook",
+        "BiteFoundry/outlook",
         false,
         false,
         &fake_exe,
@@ -1932,7 +1932,7 @@ async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
     ));
     let err_bad_hash = updater::check_or_apply_update_at(
         &gh_base_apply,
-        "shinick-dev/outlook",
+        "BiteFoundry/outlook",
         false,
         false,
         &fake_exe,
@@ -1947,7 +1947,7 @@ async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
     *gh_state.sums_text.write().unwrap() = Some(format!("{valid_digest}  {raw_bin_asset}\n"));
     let applied = updater::check_or_apply_update_at(
         &gh_base_apply,
-        "shinick-dev/outlook",
+        "BiteFoundry/outlook",
         false,
         false,
         &fake_exe,

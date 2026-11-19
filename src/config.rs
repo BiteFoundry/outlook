@@ -21,7 +21,7 @@ pub const DEFAULT_AUTH_BASE_URL: &str = "https://login.microsoftonline.com";
 /// Users can always override via `--client-id`, `OUTLOOK_CLIENT_ID`, `TEAMS_CLIENT_ID`, `AZURE_CLIENT_ID`, or `config.toml`.
 pub const DEFAULT_PUBLIC_CLIENT_ID: &str = "14d82eec-204b-4c2f-b7e8-296a70dab67e";
 pub const DEFAULT_TENANT_ID: &str = "common";
-pub const DEFAULT_GITHUB_REPO: &str = "shinick-dev/outlook";
+pub const DEFAULT_GITHUB_REPO: &str = "BiteFoundry/outlook";
 pub const DEFAULT_SERVE_PORT: u16 = 3939;
 
 /// Message/mail list density mode in TUI (`Cozy` default vs `Compact`).

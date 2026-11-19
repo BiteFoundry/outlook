@@ -611,8 +611,8 @@ fn main() {
             response_status: "tentativelyAccepted".into(),
             is_online_meeting: true,
             online_meeting_url: Some("https://teams.microsoft.com/l/meetup-join/acme-mcp".into()),
-            body_html: "<p>Review MCP tool schemas across the @shinick terminal suite.</p>".into(),
-            body_plain: "Review MCP tool schemas across the @shinick terminal suite.".into(),
+            body_html: "<p>Review MCP tool schemas across the @bitefoundry terminal suite.</p>".into(),
+            body_plain: "Review MCP tool schemas across the @bitefoundry terminal suite.".into(),
             is_cancelled: false,
             web_link: None,
         },
@@ -904,7 +904,7 @@ fn main() {
 
     let spec = json!({
         "title": "outlook — Acme Engineering",
-        "badge": "@shinick/outlook v0.1.2",
+        "badge": "@bitefoundry/outlook v0.1.0",
         "width": WIDTH,
         "height": HEIGHT,
         "bg": [20, 22, 32],

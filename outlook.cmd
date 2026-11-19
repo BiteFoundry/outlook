@@ -7,9 +7,9 @@ if exist "%ROOT%target\release\outlook.exe" goto run
 
 where gh >nul 2>nul
 if %errorlevel% equ 0 (
-    echo [outlook] downloading prebuilt binary from GitHub Release ^(shinick-dev/outlook^)... >&2
+    echo [outlook] downloading prebuilt binary from GitHub Release ^(BiteFoundry/outlook^)... >&2
     if not exist "%ROOT%target\release" mkdir "%ROOT%target\release"
-    gh release download -R shinick-dev/outlook --pattern "outlook.exe" --dir "%ROOT%target\release" --clobber >nul 2>&1
+    gh release download -R BiteFoundry/outlook --pattern "outlook.exe" --dir "%ROOT%target\release" --clobber >nul 2>&1
     if exist "%ROOT%target\release\outlook.exe" goto run
 )
 

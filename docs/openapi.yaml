@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: outlook-cli local HTTP API (Mail · Calendar · To Do · Contacts)
-  version: 0.1.1
+  version: 0.1.0
   description: |
     Local HTTP/JSON contract exposed by `outlook serve` (alias `api`).
 

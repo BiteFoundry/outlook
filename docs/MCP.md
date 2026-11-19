@@ -6,7 +6,7 @@
 
 1. Install or build the `outlook` binary:
    ```bash
-   npm install -g @shinick/outlook
+   npm install -g @bitefoundry/outlook
    # or from source:
    cargo build --release
    ```
