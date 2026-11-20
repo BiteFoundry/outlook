@@ -1111,20 +1111,57 @@ mod tests {
         msg.last_modified_at = Some("2026-11-18T10:00:00Z".into());
         storage.upsert_mail_messages(&[msg.clone()]).unwrap();
 
-        // Read-state change + last_modified_at bump must NOT invalidate hydrated body
-        let mut read_only = msg.clone();
-        read_only.body_loaded = false;
-        read_only.body_html.clear();
-        read_only.body_plain.clear();
-        read_only.is_read = true;
-        read_only.last_modified_at = Some("2026-11-18T10:01:00Z".into());
-        storage.upsert_mail_messages(&[read_only.clone()]).unwrap();
-        let after_read = storage.get_mail_message("m-mod").unwrap().unwrap();
-        assert!(after_read.body_loaded);
-        assert_eq!(after_read.body_html, "<p>Long body v1</p>");
+        // Same-timestamp metadata-only header update preserves hydrated body
+        let mut same_ts_meta = msg.clone();
+        same_ts_meta.body_loaded = false;
+        same_ts_meta.body_html.clear();
+        same_ts_meta.body_plain.clear();
+        same_ts_meta.is_read = true;
+        storage.upsert_mail_messages(&[same_ts_meta.clone()]).unwrap();
+        let after_same_ts = storage.get_mail_message("m-mod").unwrap().unwrap();
+        assert!(after_same_ts.body_loaded);
+        assert!(after_same_ts.is_read);
+        assert_eq!(after_same_ts.body_html, "<p>Long body v1</p>");
+
+        // Late/older summary must NOT regress newer metadata or invalidate hydrated body
+        let mut older_delta = same_ts_meta.clone();
+        older_delta.is_read = false;
+        older_delta.last_modified_at = Some("2026-11-18T09:59:00Z".into());
+        assert_eq!(storage.upsert_mail_messages(&[older_delta]).unwrap(), 0);
+        let after_older = storage.get_mail_message("m-mod").unwrap().unwrap();
+        assert!(after_older.body_loaded);
+        assert!(after_older.is_read);
+        assert_eq!(
+            after_older.last_modified_at.as_deref(),
+            Some("2026-11-18T10:00:00Z")
+        );
+        assert_eq!(after_older.body_html, "<p>Long body v1</p>");
+
+        // Combined read-state change + strictly newer last_modified_at (same subject/preview)
+        // MUST mark body_loaded=false so open mail re-checks its body
+        let mut combined_edit = same_ts_meta;
+        combined_edit.is_read = false;
+        combined_edit.last_modified_at = Some("2026-11-18T10:01:00Z".into());
+        assert_eq!(storage.upsert_mail_messages(&[combined_edit.clone()]).unwrap(), 1);
+        let after_combined = storage.get_mail_message("m-mod").unwrap().unwrap();
+        assert!(!after_combined.body_loaded);
+        assert!(!after_combined.is_read);
+        assert!(after_combined.body_html.is_empty());
+
+        // Re-hydrating v2 body then re-receiving the exact same delta keeps body_loaded=true (0 changes)
+        let mut hydrated_v2 = msg.clone();
+        hydrated_v2.is_read = false;
+        hydrated_v2.last_modified_at = Some("2026-11-18T10:01:00Z".into());
+        hydrated_v2.body_html = "<p>Long body v2</p>".into();
+        hydrated_v2.body_plain = "Long body v2".into();
+        storage.upsert_mail_messages(&[hydrated_v2]).unwrap();
+        assert_eq!(storage.upsert_mail_messages(&[combined_edit.clone()]).unwrap(), 0);
+        let after_repeat = storage.get_mail_message("m-mod").unwrap().unwrap();
+        assert!(after_repeat.body_loaded);
+        assert_eq!(after_repeat.body_html, "<p>Long body v2</p>");
 
         // last_modified_at bump WITHOUT read/flag/folder change (e.g. body edit past 255 chars) invalidates body
-        let mut deep_body_edit = read_only;
+        let mut deep_body_edit = combined_edit;
         deep_body_edit.last_modified_at = Some("2026-11-18T10:02:00Z".into());
         storage.upsert_mail_messages(&[deep_body_edit]).unwrap();
         let after_edit = storage.get_mail_message("m-mod").unwrap().unwrap();

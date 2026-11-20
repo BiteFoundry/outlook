@@ -9,9 +9,10 @@ use anyhow::Result;
 #[cfg(not(windows))]
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyCode,
-    KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+    Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -48,6 +49,8 @@ static KITTY_USED_GLOBAL: AtomicBool = AtomicBool::new(false);
 /// ensures ConPTY / Windows Terminal / xterm.js report mouse wheel events cleanly.
 pub(crate) const VT_ENABLE_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 pub(crate) const VT_DISABLE_MOUSE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+pub(crate) const VT_ENABLE_FOCUS: &str = "\x1b[?1004h";
+pub(crate) const VT_DISABLE_FOCUS: &str = "\x1b[?1004l";
 
 pub(crate) fn write_vt_mouse_enable(w: &mut impl io::Write) -> io::Result<()> {
     w.write_all(VT_ENABLE_MOUSE.as_bytes())?;
@@ -56,6 +59,16 @@ pub(crate) fn write_vt_mouse_enable(w: &mut impl io::Write) -> io::Result<()> {
 
 pub(crate) fn write_vt_mouse_disable(w: &mut impl io::Write) -> io::Result<()> {
     w.write_all(VT_DISABLE_MOUSE.as_bytes())?;
+    w.flush()
+}
+
+pub(crate) fn write_vt_focus_enable(w: &mut impl io::Write) -> io::Result<()> {
+    w.write_all(VT_ENABLE_FOCUS.as_bytes())?;
+    w.flush()
+}
+
+pub(crate) fn write_vt_focus_disable(w: &mut impl io::Write) -> io::Result<()> {
+    w.write_all(VT_DISABLE_FOCUS.as_bytes())?;
     w.flush()
 }
 
@@ -290,12 +303,19 @@ impl TerminalGuard {
             stdout,
             EnterAlternateScreen,
             EnableMouseCapture,
-            EnableBracketedPaste
+            EnableBracketedPaste,
+            EnableFocusChange
         )?;
         #[cfg(windows)]
         {
-            execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+            execute!(
+                stdout,
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                EnableFocusChange
+            )?;
             write_vt_mouse_enable(&mut stdout)?;
+            let _ = write_vt_focus_enable(&mut stdout);
         }
 
         let keyboard_enhanced = if supports_keyboard_enhancement().unwrap_or(false) {
@@ -315,6 +335,7 @@ impl TerminalGuard {
         {
             win_console::enforce_windows_mouse_capture();
             let _ = write_vt_mouse_enable(&mut stdout);
+            let _ = write_vt_focus_enable(&mut stdout);
         }
 
         let backend = CrosstermBackend::new(stdout);
@@ -348,14 +369,21 @@ impl TerminalGuard {
         #[cfg(not(windows))]
         let _ = execute!(
             stdout,
+            DisableFocusChange,
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
         #[cfg(windows)]
         {
+            let _ = write_vt_focus_disable(&mut stdout);
             let _ = write_vt_mouse_disable(&mut stdout);
-            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+            let _ = execute!(
+                stdout,
+                DisableFocusChange,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
         }
         let _ = disable_raw_mode();
         #[cfg(windows)]
@@ -386,14 +414,21 @@ fn install_panic_hook(keyboard_enhanced: bool, orig_conin_mode: Option<u32>) {
         #[cfg(not(windows))]
         let _ = execute!(
             stdout,
+            DisableFocusChange,
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
         #[cfg(windows)]
         {
+            let _ = write_vt_focus_disable(&mut stdout);
             let _ = write_vt_mouse_disable(&mut stdout);
-            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+            let _ = execute!(
+                stdout,
+                DisableFocusChange,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
         }
         let _ = disable_raw_mode();
         #[cfg(windows)]
@@ -404,6 +439,7 @@ fn install_panic_hook(keyboard_enhanced: bool, orig_conin_mode: Option<u32>) {
 
 const MAX_COALESCED_EVENTS: usize = 64;
 const ACTIVITY_THROTTLE: Duration = Duration::from_secs(5);
+const FOCUS_SYNC_DEBOUNCE: Duration = Duration::from_secs(2);
 const PASTE_BURST_POLL: Duration = Duration::from_millis(2);
 const MAX_PASTE_BURST_EVENTS: usize = 4096;
 
@@ -474,9 +510,17 @@ async fn process_terminal_event_with_burst(
     ui: &mut UiState,
     dirty: &mut bool,
     last_activity_sent: &mut Option<Instant>,
+    last_focus_sync: &mut Option<Instant>,
 ) -> LoopStep {
     let CrosstermEvent::Key(first_key) = first_ev else {
-        return handle_terminal_event(first_ev, app, ui, dirty, last_activity_sent);
+        return handle_terminal_event(
+            first_ev,
+            app,
+            ui,
+            dirty,
+            last_activity_sent,
+            last_focus_sync,
+        );
     };
     if !ui.accepts_text_input() || !PasteBurstDetector::is_candidate_key(&first_key) {
         return handle_terminal_event(
@@ -485,6 +529,7 @@ async fn process_terminal_event_with_burst(
             ui,
             dirty,
             last_activity_sent,
+            last_focus_sync,
         );
     }
 
@@ -545,7 +590,8 @@ async fn process_terminal_event_with_burst(
                         app,
                         ui,
                         dirty,
-                        last_activity_sent
+                        last_activity_sent,
+                        last_focus_sync
                     ),
                     LoopStep::Quit
                 ) {
@@ -557,7 +603,14 @@ async fn process_terminal_event_with_burst(
 
     if let Some(extra) = trailing_event {
         if matches!(
-            handle_terminal_event(extra, app, ui, dirty, last_activity_sent),
+            handle_terminal_event(
+                extra,
+                app,
+                ui,
+                dirty,
+                last_activity_sent,
+                last_focus_sync
+            ),
             LoopStep::Quit
         ) {
             return LoopStep::Quit;
@@ -754,6 +807,7 @@ fn handle_terminal_event(
     ui: &mut UiState,
     dirty: &mut bool,
     last_activity_sent: &mut Option<Instant>,
+    last_focus_sync: &mut Option<Instant>,
 ) -> LoopStep {
     match ev {
         CrosstermEvent::Key(key) => {
@@ -834,6 +888,21 @@ fn handle_terminal_event(
                 Some(ui::overlays::Overlay::ImagePreview(_))
             ) {
                 let _ = action::dispatch(Action::LoadPreviewImage, app, ui);
+            }
+        }
+        CrosstermEvent::FocusGained => {
+            let now = Instant::now();
+            app.sync_ctrl.notify_activity();
+            *last_activity_sent = Some(now);
+            if last_focus_sync.is_none_or(|t| now.saturating_duration_since(t) >= FOCUS_SYNC_DEBOUNCE)
+            {
+                *last_focus_sync = Some(now);
+                app.request_sync_for_active_view(ui.active_nav_tab);
+                if let Some(Overlay::MailCompose(c)) = ui.overlays.last() {
+                    if c.field <= 2 {
+                        app.request_contacts_sync();
+                    }
+                }
             }
         }
         _ => {}
@@ -1022,6 +1091,7 @@ pub async fn run_with_persona(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
     let mut last_activity_sent: Option<Instant> = None;
+    let mut last_focus_sync: Option<Instant> = None;
 
     loop {
         if ui.editor_requested {
@@ -1069,12 +1139,19 @@ pub async fn run_with_persona(
                 stdout,
                 EnterAlternateScreen,
                 EnableMouseCapture,
-                EnableBracketedPaste
+                EnableBracketedPaste,
+                EnableFocusChange
             )?;
             #[cfg(windows)]
             {
-                execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+                execute!(
+                    stdout,
+                    EnterAlternateScreen,
+                    EnableMouseCapture,
+                    EnableFocusChange
+                )?;
                 write_vt_mouse_enable(&mut stdout)?;
+                let _ = write_vt_focus_enable(&mut stdout);
             }
             if guard.keyboard_enhanced {
                 let _ = execute!(
@@ -1089,6 +1166,7 @@ pub async fn run_with_persona(
             {
                 win_console::enforce_windows_mouse_capture();
                 let _ = write_vt_mouse_enable(&mut stdout);
+                let _ = write_vt_focus_enable(&mut stdout);
             }
             terminal.clear()?;
             dirty = true;
@@ -1151,7 +1229,8 @@ pub async fn run_with_persona(
                                 &mut app,
                                 &mut ui,
                                 &mut dirty,
-                                &mut last_activity_sent
+                                &mut last_activity_sent,
+                                &mut last_focus_sync
                             )
                             .await,
                             LoopStep::Quit
@@ -1212,7 +1291,8 @@ pub async fn run_with_persona(
                                 &mut app,
                                 &mut ui,
                                 &mut dirty,
-                                &mut last_activity_sent
+                                &mut last_activity_sent,
+                                &mut last_focus_sync
                             )
                             .await,
                             LoopStep::Quit
@@ -1332,6 +1412,66 @@ mod tests {
             String::from_utf8(disable_buf).unwrap(),
             "\x1b[?1006l\x1b[?1002l\x1b[?1000l"
         );
+
+        let mut focus_en = Vec::new();
+        write_vt_focus_enable(&mut focus_en).unwrap();
+        assert_eq!(String::from_utf8(focus_en).unwrap(), "\x1b[?1004h");
+
+        let mut focus_dis = Vec::new();
+        write_vt_focus_disable(&mut focus_dis).unwrap();
+        assert_eq!(String::from_utf8(focus_dis).unwrap(), "\x1b[?1004l");
+    }
+
+    #[test]
+    fn test_focus_gained_triggers_active_view_sync_and_debounces() {
+        use crate::ui::nav_pane::TAB_CALENDAR;
+
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
+        let (nudge_tx, mut nudge_rx) = mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+        let (ui_tx, _) = mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+        ui.active_nav_tab = TAB_CALENDAR;
+
+        let mut dirty = false;
+        let mut last_activity = None;
+        let mut last_focus = None;
+
+        // First FocusGained wakes activity and immediately dispatches SyncCalendar
+        handle_terminal_event(
+            CrosstermEvent::FocusGained,
+            &mut app,
+            &mut ui,
+            &mut dirty,
+            &mut last_activity,
+            &mut last_focus,
+        );
+        let mut cmds = Vec::new();
+        while let Ok(c) = nudge_rx.try_recv() {
+            cmds.push(c);
+        }
+        assert!(cmds.iter().any(|c| matches!(c, SyncCommand::NotifyUserActivity)));
+        assert!(cmds.iter().any(|c| matches!(c, SyncCommand::SyncCalendar)));
+
+        // Immediate second FocusGained within debounce window skips duplicate SyncCalendar
+        handle_terminal_event(
+            CrosstermEvent::FocusGained,
+            &mut app,
+            &mut ui,
+            &mut dirty,
+            &mut last_activity,
+            &mut last_focus,
+        );
+        let mut cmds2 = Vec::new();
+        while let Ok(c) = nudge_rx.try_recv() {
+            cmds2.push(c);
+        }
+        assert!(!cmds2.iter().any(|c| matches!(c, SyncCommand::SyncCalendar)));
     }
 
     fn sample_graphic(

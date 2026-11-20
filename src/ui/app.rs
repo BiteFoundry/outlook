@@ -24,12 +24,13 @@ use crate::models::{
 };
 use crate::parser;
 use crate::storage::Storage;
-use crate::sync::{FocusTarget, SyncCommand, SyncController};
+use crate::sync::{ActiveView, FocusTarget, SyncCommand, SyncController};
 
 use super::hitmap::{HitMap, HitTarget};
 use super::keymap::Keymap;
 use super::nav_pane::{
-    find_folder_by_wellknown, TAB_MAIL, VIRTUAL_FLAGGED_FOLDER, VIRTUAL_UNREAD_FOLDER,
+    find_folder_by_wellknown, TAB_CALENDAR, TAB_MAIL, TAB_TASKS, VIRTUAL_FLAGGED_FOLDER,
+    VIRTUAL_UNREAD_FOLDER,
 };
 use super::notification;
 use super::overlays::html_preview::HtmlPreviewOverlay;
@@ -390,6 +391,7 @@ pub struct AppState {
     pub my_profile: Option<UserProfile>,
     pub my_email: String,
     pub my_display_name: String,
+    pub active_view: ActiveView,
     pub mail_folders: Vec<MailFolder>,
     pub active_folder_id: String,
     pub mail_messages: Vec<MailMessage>,
@@ -459,6 +461,7 @@ impl AppState {
             my_profile: None,
             my_email: String::new(),
             my_display_name: String::new(),
+            active_view: ActiveView::Mail,
             mail_folders: Vec::new(),
             active_folder_id: "inbox".to_string(),
             mail_messages: Vec::new(),
@@ -1030,6 +1033,14 @@ impl AppState {
         });
     }
 
+    pub fn active_view_for_tab(tab: usize) -> ActiveView {
+        match tab {
+            TAB_CALENDAR => ActiveView::Calendar,
+            TAB_TASKS => ActiveView::Tasks,
+            _ => ActiveView::Mail,
+        }
+    }
+
     pub fn push_focus_to_sync(&self) {
         let folder_id = if self.active_folder_id == VIRTUAL_UNREAD_FOLDER
             || self.active_folder_id == VIRTUAL_FLAGGED_FOLDER
@@ -1039,13 +1050,48 @@ impl AppState {
             Some(self.active_folder_id.clone())
         };
         self.sync_ctrl.set_focus(FocusTarget {
+            active_view: self.active_view,
             active_folder_id: folder_id,
             active_message_id: self.active_mail_id.clone(),
             active_todo_list_id: self.active_todo_list_id.clone(),
         });
     }
 
+    /// Synchronizes the active tab's view immediately (used on tab switch and terminal FocusGained).
+    /// Virtual mail folders (`Unread`, `Flagged`) reuse the existing Inbox folder delta scope.
+    pub fn request_sync_for_active_view(&mut self, tab: usize) {
+        let view = Self::active_view_for_tab(tab);
+        self.active_view = view;
+        self.push_focus_to_sync();
+        match view {
+            ActiveView::Mail => {
+                let folder_id = if self.active_folder_id == VIRTUAL_UNREAD_FOLDER
+                    || self.active_folder_id == VIRTUAL_FLAGGED_FOLDER
+                {
+                    self.find_inbox_folder_id()
+                        .unwrap_or_else(|| "inbox".to_string())
+                } else {
+                    self.active_folder_id.clone()
+                };
+                self.sync_ctrl.request(SyncCommand::SyncFolder { folder_id });
+            }
+            ActiveView::Calendar => {
+                self.sync_ctrl.request(SyncCommand::SyncCalendar);
+            }
+            ActiveView::Tasks => {
+                self.sync_ctrl.request(SyncCommand::SyncTodo {
+                    list_id: self.active_todo_list_id.clone(),
+                });
+            }
+        }
+    }
+
+    pub fn request_contacts_sync(&self) {
+        self.sync_ctrl.request(SyncCommand::SyncContacts);
+    }
+
     pub fn select_mail_folder(&mut self, ui: &mut UiState, folder_id: String) {
+        self.active_view = ActiveView::Mail;
         self.active_folder_id = folder_id.clone();
         self.pinned_mail = None;
         self.clear_mail_detail_cache();
@@ -1946,6 +1992,7 @@ impl AppState {
     }
 
     pub fn select_todo_list(&mut self, ui: &mut UiState, list_id: String) {
+        self.active_view = ActiveView::Tasks;
         self.active_todo_list_id = Some(list_id.clone());
         ui.todo_list_scroll = ScrollState::default();
         ui.todo_detail_scroll = ScrollState::default();
@@ -2833,9 +2880,12 @@ impl AppState {
             CoreEvent::CalendarEventsUpdated(events) => {
                 ui.poll_retrying = false;
                 self.calendar_events = events;
-                if self.active_event_id.is_none() {
-                    let vis = self.visible_calendar_events(ui);
+                let vis = self.visible_calendar_events(ui);
+                if self.active_event().is_none() {
                     self.active_event_id = vis.first().map(|e| e.id.clone());
+                    ui.cal_list_scroll.selected_idx = (!vis.is_empty()).then_some(0);
+                } else if let Some(ref active_id) = self.active_event_id {
+                    ui.cal_list_scroll.selected_idx = vis.iter().position(|e| e.id == *active_id);
                 }
             }
             CoreEvent::ContactsUpdated(contacts) => {
@@ -2853,10 +2903,18 @@ impl AppState {
                 }
             }
             CoreEvent::TodoTasksUpdated { list_id, tasks } => {
+                if self.active_todo_list_id.is_none() {
+                    self.active_todo_list_id = Some(list_id.clone());
+                }
                 if self.active_todo_list_id.as_deref() == Some(list_id.as_str()) {
                     self.todo_tasks = tasks;
-                    if self.active_todo_task_id.is_none() {
+                    if self.active_todo_task().is_none() {
                         self.active_todo_task_id = self.todo_tasks.first().map(|t| t.id.clone());
+                        ui.todo_list_scroll.selected_idx =
+                            (!self.todo_tasks.is_empty()).then_some(0);
+                    } else if let Some(ref active_id) = self.active_todo_task_id {
+                        ui.todo_list_scroll.selected_idx =
+                            self.todo_tasks.iter().position(|t| t.id == *active_id);
                     }
                 }
             }
@@ -3106,9 +3164,15 @@ impl AppState {
                 self.calendar_events.push(created);
                 self.calendar_events
                     .sort_by(|a, b| a.start_iso.cmp(&b.start_iso));
+                if self.daemon_attached {
+                    self.sync_ctrl.request(SyncCommand::SyncCalendar);
+                }
             }
             UiMsg::CalendarEventDeleted(id) => {
                 self.calendar_events.retain(|e| e.id != id);
+                if self.daemon_attached {
+                    self.sync_ctrl.request(SyncCommand::SyncCalendar);
+                }
             }
             UiMsg::CalendarRsvpDone {
                 event_id,
@@ -3116,6 +3180,9 @@ impl AppState {
             } => {
                 if let Some(ev) = self.calendar_events.iter_mut().find(|e| e.id == event_id) {
                     ev.response_status = response_status;
+                }
+                if self.daemon_attached {
+                    self.sync_ctrl.request(SyncCommand::SyncCalendar);
                 }
             }
             UiMsg::TodoListCreated(list) => {
@@ -4138,5 +4205,97 @@ mod tests {
         );
         assert!(app.mail_messages.is_empty());
         assert!(app.active_mail_id.is_none());
+    }
+
+    #[test]
+    fn tab_switch_virtual_folders_compose_contacts_and_open_only_hydration() {
+        use crate::ui::action::{self, Action};
+        use crate::ui::nav_pane::{TAB_CALENDAR, TAB_MAIL, TAB_TASKS};
+
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, focus_rx) = tokio::sync::watch::channel(FocusTarget::default());
+        let (nudge_tx, mut nudge_rx) = mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+        let (ui_tx, _) = mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+
+        app.mail_folders = vec![MailFolder {
+            id: "f-inbox".into(),
+            display_name: "Inbox".into(),
+            well_known_name: Some("inbox".into()),
+            parent_folder_id: None,
+            child_folder_count: 0,
+            unread_item_count: 1,
+            total_item_count: 2,
+        }];
+        app.storage.upsert_mail_folders(&app.mail_folders).unwrap();
+        app.active_folder_id = "f-inbox".into();
+        app.active_todo_list_id = Some("todo-work".into());
+
+        // Switching to Calendar sends SyncCalendar and sets ActiveView::Calendar
+        action::dispatch(Action::SelectNavTab(TAB_CALENDAR), &mut app, &mut ui);
+        assert_eq!(focus_rx.borrow().active_view, ActiveView::Calendar);
+        assert!(matches!(nudge_rx.try_recv(), Ok(SyncCommand::SyncCalendar)));
+
+        // Switching to Tasks sends SyncTodo for selected list and sets ActiveView::Tasks
+        action::dispatch(Action::SelectNavTab(TAB_TASKS), &mut app, &mut ui);
+        assert_eq!(focus_rx.borrow().active_view, ActiveView::Tasks);
+        assert!(matches!(
+            nudge_rx.try_recv(),
+            Ok(SyncCommand::SyncTodo { list_id: Some(ref id) }) if id == "todo-work"
+        ));
+
+        // Switching back to Mail on a virtual folder (Unread) uses existing Inbox scope,
+        // never requesting SyncFolder with "__virtual_unread__".
+        app.active_folder_id = VIRTUAL_UNREAD_FOLDER.into();
+        action::dispatch(Action::SelectNavTab(TAB_MAIL), &mut app, &mut ui);
+        assert_eq!(focus_rx.borrow().active_view, ActiveView::Mail);
+        assert_eq!(focus_rx.borrow().active_folder_id, None);
+        assert!(matches!(
+            nudge_rx.try_recv(),
+            Ok(SyncCommand::SyncFolder { ref folder_id }) if folder_id == "f-inbox"
+        ));
+
+        // Opening Mail Compose triggers SyncContacts once; typing in To: does not spam extra SyncContacts
+        app.draft_store = DraftStore::default();
+        action::dispatch(Action::OpenMailCompose, &mut app, &mut ui);
+        assert!(matches!(nudge_rx.try_recv(), Ok(SyncCommand::SyncContacts)));
+        action::dispatch(Action::Input('b'), &mut app, &mut ui);
+        action::dispatch(Action::Input('o'), &mut app, &mut ui);
+        assert!(nudge_rx.try_recv().is_err());
+        action::dispatch(Action::CloseOverlay, &mut app, &mut ui);
+
+        // When two messages have body_loaded=false after delta, ONLY the open mail requests HydrateMessage
+        app.active_folder_id = "f-inbox".into();
+        let mut m_open = make_mail("m-open", "c-open", "2026-11-20T10:00:00Z", false, false);
+        m_open.folder_id = Some("f-inbox".into());
+        m_open.body_loaded = false;
+        let mut m_closed = make_mail("m-closed", "c-closed", "2026-11-20T09:00:00Z", false, false);
+        m_closed.folder_id = Some("f-inbox".into());
+        m_closed.body_loaded = false;
+        app.storage
+            .upsert_mail_messages(&[m_open, m_closed])
+            .unwrap();
+        app.active_mail_id = Some("m-open".into());
+        while nudge_rx.try_recv().is_ok() {}
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::MailMessagesUpdated {
+                folder_id: "f-inbox".into(),
+                messages: vec![],
+                notify_candidate: None,
+            },
+        );
+        let mut hydrated_reqs = Vec::new();
+        while let Ok(cmd) = nudge_rx.try_recv() {
+            if let SyncCommand::HydrateMessage { message_id } = cmd {
+                hydrated_reqs.push(message_id);
+            }
+        }
+        assert_eq!(hydrated_reqs, vec!["m-open".to_string()]);
     }
 }

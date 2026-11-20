@@ -61,6 +61,7 @@ pub struct MailComposeOverlay {
     pub button_idx: usize,
     pub suggestion_idx: usize,
     pub suggestion_dismissed: bool,
+    pub contacts_sync_requested: bool,
     pub error: Option<String>,
 }
 
@@ -84,6 +85,7 @@ impl MailComposeOverlay {
             button_idx: 0,
             suggestion_idx: 0,
             suggestion_dismissed: false,
+            contacts_sync_requested: false,
             error: None,
         }
     }
@@ -386,12 +388,19 @@ impl MailComposeOverlay {
         })
     }
 
+    pub fn maybe_request_contacts_sync(&mut self, app: &AppState) {
+        if self.field <= 2 && !self.contacts_sync_requested {
+            self.contacts_sync_requested = true;
+            app.request_contacts_sync();
+        }
+    }
+
     pub fn handle(&mut self, action: &Action, app: &AppState) -> OverlayOutcome {
         let suggestions = self.matching_contacts(&app.contacts);
         let suggestions_len = suggestions.len();
         let has_suggestions = self.field <= 2 && suggestions_len > 0;
 
-        match action {
+        let outcome = match action {
             Action::OverlaySubmit => self.submit(),
             Action::SaveDraft => OverlayOutcome::Dispatch(Action::SaveMailDraft),
             Action::OpenAttachPicker | Action::OpenFilePicker => {
@@ -420,6 +429,9 @@ impl MailComposeOverlay {
                     buf.push(*ch);
                     self.suggestion_idx = 0;
                 }
+                if self.field <= 2 {
+                    self.maybe_request_contacts_sync(app);
+                }
                 OverlayOutcome::Handled
             }
             Action::Paste(text) => {
@@ -429,6 +441,9 @@ impl MailComposeOverlay {
                 } else if let Some(buf) = self.active_header_mut() {
                     buf.push_str(&text.replace(['\r', '\n'], " "));
                     self.suggestion_dismissed = false;
+                    if self.field <= 2 {
+                        self.maybe_request_contacts_sync(app);
+                    }
                 }
                 OverlayOutcome::Handled
             }
@@ -440,6 +455,9 @@ impl MailComposeOverlay {
                     buf.pop();
                     self.suggestion_idx = 0;
                     self.suggestion_dismissed = false;
+                    if self.field <= 2 {
+                        self.maybe_request_contacts_sync(app);
+                    }
                 }
                 OverlayOutcome::Handled
             }
@@ -560,7 +578,11 @@ impl MailComposeOverlay {
             }
             Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
             _ => OverlayOutcome::Handled,
+        };
+        if self.field <= 2 && matches!(outcome, OverlayOutcome::Handled) {
+            self.maybe_request_contacts_sync(app);
         }
+        outcome
     }
 
     fn activate_button(&mut self) -> OverlayOutcome {

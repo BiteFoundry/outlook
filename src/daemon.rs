@@ -1497,9 +1497,27 @@ async fn handle_client_connection(
                             }
                             Err(broadcast::error::RecvError::Lagged(_)) => {
                                 let st = storage.clone();
-                                if let Ok(Ok(folders)) = tokio::task::spawn_blocking(move || st.list_mail_folders()).await {
+                                if let Ok(Ok((folders, events))) =
+                                    tokio::task::spawn_blocking(move || {
+                                        Ok::<_, anyhow::Error>((
+                                            st.list_mail_folders()?,
+                                            st.list_calendar_events(None, None, 200)?,
+                                        ))
+                                    })
+                                    .await
+                                {
                                     let ev = CoreEvent::MailFoldersUpdated(folders);
-                                    if write_json_line(&mut write_half, &ServerFrame::Event(ev)).await.is_err() {
+                                    if write_json_line(&mut write_half, &ServerFrame::Event(ev))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    let cal_ev = CoreEvent::CalendarEventsUpdated(events);
+                                    if write_json_line(&mut write_half, &ServerFrame::Event(cal_ev))
+                                        .await
+                                        .is_err()
+                                    {
                                         break;
                                     }
                                 }
@@ -1696,6 +1714,7 @@ mod tests {
         assert!(matches!(forwarded_cmd, SyncCommand::RefreshAll));
 
         conn.sync_ctrl.set_focus(FocusTarget {
+            active_view: sync::ActiveView::Mail,
             active_folder_id: Some("inbox".to_string()),
             active_message_id: Some("msg-1".to_string()),
             active_todo_list_id: None,

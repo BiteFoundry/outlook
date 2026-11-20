@@ -219,11 +219,25 @@ struct ExistingMailRow {
     web_link: Option<String>,
 }
 
-/// Upserts `messages`, enforcing the selective header-first preservation rule:
-/// metadata-only header updates (`is_read`, `flagged`, `importance`, `folder_id`, etc.)
-/// preserve cached full bodies/attachments, whereas content changes (`subject`, `preview`,
-/// `is_draft`, `has_attachments`, or `last_modified_at` without a metadata-only change)
-/// invalidate `body_loaded` so the reader re-hydrates the updated body.
+/// Compares two RFC 3339 / ISO 8601 timestamps, falling back to lexicographical order.
+fn compare_iso_timestamps(incoming: &str, existing: &str) -> std::cmp::Ordering {
+    let inc = incoming.trim();
+    let ex = existing.trim();
+    match (
+        chrono::DateTime::parse_from_rfc3339(inc),
+        chrono::DateTime::parse_from_rfc3339(ex),
+    ) {
+        (Ok(a), Ok(b)) => a.cmp(&b),
+        _ => inc.cmp(ex),
+    }
+}
+
+/// Upserts `messages`, enforcing the header-first body freshness rule:
+/// - Older summaries (`last_modified_at < existing`) never regress newer cached rows or bodies.
+/// - Same-timestamp or timestamp-less metadata-only header updates preserve cached full bodies.
+/// - Strictly newer `last_modified_at` (even alongside read/flag/folder changes) or content
+///   changes (`subject`, `preview`, `is_draft`, `has_attachments`) mark `body_loaded = 0` so
+///   the active reader re-hydrates the updated body while other messages hydrate on open.
 pub fn upsert_mail_messages(conn: &mut Connection, messages: &[MailMessage]) -> Result<usize> {
     if messages.is_empty() {
         return Ok(0);
@@ -374,10 +388,25 @@ fn upsert_mail_messages_in_tx(tx: &Transaction<'_>, messages: &[MailMessage]) ->
             let eff_folder_id = msg.folder_id.as_deref().or(ex.folder_id.as_deref());
             let eff_from_json = from_json.as_deref().or(ex.from_json.as_deref());
             let eff_sent_at = msg.sent_at.as_deref().or(ex.sent_at.as_deref());
-            let eff_last_modified = msg
+            let inc_last_modified = msg
                 .last_modified_at
                 .as_deref()
-                .or(ex.last_modified_at.as_deref());
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let ex_last_modified = ex
+                .last_modified_at
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let last_modified_cmp = match (inc_last_modified, ex_last_modified) {
+                (Some(inc), Some(old)) => Some(compare_iso_timestamps(inc, old)),
+                _ => None,
+            };
+            // Never let a late/older delta summary or stale hydration regress a newer cached row.
+            if matches!(last_modified_cmp, Some(std::cmp::Ordering::Less)) {
+                continue;
+            }
+            let eff_last_modified = inc_last_modified.or(ex_last_modified);
             let eff_inference = msg
                 .inference_classification
                 .as_deref()
@@ -394,21 +423,14 @@ fn upsert_mail_messages_in_tx(tx: &Transaction<'_>, messages: &[MailMessage]) ->
             };
 
             let header_over_hydrated = !msg.body_loaded && ex.body_loaded != 0;
-            let metadata_only_diff = is_read_i != ex.is_read
-                || flagged_i != ex.flagged
-                || eff_folder_id != ex.folder_id.as_deref()
-                || msg.importance != ex.importance
-                || eff_inference != ex.inference_classification.as_deref();
-            let modified_without_flag_diff = msg.last_modified_at.is_some()
-                && ex.last_modified_at.is_some()
-                && msg.last_modified_at != ex.last_modified_at
-                && !metadata_only_diff;
+            let incoming_newer_modified =
+                matches!(last_modified_cmp, Some(std::cmp::Ordering::Greater));
             let invalidate_body = header_over_hydrated
                 && (msg.subject != ex.subject
                     || (!msg.preview.is_empty() && msg.preview != ex.preview)
                     || is_draft_i != ex.is_draft
                     || has_att_i != ex.has_attachments
-                    || modified_without_flag_diff);
+                    || incoming_newer_modified);
 
             let preserve_hydrated = header_over_hydrated && !invalidate_body;
 

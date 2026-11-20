@@ -325,6 +325,7 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     ui.todo_list_scroll.selected_idx = Some(0);
                 }
             }
+            app.request_sync_for_active_view(ui.active_nav_tab);
         }
         Action::SelectNavRow(idx) => {
             activate_nav_row(app, ui, idx);
@@ -401,10 +402,11 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::OpenMailCompose => {
             let mode = MailComposeMode::New;
-            let compose = match app.draft_store.get_mail(&mode.draft_key()) {
+            let mut compose = match app.draft_store.get_mail(&mode.draft_key()) {
                 Some(entry) => MailComposeOverlay::from_draft_entry(mode, entry),
                 None => MailComposeOverlay::new(),
             };
+            compose.maybe_request_contacts_sync(app);
             ui.close_overlays_of(OverlayKind::MailCompose);
             ui.push_overlay(Overlay::mail_compose(compose));
         }
@@ -419,6 +421,7 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 if let Some(saved) = app.draft_store.get_mail(&compose.mode.draft_key()) {
                     compose = MailComposeOverlay::from_draft_entry(compose.mode.clone(), saved);
                 }
+                compose.maybe_request_contacts_sync(app);
                 ui.close_overlays_of(OverlayKind::MailCompose);
                 ui.push_overlay(Overlay::mail_compose(compose));
             }
@@ -429,6 +432,7 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 if let Some(saved) = app.draft_store.get_mail(&compose.mode.draft_key()) {
                     compose = MailComposeOverlay::from_draft_entry(compose.mode.clone(), saved);
                 }
+                compose.maybe_request_contacts_sync(app);
                 ui.close_overlays_of(OverlayKind::MailCompose);
                 ui.push_overlay(Overlay::mail_compose(compose));
             }
@@ -677,6 +681,7 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             let vis = app.visible_calendar_events(ui);
             ui.cal_list_scroll.selected_idx = vis.iter().position(|e| e.id == event_id);
             ui.set_focus(Focus::List);
+            app.request_sync_for_active_view(TAB_CALENDAR);
         }
 
         // Todo
@@ -1260,6 +1265,7 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
             Some(HitTarget::ComposeField(idx)) => {
                 if let Some(Overlay::MailCompose(ref mut compose)) = ui.overlays.last_mut() {
                     compose.select_field(idx);
+                    compose.maybe_request_contacts_sync(app);
                 }
                 return false;
             }
