@@ -1192,16 +1192,52 @@ async fn run_initial_bootstrap(
                 let _ = event_tx.send(CoreEvent::MailFoldersUpdated(folders));
             }
             let st_msgs = storage.clone();
-            if let Ok(Ok(messages)) = tokio::task::spawn_blocking(move || {
-                st_msgs.list_mail_summaries_filtered(Some("inbox"), false, false, false, 100)
+            if let Ok(Ok((real_inbox_id, messages))) = tokio::task::spawn_blocking(move || {
+                let real_inbox = st_msgs
+                    .find_well_known_folder_id("inbox")?
+                    .unwrap_or_else(|| "inbox".to_string());
+                let msgs = st_msgs.list_mail_summaries_filtered(
+                    Some(&real_inbox),
+                    false,
+                    false,
+                    false,
+                    150,
+                )?;
+                Ok::<_, anyhow::Error>((real_inbox, msgs))
             })
             .await
             {
                 let _ = event_tx.send(CoreEvent::MailMessagesUpdated {
-                    folder_id: "inbox".to_string(),
+                    folder_id: real_inbox_id,
                     messages,
                     notify_candidate: None,
                 });
+            }
+            let st_rest = storage.clone();
+            if let Ok(Ok((events, contacts, lists, def_tasks))) =
+                tokio::task::spawn_blocking(move || {
+                    let events = st_rest.list_calendar_events(None, None, 200)?;
+                    let contacts = st_rest.list_contacts(None, 200)?;
+                    let lists = st_rest.list_todo_lists()?;
+                    let def_id = lists
+                        .iter()
+                        .find(|l| l.wellknown_list_name.as_deref() == Some("defaultList"))
+                        .or_else(|| lists.first())
+                        .map(|l| l.id.clone());
+                    let tasks = match def_id {
+                        Some(lid) => Some((lid.clone(), st_rest.list_todo_tasks(Some(&lid), true)?)),
+                        None => None,
+                    };
+                    Ok::<_, anyhow::Error>((events, contacts, lists, tasks))
+                })
+                .await
+            {
+                let _ = event_tx.send(CoreEvent::CalendarEventsUpdated(events));
+                let _ = event_tx.send(CoreEvent::ContactsUpdated(contacts));
+                let _ = event_tx.send(CoreEvent::TodoListsUpdated(lists));
+                if let Some((list_id, tasks)) = def_tasks {
+                    let _ = event_tx.send(CoreEvent::TodoTasksUpdated { list_id, tasks });
+                }
             }
             let _ = event_tx.send(CoreEvent::SyncStateChanged {
                 busy: false,

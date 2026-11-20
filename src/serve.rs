@@ -588,23 +588,25 @@ async fn list_mail_folders(
     State(state): State<Arc<AppState>>,
     Query(query): Query<RefreshOfflineQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let cached = with_storage(&state.storage, |s| s.list_mail_folders()).await?;
-    let folders = if !query.offline && (query.refresh || cached.is_empty()) {
+    let ttl = cli::cli_cache_ttl_secs(&state.config);
+    let (cached, fresh) = with_storage(&state.storage, move |s| {
+        let folders = s.list_mail_folders()?;
+        let is_fresh = cli::is_cursor_fresh(s, &["cli:mail_folders"], ttl);
+        Ok((folders, is_fresh))
+    })
+    .await?;
+    let folders = if !query.offline && (query.refresh || cached.is_empty() || !fresh) {
         let fetched = match state.graph.list_mail_folders().await {
             Ok(f) => f,
             Err(err) => return Err(map_graph_error(&state.graph, err).await),
         };
         let fetched_clone = fetched.clone();
-        let stored = with_storage(&state.storage, move |s| {
-            s.upsert_mail_folders(&fetched_clone)?;
+        with_storage(&state.storage, move |s| {
+            s.replace_mail_folders(&fetched_clone)?;
+            cli::record_cli_sync_cursor(s, "cli:mail_folders");
             s.list_mail_folders()
         })
-        .await?;
-        if stored.is_empty() {
-            fetched
-        } else {
-            stored
-        }
+        .await?
     } else {
         cached
     };
@@ -630,33 +632,36 @@ async fn list_mail_messages(
     let resolved_folder = resolve_mail_folder_for_api(&state, folder_arg, query.offline).await?;
     let folder_id = resolved_folder.id.clone();
 
+    let ttl = cli::cli_cache_ttl_secs(&state.config);
     let fid_for_read = folder_id.clone();
-    let cached = with_storage(&state.storage, move |s| {
-        s.list_mail_messages(Some(&fid_for_read), false, false, false, fetch_limit)
+    let (cached, fresh) = with_storage(&state.storage, move |s| {
+        let cli_key = format!("cli:mail:{fid_for_read}");
+        let delta_key = format!("mail_delta:{fid_for_read}");
+        let is_fresh = cli::is_cursor_fresh(s, &[cli_key.as_str(), delta_key.as_str()], ttl);
+        let msgs = s.list_mail_messages(Some(&fid_for_read), false, false, false, fetch_limit)?;
+        Ok((msgs, is_fresh))
     })
     .await?;
 
-    let messages = if !query.offline && (query.refresh || cached.is_empty()) {
-        let fetched = match state
-            .graph
-            .list_mail_messages(&folder_id, fetch_limit, false)
-            .await
+    let messages = if !query.offline && (query.refresh || cached.is_empty() || !fresh) {
+        let outcome = match crate::sync::sync_mail_folder_delta(
+            &folder_id,
+            &state.graph,
+            &state.storage,
+            None,
+            false,
+        )
+        .await
         {
-            Ok(m) => m,
+            Ok(o) => o,
             Err(err) => return Err(map_graph_error(&state.graph, err).await),
         };
-        let fetched_clone = fetched.clone();
-        let fid_for_store = folder_id.clone();
-        let stored = with_storage(&state.storage, move |s| {
-            s.upsert_mail_messages(&fetched_clone)?;
+        let fid_for_store = outcome.folder_id;
+        with_storage(&state.storage, move |s| {
+            cli::record_cli_sync_cursor(s, &format!("cli:mail:{fid_for_store}"));
             s.list_mail_messages(Some(&fid_for_store), false, false, false, fetch_limit)
         })
-        .await?;
-        if stored.is_empty() {
-            fetched
-        } else {
-            stored
-        }
+        .await?
     } else {
         cached
     };
@@ -857,14 +862,11 @@ async fn patch_mail_message(
     let is_read_val = body.is_read;
     let flagged_val = body.flagged;
     let _ = with_storage(&state.storage, move |s| {
-        if let Some(mut cached) = s.get_mail_message(&id_for_cache)? {
-            if let Some(r) = is_read_val {
-                cached.is_read = r;
-            }
-            if let Some(f) = flagged_val {
-                cached.flagged = f;
-            }
-            s.upsert_mail_messages(&[cached])?;
+        if let Some(r) = is_read_val {
+            s.set_mail_read_local(&id_for_cache, r)?;
+        }
+        if let Some(f) = flagged_val {
+            s.set_mail_flagged_local(&id_for_cache, f)?;
         }
         Ok(())
     })
@@ -877,9 +879,9 @@ async fn patch_mail_message(
             Err(err) => return Err(map_graph_error(&state.graph, err).await),
         };
         let moved_clone = moved.clone();
+        let old_id_clone = id.clone();
         let _ = with_storage(&state.storage, move |s| {
-            s.upsert_mail_messages(std::slice::from_ref(&moved_clone))?;
-            Ok(())
+            s.replace_moved_mail_local(&old_id_clone, &moved_clone)
         })
         .await;
         Some(moved)
@@ -1023,17 +1025,24 @@ async fn list_calendar_events(
         })
         .await?
     } else {
-        let fetched = match state
+        let (fetched, reached_end) = match state
             .graph
-            .list_calendar_view(&start_iso, &end_iso, limit)
+            .list_calendar_view_complete(&start_iso, &end_iso, limit)
             .await
         {
             Ok(ev) => ev,
             Err(err) => return Err(map_graph_error(&state.graph, err).await),
         };
         let fetched_clone = fetched.clone();
+        let s_iso = start_iso.clone();
+        let e_iso = end_iso.clone();
         let _ = with_storage(&state.storage, move |s| {
-            s.upsert_calendar_events(&fetched_clone)
+            if reached_end {
+                s.replace_calendar_events_in_window(&s_iso, &e_iso, &fetched_clone)?;
+                Ok(())
+            } else {
+                s.upsert_calendar_events(&fetched_clone)
+            }
         })
         .await;
         fetched
@@ -1133,6 +1142,12 @@ async fn rsvp_calendar_event(
     {
         return Err(map_graph_error(&state.graph, err).await);
     }
+    let id_clone = id.clone();
+    let status = cli::rsvp_action_to_graph_status(normalized);
+    let _ = with_storage(&state.storage, move |s| {
+        s.update_event_response_local(&id_clone, status)
+    })
+    .await;
 
     Ok(Json(json!({
         "ok": true,
@@ -1164,23 +1179,25 @@ async fn list_todo_lists(
     State(state): State<Arc<AppState>>,
     Query(query): Query<RefreshOfflineQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let cached = with_storage(&state.storage, |s| s.list_todo_lists()).await?;
-    let lists = if !query.offline && (query.refresh || cached.is_empty()) {
+    let ttl = cli::cli_cache_ttl_secs(&state.config);
+    let (cached, fresh) = with_storage(&state.storage, move |s| {
+        let lists = s.list_todo_lists()?;
+        let is_fresh = cli::is_cursor_fresh(s, &["cli:todo_lists"], ttl);
+        Ok((lists, is_fresh))
+    })
+    .await?;
+    let lists = if !query.offline && (query.refresh || cached.is_empty() || !fresh) {
         let fetched = match state.graph.list_todo_lists().await {
             Ok(l) => l,
             Err(err) => return Err(map_graph_error(&state.graph, err).await),
         };
         let fetched_clone = fetched.clone();
-        let stored = with_storage(&state.storage, move |s| {
-            s.upsert_todo_lists(&fetched_clone)?;
+        with_storage(&state.storage, move |s| {
+            s.replace_todo_lists(&fetched_clone)?;
+            cli::record_cli_sync_cursor(s, "cli:todo_lists");
             s.list_todo_lists()
         })
-        .await?;
-        if stored.is_empty() {
-            fetched
-        } else {
-            stored
-        }
+        .await?
     } else {
         cached
     };
@@ -1202,17 +1219,21 @@ async fn list_todo_tasks(
     let resolved = resolve_todo_list_for_api(&state, list_query, query.offline).await?;
     let list_id = resolved.id.clone();
 
+    let ttl = cli::cli_cache_ttl_secs(&state.config);
     let lid_for_read = list_id.clone();
     let include_completed = query.all;
-    let cached = with_storage(&state.storage, move |s| {
-        s.list_todo_tasks(Some(&lid_for_read), include_completed)
+    let (cached, fresh) = with_storage(&state.storage, move |s| {
+        let cursor_key = format!("cli:todo_tasks:{lid_for_read}");
+        let is_fresh = cli::is_cursor_fresh(s, &[cursor_key.as_str()], ttl);
+        let tasks = s.list_todo_tasks(Some(&lid_for_read), include_completed)?;
+        Ok((tasks, is_fresh))
     })
     .await?;
 
-    let mut tasks = if !query.offline && (query.refresh || cached.is_empty()) {
-        let fetched = match state
+    let mut tasks = if !query.offline && (query.refresh || cached.is_empty() || !fresh) {
+        let (fetched, reached_end) = match state
             .graph
-            .list_todo_tasks(&list_id, include_completed, limit)
+            .list_todo_tasks_complete(&list_id, include_completed, limit)
             .await
         {
             Ok(t) => t,
@@ -1220,16 +1241,16 @@ async fn list_todo_tasks(
         };
         let fetched_clone = fetched.clone();
         let lid_for_store = list_id.clone();
-        let stored = with_storage(&state.storage, move |s| {
-            s.upsert_todo_tasks(&fetched_clone)?;
+        with_storage(&state.storage, move |s| {
+            if reached_end {
+                s.replace_todo_tasks_for_list(&lid_for_store, include_completed, &fetched_clone)?;
+            } else {
+                s.upsert_todo_tasks(&fetched_clone)?;
+            }
+            cli::record_cli_sync_cursor(s, &format!("cli:todo_tasks:{lid_for_store}"));
             s.list_todo_tasks(Some(&lid_for_store), include_completed)
         })
-        .await?;
-        if stored.is_empty() {
-            fetched
-        } else {
-            stored
-        }
+        .await?
     } else {
         cached
     };
@@ -1381,12 +1402,19 @@ async fn list_contacts(
         let _ = with_storage(&state.storage, move |s| s.upsert_contacts(&fetched_clone)).await;
         fetched
     } else {
-        let fetched = match state.graph.list_contacts(limit).await {
+        let (fetched, reached_end) = match state.graph.list_contacts_complete(limit).await {
             Ok(c) => c,
             Err(err) => return Err(map_graph_error(&state.graph, err).await),
         };
         let fetched_clone = fetched.clone();
-        let _ = with_storage(&state.storage, move |s| s.upsert_contacts(&fetched_clone)).await;
+        let _ = with_storage(&state.storage, move |s| {
+            if reached_end {
+                s.replace_personal_contacts(&fetched_clone)
+            } else {
+                s.upsert_contacts(&fetched_clone)
+            }
+        })
+        .await;
         fetched
     };
 
@@ -1556,6 +1584,7 @@ mod tests {
                 reply_to: Vec::new(),
                 received_at: "2026-11-18T10:00:00Z".to_string(),
                 sent_at: None,
+                last_modified_at: None,
                 is_read: false,
                 is_draft: false,
                 flagged: true,

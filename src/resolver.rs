@@ -193,7 +193,7 @@ pub async fn resolve_mail_folder(
     }
 
     let fetched = graph.list_mail_folders().await?;
-    storage.upsert_mail_folders(&fetched)?;
+    storage.replace_mail_folders(&fetched)?;
 
     match resolve_mail_folder_from_slice(&fetched, q) {
         Ok(found) => Ok(found),
@@ -320,7 +320,7 @@ pub async fn resolve_todo_list(
     }
 
     let fetched = graph.list_todo_lists().await?;
-    storage.upsert_todo_lists(&fetched)?;
+    storage.replace_todo_lists(&fetched)?;
     resolve_todo_list_from_slice(&fetched, list_query)
 }
 

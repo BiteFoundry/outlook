@@ -157,8 +157,13 @@ impl From<GraphDirectoryUser> for ContactItem {
 
 impl GraphClient {
     pub async fn list_contacts(&self, limit: usize) -> Result<Vec<ContactItem>> {
+        let (contacts, _) = self.list_contacts_complete(limit).await?;
+        Ok(contacts)
+    }
+
+    pub async fn list_contacts_complete(&self, limit: usize) -> Result<(Vec<ContactItem>, bool)> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
         let top = limit.min(100);
         let mut next_url = Some(format!("/me/contacts?$top={top}&$orderby=displayName asc"));
@@ -166,16 +171,19 @@ impl GraphClient {
 
         while let Some(url) = next_url {
             let page: GraphListPage<GraphContact> = self.get_json(&url).await?;
-            for raw in page.value {
+            let page_has_more = page.next_link.is_some();
+            let total_in_page = page.value.len();
+            for (idx, raw) in page.value.into_iter().enumerate() {
                 contacts.push(ContactItem::from(raw));
                 if contacts.len() >= limit {
-                    return Ok(contacts);
+                    let reached_end = !page_has_more && idx + 1 >= total_in_page;
+                    return Ok((contacts, reached_end));
                 }
             }
             next_url = page.next_link;
         }
 
-        Ok(contacts)
+        Ok((contacts, true))
     }
 
     pub async fn search_contacts_and_directory(

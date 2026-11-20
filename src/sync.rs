@@ -381,55 +381,68 @@ fn pick_default_todo_list(lists: &[TodoList]) -> Option<&TodoList> {
 /// Best-effort per optional capability so missing scopes never abort bootstrap.
 pub async fn bootstrap_outlook(graph: &GraphClient, storage: &Storage) -> Result<()> {
     let (start_iso, end_iso) = default_calendar_window();
-    let (me_res, folders_res, inbox_res, sent_res, events_res, contacts_res, lists_res) = tokio::join!(
+    let (me_res, folders_res, events_res, contacts_res, lists_res) = tokio::join!(
         graph.get_me(),
         graph.list_mail_folders(),
-        graph.list_mail_messages("inbox", 50, true),
-        graph.list_mail_messages("sentitems", 30, true),
-        graph.list_calendar_view(&start_iso, &end_iso, 100),
-        graph.list_contacts(100),
+        graph.list_calendar_view_complete(&start_iso, &end_iso, 100),
+        graph.list_contacts_complete(100),
         graph.list_todo_lists(),
     );
 
     let _ = me_res;
 
     if let Ok(folders) = folders_res {
-        run_storage(storage, move |st| st.upsert_mail_folders(&folders)).await?;
+        run_storage(storage, move |st| st.replace_mail_folders(&folders)).await?;
     }
 
-    let inbox_msgs = inbox_res?;
-    if !inbox_msgs.is_empty() {
-        run_storage(storage, move |st| {
-            st.upsert_mail_messages(&inbox_msgs)?;
-            Ok(())
-        })
-        .await?;
-    }
+    let (inbox_res, sent_res) = tokio::join!(
+        sync_mail_folder_delta("inbox", graph, storage, None, false),
+        sync_mail_folder_delta("sentitems", graph, storage, None, false),
+    );
+    inbox_res?;
+    let _ = sent_res;
 
-    if let Ok(sent_msgs) = sent_res {
-        if !sent_msgs.is_empty() {
-            let _ = run_storage(storage, move |st| {
-                st.upsert_mail_messages(&sent_msgs)?;
+    if let Ok((events, reached_end)) = events_res {
+        let s_iso = start_iso.clone();
+        let e_iso = end_iso.clone();
+        let _ = run_storage(storage, move |st| {
+            if reached_end {
+                st.replace_calendar_events_in_window(&s_iso, &e_iso, &events)?;
                 Ok(())
-            })
-            .await;
-        }
+            } else {
+                st.upsert_calendar_events(&events)
+            }
+        })
+        .await;
     }
 
-    if let Ok(events) = events_res {
-        let _ = run_storage(storage, move |st| st.upsert_calendar_events(&events)).await;
-    }
-
-    if let Ok(contacts) = contacts_res {
-        let _ = run_storage(storage, move |st| st.upsert_contacts(&contacts)).await;
+    if let Ok((contacts, reached_end)) = contacts_res {
+        let _ = run_storage(storage, move |st| {
+            if reached_end {
+                st.replace_personal_contacts(&contacts)
+            } else {
+                st.upsert_contacts(&contacts)
+            }
+        })
+        .await;
     }
 
     if let Ok(lists) = lists_res {
         let default_list_id = pick_default_todo_list(&lists).map(|l| l.id.clone());
-        let _ = run_storage(storage, move |st| st.upsert_todo_lists(&lists)).await;
+        let _ = run_storage(storage, move |st| st.replace_todo_lists(&lists)).await;
         if let Some(list_id) = default_list_id {
-            if let Ok(tasks) = graph.list_todo_tasks(&list_id, true, 100).await {
-                let _ = run_storage(storage, move |st| st.upsert_todo_tasks(&tasks)).await;
+            if let Ok((tasks, reached_end)) =
+                graph.list_todo_tasks_complete(&list_id, true, 100).await
+            {
+                let lid = list_id.clone();
+                let _ = run_storage(storage, move |st| {
+                    if reached_end {
+                        st.replace_todo_tasks_for_list(&lid, true, &tasks)
+                    } else {
+                        st.upsert_todo_tasks(&tasks)
+                    }
+                })
+                .await;
             }
         }
     }
@@ -447,6 +460,7 @@ pub fn spawn_sync_engine(
     event_tx: mpsc::UnboundedSender<CoreEvent>,
 ) -> SyncController {
     let (focus_tx, mut focus_rx) = watch::channel(FocusTarget::default());
+    let bg_focus_rx = focus_rx.clone();
     let (nudge_tx, mut nudge_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (bg_tx, mut bg_rx) = mpsc::unbounded_channel::<SyncCommand>();
@@ -730,7 +744,9 @@ pub fn spawn_sync_engine(
                             breakers.reset_all();
                             mail_err_backoff.reset_window();
                             slow_err_backoff.reset_window();
+                            let focus = bg_focus_rx.borrow().clone();
                             run_refresh_all_and_emit(
+                                &focus,
                                 &graph,
                                 &storage,
                                 &event_tx,
@@ -1109,20 +1125,75 @@ async fn load_older_mail_page(
     Ok(())
 }
 
-async fn sync_mail_folder_via_page(
+#[derive(Debug, Clone)]
+pub struct MailFolderSyncOutcome {
+    pub folder_id: String,
+    pub changed_rows: usize,
+    pub deleted_rows: usize,
+}
+
+async fn resolve_canonical_folder_id(
     folder_id: &str,
+    graph: &GraphClient,
+    storage: &Storage,
+) -> (String, Option<String>) {
+    let trimmed = folder_id.trim();
+    let wk_alias = crate::resolver::canonical_well_known_folder(trimmed).map(str::to_string);
+
+    let q_local = trimmed.to_string();
+    if let Ok(Ok(found)) = run_storage(storage, move |st| {
+        let folders = st.list_mail_folders()?;
+        Ok(crate::resolver::resolve_mail_folder_from_slice(&folders, &q_local))
+    })
+    .await
+    {
+        return (
+            found.id,
+            found.well_known_name.or(wk_alias),
+        );
+    }
+
+    if let Ok(folders) = graph.list_mail_folders().await {
+        let folders_for_db = folders.clone();
+        let _ = run_storage(storage, move |st| st.replace_mail_folders(&folders_for_db)).await;
+        if let Ok(found) = crate::resolver::resolve_mail_folder_from_slice(&folders, trimmed) {
+            return (
+                found.id,
+                found.well_known_name.or(wk_alias),
+            );
+        }
+    }
+
+    (trimmed.to_string(), wk_alias)
+}
+
+fn normalize_incoming_folder_ids(messages: &mut [MailMessage], real_folder_id: &str) {
+    for msg in messages {
+        if msg
+            .folder_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+        {
+            msg.folder_id = Some(real_folder_id.to_string());
+        }
+    }
+}
+
+async fn sync_mail_folder_first_page(
+    real_folder_id: &str,
     had_initial: bool,
     graph: &GraphClient,
     storage: &Storage,
-    event_tx: &mpsc::UnboundedSender<CoreEvent>,
-    is_periodic: bool,
+    event_tx: Option<&mpsc::UnboundedSender<CoreEvent>>,
 ) -> Result<()> {
-    let (page_msgs, next_link) = graph
-        .list_mail_messages_page(folder_id, 50, None, true)
+    let (mut page_msgs, next_link) = graph
+        .list_mail_messages_page(real_folder_id, 50, None, true)
         .await?;
-    let fid_clone = folder_id.to_string();
-    let hist_scope = format!("mail_history:{folder_id}");
-    let delta_scope = format!("mail_delta:{folder_id}");
+    normalize_incoming_folder_ids(&mut page_msgs, real_folder_id);
+    let fid_clone = real_folder_id.to_string();
+    let hist_scope = format!("mail_history:{real_folder_id}");
     let (changed_rows, notify_candidate, stored_msgs) = run_storage(storage, move |st| {
         let notify = if had_initial {
             find_new_unread_mail_candidate(&fid_clone, st, &page_msgs)
@@ -1138,45 +1209,80 @@ async fn sync_mail_folder_via_page(
                 last_synced_at: chrono::Utc::now().to_rfc3339(),
             })?;
         }
-        if st.get_sync_cursor(&delta_scope)?.is_none() {
-            st.upsert_sync_cursor(&SyncCursor {
-                scope_key: delta_scope,
-                delta_link: None,
-                history_next_link: None,
-                last_synced_at: chrono::Utc::now().to_rfc3339(),
-            })?;
-        }
-        let list = if changed > 0 || !is_periodic {
-            st.list_mail_summaries_filtered(Some(&fid_clone), false, false, false, 100)?
-        } else {
-            Vec::new()
-        };
+        let list = st.list_mail_summaries_filtered(Some(&fid_clone), false, false, false, 150)?;
         Ok((changed, notify, list))
     })
     .await?;
 
-    if !is_periodic || changed_rows > 0 {
-        let _ = event_tx.send(CoreEvent::MailMessagesUpdated {
-            folder_id: folder_id.to_string(),
-            messages: stored_msgs,
-            notify_candidate,
-        });
+    if let Some(tx) = event_tx {
+        if changed_rows > 0 || !had_initial {
+            let _ = tx.send(CoreEvent::MailMessagesUpdated {
+                folder_id: real_folder_id.to_string(),
+                messages: stored_msgs,
+                notify_candidate,
+            });
+        }
     }
     Ok(())
 }
 
-async fn sync_mail_folder(
+/// Synchronizes a single mail folder using per-folder Microsoft Graph `/messages/delta`:
+/// - Always resolves well-known aliases (`"inbox"`, etc.) to the real Graph folder ID.
+/// - Preserves fast first-page display when bootstrapping an uncached folder in interactive mode.
+/// - Streams header-only delta pages to SQLite without an arbitrary page cap (guarding against
+///   cyclic/repeated `@odata.nextLink`), never drops prior cached rows on partial/error runs,
+///   reconciles missing rows strictly for this folder only upon reaching the terminal
+///   `@odata.deltaLink`, and commits the terminal page + reconciliation + cursor atomically.
+pub async fn sync_mail_folder_delta(
     folder_id: &str,
     graph: &GraphClient,
     storage: &Storage,
-    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    event_tx: Option<&mpsc::UnboundedSender<CoreEvent>>,
     is_periodic: bool,
-) -> Result<()> {
-    let scope_key = format!("mail_delta:{folder_id}");
+) -> Result<MailFolderSyncOutcome> {
+    sync_mail_folder_delta_with_page_size(folder_id, graph, storage, event_tx, is_periodic, 50)
+        .await
+}
+
+pub(crate) async fn sync_mail_folder_delta_with_page_size(
+    folder_id: &str,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: Option<&mpsc::UnboundedSender<CoreEvent>>,
+    is_periodic: bool,
+    page_size: usize,
+) -> Result<MailFolderSyncOutcome> {
+    let (real_folder_id, folder_alias) =
+        resolve_canonical_folder_id(folder_id, graph, storage).await;
+    let scope_key = format!("mail_delta:{real_folder_id}");
     let scope_for_read = scope_key.clone();
-    let fid_for_read = folder_id.to_string();
+    let fid_for_read = real_folder_id.clone();
+    let alias_for_read = folder_alias.clone();
     let (prev_cursor, existing_count) = run_storage(storage, move |st| {
-        let cursor = st.get_sync_cursor(&scope_for_read)?;
+        let mut cursor = st.get_sync_cursor(&scope_for_read)?;
+        if cursor
+            .as_ref()
+            .and_then(|c| c.delta_link.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+        {
+            if let Some(ref alias) = alias_for_read {
+                if !alias.eq_ignore_ascii_case(&fid_for_read) {
+                    if let Some(alias_cur) = st.get_sync_cursor(&format!("mail_delta:{alias}"))? {
+                        if alias_cur
+                            .delta_link
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .is_some()
+                        {
+                            cursor = Some(alias_cur);
+                        }
+                    }
+                }
+            }
+        }
         let summaries = st.list_mail_summaries(Some(&fid_for_read), 1)?;
         Ok((cursor, summaries.len()))
     })
@@ -1187,100 +1293,208 @@ async fn sync_mail_folder(
         .as_ref()
         .and_then(|c| c.delta_link.as_deref())
         .map(str::trim)
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
-    // Initial folder load (and any refresh without an active delta token) uses fast single-page
-    // listing instead of unbounded `/messages/delta`, avoiding Lane 1 starvation on large mailboxes.
-    let Some(delta_link) = existing_delta_link else {
-        return sync_mail_folder_via_page(
-            folder_id,
+    let mut is_full_bootstrap = existing_delta_link.is_none();
+    if is_full_bootstrap && event_tx.is_some() && !had_initial {
+        // Keep fast first-page listing on initial empty interactive load so UI renders promptly
+        // before full folder delta bootstrap finishes.
+        let _ = sync_mail_folder_first_page(
+            &real_folder_id,
             had_initial,
             graph,
             storage,
             event_tx,
-            is_periodic,
         )
         .await;
-    };
-
-    let delta_res = graph
-        .delta_mail_messages(folder_id, Some(delta_link), 50)
-        .await;
-
-    let (incoming, deleted_ids, new_delta_link) = match delta_res {
-        Ok(res) => res,
-        Err(err) if is_expired_delta_error(&err) => {
-            // Clear stale delta token and fall back to page listing cleanly.
-            let stale_scope = scope_key.clone();
-            let hist_link = prev_cursor
-                .as_ref()
-                .and_then(|c| c.history_next_link.clone());
-            let _ = run_storage(storage, move |st| {
-                st.upsert_sync_cursor(&SyncCursor {
-                    scope_key: stale_scope,
-                    delta_link: None,
-                    history_next_link: hist_link,
-                    last_synced_at: chrono::Utc::now().to_rfc3339(),
-                })
-            })
-            .await;
-
-            return sync_mail_folder_via_page(
-                folder_id,
-                had_initial,
-                graph,
-                storage,
-                event_tx,
-                is_periodic,
-            )
-            .await;
-        }
-        Err(err) => return Err(err),
-    };
-
-    let fid_clone = folder_id.to_string();
-    let effective_delta = new_delta_link.or_else(|| {
-        if incoming.is_empty() && deleted_ids.is_empty() {
-            prev_cursor.as_ref().and_then(|c| c.delta_link.clone())
-        } else {
-            None
-        }
-    });
-    let hist_link = prev_cursor.and_then(|c| c.history_next_link);
-    let had_deleted = !deleted_ids.is_empty();
-
-    let (changed_rows, notify_candidate, stored_msgs) = run_storage(storage, move |st| {
-        let notify = if had_initial {
-            find_new_unread_mail_candidate(&fid_clone, st, &incoming)
-        } else {
-            None
-        };
-        if !deleted_ids.is_empty() {
-            st.delete_mail_messages_by_ids(&deleted_ids)?;
-        }
-        let changed = st.upsert_mail_messages(&incoming)?;
-        st.upsert_sync_cursor(&SyncCursor {
-            scope_key,
-            delta_link: effective_delta,
-            history_next_link: hist_link,
-            last_synced_at: chrono::Utc::now().to_rfc3339(),
-        })?;
-        let list = if changed > 0 || had_deleted || !is_periodic {
-            st.list_mail_summaries_filtered(Some(&fid_clone), false, false, false, 100)?
-        } else {
-            Vec::new()
-        };
-        Ok((changed, notify, list))
-    })
-    .await?;
-
-    if !is_periodic || changed_rows > 0 || had_deleted {
-        let _ = event_tx.send(CoreEvent::MailMessagesUpdated {
-            folder_id: folder_id.to_string(),
-            messages: stored_msgs,
-            notify_candidate,
-        });
     }
+
+    let mut next_link: Option<String> = existing_delta_link.clone();
+    let mut seen_urls = HashSet::new();
+    seen_urls.insert(crate::graph::mail::canonical_delta_url_key(
+        &real_folder_id,
+        next_link.as_deref(),
+    ));
+    let mut reconcile_seen: Option<HashSet<String>> = if is_full_bootstrap {
+        Some(HashSet::new())
+    } else {
+        None
+    };
+    let mut tried_expired_reset = false;
+    let mut total_changed = 0usize;
+    let mut total_deleted = 0usize;
+    let mut notify_candidate: Option<NotificationCandidate> = None;
+    let hist_link = prev_cursor.as_ref().and_then(|c| c.history_next_link.clone());
+
+    loop {
+        let mut page = match graph
+            .delta_mail_messages_page(&real_folder_id, next_link.as_deref(), page_size)
+            .await
+        {
+            Ok(p) => p,
+            Err(err)
+                if next_link.is_some()
+                    && !tried_expired_reset
+                    && is_expired_delta_error(&err) =>
+            {
+                // Persist cleared expired cursor immediately so an interrupted re-bootstrap
+                // retries a full delta instead of replaying the dead token.
+                tried_expired_reset = true;
+                let expired_scope = scope_key.clone();
+                let expired_hist = hist_link.clone();
+                let _ = run_storage(storage, move |st| {
+                    st.upsert_sync_cursor(&SyncCursor {
+                        scope_key: expired_scope,
+                        delta_link: None,
+                        history_next_link: expired_hist,
+                        last_synced_at: chrono::Utc::now().to_rfc3339(),
+                    })
+                })
+                .await;
+                is_full_bootstrap = true;
+                reconcile_seen = Some(HashSet::new());
+                next_link = None;
+                seen_urls.clear();
+                seen_urls.insert(crate::graph::mail::canonical_delta_url_key(
+                    &real_folder_id,
+                    None,
+                ));
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+
+        normalize_incoming_folder_ids(&mut page.upserted, &real_folder_id);
+        if let Some(ref mut seen) = reconcile_seen {
+            for msg in &page.upserted {
+                seen.insert(msg.id.clone());
+            }
+        }
+
+        let is_terminal = page.delta_link.is_some() || page.next_link.is_none();
+        if !is_terminal {
+            let next = page.next_link.expect("non-terminal page has next_link");
+            let next_key =
+                crate::graph::mail::canonical_delta_url_key(&real_folder_id, Some(&next));
+            if !seen_urls.insert(next_key) {
+                anyhow::bail!(
+                    "Cyclic or repeated @odata.nextLink detected during mail delta sync for folder {real_folder_id}: {next}"
+                );
+            }
+
+            let fid_p = real_folder_id.clone();
+            let alias_p = folder_alias.clone();
+            let incoming_p = page.upserted;
+            let removed_p = page.removed_ids;
+            let need_notify = had_initial && notify_candidate.is_none();
+            let (changed, deleted, page_notify) = run_storage(storage, move |st| {
+                let cand = if need_notify {
+                    find_new_unread_mail_candidate(&fid_p, st, &incoming_p)
+                } else {
+                    None
+                };
+                let (c, d) = st.apply_mail_folder_delta_page(
+                    &fid_p,
+                    alias_p.as_deref(),
+                    &incoming_p,
+                    &removed_p,
+                )?;
+                Ok((c, d, cand))
+            })
+            .await?;
+            total_changed += changed;
+            total_deleted += deleted;
+            if notify_candidate.is_none() {
+                notify_candidate = page_notify;
+            }
+            next_link = Some(next);
+            continue;
+        }
+
+        let delta_complete = page.delta_link.is_some();
+        let final_reconcile = if is_full_bootstrap && delta_complete {
+            reconcile_seen.take()
+        } else {
+            None
+        };
+        // Only advance the delta cursor when delta ran to completion; if malformed/truncated
+        // (no deltaLink), preserve the prior valid delta_link (or None during bootstrap).
+        let effective_delta = if delta_complete {
+            page.delta_link
+        } else if is_full_bootstrap {
+            None
+        } else {
+            existing_delta_link.clone()
+        };
+
+        let fid_clone = real_folder_id.clone();
+        let alias_clone = folder_alias.clone();
+        let incoming_final = page.upserted;
+        let removed_final = page.removed_ids;
+        let need_notify = had_initial && notify_candidate.is_none();
+        let cursor = SyncCursor {
+            scope_key: scope_key.clone(),
+            delta_link: effective_delta,
+            history_next_link: hist_link.clone(),
+            last_synced_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        let (changed, deleted, page_notify) = run_storage(storage, move |st| {
+            let cand = if need_notify {
+                find_new_unread_mail_candidate(&fid_clone, st, &incoming_final)
+            } else {
+                None
+            };
+            let (c, d) = st.apply_mail_folder_delta(
+                &fid_clone,
+                alias_clone.as_deref(),
+                &incoming_final,
+                &removed_final,
+                final_reconcile.as_ref(),
+                &cursor,
+            )?;
+            Ok((c, d, cand))
+        })
+        .await?;
+        total_changed += changed;
+        total_deleted += deleted;
+        if notify_candidate.is_none() {
+            notify_candidate = page_notify;
+        }
+        break;
+    }
+
+    if let Some(tx) = event_tx {
+        if !is_periodic || total_changed > 0 || total_deleted > 0 {
+            let fid_list = real_folder_id.clone();
+            let stored_msgs = run_storage(storage, move |st| {
+                st.list_mail_summaries_filtered(Some(&fid_list), false, false, false, 150)
+            })
+            .await?;
+            let _ = tx.send(CoreEvent::MailMessagesUpdated {
+                folder_id: real_folder_id.clone(),
+                messages: stored_msgs,
+                notify_candidate,
+            });
+        }
+    }
+
+    Ok(MailFolderSyncOutcome {
+        folder_id: real_folder_id,
+        changed_rows: total_changed,
+        deleted_rows: total_deleted,
+    })
+}
+
+async fn sync_mail_folder(
+    folder_id: &str,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    is_periodic: bool,
+) -> Result<()> {
+    sync_mail_folder_delta(folder_id, graph, storage, Some(event_tx), is_periodic).await?;
     Ok(())
 }
 
@@ -1294,7 +1508,7 @@ async fn poll_mail_folders_quiet(
     let changed = last_folders.as_ref() != Some(&folders);
     if changed {
         let to_store = folders.clone();
-        run_storage(storage, move |st| st.upsert_mail_folders(&to_store)).await?;
+        run_storage(storage, move |st| st.replace_mail_folders(&to_store)).await?;
         *last_folders = Some(folders.clone());
         let _ = event_tx.send(CoreEvent::MailFoldersUpdated(folders));
     }
@@ -1310,10 +1524,8 @@ async fn poll_mail_lane2_quiet(
     slow_err_backoff: &ErrorBackoffState,
     last_folders: &mut Option<Vec<MailFolder>>,
 ) {
-    let (folders_res, inbox_res) = tokio::join!(
-        poll_mail_folders_quiet(graph, storage, event_tx, last_folders),
-        sync_mail_folder("inbox", graph, storage, event_tx, true),
-    );
+    let folders_res = poll_mail_folders_quiet(graph, storage, event_tx, last_folders).await;
+    let inbox_res = sync_mail_folder("inbox", graph, storage, event_tx, true).await;
 
     if let Err(err) = folders_res.and(inbox_res) {
         match classify_sync_error(&err) {
@@ -1393,7 +1605,16 @@ async fn poll_calendar_with_flag(
     }
 
     let (start_iso, end_iso) = default_calendar_window();
-    let cursor = run_storage(storage, |st| st.get_sync_cursor("calendar_delta")).await.ok().flatten();
+    let cursor = run_storage(storage, |st| st.get_sync_cursor("calendar_delta"))
+        .await
+        .ok()
+        .flatten();
+    let had_delta_link = cursor
+        .as_ref()
+        .and_then(|c| c.delta_link.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
 
     let delta_res = graph
         .delta_calendar_view(
@@ -1405,42 +1626,57 @@ async fn poll_calendar_with_flag(
 
     let res = match delta_res {
         Ok((events, removed_ids, new_delta_link)) => {
+            let delta_complete = new_delta_link
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_some();
+            let reconcile_window = !had_delta_link && delta_complete;
             let effective_delta = new_delta_link
                 .or_else(|| cursor.as_ref().and_then(|c| c.delta_link.clone()));
-            let has_changes = !events.is_empty() || !removed_ids.is_empty();
+            let sync_cursor = SyncCursor {
+                scope_key: "calendar_delta".to_string(),
+                delta_link: effective_delta,
+                history_next_link: None,
+                last_synced_at: chrono::Utc::now().to_rfc3339(),
+            };
+            let s_iso = start_iso.clone();
+            let e_iso = end_iso.clone();
             let stored = run_storage(storage, move |st| {
-                if !removed_ids.is_empty() {
-                    st.delete_calendar_events_by_ids(&removed_ids)?;
-                }
-                if !events.is_empty() {
-                    st.upsert_calendar_events(&events)?;
-                }
-                st.upsert_sync_cursor(&SyncCursor {
-                    scope_key: "calendar_delta".to_string(),
-                    delta_link: effective_delta,
-                    history_next_link: None,
-                    last_synced_at: chrono::Utc::now().to_rfc3339(),
-                })?;
+                let has_changes = st.apply_calendar_delta(
+                    &s_iso,
+                    &e_iso,
+                    &events,
+                    &removed_ids,
+                    reconcile_window,
+                    &sync_cursor,
+                )?;
                 if has_changes {
-                    st.list_calendar_events(Some(&start_iso), Some(&end_iso), 200)
+                    let list = st.list_calendar_events(Some(&s_iso), Some(&e_iso), 200)?;
+                    Ok(Some(list))
                 } else {
-                    Ok(Vec::new())
+                    Ok(None)
                 }
             })
             .await;
-            if let Ok(list) = stored {
-                if has_changes {
+            match stored {
+                Ok(Some(list)) => {
                     let _ = event_tx.send(CoreEvent::CalendarEventsUpdated(list));
+                    Ok(())
                 }
-                Ok(())
-            } else {
-                stored.map(|_| ())
+                Ok(None) => Ok(()),
+                Err(err) => Err(err),
             }
         }
         Err(err) if is_expired_delta_error(&err) => {
-            match graph.list_calendar_view(&start_iso, &end_iso, 100).await {
-                Ok(events) => {
+            match graph
+                .list_calendar_view_complete(&start_iso, &end_iso, 100)
+                .await
+            {
+                Ok((events, reached_end)) => {
                     let to_store = events.clone();
+                    let s_iso = start_iso.clone();
+                    let e_iso = end_iso.clone();
                     let _ = run_storage(storage, move |st| {
                         st.upsert_sync_cursor(&SyncCursor {
                             scope_key: "calendar_delta".to_string(),
@@ -1448,7 +1684,12 @@ async fn poll_calendar_with_flag(
                             history_next_link: None,
                             last_synced_at: chrono::Utc::now().to_rfc3339(),
                         })?;
-                        st.upsert_calendar_events(&to_store)
+                        if reached_end {
+                            st.replace_calendar_events_in_window(&s_iso, &e_iso, &to_store)?;
+                            Ok(())
+                        } else {
+                            st.upsert_calendar_events(&to_store)
+                        }
                     })
                     .await;
                     let _ = event_tx.send(CoreEvent::CalendarEventsUpdated(events));
@@ -1549,7 +1790,7 @@ async fn poll_todo_with_flag(
         .or_else(|| pick_default_todo_list(&lists).map(|l| l.id.clone()));
 
     let lists_for_db = lists.clone();
-    if run_storage(storage, move |st| st.upsert_todo_lists(&lists_for_db))
+    if run_storage(storage, move |st| st.replace_todo_lists(&lists_for_db))
         .await
         .is_ok()
     {
@@ -1557,10 +1798,18 @@ async fn poll_todo_with_flag(
     }
 
     if let Some(lid) = chosen_list_id {
-        match graph.list_todo_tasks(&lid, true, 100).await {
-            Ok(tasks) => {
+        match graph.list_todo_tasks_complete(&lid, true, 100).await {
+            Ok((tasks, reached_end)) => {
                 let tasks_for_db = tasks.clone();
-                let _ = run_storage(storage, move |st| st.upsert_todo_tasks(&tasks_for_db)).await;
+                let lid_for_db = lid.clone();
+                let _ = run_storage(storage, move |st| {
+                    if reached_end {
+                        st.replace_todo_tasks_for_list(&lid_for_db, true, &tasks_for_db)
+                    } else {
+                        st.upsert_todo_tasks(&tasks_for_db)
+                    }
+                })
+                .await;
                 let _ = event_tx.send(CoreEvent::TodoTasksUpdated {
                     list_id: lid,
                     tasks,
@@ -1621,12 +1870,18 @@ async fn poll_contacts_with_flag(
         return;
     }
 
-    match graph.list_contacts(100).await {
-        Ok(contacts) => {
+    match graph.list_contacts_complete(100).await {
+        Ok((contacts, reached_end)) => {
             let to_store = contacts.clone();
-            if run_storage(storage, move |st| st.upsert_contacts(&to_store))
-                .await
-                .is_ok()
+            if run_storage(storage, move |st| {
+                if reached_end {
+                    st.replace_personal_contacts(&to_store)
+                } else {
+                    st.upsert_contacts(&to_store)
+                }
+            })
+            .await
+            .is_ok()
             {
                 let _ = event_tx.send(CoreEvent::ContactsUpdated(contacts));
             }
@@ -1670,10 +1925,8 @@ async fn run_bootstrap_and_emit(
     }
 
     let token_fp = current_token_fingerprint(graph).await;
-    let (folders_res, inbox_res) = tokio::join!(
-        poll_mail_folders_quiet(graph, storage, event_tx, last_folders),
-        sync_mail_folder("inbox", graph, storage, event_tx, false),
-    );
+    let folders_res = poll_mail_folders_quiet(graph, storage, event_tx, last_folders).await;
+    let inbox_res = sync_mail_folder("inbox", graph, storage, event_tx, false).await;
 
     let mail_ok = match folders_res.and(inbox_res) {
         Ok(()) => {
@@ -1751,6 +2004,7 @@ async fn run_bootstrap_and_emit(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_refresh_all_and_emit(
+    focus: &FocusTarget,
     graph: &GraphClient,
     storage: &Storage,
     event_tx: &mpsc::UnboundedSender<CoreEvent>,
@@ -1770,6 +2024,48 @@ async fn run_refresh_all_and_emit(
         last_folders,
     )
     .await;
+
+    if let Some(active_fid) = focus
+        .active_folder_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let (inbox_real, _) = resolve_canonical_folder_id("inbox", graph, storage).await;
+        if !active_fid.eq_ignore_ascii_case("inbox") && active_fid != inbox_real {
+            let _ = sync_mail_folder(active_fid, graph, storage, event_tx, false).await;
+        }
+    }
+
+    if let Some(active_mid) = focus
+        .active_message_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let _ = hydrate_message_if_needed(active_mid, true, graph, storage, event_tx).await;
+    }
+
+    if let Some(active_lid) = focus
+        .active_todo_list_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let token_fp = current_token_fingerprint(graph).await;
+        poll_todo_quiet(
+            Some(active_lid),
+            graph,
+            storage,
+            event_tx,
+            shared,
+            slow_err_backoff,
+            breakers,
+            &token_fp,
+        )
+        .await;
+    }
+
     slow_err_backoff.record_success();
 }
 
@@ -1973,7 +2269,7 @@ mod tests {
                 }),
             )
             .route(
-                "/v1.0/me/mailFolders/inbox/messages",
+                "/v1.0/me/mailFolders/{fid}/messages",
                 get(move || {
                     let should_fail = fail_c3.load(Ordering::SeqCst);
                     async move {
@@ -1992,7 +2288,7 @@ mod tests {
                 }),
             )
             .route(
-                "/v1.0/me/mailFolders/inbox/messages/delta",
+                "/v1.0/me/mailFolders/{fid}/messages/delta",
                 get(move || {
                     let should_fail = fail_c2.load(Ordering::SeqCst);
                     async move {
@@ -2117,6 +2413,7 @@ mod tests {
             reply_to: Vec::new(),
             received_at: "2026-11-18T12:00:00Z".to_string(),
             sent_at: None,
+            last_modified_at: None,
             is_read: false,
             is_draft: false,
             flagged: false,
@@ -2137,7 +2434,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sync_mail_folder_initial_uses_fast_page_without_delta() {
+    async fn test_sync_mail_folder_initial_uses_fast_page_and_bootstraps_delta() {
         use axum::{routing::get, Json, Router};
         use std::sync::atomic::AtomicUsize;
 
@@ -2148,7 +2445,22 @@ mod tests {
 
         let app = Router::new()
             .route(
-                "/v1.0/me/mailFolders/inbox/messages",
+                "/v1.0/me/mailFolders",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [{
+                            "id": "fld-inbox",
+                            "displayName": "Inbox",
+                            "wellKnownName": "inbox",
+                            "childFolderCount": 0,
+                            "unreadItemCount": 1,
+                            "totalItemCount": 2
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/{fid}/messages",
                 get(move || {
                     page_hits_c.fetch_add(1, Ordering::SeqCst);
                     async {
@@ -2156,7 +2468,7 @@ mod tests {
                             "value": [
                                 {
                                     "id": "m1",
-                                    "parentFolderId": "inbox",
+                                    "parentFolderId": "fld-inbox",
                                     "subject": "Fast Page 1",
                                     "receivedDateTime": "2026-11-18T10:00:00Z",
                                     "isRead": false,
@@ -2164,23 +2476,45 @@ mod tests {
                                 },
                                 {
                                     "id": "m2",
-                                    "parentFolderId": "inbox",
+                                    "parentFolderId": "fld-inbox",
                                     "subject": "Fast Page 2",
                                     "receivedDateTime": "2026-11-18T09:00:00Z",
                                     "isRead": true,
                                     "bodyPreview": "Preview 2"
                                 }
                             ],
-                            "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$skip=50"
+                            "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/mailFolders/fld-inbox/messages?$skip=50"
                         }))
                     }
                 }),
             )
             .route(
-                "/v1.0/me/mailFolders/inbox/messages/delta",
+                "/v1.0/me/mailFolders/{fid}/messages/delta",
                 get(move || {
                     delta_hits_c.fetch_add(1, Ordering::SeqCst);
-                    async { Json(serde_json::json!({ "value": [] })) }
+                    async {
+                        Json(serde_json::json!({
+                            "value": [
+                                {
+                                    "id": "m1",
+                                    "parentFolderId": "fld-inbox",
+                                    "subject": "Fast Page 1",
+                                    "receivedDateTime": "2026-11-18T10:00:00Z",
+                                    "isRead": false,
+                                    "bodyPreview": "Preview 1"
+                                },
+                                {
+                                    "id": "m2",
+                                    "parentFolderId": "fld-inbox",
+                                    "subject": "Fast Page 2",
+                                    "receivedDateTime": "2026-11-18T09:00:00Z",
+                                    "isRead": true,
+                                    "bodyPreview": "Preview 2"
+                                }
+                            ],
+                            "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/mailFolders/fld-inbox/messages/delta?$deltatoken=d1"
+                        }))
+                    }
                 }),
             );
 
@@ -2198,17 +2532,25 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(delta_hits.load(Ordering::SeqCst), 0);
         assert_eq!(page_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(delta_hits.load(Ordering::SeqCst), 1);
 
         let hist_cursor = storage
-            .get_sync_cursor("mail_history:inbox")
+            .get_sync_cursor("mail_history:fld-inbox")
             .unwrap()
-            .expect("history cursor stored");
+            .expect("history cursor stored under real folder ID");
         assert_eq!(
             hist_cursor.history_next_link.as_deref(),
-            Some("https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$skip=50")
+            Some("https://graph.microsoft.com/v1.0/me/mailFolders/fld-inbox/messages?$skip=50")
         );
+        let delta_cursor = storage
+            .get_sync_cursor("mail_delta:fld-inbox")
+            .unwrap()
+            .expect("delta cursor stored under real folder ID");
+        assert!(delta_cursor
+            .delta_link
+            .as_deref()
+            .is_some_and(|l| l.contains("deltatoken=d1")));
 
         let ev = event_rx.try_recv().expect("MailMessagesUpdated emitted");
         match ev {
@@ -2217,7 +2559,7 @@ mod tests {
                 messages,
                 ..
             } => {
-                assert_eq!(folder_id, "inbox");
+                assert_eq!(folder_id, "fld-inbox");
                 assert_eq!(messages.len(), 2);
             }
             other => panic!("unexpected event: {other:?}"),
@@ -2331,7 +2673,7 @@ mod tests {
                 }),
             )
             .route(
-                "/v1.0/me/mailFolders/inbox/messages",
+                "/v1.0/me/mailFolders/fld-inbox/messages/delta",
                 get(|| async {
                     Json(serde_json::json!({
                         "value": [{
@@ -2340,12 +2682,13 @@ mod tests {
                             "subject": "Inbox Mail",
                             "receivedDateTime": "2026-11-18T10:00:00Z",
                             "isRead": true
-                        }]
+                        }],
+                        "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/mailFolders/fld-inbox/messages/delta?$deltatoken=in1"
                     }))
                 }),
             )
             .route(
-                "/v1.0/me/mailFolders/sentitems/messages",
+                "/v1.0/me/mailFolders/fld-sent/messages/delta",
                 get(|| async {
                     Json(serde_json::json!({
                         "value": [{
@@ -2354,7 +2697,8 @@ mod tests {
                             "subject": "Sent Mail",
                             "receivedDateTime": "2026-11-18T09:00:00Z",
                             "isRead": true
-                        }]
+                        }],
+                        "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/mailFolders/fld-sent/messages/delta?$deltatoken=sent1"
                     }))
                 }),
             );
@@ -2374,5 +2718,824 @@ mod tests {
             .unwrap();
         assert_eq!(sent_msgs.len(), 1);
         assert_eq!(sent_msgs[0].id, "sent-1");
+    }
+
+    #[tokio::test]
+    async fn test_sync_mail_folder_delta_multipage_interrupted_reconcile_and_expired() {
+        use axum::{extract::RawQuery, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let fail_page2 = Arc::new(AtomicBool::new(true));
+        let fail_page2_c = Arc::clone(&fail_page2);
+        let expire_token = Arc::new(AtomicBool::new(false));
+        let expire_token_c = Arc::clone(&expire_token);
+        let post_expire_removed = Arc::new(AtomicBool::new(false));
+        let post_expire_removed_c = Arc::clone(&post_expire_removed);
+        let delta_calls = Arc::new(AtomicUsize::new(0));
+        let delta_calls_c = Arc::clone(&delta_calls);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_for_router = format!("http://{addr}/v1.0");
+        let base_c = base_for_router.clone();
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/mailFolders",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [
+                            { "id": "fld-inbox", "displayName": "Inbox", "wellKnownName": "inbox", "childFolderCount": 0, "unreadItemCount": 1, "totalItemCount": 6 },
+                            { "id": "fld-archive", "displayName": "Archive", "wellKnownName": "archive", "childFolderCount": 0, "unreadItemCount": 0, "totalItemCount": 1 }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/fld-inbox/messages/delta",
+                get(move |RawQuery(query): RawQuery| {
+                    let q = query.unwrap_or_default();
+                    let fail_p2 = Arc::clone(&fail_page2_c);
+                    let expire = Arc::clone(&expire_token_c);
+                    let after_exp = Arc::clone(&post_expire_removed_c);
+                    let calls = Arc::clone(&delta_calls_c);
+                    let base = base_c.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        if q.contains("deltatoken=d1") {
+                            if expire.load(Ordering::SeqCst) {
+                                return (
+                                    StatusCode::GONE,
+                                    Json(serde_json::json!({
+                                        "error": { "code": "syncStateNotFound", "message": "Delta token expired" }
+                                    })),
+                                )
+                                    .into_response();
+                            }
+                            return Json(serde_json::json!({
+                                "value": [
+                                    { "id": "m-page1", "@removed": { "reason": "deleted" } },
+                                    { "id": "m-moved-same-id", "@removed": { "reason": "deleted" } }
+                                ],
+                                "@odata.deltaLink": format!("{base}/me/mailFolders/fld-inbox/messages/delta?$deltatoken=d2")
+                            }))
+                            .into_response();
+                        }
+
+                        if q.contains("page=2") {
+                            if fail_p2.load(Ordering::SeqCst) {
+                                return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(serde_json::json!({
+                                        "error": { "code": "InternalServerError", "message": "Simulated mid-delta failure" }
+                                    })),
+                                )
+                                    .into_response();
+                            }
+                            return Json(serde_json::json!({
+                                "value": [{
+                                    "id": "m-page2",
+                                    "parentFolderId": "fld-inbox",
+                                    "subject": "Page 2 Mail",
+                                    "receivedDateTime": "2026-11-18T10:02:00Z",
+                                    "isRead": true
+                                }],
+                                "@odata.nextLink": format!("{base}/me/mailFolders/fld-inbox/messages/delta?page=3")
+                            }))
+                            .into_response();
+                        }
+                        if q.contains("page=3") {
+                            return Json(serde_json::json!({
+                                "value": [{
+                                    "id": "m-page3",
+                                    "parentFolderId": "fld-inbox",
+                                    "subject": "Page 3 Mail",
+                                    "receivedDateTime": "2026-11-18T10:03:00Z",
+                                    "isRead": true
+                                }],
+                                "@odata.nextLink": format!("{base}/me/mailFolders/fld-inbox/messages/delta?page=4")
+                            }))
+                            .into_response();
+                        }
+                        if q.contains("page=4") {
+                            return Json(serde_json::json!({
+                                "value": [{
+                                    "id": "m-page4",
+                                    "parentFolderId": "fld-inbox",
+                                    "subject": "Page 4 Mail",
+                                    "receivedDateTime": "2026-11-18T10:04:00Z",
+                                    "isRead": true
+                                }],
+                                "@odata.nextLink": format!("{base}/me/mailFolders/fld-inbox/messages/delta?page=5")
+                            }))
+                            .into_response();
+                        }
+                        if q.contains("page=5") {
+                            let val = if after_exp.load(Ordering::SeqCst) {
+                                serde_json::json!([])
+                            } else {
+                                serde_json::json!([{
+                                    "id": "m-page5",
+                                    "parentFolderId": "fld-inbox",
+                                    "subject": "Page 5 Mail",
+                                    "receivedDateTime": "2026-11-18T10:05:00Z",
+                                    "isRead": false
+                                }])
+                            };
+                            return Json(serde_json::json!({
+                                "value": val,
+                                "@odata.deltaLink": format!("{base}/me/mailFolders/fld-inbox/messages/delta?$deltatoken=d1")
+                            }))
+                            .into_response();
+                        }
+
+                        // Page 1 of initial delta
+                        Json(serde_json::json!({
+                            "value": [{
+                                "id": "m-page1",
+                                "parentFolderId": "fld-inbox",
+                                "subject": "Page 1 Mail",
+                                "receivedDateTime": "2026-11-18T10:01:00Z",
+                                "isRead": false
+                            }],
+                            "@odata.nextLink": format!("{base}/me/mailFolders/fld-inbox/messages/delta?page=2")
+                        }))
+                        .into_response()
+                    }
+                }),
+            );
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = mock_client(base_for_router);
+        let storage = Storage::open_in_memory().unwrap();
+        // Seed a stale ghost in inbox AND a moved item already in archive (same ID)
+        storage
+            .upsert_mail_folders(&[
+                MailFolder {
+                    id: "fld-inbox".into(),
+                    display_name: "Inbox".into(),
+                    well_known_name: Some("inbox".into()),
+                    parent_folder_id: None,
+                    child_folder_count: 0,
+                    unread_item_count: 1,
+                    total_item_count: 1,
+                },
+                MailFolder {
+                    id: "fld-archive".into(),
+                    display_name: "Archive".into(),
+                    well_known_name: Some("archive".into()),
+                    parent_folder_id: None,
+                    child_folder_count: 0,
+                    unread_item_count: 0,
+                    total_item_count: 1,
+                },
+            ])
+            .unwrap();
+        let make_seed = |id: &str, folder: &str| MailMessage {
+            id: id.into(),
+            internet_message_id: None,
+            conversation_id: None,
+            folder_id: Some(folder.into()),
+            subject: format!("Seed {id}"),
+            from: None,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            bcc_recipients: vec![],
+            reply_to: vec![],
+            received_at: "2026-11-18T09:00:00Z".into(),
+            sent_at: None,
+            last_modified_at: None,
+            is_read: true,
+            is_draft: false,
+            flagged: false,
+            importance: "normal".into(),
+            inference_classification: None,
+            has_attachments: false,
+            body_loaded: false,
+            preview: String::new(),
+            body_html: String::new(),
+            body_plain: String::new(),
+            attachments: vec![],
+            meeting_request: None,
+            web_link: None,
+        };
+        storage
+            .upsert_mail_messages(&[
+                make_seed("m-stale-ghost", "fld-inbox"),
+                make_seed("m-moved-same-id", "fld-archive"),
+            ])
+            .unwrap();
+
+        // 1. Interrupted initial delta (page 2 returns 500) must NOT prune existing cache or save a cursor
+        let err = sync_mail_folder_delta("inbox", &client, &storage, None, false).await;
+        assert!(err.is_err());
+        assert!(storage.get_mail_message("m-stale-ghost").unwrap().is_some());
+        assert!(storage.get_sync_cursor("mail_delta:fld-inbox").unwrap().is_none());
+
+        // 2. Retry succeeds across all 5 pages (> old DELTA_MAX_PAGES=4), reconciles stale ghost,
+        // preserves archive item, and stores real-folder-ID delta cursor.
+        fail_page2.store(false, Ordering::SeqCst);
+        let outcome = sync_mail_folder_delta("inbox", &client, &storage, None, false)
+            .await
+            .unwrap();
+        assert_eq!(outcome.folder_id, "fld-inbox");
+        assert!(storage.get_mail_message("m-stale-ghost").unwrap().is_none());
+        assert!(storage.get_mail_message("m-page5").unwrap().is_some());
+        assert_eq!(
+            storage
+                .get_mail_message("m-moved-same-id")
+                .unwrap()
+                .unwrap()
+                .folder_id
+                .as_deref(),
+            Some("fld-archive")
+        );
+        assert!(storage
+            .get_sync_cursor("mail_delta:fld-inbox")
+            .unwrap()
+            .unwrap()
+            .delta_link
+            .as_deref()
+            .is_some_and(|l| l.contains("deltatoken=d1")));
+
+        // 3. Incremental delta deletes m-page1 in inbox, but late @removed for m-moved-same-id
+        // preserves it in fld-archive!
+        sync_mail_folder_delta("inbox", &client, &storage, None, true)
+            .await
+            .unwrap();
+        assert!(storage.get_mail_message("m-page1").unwrap().is_none());
+        assert_eq!(
+            storage
+                .get_mail_message("m-moved-same-id")
+                .unwrap()
+                .unwrap()
+                .folder_id
+                .as_deref(),
+            Some("fld-archive"),
+            "late source-folder @removed must preserve item already moved to archive"
+        );
+
+        // 4. Expired delta token (410) triggers full re-bootstrap and reconciles m-page5 removed remotely
+        storage
+            .upsert_sync_cursor(&SyncCursor {
+                scope_key: "mail_delta:fld-inbox".into(),
+                delta_link: Some(format!(
+                    "http://{addr}/v1.0/me/mailFolders/fld-inbox/messages/delta?$deltatoken=d1"
+                )),
+                history_next_link: None,
+                last_synced_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        expire_token.store(true, Ordering::SeqCst);
+        post_expire_removed.store(true, Ordering::SeqCst);
+        sync_mail_folder_delta("inbox", &client, &storage, None, false)
+            .await
+            .unwrap();
+        assert!(storage.get_mail_message("m-page5").unwrap().is_none());
+        assert!(storage.get_mail_message("m-page2").unwrap().is_some());
+        assert!(storage.get_mail_message("m-moved-same-id").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_mail_delta_bootstrap_501_pages_cyclic_and_partial_safety() {
+        use axum::{
+            extract::Query,
+            http::StatusCode,
+            response::IntoResponse,
+            routing::get,
+            Json, Router,
+        };
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+        const TOTAL_PAGES: usize = 501;
+        // mode: 0 = cyclic nextLink at page 3 -> page 2; 1 = 500 error at page 250; 2 = healthy 501 pages
+        let mode = Arc::new(AtomicU8::new(0));
+        let delta_hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}/v1.0");
+        let base_for_router = base_url.clone();
+
+        let mode_r = Arc::clone(&mode);
+        let hits_r = Arc::clone(&delta_hits);
+        let app = Router::new().route(
+            "/v1.0/me/mailFolders/fld-large/messages/delta",
+            get(move |Query(params): Query<HashMap<String, String>>| {
+                let mode = Arc::clone(&mode_r);
+                let hits = Arc::clone(&hits_r);
+                let base = base_url.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    if params.contains_key("$deltatoken") {
+                        return Json(serde_json::json!({
+                            "value": [],
+                            "@odata.deltaLink": format!("{base}/me/mailFolders/fld-large/messages/delta?$deltatoken=large-d2")
+                        }))
+                        .into_response();
+                    }
+
+                    let page: usize = params
+                        .get("page")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1);
+                    let cur_mode = mode.load(Ordering::SeqCst);
+
+                    if cur_mode == 1 && page == 250 {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": { "code": "InternalServerError", "message": "Page 250 transient failure" }
+                            })),
+                        )
+                            .into_response();
+                    }
+
+                    let item = serde_json::json!({
+                        "id": format!("large-m-{page:04}"),
+                        "parentFolderId": "fld-large",
+                        "subject": format!("Large Folder Mail {page}"),
+                        "receivedDateTime": "2026-11-20T05:00:00Z",
+                        "isRead": true
+                    });
+
+                    if cur_mode == 0 && page >= 3 {
+                        return Json(serde_json::json!({
+                            "value": [item],
+                            "@odata.nextLink": format!("{base}/me/mailFolders/fld-large/messages/delta?page=2")
+                        }))
+                        .into_response();
+                    }
+
+                    if page < TOTAL_PAGES {
+                        Json(serde_json::json!({
+                            "value": [item],
+                            "@odata.nextLink": format!("{base}/me/mailFolders/fld-large/messages/delta?page={}", page + 1)
+                        }))
+                        .into_response()
+                    } else {
+                        Json(serde_json::json!({
+                            "value": [item],
+                            "@odata.deltaLink": format!("{base}/me/mailFolders/fld-large/messages/delta?$deltatoken=large-d1")
+                        }))
+                        .into_response()
+                    }
+                }
+            }),
+        );
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = mock_client(base_for_router);
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_mail_folders(&[MailFolder {
+                id: "fld-large".into(),
+                display_name: "Large Archive".into(),
+                well_known_name: None,
+                parent_folder_id: None,
+                child_folder_count: 0,
+                unread_item_count: 0,
+                total_item_count: TOTAL_PAGES as i32,
+            }])
+            .unwrap();
+        storage
+            .upsert_mail_messages(&[MailMessage {
+                id: "m-orphan-large".into(),
+                internet_message_id: None,
+                conversation_id: None,
+                folder_id: Some("fld-large".into()),
+                subject: "Prior Cached Orphan".into(),
+                from: None,
+                to_recipients: vec![],
+                cc_recipients: vec![],
+                bcc_recipients: vec![],
+                reply_to: vec![],
+                received_at: "2026-11-19T00:00:00Z".into(),
+                sent_at: None,
+                last_modified_at: None,
+                is_read: true,
+                is_draft: false,
+                flagged: false,
+                importance: "normal".into(),
+                inference_classification: None,
+                has_attachments: false,
+                body_loaded: false,
+                preview: String::new(),
+                body_html: String::new(),
+                body_plain: String::new(),
+                attachments: vec![],
+                meeting_request: None,
+                web_link: None,
+            }])
+            .unwrap();
+
+        // 1. Cyclic nextLink fails fast and preserves prior cached row + empty delta_link
+        let cyc_err = sync_mail_folder_delta_with_page_size("fld-large", &client, &storage, None, false, 1)
+            .await
+            .expect_err("cyclic nextLink must fail");
+        assert!(format!("{cyc_err:#}").contains("Cyclic or repeated @odata.nextLink"));
+        assert_eq!(delta_hits.load(Ordering::SeqCst), 3);
+        assert!(storage.get_mail_message("m-orphan-large").unwrap().is_some());
+        assert!(storage.get_sync_cursor("mail_delta:fld-large").unwrap().is_none());
+
+        // 2. Mid-stream 500 error at page 250 preserves prior cached row + empty delta_link
+        mode.store(1, Ordering::SeqCst);
+        delta_hits.store(0, Ordering::SeqCst);
+        let err_250 = sync_mail_folder_delta_with_page_size("fld-large", &client, &storage, None, false, 1)
+            .await
+            .expect_err("page 250 error must abort bootstrap");
+        assert!(format!("{err_250:#}").contains("500") || format!("{err_250:#}").contains("InternalServerError"));
+        assert_eq!(delta_hits.load(Ordering::SeqCst), 250);
+        assert!(storage.get_mail_message("m-orphan-large").unwrap().is_some());
+        assert!(storage.get_sync_cursor("mail_delta:fld-large").unwrap().is_none());
+
+        // 3. Healthy 501-page bootstrap reaches terminal deltaLink, caches all 501 rows (header-only),
+        // prunes m-orphan-large, and persists deltaLink so follow-up sync takes 1 incremental call.
+        mode.store(2, Ordering::SeqCst);
+        delta_hits.store(0, Ordering::SeqCst);
+        let outcome = sync_mail_folder_delta_with_page_size("fld-large", &client, &storage, None, false, 1)
+            .await
+            .expect("501-page bootstrap must succeed");
+        assert_eq!(outcome.folder_id, "fld-large");
+        assert_eq!(delta_hits.load(Ordering::SeqCst), TOTAL_PAGES);
+        assert!(storage.get_mail_message("m-orphan-large").unwrap().is_none());
+        let first_msg = storage.get_mail_message("large-m-0001").unwrap().unwrap();
+        let last_msg = storage.get_mail_message("large-m-0501").unwrap().unwrap();
+        assert!(!first_msg.body_loaded && !last_msg.body_loaded);
+        assert_eq!(
+            storage
+                .list_mail_summaries(Some("fld-large"), 600)
+                .unwrap()
+                .len(),
+            TOTAL_PAGES
+        );
+        let saved_cur = storage
+            .get_sync_cursor("mail_delta:fld-large")
+            .unwrap()
+            .expect("terminal deltaLink must be persisted");
+        assert!(saved_cur
+            .delta_link
+            .as_deref()
+            .is_some_and(|l| l.contains("$deltatoken=large-d1")));
+
+        // 4. Subsequent sync uses saved deltaLink in 1 call (never replays pages 1..500)
+        delta_hits.store(0, Ordering::SeqCst);
+        sync_mail_folder_delta_with_page_size("fld-large", &client, &storage, None, true, 1)
+            .await
+            .unwrap();
+        assert_eq!(delta_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_move_same_id_then_late_source_tombstone_preserves_destination_row_and_fts() {
+        use axum::{routing::get, Json, Router};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}/v1.0");
+        let base_for_router = base_url.clone();
+
+        let app = Router::new().route(
+            "/v1.0/me/mailFolders/fld-inbox/messages/delta",
+            get(move || {
+                let base = base_url.clone();
+                async move {
+                    Json(serde_json::json!({
+                        "value": [
+                            { "id": "m-same-move", "@removed": { "reason": "deleted" } }
+                        ],
+                        "@odata.deltaLink": format!("{base}/me/mailFolders/fld-inbox/messages/delta?$deltatoken=after-tombstone")
+                    }))
+                }
+            }),
+        );
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = mock_client(base_for_router);
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_mail_folders(&[
+                MailFolder {
+                    id: "fld-inbox".into(),
+                    display_name: "Inbox".into(),
+                    well_known_name: Some("inbox".into()),
+                    parent_folder_id: None,
+                    child_folder_count: 0,
+                    unread_item_count: 1,
+                    total_item_count: 1,
+                },
+                MailFolder {
+                    id: "fld-archive".into(),
+                    display_name: "Archive".into(),
+                    well_known_name: Some("archive".into()),
+                    parent_folder_id: None,
+                    child_folder_count: 0,
+                    unread_item_count: 0,
+                    total_item_count: 0,
+                },
+            ])
+            .unwrap();
+
+        let orig = MailMessage {
+            id: "m-same-move".into(),
+            internet_message_id: Some("<same@example.com>".into()),
+            conversation_id: Some("conv-same".into()),
+            folder_id: Some("fld-inbox".into()),
+            subject: "Immutable ID Quarterly Report".into(),
+            from: None,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            bcc_recipients: vec![],
+            reply_to: vec![],
+            received_at: "2026-11-20T05:00:00Z".into(),
+            sent_at: None,
+            last_modified_at: Some("2026-11-20T05:00:00Z".into()),
+            is_read: false,
+            is_draft: false,
+            flagged: false,
+            importance: "normal".into(),
+            inference_classification: None,
+            has_attachments: false,
+            body_loaded: true,
+            preview: "Quarterly report preview".into(),
+            body_html: "<p>Quarterly report full body</p>".into(),
+            body_plain: "Quarterly report full body".into(),
+            attachments: vec![],
+            meeting_request: None,
+            web_link: None,
+        };
+        storage.upsert_mail_messages(&[orig.clone()]).unwrap();
+        storage
+            .upsert_sync_cursor(&SyncCursor {
+                scope_key: "mail_delta:fld-inbox".into(),
+                delta_link: Some(format!(
+                    "http://{addr}/v1.0/me/mailFolders/fld-inbox/messages/delta?$deltatoken=before-move"
+                )),
+                history_next_link: None,
+                last_synced_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+
+        // Move m-same-move to fld-archive keeping the EXACT same ID (ImmutableId / in-place move)
+        let mut moved = orig.clone();
+        moved.folder_id = Some("fld-archive".into());
+        moved.body_loaded = false;
+        moved.body_html.clear();
+        moved.body_plain.clear();
+        storage
+            .replace_moved_mail_local("m-same-move", &moved)
+            .unwrap();
+
+        // Late source-folder delta emits @removed tombstone for m-same-move
+        sync_mail_folder_delta("inbox", &client, &storage, None, true)
+            .await
+            .unwrap();
+
+        let survived = storage
+            .get_mail_message("m-same-move")
+            .unwrap()
+            .expect("late source-folder tombstone must NOT delete same ID now in archive");
+        assert_eq!(survived.folder_id.as_deref(), Some("fld-archive"));
+        assert!(survived.body_loaded);
+        assert_eq!(survived.body_html, "<p>Quarterly report full body</p>");
+
+        let archive_hits = storage
+            .search_mail("Quarterly", Some("archive"), 10)
+            .unwrap();
+        assert_eq!(archive_hits.len(), 1);
+        assert_eq!(archive_hits[0].id, "m-same-move");
+        let inbox_hits = storage.search_mail("Quarterly", Some("inbox"), 10).unwrap();
+        assert!(inbox_hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_hydrate_refetch_changed_vs_unchanged_body_after_delta() {
+        use axum::{extract::Path as AxumPath, routing::get, Json, Router};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let phase_v2 = Arc::new(AtomicBool::new(false));
+        let unchanged_gets = Arc::new(AtomicUsize::new(0));
+        let changed_content_gets = Arc::new(AtomicUsize::new(0));
+        let changed_body_only_gets = Arc::new(AtomicUsize::new(0));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}/v1.0");
+        let base_for_router = base_url.clone();
+
+        let p2_msg = Arc::clone(&phase_v2);
+        let u_gets = Arc::clone(&unchanged_gets);
+        let cc_gets = Arc::clone(&changed_content_gets);
+        let cbo_gets = Arc::clone(&changed_body_only_gets);
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/messages/{id}",
+                get(move |AxumPath(id): AxumPath<String>| {
+                    let p2 = p2_msg.load(Ordering::SeqCst);
+                    let u_gets = Arc::clone(&u_gets);
+                    let cc_gets = Arc::clone(&cc_gets);
+                    let cbo_gets = Arc::clone(&cbo_gets);
+                    async move {
+                        match id.as_str() {
+                            "m-unchanged" => {
+                                u_gets.fetch_add(1, Ordering::SeqCst);
+                                Json(serde_json::json!({
+                                    "id": "m-unchanged",
+                                    "parentFolderId": "fld-inbox",
+                                    "subject": "Stable Subject",
+                                    "receivedDateTime": "2026-11-20T05:00:00Z",
+                                    "lastModifiedDateTime": if p2 { "2026-11-20T06:00:00Z" } else { "2026-11-20T05:00:00Z" },
+                                    "isRead": p2,
+                                    "bodyPreview": "Stable preview",
+                                    "body": { "contentType": "html", "content": "<p>Unchanged v1 body</p>" }
+                                }))
+                            }
+                            "m-changed-content" => {
+                                cc_gets.fetch_add(1, Ordering::SeqCst);
+                                Json(serde_json::json!({
+                                    "id": "m-changed-content",
+                                    "parentFolderId": "fld-inbox",
+                                    "subject": if p2 { "Edited Subject v2" } else { "Edited Subject v1" },
+                                    "receivedDateTime": "2026-11-20T05:01:00Z",
+                                    "lastModifiedDateTime": if p2 { "2026-11-20T06:00:00Z" } else { "2026-11-20T05:01:00Z" },
+                                    "isRead": true,
+                                    "bodyPreview": if p2 { "Edited preview v2" } else { "Edited preview v1" },
+                                    "body": { "contentType": "html", "content": if p2 { "<p>Edited body v2</p>" } else { "<p>Edited body v1</p>" } }
+                                }))
+                            }
+                            "m-changed-body-only" => {
+                                cbo_gets.fetch_add(1, Ordering::SeqCst);
+                                Json(serde_json::json!({
+                                    "id": "m-changed-body-only",
+                                    "parentFolderId": "fld-inbox",
+                                    "subject": "Draft With Body Edit",
+                                    "receivedDateTime": "2026-11-20T05:02:00Z",
+                                    "lastModifiedDateTime": if p2 { "2026-11-20T06:00:00Z" } else { "2026-11-20T05:02:00Z" },
+                                    "isRead": true,
+                                    "bodyPreview": "Same leading preview",
+                                    "body": { "contentType": "html", "content": if p2 { "<p>Same leading preview + UPDATED tail v2</p>" } else { "<p>Same leading preview + old tail v1</p>" } }
+                                }))
+                            }
+                            _ => Json(serde_json::json!({})),
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/fld-inbox/messages/delta",
+                get(move || {
+                    let base = base_url.clone();
+                    async move {
+                        Json(serde_json::json!({
+                            "value": [
+                                {
+                                    "id": "m-unchanged",
+                                    "parentFolderId": "fld-inbox",
+                                    "subject": "Stable Subject",
+                                    "receivedDateTime": "2026-11-20T05:00:00Z",
+                                    "lastModifiedDateTime": "2026-11-20T06:00:00Z",
+                                    "isRead": true,
+                                    "bodyPreview": "Stable preview"
+                                },
+                                {
+                                    "id": "m-changed-content",
+                                    "parentFolderId": "fld-inbox",
+                                    "subject": "Edited Subject v2",
+                                    "receivedDateTime": "2026-11-20T05:01:00Z",
+                                    "lastModifiedDateTime": "2026-11-20T06:00:00Z",
+                                    "isRead": true,
+                                    "bodyPreview": "Edited preview v2"
+                                },
+                                {
+                                    "id": "m-changed-body-only",
+                                    "parentFolderId": "fld-inbox",
+                                    "subject": "Draft With Body Edit",
+                                    "receivedDateTime": "2026-11-20T05:02:00Z",
+                                    "lastModifiedDateTime": "2026-11-20T06:00:00Z",
+                                    "isRead": true,
+                                    "bodyPreview": "Same leading preview"
+                                }
+                            ],
+                            "@odata.deltaLink": format!("{base}/me/mailFolders/fld-inbox/messages/delta?$deltatoken=d2")
+                        }))
+                    }
+                }),
+            );
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = mock_client(base_for_router);
+        let storage = Storage::open_in_memory().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        storage
+            .upsert_mail_folders(&[MailFolder {
+                id: "fld-inbox".into(),
+                display_name: "Inbox".into(),
+                well_known_name: Some("inbox".into()),
+                parent_folder_id: None,
+                child_folder_count: 0,
+                unread_item_count: 1,
+                total_item_count: 3,
+            }])
+            .unwrap();
+        storage
+            .upsert_sync_cursor(&SyncCursor {
+                scope_key: "mail_delta:fld-inbox".into(),
+                delta_link: Some(format!(
+                    "http://{addr}/v1.0/me/mailFolders/fld-inbox/messages/delta?$deltatoken=d1"
+                )),
+                history_next_link: None,
+                last_synced_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+
+        // Initial hydration of all 3 messages (1 GET each)
+        for id in ["m-unchanged", "m-changed-content", "m-changed-body-only"] {
+            hydrate_message_if_needed(id, false, &client, &storage, &event_tx)
+                .await
+                .unwrap();
+        }
+        assert_eq!(unchanged_gets.load(Ordering::SeqCst), 1);
+        assert_eq!(changed_content_gets.load(Ordering::SeqCst), 1);
+        assert_eq!(changed_body_only_gets.load(Ordering::SeqCst), 1);
+
+        // Second non-forced hydration before any changes must be 0 GETs for all 3
+        for id in ["m-unchanged", "m-changed-content", "m-changed-body-only"] {
+            hydrate_message_if_needed(id, false, &client, &storage, &event_tx)
+                .await
+                .unwrap();
+        }
+        assert_eq!(unchanged_gets.load(Ordering::SeqCst), 1);
+        assert_eq!(changed_content_gets.load(Ordering::SeqCst), 1);
+        assert_eq!(changed_body_only_gets.load(Ordering::SeqCst), 1);
+
+        // Drain initial events, advance server to v2, and run incremental header delta
+        while event_rx.try_recv().is_ok() {}
+        phase_v2.store(true, Ordering::SeqCst);
+        sync_mail_folder_delta("inbox", &client, &storage, None, true)
+            .await
+            .unwrap();
+
+        assert!(storage.get_mail_message("m-unchanged").unwrap().unwrap().body_loaded);
+        assert!(!storage.get_mail_message("m-changed-content").unwrap().unwrap().body_loaded);
+        assert!(!storage.get_mail_message("m-changed-body-only").unwrap().unwrap().body_loaded);
+
+        // Non-forced hydration after delta:
+        // - m-unchanged must NOT refetch (still 1 GET)
+        // - m-changed-content & m-changed-body-only MUST refetch (2 GETs each)
+        for id in ["m-unchanged", "m-changed-content", "m-changed-body-only"] {
+            hydrate_message_if_needed(id, false, &client, &storage, &event_tx)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            unchanged_gets.load(Ordering::SeqCst),
+            1,
+            "metadata-only read toggle must NOT trigger body refetch"
+        );
+        assert_eq!(
+            changed_content_gets.load(Ordering::SeqCst),
+            2,
+            "subject/preview change must trigger body refetch"
+        );
+        assert_eq!(
+            changed_body_only_gets.load(Ordering::SeqCst),
+            2,
+            "body-only lastModifiedDateTime change must trigger body refetch"
+        );
+
+        let u = storage.get_mail_message("m-unchanged").unwrap().unwrap();
+        assert!(u.is_read && u.body_loaded && u.body_html == "<p>Unchanged v1 body</p>");
+        let cc = storage.get_mail_message("m-changed-content").unwrap().unwrap();
+        assert!(cc.body_loaded && cc.body_html == "<p>Edited body v2</p>");
+        let cbo = storage.get_mail_message("m-changed-body-only").unwrap().unwrap();
+        assert!(cbo.body_loaded && cbo.body_html == "<p>Same leading preview + UPDATED tail v2</p>");
+
+        let mut hydrated_event_ids = Vec::new();
+        while let Ok(ev) = event_rx.try_recv() {
+            if let CoreEvent::MailMessageHydrated(m) = ev {
+                hydrated_event_ids.push(m.id);
+            }
+        }
+        assert_eq!(
+            hydrated_event_ids,
+            vec![
+                "m-changed-content".to_string(),
+                "m-changed-body-only".to_string()
+            ]
+        );
     }
 }

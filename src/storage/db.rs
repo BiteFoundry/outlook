@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-const SCHEMA_USER_VERSION_UNICODE61: i32 = 60;
-const SCHEMA_USER_VERSION_TRIGRAM: i32 = 61;
+const SCHEMA_USER_VERSION_UNICODE61: i32 = 62;
+const SCHEMA_USER_VERSION_TRIGRAM: i32 = 63;
 
 /// Initializes SQLite PRAGMAs, tables, indexes, and FTS5 virtual table.
 /// Returns `true` if `mail_fts` uses the `trigram` tokenizer, `false` if using `unicode61`.
@@ -105,6 +105,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             from_display TEXT NOT NULL,
             received_at TEXT NOT NULL,
             sent_at TEXT,
+            last_modified_at TEXT,
             is_read INTEGER NOT NULL DEFAULT 0,
             is_draft INTEGER NOT NULL DEFAULT 0,
             flagged INTEGER NOT NULL DEFAULT 0,
@@ -242,7 +243,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
         let prev_ver: i32 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap_or(0);
-        if prev_ver > 0 && prev_ver < SCHEMA_USER_VERSION_UNICODE61 {
+        if prev_ver > 0 && prev_ver < 60 {
             conn.execute_batch(
                 "
                 DELETE FROM mail_fts;
@@ -294,6 +295,7 @@ fn migrate_legacy_outlook_columns(conn: &Connection) -> Result<()> {
         ("inference_classification", "ALTER TABLE mail_messages ADD COLUMN inference_classification TEXT;"),
         ("body_loaded", "ALTER TABLE mail_messages ADD COLUMN body_loaded INTEGER NOT NULL DEFAULT 0;"),
         ("meeting_request_json", "ALTER TABLE mail_messages ADD COLUMN meeting_request_json TEXT;"),
+        ("last_modified_at", "ALTER TABLE mail_messages ADD COLUMN last_modified_at TEXT;"),
     ];
     for (col, ddl) in mail_migrations {
         if !column_exists(conn, "mail_messages", col) {

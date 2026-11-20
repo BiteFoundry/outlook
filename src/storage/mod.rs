@@ -5,6 +5,7 @@ pub mod outlook;
 pub mod search;
 
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -178,6 +179,11 @@ impl Storage {
         outlook::upsert_mail_folders(&mut conn, folders)
     }
 
+    pub fn replace_mail_folders(&self, folders: &[MailFolder]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        outlook::replace_mail_folders(&mut conn, folders)
+    }
+
     pub fn list_mail_folders(&self) -> Result<Vec<MailFolder>> {
         let conn = self.read_conn()?;
         outlook::list_mail_folders(&conn)
@@ -253,6 +259,49 @@ impl Storage {
         outlook::move_mail_folder_local(&mut conn, id, target_folder_id)
     }
 
+    pub fn replace_moved_mail_local(&self, old_id: &str, moved: &MailMessage) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        outlook::replace_moved_mail_local(&mut conn, old_id, moved)
+    }
+
+    pub fn apply_mail_folder_delta_page(
+        &self,
+        folder_id: &str,
+        folder_alias: Option<&str>,
+        incoming: &[MailMessage],
+        removed_ids: &[String],
+    ) -> Result<(usize, usize)> {
+        let mut conn = self.lock_conn()?;
+        outlook::apply_mail_folder_delta_page(
+            &mut conn,
+            folder_id,
+            folder_alias,
+            incoming,
+            removed_ids,
+        )
+    }
+
+    pub fn apply_mail_folder_delta(
+        &self,
+        folder_id: &str,
+        folder_alias: Option<&str>,
+        incoming: &[MailMessage],
+        removed_ids: &[String],
+        reconcile_seen_ids: Option<&HashSet<String>>,
+        cursor: &SyncCursor,
+    ) -> Result<(usize, usize)> {
+        let mut conn = self.lock_conn()?;
+        outlook::apply_mail_folder_delta(
+            &mut conn,
+            folder_id,
+            folder_alias,
+            incoming,
+            removed_ids,
+            reconcile_seen_ids,
+            cursor,
+        )
+    }
+
     pub fn delete_mail_messages_by_ids(&self, ids: &[String]) -> Result<()> {
         let mut conn = self.lock_conn()?;
         outlook::delete_mail_messages_by_ids(&mut conn, ids)
@@ -273,6 +322,37 @@ impl Storage {
     pub fn upsert_calendar_events(&self, events: &[CalendarEvent]) -> Result<()> {
         let mut conn = self.lock_conn()?;
         outlook::upsert_calendar_events(&mut conn, events)
+    }
+
+    pub fn replace_calendar_events_in_window(
+        &self,
+        start_iso: &str,
+        end_iso: &str,
+        events: &[CalendarEvent],
+    ) -> Result<usize> {
+        let mut conn = self.lock_conn()?;
+        outlook::replace_calendar_events_in_window(&mut conn, start_iso, end_iso, events)
+    }
+
+    pub fn apply_calendar_delta(
+        &self,
+        start_iso: &str,
+        end_iso: &str,
+        events: &[CalendarEvent],
+        removed_ids: &[String],
+        reconcile_window: bool,
+        cursor: &SyncCursor,
+    ) -> Result<bool> {
+        let mut conn = self.lock_conn()?;
+        outlook::apply_calendar_delta(
+            &mut conn,
+            start_iso,
+            end_iso,
+            events,
+            removed_ids,
+            reconcile_window,
+            cursor,
+        )
     }
 
     pub fn list_calendar_events(
@@ -312,6 +392,11 @@ impl Storage {
         outlook::upsert_contacts(&mut conn, contacts)
     }
 
+    pub fn replace_personal_contacts(&self, contacts: &[ContactItem]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        outlook::replace_personal_contacts(&mut conn, contacts)
+    }
+
     pub fn list_contacts(&self, query: Option<&str>, limit: usize) -> Result<Vec<ContactItem>> {
         let conn = self.read_conn()?;
         outlook::list_contacts(&conn, query, limit)
@@ -329,6 +414,11 @@ impl Storage {
         outlook::upsert_todo_lists(&mut conn, lists)
     }
 
+    pub fn replace_todo_lists(&self, lists: &[TodoList]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        outlook::replace_todo_lists(&mut conn, lists)
+    }
+
     pub fn list_todo_lists(&self) -> Result<Vec<TodoList>> {
         let conn = self.read_conn()?;
         outlook::list_todo_lists(&conn)
@@ -337,6 +427,16 @@ impl Storage {
     pub fn upsert_todo_tasks(&self, tasks: &[TodoTask]) -> Result<()> {
         let mut conn = self.lock_conn()?;
         outlook::upsert_todo_tasks(&mut conn, tasks)
+    }
+
+    pub fn replace_todo_tasks_for_list(
+        &self,
+        list_id: &str,
+        include_completed: bool,
+        tasks: &[TodoTask],
+    ) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        outlook::replace_todo_tasks_for_list(&mut conn, list_id, include_completed, tasks)
     }
 
     pub fn list_todo_tasks(
@@ -410,6 +510,7 @@ mod tests {
             reply_to: Vec::new(),
             received_at: received_at.to_string(),
             sent_at: Some(received_at.to_string()),
+            last_modified_at: None,
             is_read: false,
             is_draft: false,
             flagged: false,
@@ -492,8 +593,9 @@ mod tests {
         assert_eq!(storage.upsert_mail_messages(&[full_msg]).unwrap(), 0);
         assert_eq!(storage.conn().lock().unwrap().total_changes() - before_noop, 0);
 
-        // Header-only delta update (`body_loaded == false`) must NOT overwrite cached body/attachments,
-        // while updating mutable metadata (`is_read`, `flagged`, `importance`, `inference_classification`, `preview`).
+        // Metadata-only header delta update (`body_loaded == false`, same subject/preview/attachments)
+        // must NOT overwrite cached body/attachments while updating mutable metadata
+        // (`is_read`, `flagged`, `importance`, `inference_classification`).
         let mut header_update = sample_mail(
             "m1",
             "fld-inbox",
@@ -509,9 +611,9 @@ mod tests {
         header_update.flagged = true;
         header_update.importance = "high".to_string();
         header_update.inference_classification = Some("other".to_string());
-        header_update.preview = "Updated preview".to_string();
+        header_update.preview = "Full body with...".to_string();
         header_update.to_recipients.clear();
-        header_update.has_attachments = false;
+        header_update.has_attachments = true;
 
         assert_eq!(storage.upsert_mail_messages(&[header_update.clone()]).unwrap(), 1);
         // Repeating the exact same header-only poll returns 0 changed rows.
@@ -523,7 +625,7 @@ mod tests {
         assert!(loaded.flagged);
         assert_eq!(loaded.importance, "high");
         assert_eq!(loaded.inference_classification.as_deref(), Some("other"));
-        assert_eq!(loaded.preview, "Updated preview");
+        assert_eq!(loaded.preview, "Full body with...");
         assert_eq!(
             loaded.body_html,
             "<p>Full body with Kubernetes rollout details</p>"
@@ -543,6 +645,34 @@ mod tests {
         assert!(hits[0].flagged);
         assert!(hits[0].is_read);
 
+        // Content-changing header update (subject or preview changed) invalidates `body_loaded`
+        // so stale v1 body is not served alongside v2 summary metadata.
+        let mut content_update = sample_mail(
+            "m1",
+            "fld-inbox",
+            "Q4 Budget Review v2",
+            "Alice",
+            "alice@example.com",
+            "2026-11-18T10:00:00Z",
+            false,
+            "",
+            "",
+        );
+        content_update.is_read = true;
+        content_update.flagged = true;
+        content_update.importance = "high".to_string();
+        content_update.inference_classification = Some("other".to_string());
+        content_update.preview = "Updated v2 body preview".to_string();
+        content_update.has_attachments = true;
+
+        assert_eq!(storage.upsert_mail_messages(&[content_update]).unwrap(), 1);
+        let invalidated = storage.get_mail_message("m1").unwrap().unwrap();
+        assert!(!invalidated.body_loaded);
+        assert_eq!(invalidated.subject, "Q4 Budget Review v2");
+        assert_eq!(invalidated.preview, "Updated v2 body preview");
+        assert!(invalidated.body_html.is_empty());
+        assert_eq!(invalidated.body_plain, "Updated v2 body preview");
+
         // Focused filter excludes `other`
         let focused = storage
             .list_mail_messages(Some("inbox"), false, false, true, 10)
@@ -560,7 +690,7 @@ mod tests {
             .unwrap();
         assert!(storage.get_mail_message("m1").unwrap().is_none());
         assert!(storage
-            .search_mail("Kubernetes", None, 10)
+            .search_mail("Updated", None, 10)
             .unwrap()
             .is_empty());
     }
@@ -853,5 +983,289 @@ mod tests {
         assert_eq!(full.cc_recipients.len(), 1);
         assert_eq!(full.attachments.len(), 1);
         assert_eq!(full.web_link, s.web_link);
+    }
+
+    #[test]
+    fn test_replace_moved_mail_local_atomic_fts_and_late_source_delete_preservation() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .replace_mail_folders(&[
+                MailFolder {
+                    id: "fld-inbox".into(),
+                    display_name: "Inbox".into(),
+                    well_known_name: Some("inbox".into()),
+                    parent_folder_id: None,
+                    child_folder_count: 0,
+                    unread_item_count: 2,
+                    total_item_count: 2,
+                },
+                MailFolder {
+                    id: "fld-archive".into(),
+                    display_name: "Archive".into(),
+                    well_known_name: Some("archive".into()),
+                    parent_folder_id: None,
+                    child_folder_count: 0,
+                    unread_item_count: 0,
+                    total_item_count: 0,
+                },
+            ])
+            .unwrap();
+
+        let m1 = sample_mail(
+            "m1",
+            "fld-inbox",
+            "Unique Quantum Budget",
+            "Alice",
+            "alice@example.com",
+            "2026-11-18T10:00:00Z",
+            true,
+            "<p>Quantum details</p>",
+            "Quantum details",
+        );
+        let m2 = sample_mail(
+            "m2",
+            "fld-inbox",
+            "Keep Same Id Move",
+            "Bob",
+            "bob@example.com",
+            "2026-11-18T09:00:00Z",
+            true,
+            "<p>Preserved body</p>",
+            "Preserved body",
+        );
+        storage.upsert_mail_messages(&[m1, m2]).unwrap();
+
+        // 1. Move m1 -> m1-moved into Archive (Graph ID change): atomic replace of SQLite + FTS + counts
+        let mut m1_moved = sample_mail(
+            "m1-moved",
+            "fld-archive",
+            "Unique Quantum Budget",
+            "Alice",
+            "alice@example.com",
+            "2026-11-18T10:00:00Z",
+            false,
+            "",
+            "",
+        );
+        m1_moved.preview = "Quantum details".into();
+        storage.replace_moved_mail_local("m1", &m1_moved).unwrap();
+
+        assert!(storage.get_mail_message("m1").unwrap().is_none());
+        let moved_loaded = storage.get_mail_message("m1-moved").unwrap().unwrap();
+        assert_eq!(moved_loaded.folder_id.as_deref(), Some("fld-archive"));
+        assert!(moved_loaded.body_loaded, "should preserve hydrated body across move");
+        assert_eq!(moved_loaded.body_html, "<p>Quantum details</p>");
+        let fts_hits = storage.search_mail("Quantum", None, 10).unwrap();
+        assert_eq!(fts_hits.len(), 1);
+        assert_eq!(fts_hits[0].id, "m1-moved");
+        assert_eq!(fts_hits[0].folder_id.as_deref(), Some("fld-archive"));
+        let folders = storage.list_mail_folders().unwrap();
+        let inbox = folders.iter().find(|f| f.id == "fld-inbox").unwrap();
+        let archive = folders.iter().find(|f| f.id == "fld-archive").unwrap();
+        assert_eq!(inbox.total_item_count, 1);
+        assert_eq!(inbox.unread_item_count, 1);
+        assert_eq!(archive.total_item_count, 1);
+        assert_eq!(archive.unread_item_count, 1);
+
+        // 2. Move m2 -> Archive keeping same ID, then a late source-folder @removed arrives for m2 in fld-inbox:
+        // m2 in fld-archive MUST be preserved!
+        storage.move_mail_folder_local("m2", "fld-archive").unwrap();
+        let cursor = SyncCursor {
+            scope_key: "mail_delta:fld-inbox".into(),
+            delta_link: Some("https://graph.microsoft.com/v1.0/delta?t=2".into()),
+            history_next_link: None,
+            last_synced_at: "2026-11-18T10:05:00Z".into(),
+        };
+        let (_changed, deleted) = storage
+            .apply_mail_folder_delta(
+                "fld-inbox",
+                Some("inbox"),
+                &[],
+                &["m2".to_string()],
+                None,
+                &cursor,
+            )
+            .unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(
+            storage.get_mail_message("m2").unwrap().unwrap().folder_id.as_deref(),
+            Some("fld-archive")
+        );
+        assert_eq!(storage.search_mail("Preserved", None, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_selective_body_invalidation_and_non_delta_snapshot_reconciliation() {
+        let storage = Storage::open_in_memory().unwrap();
+        let mut msg = sample_mail(
+            "m-mod",
+            "fld-inbox",
+            "Draft Subject",
+            "Alice",
+            "alice@example.com",
+            "2026-11-18T10:00:00Z",
+            true,
+            "<p>Long body v1</p>",
+            "Long body v1",
+        );
+        msg.last_modified_at = Some("2026-11-18T10:00:00Z".into());
+        storage.upsert_mail_messages(&[msg.clone()]).unwrap();
+
+        // Read-state change + last_modified_at bump must NOT invalidate hydrated body
+        let mut read_only = msg.clone();
+        read_only.body_loaded = false;
+        read_only.body_html.clear();
+        read_only.body_plain.clear();
+        read_only.is_read = true;
+        read_only.last_modified_at = Some("2026-11-18T10:01:00Z".into());
+        storage.upsert_mail_messages(&[read_only.clone()]).unwrap();
+        let after_read = storage.get_mail_message("m-mod").unwrap().unwrap();
+        assert!(after_read.body_loaded);
+        assert_eq!(after_read.body_html, "<p>Long body v1</p>");
+
+        // last_modified_at bump WITHOUT read/flag/folder change (e.g. body edit past 255 chars) invalidates body
+        let mut deep_body_edit = read_only;
+        deep_body_edit.last_modified_at = Some("2026-11-18T10:02:00Z".into());
+        storage.upsert_mail_messages(&[deep_body_edit]).unwrap();
+        let after_edit = storage.get_mail_message("m-mod").unwrap().unwrap();
+        assert!(!after_edit.body_loaded);
+        assert!(after_edit.body_html.is_empty());
+
+        // Non-delta snapshot reconciliation for folders, todo lists/tasks, personal contacts, calendar window
+        storage
+            .replace_mail_folders(&[
+                MailFolder {
+                    id: "f1".into(),
+                    display_name: "Inbox".into(),
+                    well_known_name: Some("inbox".into()),
+                    parent_folder_id: None,
+                    child_folder_count: 0,
+                    unread_item_count: 0,
+                    total_item_count: 0,
+                },
+                MailFolder {
+                    id: "f2".into(),
+                    display_name: "Temp".into(),
+                    well_known_name: None,
+                    parent_folder_id: None,
+                    child_folder_count: 0,
+                    unread_item_count: 0,
+                    total_item_count: 0,
+                },
+            ])
+            .unwrap();
+        storage
+            .replace_mail_folders(&[MailFolder {
+                id: "f1".into(),
+                display_name: "Inbox".into(),
+                well_known_name: Some("inbox".into()),
+                parent_folder_id: None,
+                child_folder_count: 0,
+                unread_item_count: 0,
+                total_item_count: 0,
+            }])
+            .unwrap();
+        assert_eq!(storage.list_mail_folders().unwrap().len(), 1);
+
+        storage
+            .replace_todo_lists(&[TodoList {
+                id: "l1".into(),
+                display_name: "Tasks".into(),
+                wellknown_list_name: Some("defaultList".into()),
+                is_owner: true,
+                is_shared: false,
+            }])
+            .unwrap();
+        storage
+            .replace_todo_tasks_for_list(
+                "l1",
+                true,
+                &[
+                    TodoTask {
+                        id: "t1".into(),
+                        list_id: "l1".into(),
+                        title: "Keep".into(),
+                        status: "notStarted".into(),
+                        importance: "normal".into(),
+                        body_plain: None,
+                        due_date_iso: None,
+                        reminder_iso: None,
+                        completed_at: None,
+                        created_at: None,
+                        updated_at: None,
+                    },
+                    TodoTask {
+                        id: "t2".into(),
+                        list_id: "l1".into(),
+                        title: "Delete me".into(),
+                        status: "notStarted".into(),
+                        importance: "normal".into(),
+                        body_plain: None,
+                        due_date_iso: None,
+                        reminder_iso: None,
+                        completed_at: None,
+                        created_at: None,
+                        updated_at: None,
+                    },
+                ],
+            )
+            .unwrap();
+        storage
+            .replace_todo_tasks_for_list(
+                "l1",
+                true,
+                &[TodoTask {
+                    id: "t1".into(),
+                    list_id: "l1".into(),
+                    title: "Keep".into(),
+                    status: "notStarted".into(),
+                    importance: "normal".into(),
+                    body_plain: None,
+                    due_date_iso: None,
+                    reminder_iso: None,
+                    completed_at: None,
+                    created_at: None,
+                    updated_at: None,
+                }],
+            )
+            .unwrap();
+        assert_eq!(storage.list_todo_tasks(Some("l1"), true).unwrap().len(), 1);
+
+        storage
+            .upsert_contacts(&[
+                ContactItem {
+                    id: "c-personal-del".into(),
+                    display_name: "Old Personal".into(),
+                    given_name: None,
+                    surname: None,
+                    email_addresses: vec!["old@example.com".into()],
+                    mobile_phone: None,
+                    business_phones: vec![],
+                    company_name: None,
+                    job_title: None,
+                    department: None,
+                    notes: None,
+                    source: "contact".into(),
+                },
+                ContactItem {
+                    id: "c-dir-keep".into(),
+                    display_name: "Directory Person".into(),
+                    given_name: None,
+                    surname: None,
+                    email_addresses: vec!["dir@example.com".into()],
+                    mobile_phone: None,
+                    business_phones: vec![],
+                    company_name: None,
+                    job_title: None,
+                    department: None,
+                    notes: None,
+                    source: "directory".into(),
+                },
+            ])
+            .unwrap();
+        storage.replace_personal_contacts(&[]).unwrap();
+        let remaining_contacts = storage.list_contacts(None, 10).unwrap();
+        assert_eq!(remaining_contacts.len(), 1);
+        assert_eq!(remaining_contacts[0].id, "c-dir-keep");
     }
 }

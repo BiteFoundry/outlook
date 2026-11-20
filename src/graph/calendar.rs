@@ -296,8 +296,18 @@ impl GraphClient {
         end_iso: &str,
         limit: usize,
     ) -> Result<Vec<CalendarEvent>> {
+        let (events, _) = self.list_calendar_view_complete(start_iso, end_iso, limit).await?;
+        Ok(events)
+    }
+
+    pub async fn list_calendar_view_complete(
+        &self,
+        start_iso: &str,
+        end_iso: &str,
+        limit: usize,
+    ) -> Result<(Vec<CalendarEvent>, bool)> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
         let top = limit.min(100);
         let mut next_url = Some(format!(
@@ -311,16 +321,19 @@ impl GraphClient {
         while let Some(url) = next_url {
             let page: GraphListPage<GraphCalendarEvent> =
                 self.get_json_with_headers(&url, &headers).await?;
-            for raw in page.value {
+            let page_has_more = page.next_link.is_some();
+            let total_in_page = page.value.len();
+            for (idx, raw) in page.value.into_iter().enumerate() {
                 events.push(CalendarEvent::from(raw));
                 if events.len() >= limit {
-                    return Ok(events);
+                    let reached_end = !page_has_more && idx + 1 >= total_in_page;
+                    return Ok((events, reached_end));
                 }
             }
             next_url = page.next_link;
         }
 
-        Ok(events)
+        Ok((events, true))
     }
 
     pub async fn delta_calendar_view(
@@ -338,7 +351,11 @@ impl GraphClient {
             ),
         };
 
-        let headers = [("Prefer", "odata.maxpagesize=50")];
+        let headers = [("Prefer", "outlook.timezone=\"UTC\", odata.maxpagesize=50")];
+        let mut seen_urls = std::collections::HashSet::new();
+        seen_urls.insert(
+            super::mail::canonical_pagination_key(&initial_url).to_string(),
+        );
         let mut next_url = Some(initial_url);
         let mut upserted = Vec::new();
         let mut removed_ids = Vec::new();
@@ -358,10 +375,30 @@ impl GraphClient {
                     upserted.push(CalendarEvent::from(raw));
                 }
             }
-            if page.delta_link.is_some() {
-                new_delta_link = page.delta_link;
+            if let Some(dlink) = page
+                .delta_link
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                new_delta_link = Some(dlink);
+                break;
             }
-            next_url = page.next_link;
+            next_url = match page
+                .next_link
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                Some(next) => {
+                    let key = super::mail::canonical_pagination_key(&next).to_string();
+                    if !seen_urls.insert(key) {
+                        bail!(
+                            "Cyclic or repeated @odata.nextLink detected during calendar delta sync: {next}"
+                        );
+                    }
+                    Some(next)
+                }
+                None => None,
+            };
         }
 
         Ok((upserted, removed_ids, new_delta_link))
@@ -779,9 +816,9 @@ mod tests {
         assert_eq!(
             prefers,
             vec![
-                "odata.maxpagesize=50",
-                "odata.maxpagesize=50",
-                "odata.maxpagesize=50"
+                "outlook.timezone=\"UTC\", odata.maxpagesize=50",
+                "outlook.timezone=\"UTC\", odata.maxpagesize=50",
+                "outlook.timezone=\"UTC\", odata.maxpagesize=50"
             ]
         );
     }

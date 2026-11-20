@@ -29,7 +29,6 @@ use crate::models::{
 const MAIL_SMALL_ATTACHMENT_LIMIT: u64 = 3 * 1024 * 1024; // 3 MiB
 const MAIL_UPLOAD_CHUNK_SIZE: usize = 3_276_800; // 3.2 MiB
 const MAX_FOLDER_DEPTH: usize = 6;
-const DELTA_MAX_PAGES: usize = 4;
 const SEARCH_MAX_PAGES: usize = 2;
 const WELL_KNOWN_FOLDER_NAMES: [&str; 6] = [
     "inbox",
@@ -40,8 +39,8 @@ const WELL_KNOWN_FOLDER_NAMES: [&str; 6] = [
     "junkemail",
 ];
 
-const MAIL_HEADER_SELECT_FIELDS: &str = "id,internetMessageId,conversationId,parentFolderId,subject,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,isRead,isDraft,flag,importance,inferenceClassification,hasAttachments,bodyPreview,webLink";
-const MAIL_FULL_SELECT_FIELDS: &str = "id,internetMessageId,conversationId,parentFolderId,subject,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,isRead,isDraft,flag,importance,inferenceClassification,hasAttachments,bodyPreview,body,webLink";
+const MAIL_HEADER_SELECT_FIELDS: &str = "id,internetMessageId,conversationId,parentFolderId,subject,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,lastModifiedDateTime,isRead,isDraft,flag,importance,inferenceClassification,hasAttachments,bodyPreview,webLink";
+const MAIL_FULL_SELECT_FIELDS: &str = "id,internetMessageId,conversationId,parentFolderId,subject,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,lastModifiedDateTime,isRead,isDraft,flag,importance,inferenceClassification,hasAttachments,bodyPreview,body,webLink";
 
 // ---------------------------------------------------------------------------
 // Shared Graph Outlook Wire DTOs & Normalization Helpers
@@ -411,6 +410,8 @@ struct GraphMailMessage {
     received_date_time: Option<String>,
     #[serde(rename = "sentDateTime", default)]
     sent_date_time: Option<String>,
+    #[serde(rename = "lastModifiedDateTime", default)]
+    last_modified_date_time: Option<String>,
     #[serde(rename = "isRead", default)]
     is_read: Option<bool>,
     #[serde(rename = "isDraft", default)]
@@ -553,6 +554,9 @@ impl GraphMailMessage {
                 .collect(),
             received_at: self.received_date_time.unwrap_or_default(),
             sent_at: self.sent_date_time.filter(|s| !s.trim().is_empty()),
+            last_modified_at: self
+                .last_modified_date_time
+                .filter(|s| !s.trim().is_empty()),
             is_read: self.is_read.unwrap_or(false),
             is_draft: self.is_draft.unwrap_or(false),
             flagged,
@@ -584,6 +588,41 @@ struct MailUploadSessionResponse {
 #[derive(Debug, Deserialize)]
 struct CreatedDraftResponse {
     id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MailDeltaPage {
+    pub upserted: Vec<MailMessage>,
+    pub removed_ids: Vec<String>,
+    pub next_link: Option<String>,
+    pub delta_link: Option<String>,
+}
+
+pub(crate) fn initial_mail_delta_url(folder_id: &str) -> String {
+    let base_path = match normalize_folder_target(folder_id) {
+        None => "/me/messages/delta".to_string(),
+        Some(folder) => format!(
+            "/me/mailFolders/{}/messages/delta",
+            urlencoding::encode(&folder)
+        ),
+    };
+    format!("{base_path}?$select={MAIL_HEADER_SELECT_FIELDS}")
+}
+
+pub(crate) fn canonical_pagination_key(url: &str) -> &str {
+    let trimmed = url.trim();
+    if let Some(idx) = trimmed.find("/me/") {
+        &trimmed[idx..]
+    } else {
+        trimmed
+    }
+}
+
+pub(crate) fn canonical_delta_url_key(folder_id: &str, delta_or_next_link: Option<&str>) -> String {
+    match delta_or_next_link.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(link) => canonical_pagination_key(link).to_string(),
+        None => canonical_pagination_key(&initial_mail_delta_url(folder_id)).to_string(),
+    }
 }
 
 struct StagedFile<'a> {
@@ -868,62 +907,94 @@ impl GraphClient {
         Ok((messages, page.next_link))
     }
 
-    /// Synchronizes mail message changes via `/messages/delta`, returning
-    /// `(upserted_messages, removed_ids, new_delta_link)`.
-    pub async fn delta_mail_messages(
+    /// Fetches a single page of `/messages/delta` headers (never full bodies) so callers can
+    /// stream large folders page-by-page without holding all pages in RAM.
+    pub async fn delta_mail_messages_page(
         &self,
         folder_id: &str,
         delta_or_next_link: Option<&str>,
         top: usize,
-    ) -> Result<(Vec<MailMessage>, Vec<String>, Option<String>)> {
-        let initial_url = match delta_or_next_link.map(str::trim).filter(|s| !s.is_empty()) {
+    ) -> Result<MailDeltaPage> {
+        let url = match delta_or_next_link.map(str::trim).filter(|s| !s.is_empty()) {
             Some(link) => link.to_string(),
-            None => {
-                let base_path = match normalize_folder_target(folder_id) {
-                    None => "/me/messages/delta".to_string(),
-                    Some(folder) => {
-                        format!(
-                            "/me/mailFolders/{}/messages/delta",
-                            urlencoding::encode(&folder)
-                        )
-                    }
-                };
-                format!("{base_path}?$select={MAIL_HEADER_SELECT_FIELDS}")
-            }
+            None => initial_mail_delta_url(folder_id),
         };
 
         let page_size = if top == 0 { 50 } else { top.min(100) };
         let prefer_val = format!("odata.maxpagesize={page_size}");
         let headers = [("Prefer", prefer_val.as_str())];
 
-        let mut next_url = Some(initial_url);
+        let page: GraphDeltaPage<serde_json::Value> =
+            self.get_json_with_headers(&url, &headers).await?;
+        let mut upserted = Vec::with_capacity(page.value.len());
+        let mut removed_ids = Vec::new();
+        for val in page.value {
+            if val.get("@removed").is_some() {
+                if let Some(id) = val.get("id").and_then(|v| v.as_str()) {
+                    removed_ids.push(id.to_string());
+                }
+            } else {
+                let raw: GraphMailMessage = serde_json::from_value(val)
+                    .context("Failed to deserialize Graph mail delta item")?;
+                upserted.push(raw.into_mail_message(false));
+            }
+        }
+        let next_link = page
+            .next_link
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let delta_link = page
+            .delta_link
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        Ok(MailDeltaPage {
+            upserted,
+            removed_ids,
+            next_link,
+            delta_link,
+        })
+    }
+
+    /// Synchronizes mail message changes via `/messages/delta`, returning
+    /// `(upserted_messages, removed_ids, new_delta_link)`. Follows all valid `@odata.nextLink`
+    /// pages to the terminal `@odata.deltaLink` while guarding against cyclic or repeated links.
+    pub async fn delta_mail_messages(
+        &self,
+        folder_id: &str,
+        delta_or_next_link: Option<&str>,
+        top: usize,
+    ) -> Result<(Vec<MailMessage>, Vec<String>, Option<String>)> {
+        let mut next_url = delta_or_next_link
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let mut seen_urls = HashSet::new();
+        seen_urls.insert(canonical_delta_url_key(folder_id, next_url.as_deref()));
+
         let mut upserted = Vec::new();
         let mut removed_ids = Vec::new();
         let mut new_delta_link = None;
-        let mut pages = 0usize;
 
-        while let Some(url) = next_url {
-            if pages >= DELTA_MAX_PAGES {
-                break;
-            }
-            pages += 1;
-            let page: GraphDeltaPage<serde_json::Value> =
-                self.get_json_with_headers(&url, &headers).await?;
-            for val in page.value {
-                if val.get("@removed").is_some() {
-                    if let Some(id) = val.get("id").and_then(|v| v.as_str()) {
-                        removed_ids.push(id.to_string());
-                    }
-                } else {
-                    let raw: GraphMailMessage = serde_json::from_value(val)
-                        .context("Failed to deserialize Graph mail delta item")?;
-                    upserted.push(raw.into_mail_message(false));
-                }
-            }
+        loop {
+            let page = self
+                .delta_mail_messages_page(folder_id, next_url.as_deref(), top)
+                .await?;
+            upserted.extend(page.upserted);
+            removed_ids.extend(page.removed_ids);
+
             if page.delta_link.is_some() {
                 new_delta_link = page.delta_link;
+                break;
             }
-            next_url = page.next_link;
+            let Some(next) = page.next_link else {
+                break;
+            };
+            let key = canonical_pagination_key(&next).to_string();
+            if !seen_urls.insert(key) {
+                bail!("Cyclic or repeated @odata.nextLink detected during mail delta sync: {next}");
+            }
+            next_url = Some(next);
         }
 
         Ok((upserted, removed_ids, new_delta_link))
@@ -2469,9 +2540,11 @@ pub(crate) mod tests {
                 get(|State(st): State<ServerState>| async move {
                     let page = st.delta_pages.fetch_add(1, Ordering::SeqCst) + 1;
                     let base = st.base_url.lock().unwrap().clone();
+                    // Return a cyclic nextLink on page 3 pointing back to page 2
+                    let next_page = if page >= 3 { 2 } else { page + 1 };
                     Json(serde_json::json!({
                         "value": [{ "id": format!("d-{page}"), "subject": "Delta item" }],
-                        "@odata.nextLink": format!("{base}/v1.0/me/mailFolders/inbox/messages/delta?page={}", page + 1)
+                        "@odata.nextLink": format!("{base}/v1.0/me/mailFolders/inbox/messages/delta?page={next_page}")
                     }))
                 }),
             )
@@ -2514,13 +2587,82 @@ pub(crate) mod tests {
         assert_eq!(by_id["f-2026-p2"].parent_folder_id.as_deref(), Some("f-projects"));
         assert_eq!(by_id.len(), 9);
 
-        let (delta_msgs, _, delta_link) = client.delta_mail_messages("inbox", None, 50).await.unwrap();
-        assert_eq!(state_ref.delta_pages.load(Ordering::SeqCst), DELTA_MAX_PAGES);
-        assert_eq!(delta_msgs.len(), DELTA_MAX_PAGES);
-        assert!(delta_link.is_none());
+        let delta_err = client
+            .delta_mail_messages("inbox", None, 50)
+            .await
+            .expect_err("cyclic @odata.nextLink must fail fast instead of looping");
+        assert!(format!("{delta_err:#}").contains("Cyclic or repeated @odata.nextLink"));
+        assert_eq!(state_ref.delta_pages.load(Ordering::SeqCst), 3);
 
         let search_hits = client.search_mail_remote("budget", 100).await.unwrap();
         assert_eq!(state_ref.search_pages.load(Ordering::SeqCst), SEARCH_MAX_PAGES);
         assert_eq!(search_hits.len(), SEARCH_MAX_PAGES);
+    }
+
+    #[tokio::test]
+    async fn test_delta_mail_messages_exceeds_500_pages_to_terminal_delta_link() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const TOTAL_PAGES: usize = 505;
+        let base_url = Arc::new(Mutex::new(String::new()));
+        let base_for_router = Arc::clone(&base_url);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_router = Arc::clone(&hits);
+
+        let app = Router::new().route(
+            "/v1.0/me/mailFolders/fld-big/messages/delta",
+            get(move |Query(params): Query<HashMap<String, String>>| {
+                let base_ref = Arc::clone(&base_for_router);
+                let hits_ref = Arc::clone(&hits_for_router);
+                async move {
+                    hits_ref.fetch_add(1, Ordering::SeqCst);
+                    let page: usize = params
+                        .get("page")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1);
+                    let base = base_ref.lock().unwrap().clone();
+                    let item = serde_json::json!({
+                        "id": format!("big-{page}"),
+                        "parentFolderId": "fld-big",
+                        "subject": format!("Big Page {page}"),
+                        "receivedDateTime": "2026-11-20T05:00:00Z",
+                        "isRead": true
+                    });
+                    if page < TOTAL_PAGES {
+                        Json(serde_json::json!({
+                            "value": [item],
+                            "@odata.nextLink": format!("{base}/v1.0/me/mailFolders/fld-big/messages/delta?page={}", page + 1)
+                        }))
+                    } else {
+                        Json(serde_json::json!({
+                            "value": [item],
+                            "@odata.deltaLink": format!("{base}/v1.0/me/mailFolders/fld-big/messages/delta?$deltatoken=big-done")
+                        }))
+                    }
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        *base_url.lock().unwrap() = format!("http://{addr}");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = test_graph_client(&format!("http://{addr}/v1.0"));
+        let (msgs, removed, delta_link) = client
+            .delta_mail_messages("fld-big", None, 1)
+            .await
+            .expect("505-page delta must reach terminal deltaLink");
+        assert_eq!(hits.load(Ordering::SeqCst), TOTAL_PAGES);
+        assert_eq!(msgs.len(), TOTAL_PAGES);
+        assert!(removed.is_empty());
+        assert!(
+            delta_link
+                .as_deref()
+                .is_some_and(|l| l.contains("$deltatoken=big-done")),
+            "expected terminal deltaLink, got {delta_link:?}"
+        );
     }
 }

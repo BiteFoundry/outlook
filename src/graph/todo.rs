@@ -185,8 +185,20 @@ impl GraphClient {
         include_completed: bool,
         limit: usize,
     ) -> Result<Vec<TodoTask>> {
+        let (tasks, _) = self
+            .list_todo_tasks_complete(list_id, include_completed, limit)
+            .await?;
+        Ok(tasks)
+    }
+
+    pub async fn list_todo_tasks_complete(
+        &self,
+        list_id: &str,
+        include_completed: bool,
+        limit: usize,
+    ) -> Result<(Vec<TodoTask>, bool)> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
         let resolved_id = self.resolve_todo_list_id(list_id).await?;
         let top = limit.min(100);
@@ -198,20 +210,23 @@ impl GraphClient {
 
         while let Some(url) = next_url {
             let page: GraphListPage<GraphTodoTask> = self.get_json(&url).await?;
-            for raw in page.value {
+            let page_has_more = page.next_link.is_some();
+            let mut iter = page.value.into_iter().peekable();
+            while let Some(raw) = iter.next() {
                 let task = raw.into_todo_task(resolved_id.clone());
                 if !include_completed && task.is_completed() {
                     continue;
                 }
                 tasks.push(task);
                 if tasks.len() >= limit {
-                    return Ok(tasks);
+                    let reached_end = !page_has_more && iter.peek().is_none();
+                    return Ok((tasks, reached_end));
                 }
             }
             next_url = page.next_link;
         }
 
-        Ok(tasks)
+        Ok((tasks, true))
     }
 
     pub async fn create_todo_task(

@@ -1,7 +1,9 @@
 //! SQLite persistence for Outlook Mail, Calendar, Contacts, Microsoft To Do, and sync cursors.
 
+use std::collections::HashSet;
+
 use anyhow::Result;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 
 use crate::models::{
     CalendarEvent, ContactItem, EmailRecipient, EventAttendee, MailAttachment, MailFolder,
@@ -11,7 +13,7 @@ use crate::models::{
 const MAIL_SELECT_COLS: &str = "
     m.id, m.internet_message_id, m.conversation_id, m.folder_id, m.subject,
     m.from_json, m.to_json, m.cc_json, m.bcc_json, m.reply_to_json,
-    m.received_at, m.sent_at, m.is_read, m.is_draft, m.flagged,
+    m.received_at, m.sent_at, m.last_modified_at, m.is_read, m.is_draft, m.flagged,
     m.importance, m.inference_classification, m.has_attachments, m.body_loaded,
     m.preview, m.body_html, m.body_plain, m.attachments_json,
     m.meeting_request_json, m.web_link
@@ -24,7 +26,7 @@ pub(crate) const MAIL_SUMMARY_SELECT_COLS: &str = "
         WHEN m.to_json != '[]' AND json_valid(m.to_json) THEN json_extract(m.to_json, '$[0]')
         ELSE NULL
     END,
-    m.received_at, m.sent_at, m.is_read, m.is_draft,
+    m.received_at, m.sent_at, m.last_modified_at, m.is_read, m.is_draft,
     m.flagged, m.importance, m.inference_classification, m.has_attachments,
     m.body_loaded, m.preview, m.meeting_request_json, m.web_link
 ";
@@ -69,32 +71,58 @@ pub fn upsert_mail_folders(conn: &mut Connection, folders: &[MailFolder]) -> Res
         return Ok(());
     }
     let tx = conn.transaction()?;
+    upsert_mail_folders_in_tx(&tx, folders)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn upsert_mail_folders_in_tx(tx: &Transaction<'_>, folders: &[MailFolder]) -> Result<()> {
+    let mut stmt = tx.prepare_cached(
+        "
+        INSERT INTO mail_folders (
+            id, display_name, well_known_name, parent_folder_id,
+            child_folder_count, unread_item_count, total_item_count
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(id) DO UPDATE SET
+            display_name = excluded.display_name,
+            well_known_name = COALESCE(excluded.well_known_name, mail_folders.well_known_name),
+            parent_folder_id = excluded.parent_folder_id,
+            child_folder_count = excluded.child_folder_count,
+            unread_item_count = excluded.unread_item_count,
+            total_item_count = excluded.total_item_count
+        ",
+    )?;
+    for f in folders {
+        stmt.execute(params![
+            f.id,
+            f.display_name,
+            f.well_known_name,
+            f.parent_folder_id,
+            f.child_folder_count,
+            f.unread_item_count,
+            f.total_item_count,
+        ])?;
+    }
+    Ok(())
+}
+
+/// Atomically replaces the cached mail folder snapshot with `folders`, removing folders
+/// deleted remotely while preserving existing `well_known_name` metadata on surviving rows.
+pub fn replace_mail_folders(conn: &mut Connection, folders: &[MailFolder]) -> Result<()> {
+    let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare_cached(
-            "
-            INSERT INTO mail_folders (
-                id, display_name, well_known_name, parent_folder_id,
-                child_folder_count, unread_item_count, total_item_count
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            ON CONFLICT(id) DO UPDATE SET
-                display_name = excluded.display_name,
-                well_known_name = COALESCE(excluded.well_known_name, mail_folders.well_known_name),
-                parent_folder_id = excluded.parent_folder_id,
-                child_folder_count = excluded.child_folder_count,
-                unread_item_count = excluded.unread_item_count,
-                total_item_count = excluded.total_item_count
-            ",
-        )?;
-        for f in folders {
-            stmt.execute(params![
-                f.id,
-                f.display_name,
-                f.well_known_name,
-                f.parent_folder_id,
-                f.child_folder_count,
-                f.unread_item_count,
-                f.total_item_count,
-            ])?;
+        upsert_mail_folders_in_tx(&tx, folders)?;
+        let keep: HashSet<&str> = folders.iter().map(|f| f.id.as_str()).collect();
+        let existing_ids: Vec<String> = {
+            let mut sel = tx.prepare_cached("SELECT id FROM mail_folders")?;
+            let rows = sel.query_map([], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut del = tx.prepare_cached("DELETE FROM mail_folders WHERE id = ?1")?;
+        for id in existing_ids {
+            if !keep.contains(id.as_str()) {
+                del.execute(params![id])?;
+            }
         }
     }
     tx.commit()?;
@@ -175,6 +203,7 @@ struct ExistingMailRow {
     from_display: String,
     received_at: String,
     sent_at: Option<String>,
+    last_modified_at: Option<String>,
     is_read: i32,
     is_draft: i32,
     flagged: i32,
@@ -190,324 +219,353 @@ struct ExistingMailRow {
     web_link: Option<String>,
 }
 
-/// Upserts `messages`, enforcing the header-first preservation rule (header-only updates with
-/// `body_loaded == false` never overwrite cached full bodies/attachments), keeping `mail_fts`
-/// synchronized via `O(1)` rowid lookups, and returning the actual count of changed/inserted rows.
+/// Upserts `messages`, enforcing the selective header-first preservation rule:
+/// metadata-only header updates (`is_read`, `flagged`, `importance`, `folder_id`, etc.)
+/// preserve cached full bodies/attachments, whereas content changes (`subject`, `preview`,
+/// `is_draft`, `has_attachments`, or `last_modified_at` without a metadata-only change)
+/// invalidate `body_loaded` so the reader re-hydrates the updated body.
 pub fn upsert_mail_messages(conn: &mut Connection, messages: &[MailMessage]) -> Result<usize> {
     if messages.is_empty() {
         return Ok(0);
     }
-    let mut changed_count = 0usize;
     let tx = conn.transaction()?;
-    {
-        let mut check_stmt = tx.prepare_cached(
-            "
-            SELECT
-                rowid, internet_message_id, conversation_id, folder_id, subject,
-                from_json, to_json, cc_json, bcc_json, reply_to_json,
-                from_display, received_at, sent_at, is_read, is_draft,
-                flagged, importance, inference_classification, has_attachments, body_loaded,
-                preview, body_html, body_plain, attachments_json, meeting_request_json, web_link
-            FROM mail_messages
-            WHERE id = ?1
-            ",
-        )?;
+    let changed_count = upsert_mail_messages_in_tx(&tx, messages)?;
+    tx.commit()?;
+    Ok(changed_count)
+}
 
-        let mut msg_stmt = tx.prepare_cached(
-            "
-            INSERT INTO mail_messages (
-                id, internet_message_id, conversation_id, folder_id, subject,
-                from_json, to_json, cc_json, bcc_json, reply_to_json,
-                from_display, received_at, sent_at, is_read, is_draft,
-                flagged, importance, inference_classification, has_attachments, body_loaded,
-                preview, body_html, body_plain, attachments_json, meeting_request_json, web_link
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5,
-                ?6, ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13, ?14, ?15,
-                ?16, ?17, ?18, ?19, ?20,
-                ?21, ?22, ?23, ?24, ?25, ?26
-            )
-            ON CONFLICT(id) DO UPDATE SET
-                internet_message_id = COALESCE(excluded.internet_message_id, mail_messages.internet_message_id),
-                conversation_id = COALESCE(excluded.conversation_id, mail_messages.conversation_id),
-                folder_id = COALESCE(excluded.folder_id, mail_messages.folder_id),
-                subject = excluded.subject,
-                from_json = COALESCE(excluded.from_json, mail_messages.from_json),
-                to_json = CASE
-                    WHEN excluded.body_loaded = 0 AND mail_messages.body_loaded != 0
-                        AND excluded.to_json = '[]' AND mail_messages.to_json != '[]'
-                    THEN mail_messages.to_json
-                    ELSE excluded.to_json
-                END,
-                cc_json = CASE
-                    WHEN excluded.body_loaded = 0 AND mail_messages.body_loaded != 0
-                        AND excluded.cc_json = '[]' AND mail_messages.cc_json != '[]'
-                    THEN mail_messages.cc_json
-                    ELSE excluded.cc_json
-                END,
-                bcc_json = CASE
-                    WHEN excluded.body_loaded = 0 AND mail_messages.body_loaded != 0
-                        AND excluded.bcc_json = '[]' AND mail_messages.bcc_json != '[]'
-                    THEN mail_messages.bcc_json
-                    ELSE excluded.bcc_json
-                END,
-                reply_to_json = CASE
-                    WHEN excluded.body_loaded = 0 AND mail_messages.body_loaded != 0
-                        AND excluded.reply_to_json = '[]' AND mail_messages.reply_to_json != '[]'
-                    THEN mail_messages.reply_to_json
-                    ELSE excluded.reply_to_json
-                END,
-                from_display = excluded.from_display,
-                received_at = excluded.received_at,
-                sent_at = COALESCE(excluded.sent_at, mail_messages.sent_at),
-                is_read = excluded.is_read,
-                is_draft = excluded.is_draft,
-                flagged = excluded.flagged,
-                importance = excluded.importance,
-                inference_classification = COALESCE(excluded.inference_classification, mail_messages.inference_classification),
-                has_attachments = CASE
-                    WHEN excluded.has_attachments != 0
-                        OR (mail_messages.body_loaded != 0 AND excluded.body_loaded = 0 AND mail_messages.has_attachments != 0)
-                        OR (excluded.attachments_json = '[]'
-                            AND mail_messages.attachments_json != '[]'
-                            AND mail_messages.attachments_json != '')
-                    THEN 1
-                    ELSE 0
-                END,
-                body_loaded = MAX(mail_messages.body_loaded, excluded.body_loaded),
-                preview = CASE
-                    WHEN excluded.preview = '' AND mail_messages.preview != ''
-                    THEN mail_messages.preview
-                    ELSE excluded.preview
-                END,
-                body_html = CASE
-                    WHEN excluded.body_loaded = 0 AND mail_messages.body_loaded != 0
-                    THEN mail_messages.body_html
-                    WHEN excluded.body_loaded = 0 AND excluded.body_html = '' AND mail_messages.body_html != ''
-                    THEN mail_messages.body_html
-                    ELSE excluded.body_html
-                END,
-                body_plain = CASE
-                    WHEN excluded.body_loaded = 0 AND mail_messages.body_loaded != 0
-                    THEN mail_messages.body_plain
-                    WHEN excluded.body_loaded = 0 AND excluded.body_html = ''
-                        AND mail_messages.body_html != '' AND mail_messages.body_plain != ''
-                    THEN mail_messages.body_plain
-                    ELSE excluded.body_plain
-                END,
-                attachments_json = CASE
-                    WHEN excluded.body_loaded = 0 AND mail_messages.body_loaded != 0
-                    THEN mail_messages.attachments_json
-                    WHEN excluded.attachments_json = '[]'
-                        AND mail_messages.attachments_json != '[]'
-                        AND mail_messages.attachments_json != ''
-                    THEN mail_messages.attachments_json
-                    ELSE excluded.attachments_json
-                END,
-                meeting_request_json = COALESCE(excluded.meeting_request_json, mail_messages.meeting_request_json),
-                web_link = COALESCE(excluded.web_link, mail_messages.web_link)
-            ",
-        )?;
+fn upsert_mail_messages_in_tx(tx: &Transaction<'_>, messages: &[MailMessage]) -> Result<usize> {
+    if messages.is_empty() {
+        return Ok(0);
+    }
+    let mut changed_count = 0usize;
+    let mut check_stmt = tx.prepare_cached(
+        "
+        SELECT
+            rowid, internet_message_id, conversation_id, folder_id, subject,
+            from_json, to_json, cc_json, bcc_json, reply_to_json,
+            from_display, received_at, sent_at, last_modified_at, is_read, is_draft,
+            flagged, importance, inference_classification, has_attachments, body_loaded,
+            preview, body_html, body_plain, attachments_json, meeting_request_json, web_link
+        FROM mail_messages
+        WHERE id = ?1
+        ",
+    )?;
 
-        let mut fts_del_stmt = tx.prepare_cached("DELETE FROM mail_fts WHERE rowid = ?1")?;
-        let mut fts_ins_stmt = tx.prepare_cached(
-            "
-            INSERT INTO mail_fts (rowid, msg_id, folder_id, subject, from_display, body_plain)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-            ",
-        )?;
+    let mut msg_stmt = tx.prepare_cached(
+        "
+        INSERT INTO mail_messages (
+            id, internet_message_id, conversation_id, folder_id, subject,
+            from_json, to_json, cc_json, bcc_json, reply_to_json,
+            from_display, received_at, sent_at, last_modified_at, is_read, is_draft,
+            flagged, importance, inference_classification, has_attachments, body_loaded,
+            preview, body_html, body_plain, attachments_json, meeting_request_json, web_link
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5,
+            ?6, ?7, ?8, ?9, ?10,
+            ?11, ?12, ?13, ?14, ?15, ?16,
+            ?17, ?18, ?19, ?20, ?21,
+            ?22, ?23, ?24, ?25, ?26, ?27
+        )
+        ON CONFLICT(id) DO UPDATE SET
+            internet_message_id = excluded.internet_message_id,
+            conversation_id = excluded.conversation_id,
+            folder_id = excluded.folder_id,
+            subject = excluded.subject,
+            from_json = excluded.from_json,
+            to_json = excluded.to_json,
+            cc_json = excluded.cc_json,
+            bcc_json = excluded.bcc_json,
+            reply_to_json = excluded.reply_to_json,
+            from_display = excluded.from_display,
+            received_at = excluded.received_at,
+            sent_at = excluded.sent_at,
+            last_modified_at = excluded.last_modified_at,
+            is_read = excluded.is_read,
+            is_draft = excluded.is_draft,
+            flagged = excluded.flagged,
+            importance = excluded.importance,
+            inference_classification = excluded.inference_classification,
+            has_attachments = excluded.has_attachments,
+            body_loaded = excluded.body_loaded,
+            preview = excluded.preview,
+            body_html = excluded.body_html,
+            body_plain = excluded.body_plain,
+            attachments_json = excluded.attachments_json,
+            meeting_request_json = excluded.meeting_request_json,
+            web_link = excluded.web_link
+        ",
+    )?;
 
-        for msg in messages {
-            let from_json = msg
-                .from
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()?;
-            let to_json = serde_json::to_string(&msg.to_recipients)?;
-            let cc_json = serde_json::to_string(&msg.cc_recipients)?;
-            let bcc_json = serde_json::to_string(&msg.bcc_recipients)?;
-            let reply_to_json = serde_json::to_string(&msg.reply_to)?;
-            let attachments_json = serde_json::to_string(&msg.attachments)?;
-            let meeting_request_json = msg
-                .meeting_request
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()?;
-            let from_display = msg.from_display();
-            let is_read_i = bool_to_i32(msg.is_read);
-            let is_draft_i = bool_to_i32(msg.is_draft);
-            let flagged_i = bool_to_i32(msg.flagged);
-            let has_att_i = bool_to_i32(msg.has_attachments);
-            let body_loaded_i = bool_to_i32(msg.body_loaded);
+    let mut fts_del_stmt = tx.prepare_cached("DELETE FROM mail_fts WHERE rowid = ?1")?;
+    let mut fts_ins_stmt = tx.prepare_cached(
+        "
+        INSERT INTO mail_fts (rowid, msg_id, folder_id, subject, from_display, body_plain)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ",
+    )?;
 
-            let existing = check_stmt
-                .query_row(params![&msg.id], |row| {
-                    Ok(ExistingMailRow {
-                        rowid: row.get(0)?,
-                        internet_message_id: row.get(1)?,
-                        conversation_id: row.get(2)?,
-                        folder_id: row.get(3)?,
-                        subject: row.get(4)?,
-                        from_json: row.get(5)?,
-                        to_json: row.get(6)?,
-                        cc_json: row.get(7)?,
-                        bcc_json: row.get(8)?,
-                        reply_to_json: row.get(9)?,
-                        from_display: row.get(10)?,
-                        received_at: row.get(11)?,
-                        sent_at: row.get(12)?,
-                        is_read: row.get(13)?,
-                        is_draft: row.get(14)?,
-                        flagged: row.get(15)?,
-                        importance: row.get(16)?,
-                        inference_classification: row.get(17)?,
-                        has_attachments: row.get(18)?,
-                        body_loaded: row.get(19)?,
-                        preview: row.get(20)?,
-                        body_html: row.get(21)?,
-                        body_plain: row.get(22)?,
-                        attachments_json: row.get(23)?,
-                        meeting_request_json: row.get(24)?,
-                        web_link: row.get(25)?,
-                    })
+    for msg in messages {
+        let from_json = msg
+            .from
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let to_json = serde_json::to_string(&msg.to_recipients)?;
+        let cc_json = serde_json::to_string(&msg.cc_recipients)?;
+        let bcc_json = serde_json::to_string(&msg.bcc_recipients)?;
+        let reply_to_json = serde_json::to_string(&msg.reply_to)?;
+        let attachments_json = serde_json::to_string(&msg.attachments)?;
+        let meeting_request_json = msg
+            .meeting_request
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let from_display = msg.from_display();
+        let is_read_i = bool_to_i32(msg.is_read);
+        let is_draft_i = bool_to_i32(msg.is_draft);
+        let flagged_i = bool_to_i32(msg.flagged);
+        let has_att_i = bool_to_i32(msg.has_attachments);
+        let body_loaded_i = bool_to_i32(msg.body_loaded);
+
+        let existing = check_stmt
+            .query_row(params![&msg.id], |row| {
+                Ok(ExistingMailRow {
+                    rowid: row.get(0)?,
+                    internet_message_id: row.get(1)?,
+                    conversation_id: row.get(2)?,
+                    folder_id: row.get(3)?,
+                    subject: row.get(4)?,
+                    from_json: row.get(5)?,
+                    to_json: row.get(6)?,
+                    cc_json: row.get(7)?,
+                    bcc_json: row.get(8)?,
+                    reply_to_json: row.get(9)?,
+                    from_display: row.get(10)?,
+                    received_at: row.get(11)?,
+                    sent_at: row.get(12)?,
+                    last_modified_at: row.get(13)?,
+                    is_read: row.get(14)?,
+                    is_draft: row.get(15)?,
+                    flagged: row.get(16)?,
+                    importance: row.get(17)?,
+                    inference_classification: row.get(18)?,
+                    has_attachments: row.get(19)?,
+                    body_loaded: row.get(20)?,
+                    preview: row.get(21)?,
+                    body_html: row.get(22)?,
+                    body_plain: row.get(23)?,
+                    attachments_json: row.get(24)?,
+                    meeting_request_json: row.get(25)?,
+                    web_link: row.get(26)?,
                 })
-                .optional()?;
+            })
+            .optional()?;
 
-            let (fts_unchanged, eff_folder_str, eff_body_plain_owned) = if let Some(ref ex) = existing {
-                let eff_inet_id = msg
-                    .internet_message_id
-                    .as_deref()
-                    .or(ex.internet_message_id.as_deref());
-                let eff_conversation_id = msg
-                    .conversation_id
-                    .as_deref()
-                    .or(ex.conversation_id.as_deref());
-                let eff_folder_id = msg.folder_id.as_deref().or(ex.folder_id.as_deref());
-                let eff_from_json = from_json.as_deref().or(ex.from_json.as_deref());
-                let eff_sent_at = msg.sent_at.as_deref().or(ex.sent_at.as_deref());
-                let eff_inference = msg
-                    .inference_classification
-                    .as_deref()
-                    .or(ex.inference_classification.as_deref());
-                let eff_meeting_req = meeting_request_json
-                    .as_deref()
-                    .or(ex.meeting_request_json.as_deref());
-                let eff_web_link = msg.web_link.as_deref().or(ex.web_link.as_deref());
+        if let Some(ref ex) = existing {
+            let eff_inet_id = msg
+                .internet_message_id
+                .as_deref()
+                .or(ex.internet_message_id.as_deref());
+            let eff_conversation_id = msg
+                .conversation_id
+                .as_deref()
+                .or(ex.conversation_id.as_deref());
+            let eff_folder_id = msg.folder_id.as_deref().or(ex.folder_id.as_deref());
+            let eff_from_json = from_json.as_deref().or(ex.from_json.as_deref());
+            let eff_sent_at = msg.sent_at.as_deref().or(ex.sent_at.as_deref());
+            let eff_last_modified = msg
+                .last_modified_at
+                .as_deref()
+                .or(ex.last_modified_at.as_deref());
+            let eff_inference = msg
+                .inference_classification
+                .as_deref()
+                .or(ex.inference_classification.as_deref());
+            let eff_meeting_req = meeting_request_json
+                .as_deref()
+                .or(ex.meeting_request_json.as_deref());
+            let eff_web_link = msg.web_link.as_deref().or(ex.web_link.as_deref());
 
-                let header_over_hydrated = !msg.body_loaded && ex.body_loaded != 0;
-                let eff_to_json = if header_over_hydrated && to_json == "[]" && ex.to_json != "[]" {
-                    ex.to_json.as_str()
-                } else {
-                    to_json.as_str()
-                };
-                let eff_cc_json = if header_over_hydrated && cc_json == "[]" && ex.cc_json != "[]" {
-                    ex.cc_json.as_str()
-                } else {
-                    cc_json.as_str()
-                };
-                let eff_bcc_json = if header_over_hydrated && bcc_json == "[]" && ex.bcc_json != "[]" {
-                    ex.bcc_json.as_str()
-                } else {
-                    bcc_json.as_str()
-                };
-                let eff_reply_to_json =
-                    if header_over_hydrated && reply_to_json == "[]" && ex.reply_to_json != "[]" {
-                        ex.reply_to_json.as_str()
-                    } else {
-                        reply_to_json.as_str()
-                    };
-
-                let keep_existing_att = header_over_hydrated
-                    || (attachments_json == "[]"
-                        && ex.attachments_json != "[]"
-                        && !ex.attachments_json.is_empty());
-                let eff_attachments_json = if keep_existing_att {
-                    ex.attachments_json.as_str()
-                } else {
-                    attachments_json.as_str()
-                };
-                let eff_has_attachments = if msg.has_attachments
-                    || (header_over_hydrated && ex.has_attachments != 0)
-                    || (attachments_json == "[]"
-                        && ex.attachments_json != "[]"
-                        && !ex.attachments_json.is_empty())
-                {
-                    1i32
-                } else {
-                    0i32
-                };
-                let eff_body_loaded = ex.body_loaded.max(body_loaded_i);
-                let eff_preview = if msg.preview.is_empty() && !ex.preview.is_empty() {
-                    ex.preview.as_str()
-                } else {
-                    msg.preview.as_str()
-                };
-                let eff_body_html = if header_over_hydrated
-                    || (!msg.body_loaded && msg.body_html.is_empty() && !ex.body_html.is_empty())
-                {
-                    ex.body_html.as_str()
-                } else {
-                    msg.body_html.as_str()
-                };
-                let eff_body_plain = if header_over_hydrated
-                    || (!msg.body_loaded
-                        && msg.body_html.is_empty()
-                        && !ex.body_html.is_empty()
-                        && !ex.body_plain.is_empty())
-                {
-                    ex.body_plain.as_str()
-                } else {
-                    msg.body_plain.as_str()
-                };
-
-                let row_unchanged = eff_inet_id == ex.internet_message_id.as_deref()
-                    && eff_conversation_id == ex.conversation_id.as_deref()
-                    && eff_folder_id == ex.folder_id.as_deref()
-                    && msg.subject == ex.subject
-                    && eff_from_json == ex.from_json.as_deref()
-                    && eff_to_json == ex.to_json
-                    && eff_cc_json == ex.cc_json
-                    && eff_bcc_json == ex.bcc_json
-                    && eff_reply_to_json == ex.reply_to_json
-                    && from_display == ex.from_display
-                    && msg.received_at == ex.received_at
-                    && eff_sent_at == ex.sent_at.as_deref()
-                    && is_read_i == ex.is_read
-                    && is_draft_i == ex.is_draft
-                    && flagged_i == ex.flagged
-                    && msg.importance == ex.importance
-                    && eff_inference == ex.inference_classification.as_deref()
-                    && eff_has_attachments == ex.has_attachments
-                    && eff_body_loaded == ex.body_loaded
-                    && eff_preview == ex.preview
-                    && eff_body_html == ex.body_html
-                    && eff_body_plain == ex.body_plain
-                    && eff_attachments_json == ex.attachments_json
-                    && eff_meeting_req == ex.meeting_request_json.as_deref()
-                    && eff_web_link == ex.web_link.as_deref();
-
-                if row_unchanged {
-                    continue;
-                }
-
-                let fts_same = eff_folder_id.unwrap_or("") == ex.folder_id.as_deref().unwrap_or("")
-                    && msg.subject == ex.subject
-                    && from_display == ex.from_display
-                    && eff_body_plain == ex.body_plain;
-                (
-                    fts_same,
-                    eff_folder_id.unwrap_or("").to_string(),
-                    eff_body_plain.to_string(),
-                )
+            let eff_preview = if msg.preview.is_empty() && !ex.preview.is_empty() {
+                ex.preview.as_str()
             } else {
-                (
-                    false,
-                    msg.folder_id.as_deref().unwrap_or("").to_string(),
-                    msg.body_plain.clone(),
-                )
+                msg.preview.as_str()
             };
 
+            let header_over_hydrated = !msg.body_loaded && ex.body_loaded != 0;
+            let metadata_only_diff = is_read_i != ex.is_read
+                || flagged_i != ex.flagged
+                || eff_folder_id != ex.folder_id.as_deref()
+                || msg.importance != ex.importance
+                || eff_inference != ex.inference_classification.as_deref();
+            let modified_without_flag_diff = msg.last_modified_at.is_some()
+                && ex.last_modified_at.is_some()
+                && msg.last_modified_at != ex.last_modified_at
+                && !metadata_only_diff;
+            let invalidate_body = header_over_hydrated
+                && (msg.subject != ex.subject
+                    || (!msg.preview.is_empty() && msg.preview != ex.preview)
+                    || is_draft_i != ex.is_draft
+                    || has_att_i != ex.has_attachments
+                    || modified_without_flag_diff);
+
+            let preserve_hydrated = header_over_hydrated && !invalidate_body;
+
+            let eff_to_json = if preserve_hydrated && to_json == "[]" && ex.to_json != "[]" {
+                ex.to_json.as_str()
+            } else {
+                to_json.as_str()
+            };
+            let eff_cc_json = if preserve_hydrated && cc_json == "[]" && ex.cc_json != "[]" {
+                ex.cc_json.as_str()
+            } else {
+                cc_json.as_str()
+            };
+            let eff_bcc_json = if preserve_hydrated && bcc_json == "[]" && ex.bcc_json != "[]" {
+                ex.bcc_json.as_str()
+            } else {
+                bcc_json.as_str()
+            };
+            let eff_reply_to_json =
+                if preserve_hydrated && reply_to_json == "[]" && ex.reply_to_json != "[]" {
+                    ex.reply_to_json.as_str()
+                } else {
+                    reply_to_json.as_str()
+                };
+
+            let keep_existing_att = !invalidate_body
+                && (preserve_hydrated
+                    || (attachments_json == "[]"
+                        && ex.attachments_json != "[]"
+                        && !ex.attachments_json.is_empty()));
+            let eff_attachments_json = if invalidate_body {
+                "[]"
+            } else if keep_existing_att {
+                ex.attachments_json.as_str()
+            } else {
+                attachments_json.as_str()
+            };
+            let eff_has_attachments = if invalidate_body {
+                has_att_i
+            } else if msg.has_attachments
+                || (preserve_hydrated && ex.has_attachments != 0)
+                || (attachments_json == "[]"
+                    && ex.attachments_json != "[]"
+                    && !ex.attachments_json.is_empty())
+            {
+                1i32
+            } else {
+                0i32
+            };
+            let eff_body_loaded = if invalidate_body {
+                0i32
+            } else {
+                ex.body_loaded.max(body_loaded_i)
+            };
+            let eff_body_html = if invalidate_body {
+                ""
+            } else if preserve_hydrated
+                || (!msg.body_loaded && msg.body_html.is_empty() && !ex.body_html.is_empty())
+            {
+                ex.body_html.as_str()
+            } else {
+                msg.body_html.as_str()
+            };
+            let eff_body_plain = if invalidate_body {
+                eff_preview
+            } else if preserve_hydrated
+                || (!msg.body_loaded
+                    && msg.body_html.is_empty()
+                    && !ex.body_html.is_empty()
+                    && !ex.body_plain.is_empty())
+            {
+                ex.body_plain.as_str()
+            } else {
+                msg.body_plain.as_str()
+            };
+
+            let row_unchanged = eff_inet_id == ex.internet_message_id.as_deref()
+                && eff_conversation_id == ex.conversation_id.as_deref()
+                && eff_folder_id == ex.folder_id.as_deref()
+                && msg.subject == ex.subject
+                && eff_from_json == ex.from_json.as_deref()
+                && eff_to_json == ex.to_json
+                && eff_cc_json == ex.cc_json
+                && eff_bcc_json == ex.bcc_json
+                && eff_reply_to_json == ex.reply_to_json
+                && from_display == ex.from_display
+                && msg.received_at == ex.received_at
+                && eff_sent_at == ex.sent_at.as_deref()
+                && eff_last_modified == ex.last_modified_at.as_deref()
+                && is_read_i == ex.is_read
+                && is_draft_i == ex.is_draft
+                && flagged_i == ex.flagged
+                && msg.importance == ex.importance
+                && eff_inference == ex.inference_classification.as_deref()
+                && eff_has_attachments == ex.has_attachments
+                && eff_body_loaded == ex.body_loaded
+                && eff_preview == ex.preview
+                && eff_body_html == ex.body_html
+                && eff_body_plain == ex.body_plain
+                && eff_attachments_json == ex.attachments_json
+                && eff_meeting_req == ex.meeting_request_json.as_deref()
+                && eff_web_link == ex.web_link.as_deref();
+
+            if row_unchanged {
+                continue;
+            }
+
+            let fts_same = eff_folder_id.unwrap_or("") == ex.folder_id.as_deref().unwrap_or("")
+                && msg.subject == ex.subject
+                && from_display == ex.from_display
+                && eff_body_plain == ex.body_plain;
+            let eff_folder_str = eff_folder_id.unwrap_or("").to_string();
+            let eff_body_plain_owned = eff_body_plain.to_string();
+
+            msg_stmt.execute(params![
+                msg.id,
+                eff_inet_id,
+                eff_conversation_id,
+                eff_folder_id,
+                msg.subject,
+                eff_from_json,
+                eff_to_json,
+                eff_cc_json,
+                eff_bcc_json,
+                eff_reply_to_json,
+                from_display,
+                msg.received_at,
+                eff_sent_at,
+                eff_last_modified,
+                is_read_i,
+                is_draft_i,
+                flagged_i,
+                msg.importance,
+                eff_inference,
+                eff_has_attachments,
+                eff_body_loaded,
+                eff_preview,
+                eff_body_html,
+                eff_body_plain,
+                eff_attachments_json,
+                eff_meeting_req,
+                eff_web_link,
+            ])?;
+            changed_count += 1;
+
+            if !fts_same {
+                fts_del_stmt.execute(params![ex.rowid])?;
+                fts_ins_stmt.execute(params![
+                    ex.rowid,
+                    msg.id,
+                    eff_folder_str,
+                    msg.subject,
+                    from_display,
+                    eff_body_plain_owned,
+                ])?;
+            }
+        } else {
             msg_stmt.execute(params![
                 msg.id,
                 msg.internet_message_id,
@@ -522,6 +580,7 @@ pub fn upsert_mail_messages(conn: &mut Connection, messages: &[MailMessage]) -> 
                 from_display,
                 msg.received_at,
                 msg.sent_at,
+                msg.last_modified_at,
                 is_read_i,
                 is_draft_i,
                 flagged_i,
@@ -537,27 +596,17 @@ pub fn upsert_mail_messages(conn: &mut Connection, messages: &[MailMessage]) -> 
                 msg.web_link,
             ])?;
             changed_count += 1;
-
-            if !fts_unchanged {
-                let rowid = match existing {
-                    Some(ex) => {
-                        fts_del_stmt.execute(params![ex.rowid])?;
-                        ex.rowid
-                    }
-                    None => tx.last_insert_rowid(),
-                };
-                fts_ins_stmt.execute(params![
-                    rowid,
-                    msg.id,
-                    eff_folder_str,
-                    msg.subject,
-                    from_display,
-                    eff_body_plain_owned,
-                ])?;
-            }
+            let rowid = tx.last_insert_rowid();
+            fts_ins_stmt.execute(params![
+                rowid,
+                msg.id,
+                msg.folder_id.as_deref().unwrap_or(""),
+                msg.subject,
+                from_display,
+                msg.body_plain,
+            ])?;
         }
     }
-    tx.commit()?;
     Ok(changed_count)
 }
 
@@ -748,16 +797,42 @@ pub fn move_mail_folder_local(
             .optional()?
             .unwrap_or_else(|| trimmed.to_string());
 
-        let mut sel = tx.prepare_cached("SELECT folder_id, is_read FROM mail_messages WHERE id = ?1")?;
-        let existing: Option<(Option<String>, i32)> = sel
-            .query_row(params![message_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        let mut sel = tx.prepare_cached(
+            "SELECT rowid, folder_id, is_read, subject, from_display, body_plain FROM mail_messages WHERE id = ?1",
+        )?;
+        let existing: Option<(i64, Option<String>, i32, String, String, String)> = sel
+            .query_row(params![message_id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
             .optional()?;
 
-        if let Some((old_folder_id, is_read_i)) = existing {
+        if let Some((rowid, old_folder_id, is_read_i, subject, from_display, body_plain)) = existing
+        {
             if old_folder_id.as_deref() != Some(resolved_target.as_str()) {
                 let mut upd_msg =
                     tx.prepare_cached("UPDATE mail_messages SET folder_id = ?2 WHERE id = ?1")?;
                 upd_msg.execute(params![message_id, resolved_target])?;
+
+                let mut del_fts = tx.prepare_cached("DELETE FROM mail_fts WHERE rowid = ?1")?;
+                del_fts.execute(params![rowid])?;
+                let mut ins_fts = tx.prepare_cached(
+                    "INSERT INTO mail_fts (rowid, msg_id, folder_id, subject, from_display, body_plain) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )?;
+                ins_fts.execute(params![
+                    rowid,
+                    message_id,
+                    resolved_target,
+                    subject,
+                    from_display,
+                    body_plain
+                ])?;
 
                 if let Some(old_fid) = old_folder_id {
                     let mut dec_old = tx.prepare_cached(
@@ -793,6 +868,276 @@ pub fn move_mail_folder_local(
     Ok(())
 }
 
+/// Atomically replaces a moved/archived/soft-deleted mail message (`old_id` -> `moved.id`)
+/// across `mail_messages`, `mail_fts`, and `mail_folders` counts in a single SQLite transaction.
+pub fn replace_moved_mail_local(
+    conn: &mut Connection,
+    old_id: &str,
+    moved: &MailMessage,
+) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let old_msg = {
+            let sql = format!("SELECT {MAIL_SELECT_COLS} FROM mail_messages m WHERE m.id = ?1");
+            let mut stmt = tx.prepare_cached(&sql)?;
+            stmt.query_row(params![old_id], map_mail_message_row)
+                .optional()?
+        };
+        let old_rowid: Option<i64> = {
+            let mut sel = tx.prepare_cached("SELECT rowid FROM mail_messages WHERE id = ?1")?;
+            sel.query_row(params![old_id], |row| row.get(0)).optional()?
+        };
+
+        let mut effective = moved.clone();
+        if let Some(ref raw_fid) = effective.folder_id {
+            let trimmed = raw_fid.trim();
+            if !trimmed.is_empty() {
+                let alias = normalize_well_known_alias(trimmed);
+                let mut resolve_stmt = tx.prepare_cached(
+                    "
+                    SELECT id FROM mail_folders
+                    WHERE id = ?1
+                       OR LOWER(COALESCE(well_known_name, '')) = LOWER(?2)
+                       OR LOWER(display_name) = LOWER(?1)
+                    LIMIT 1
+                    ",
+                )?;
+                if let Some(resolved) = resolve_stmt
+                    .query_row(params![trimmed, alias], |row| row.get::<_, String>(0))
+                    .optional()?
+                {
+                    effective.folder_id = Some(resolved);
+                }
+            }
+        }
+
+        if let Some(ref old) = old_msg {
+            if !effective.body_loaded && old.body_loaded {
+                effective.body_loaded = true;
+                if effective.body_html.is_empty() {
+                    effective.body_html = old.body_html.clone();
+                }
+                if effective.body_plain.is_empty() {
+                    effective.body_plain = old.body_plain.clone();
+                }
+                if effective.attachments.is_empty() && !old.attachments.is_empty() {
+                    effective.attachments = old.attachments.clone();
+                    effective.has_attachments = old.has_attachments;
+                }
+                if effective.to_recipients.is_empty() {
+                    effective.to_recipients = old.to_recipients.clone();
+                }
+                if effective.cc_recipients.is_empty() {
+                    effective.cc_recipients = old.cc_recipients.clone();
+                }
+                if effective.bcc_recipients.is_empty() {
+                    effective.bcc_recipients = old.bcc_recipients.clone();
+                }
+                if effective.reply_to.is_empty() {
+                    effective.reply_to = old.reply_to.clone();
+                }
+            }
+            if effective.internet_message_id.is_none() {
+                effective.internet_message_id = old.internet_message_id.clone();
+            }
+            if effective.conversation_id.is_none() {
+                effective.conversation_id = old.conversation_id.clone();
+            }
+            if effective.sent_at.is_none() {
+                effective.sent_at = old.sent_at.clone();
+            }
+            if effective.last_modified_at.is_none() {
+                effective.last_modified_at = old.last_modified_at.clone();
+            }
+            if effective.meeting_request.is_none() {
+                effective.meeting_request = old.meeting_request.clone();
+            }
+            if effective.web_link.is_none() {
+                effective.web_link = old.web_link.clone();
+            }
+        }
+
+        if old_id != effective.id {
+            if let Some(rowid) = old_rowid {
+                let mut del_fts = tx.prepare_cached("DELETE FROM mail_fts WHERE rowid = ?1")?;
+                del_fts.execute(params![rowid])?;
+                let mut del_msg = tx.prepare_cached("DELETE FROM mail_messages WHERE id = ?1")?;
+                del_msg.execute(params![old_id])?;
+            }
+        }
+
+        upsert_mail_messages_in_tx(&tx, std::slice::from_ref(&effective))?;
+
+        let old_folder_id = old_msg.as_ref().and_then(|m| m.folder_id.as_deref());
+        let new_folder_id = effective.folder_id.as_deref();
+        if old_folder_id != new_folder_id {
+            if let Some(old_fid) = old_folder_id {
+                let old_read_i = bool_to_i32(old_msg.as_ref().is_some_and(|m| m.is_read));
+                let mut dec_old = tx.prepare_cached(
+                    "
+                    UPDATE mail_folders
+                    SET total_item_count = MAX(0, total_item_count - 1),
+                        unread_item_count = CASE
+                            WHEN ?2 = 0 THEN MAX(0, unread_item_count - 1)
+                            ELSE unread_item_count
+                        END
+                    WHERE id = ?1
+                    ",
+                )?;
+                dec_old.execute(params![old_fid, old_read_i])?;
+            }
+            if let Some(new_fid) = new_folder_id {
+                let new_read_i = bool_to_i32(effective.is_read);
+                let mut inc_new = tx.prepare_cached(
+                    "
+                    UPDATE mail_folders
+                    SET total_item_count = total_item_count + 1,
+                        unread_item_count = CASE
+                            WHEN ?2 = 0 THEN unread_item_count + 1
+                            ELSE unread_item_count
+                        END
+                    WHERE id = ?1
+                    ",
+                )?;
+                inc_new.execute(params![new_fid, new_read_i])?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn folder_matches_scope(
+    row_folder: Option<&str>,
+    folder_id: &str,
+    folder_alias: Option<&str>,
+) -> bool {
+    let Some(rf) = row_folder else {
+        return false;
+    };
+    if rf == folder_id {
+        return true;
+    }
+    if let Some(alias) = folder_alias {
+        if !alias.is_empty() && rf.eq_ignore_ascii_case(alias) {
+            return true;
+        }
+    }
+    false
+}
+
+fn delete_scoped_removed_in_tx(
+    tx: &Transaction<'_>,
+    folder_id: &str,
+    folder_alias: Option<&str>,
+    removed_ids: &[String],
+) -> Result<usize> {
+    if removed_ids.is_empty() {
+        return Ok(0);
+    }
+    let mut deleted_count = 0usize;
+    let mut sel_row =
+        tx.prepare_cached("SELECT rowid, folder_id FROM mail_messages WHERE id = ?1")?;
+    let mut del_fts = tx.prepare_cached("DELETE FROM mail_fts WHERE rowid = ?1")?;
+    let mut del_msg = tx.prepare_cached("DELETE FROM mail_messages WHERE id = ?1")?;
+    for id in removed_ids {
+        if let Some((rowid, row_folder)) = sel_row
+            .query_row(params![id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .optional()?
+        {
+            if folder_matches_scope(row_folder.as_deref(), folder_id, folder_alias) {
+                del_fts.execute(params![rowid])?;
+                del_msg.execute(params![id])?;
+                deleted_count += 1;
+            }
+        }
+    }
+    Ok(deleted_count)
+}
+
+/// Applies an intermediate page of a folder's mail delta (scoped `@removed` deletions that
+/// preserve items already moved to another folder, plus upserts) in a single SQLite transaction
+/// without modifying `sync_cursors` or pruning unseen rows.
+/// Returns `(changed_upserts, deleted_count)`.
+pub fn apply_mail_folder_delta_page(
+    conn: &mut Connection,
+    folder_id: &str,
+    folder_alias: Option<&str>,
+    incoming: &[MailMessage],
+    removed_ids: &[String],
+) -> Result<(usize, usize)> {
+    if incoming.is_empty() && removed_ids.is_empty() {
+        return Ok((0, 0));
+    }
+    let tx = conn.transaction()?;
+    let deleted_count;
+    let changed_count;
+    {
+        deleted_count = delete_scoped_removed_in_tx(&tx, folder_id, folder_alias, removed_ids)?;
+        changed_count = upsert_mail_messages_in_tx(&tx, incoming)?;
+    }
+    tx.commit()?;
+    Ok((changed_count, deleted_count))
+}
+
+/// Atomically applies a folder's mail delta (scoped `@removed` deletions that preserve items
+/// already moved to another folder, upserts, optional full-bootstrap reconciliation when
+/// `reconcile_seen_ids` is `Some`, and sync cursor persistence) in a single SQLite transaction.
+/// Returns `(changed_upserts, deleted_count)`.
+pub fn apply_mail_folder_delta(
+    conn: &mut Connection,
+    folder_id: &str,
+    folder_alias: Option<&str>,
+    incoming: &[MailMessage],
+    removed_ids: &[String],
+    reconcile_seen_ids: Option<&HashSet<String>>,
+    cursor: &SyncCursor,
+) -> Result<(usize, usize)> {
+    let tx = conn.transaction()?;
+    let mut deleted_count;
+    let changed_count;
+    {
+        deleted_count = delete_scoped_removed_in_tx(&tx, folder_id, folder_alias, removed_ids)?;
+        changed_count = upsert_mail_messages_in_tx(&tx, incoming)?;
+
+        if let Some(seen_ids) = reconcile_seen_ids {
+            let candidates: Vec<(String, i64)> = if let Some(alias) =
+                folder_alias.filter(|a| !a.is_empty() && !a.eq_ignore_ascii_case(folder_id))
+            {
+                let mut sel = tx.prepare_cached(
+                    "SELECT id, rowid FROM mail_messages WHERE folder_id = ?1 OR LOWER(COALESCE(folder_id, '')) = LOWER(?2)",
+                )?;
+                let rows = sel.query_map(params![folder_id, alias], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                let mut sel =
+                    tx.prepare_cached("SELECT id, rowid FROM mail_messages WHERE folder_id = ?1")?;
+                let rows =
+                    sel.query_map(params![folder_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+
+            let mut del_fts = tx.prepare_cached("DELETE FROM mail_fts WHERE rowid = ?1")?;
+            let mut del_msg = tx.prepare_cached("DELETE FROM mail_messages WHERE id = ?1")?;
+            for (id, rowid) in candidates {
+                if !seen_ids.contains(&id) {
+                    del_fts.execute(params![rowid])?;
+                    del_msg.execute(params![id])?;
+                    deleted_count += 1;
+                }
+            }
+        }
+
+        upsert_sync_cursor_in_tx(&tx, cursor)?;
+    }
+    tx.commit()?;
+    Ok((changed_count, deleted_count))
+}
+
 pub fn delete_mail_messages_by_ids(conn: &mut Connection, ids: &[String]) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
@@ -821,64 +1166,153 @@ pub fn upsert_calendar_events(conn: &mut Connection, events: &[CalendarEvent]) -
         return Ok(());
     }
     let tx = conn.transaction()?;
+    upsert_calendar_events_in_tx(&tx, events)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn upsert_calendar_events_in_tx(tx: &Transaction<'_>, events: &[CalendarEvent]) -> Result<()> {
+    let mut stmt = tx.prepare_cached(
+        "
+        INSERT INTO calendar_events (
+            id, subject, start_iso, end_iso, time_zone, is_all_day,
+            location, organizer_name, organizer_email, attendees_json,
+            response_status, is_online_meeting, online_meeting_url,
+            body_html, body_plain, is_cancelled, web_link
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6,
+            ?7, ?8, ?9, ?10,
+            ?11, ?12, ?13,
+            ?14, ?15, ?16, ?17
+        )
+        ON CONFLICT(id) DO UPDATE SET
+            subject = excluded.subject,
+            start_iso = excluded.start_iso,
+            end_iso = excluded.end_iso,
+            time_zone = excluded.time_zone,
+            is_all_day = excluded.is_all_day,
+            location = excluded.location,
+            organizer_name = excluded.organizer_name,
+            organizer_email = excluded.organizer_email,
+            attendees_json = excluded.attendees_json,
+            response_status = excluded.response_status,
+            is_online_meeting = excluded.is_online_meeting,
+            online_meeting_url = COALESCE(excluded.online_meeting_url, calendar_events.online_meeting_url),
+            body_html = excluded.body_html,
+            body_plain = excluded.body_plain,
+            is_cancelled = excluded.is_cancelled,
+            web_link = COALESCE(excluded.web_link, calendar_events.web_link)
+        ",
+    )?;
+    for ev in events {
+        let attendees_json = serde_json::to_string(&ev.attendees)?;
+        stmt.execute(params![
+            ev.id,
+            ev.subject,
+            ev.start_iso,
+            ev.end_iso,
+            ev.time_zone,
+            bool_to_i32(ev.is_all_day),
+            ev.location,
+            ev.organizer_name,
+            ev.organizer_email,
+            attendees_json,
+            ev.response_status,
+            bool_to_i32(ev.is_online_meeting),
+            ev.online_meeting_url,
+            ev.body_html,
+            ev.body_plain,
+            bool_to_i32(ev.is_cancelled),
+            ev.web_link,
+        ])?;
+    }
+    Ok(())
+}
+
+/// Atomically reconciles cached calendar events within `[start_iso, end_iso]` against a
+/// complete snapshot from Graph, removing events deleted remotely inside that window.
+pub fn replace_calendar_events_in_window(
+    conn: &mut Connection,
+    start_iso: &str,
+    end_iso: &str,
+    events: &[CalendarEvent],
+) -> Result<usize> {
+    let tx = conn.transaction()?;
+    let mut deleted = 0usize;
     {
-        let mut stmt = tx.prepare_cached(
-            "
-            INSERT INTO calendar_events (
-                id, subject, start_iso, end_iso, time_zone, is_all_day,
-                location, organizer_name, organizer_email, attendees_json,
-                response_status, is_online_meeting, online_meeting_url,
-                body_html, body_plain, is_cancelled, web_link
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6,
-                ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13,
-                ?14, ?15, ?16, ?17
-            )
-            ON CONFLICT(id) DO UPDATE SET
-                subject = excluded.subject,
-                start_iso = excluded.start_iso,
-                end_iso = excluded.end_iso,
-                time_zone = excluded.time_zone,
-                is_all_day = excluded.is_all_day,
-                location = excluded.location,
-                organizer_name = excluded.organizer_name,
-                organizer_email = excluded.organizer_email,
-                attendees_json = excluded.attendees_json,
-                response_status = excluded.response_status,
-                is_online_meeting = excluded.is_online_meeting,
-                online_meeting_url = COALESCE(excluded.online_meeting_url, calendar_events.online_meeting_url),
-                body_html = excluded.body_html,
-                body_plain = excluded.body_plain,
-                is_cancelled = excluded.is_cancelled,
-                web_link = COALESCE(excluded.web_link, calendar_events.web_link)
-            ",
-        )?;
-        for ev in events {
-            let attendees_json = serde_json::to_string(&ev.attendees)?;
-            stmt.execute(params![
-                ev.id,
-                ev.subject,
-                ev.start_iso,
-                ev.end_iso,
-                ev.time_zone,
-                bool_to_i32(ev.is_all_day),
-                ev.location,
-                ev.organizer_name,
-                ev.organizer_email,
-                attendees_json,
-                ev.response_status,
-                bool_to_i32(ev.is_online_meeting),
-                ev.online_meeting_url,
-                ev.body_html,
-                ev.body_plain,
-                bool_to_i32(ev.is_cancelled),
-                ev.web_link,
-            ])?;
+        upsert_calendar_events_in_tx(&tx, events)?;
+        let keep: HashSet<&str> = events.iter().map(|e| e.id.as_str()).collect();
+        let existing_ids: Vec<String> = {
+            let mut sel = tx.prepare_cached(
+                "
+                SELECT id FROM calendar_events
+                WHERE (end_iso >= ?1 OR start_iso >= ?1)
+                  AND start_iso <= ?2
+                ",
+            )?;
+            let rows = sel.query_map(params![start_iso, end_iso], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut del = tx.prepare_cached("DELETE FROM calendar_events WHERE id = ?1")?;
+        for id in existing_ids {
+            if !keep.contains(id.as_str()) {
+                del.execute(params![id])?;
+                deleted += 1;
+            }
         }
     }
     tx.commit()?;
-    Ok(())
+    Ok(deleted)
+}
+
+/// Atomically applies a calendar delta (deletions, upserts, optional initial-delta window
+/// reconciliation, and sync cursor save) in a single transaction.
+pub fn apply_calendar_delta(
+    conn: &mut Connection,
+    start_iso: &str,
+    end_iso: &str,
+    events: &[CalendarEvent],
+    removed_ids: &[String],
+    reconcile_window: bool,
+    cursor: &SyncCursor,
+) -> Result<bool> {
+    let tx = conn.transaction()?;
+    let mut changed = !events.is_empty() || !removed_ids.is_empty();
+    {
+        if !removed_ids.is_empty() {
+            let mut del = tx.prepare_cached("DELETE FROM calendar_events WHERE id = ?1")?;
+            for id in removed_ids {
+                del.execute(params![id])?;
+            }
+        }
+        if !events.is_empty() {
+            upsert_calendar_events_in_tx(&tx, events)?;
+        }
+        if reconcile_window {
+            let keep: HashSet<&str> = events.iter().map(|e| e.id.as_str()).collect();
+            let existing_ids: Vec<String> = {
+                let mut sel = tx.prepare_cached(
+                    "
+                    SELECT id FROM calendar_events
+                    WHERE (end_iso >= ?1 OR start_iso >= ?1)
+                      AND start_iso <= ?2
+                    ",
+                )?;
+                let rows = sel.query_map(params![start_iso, end_iso], |row| row.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut del = tx.prepare_cached("DELETE FROM calendar_events WHERE id = ?1")?;
+            for id in existing_ids {
+                if !keep.contains(id.as_str()) {
+                    del.execute(params![id])?;
+                    changed = true;
+                }
+            }
+        }
+        upsert_sync_cursor_in_tx(&tx, cursor)?;
+    }
+    tx.commit()?;
+    Ok(changed)
 }
 
 pub fn list_calendar_events(
@@ -1019,45 +1453,72 @@ pub fn upsert_contacts(conn: &mut Connection, contacts: &[ContactItem]) -> Resul
         return Ok(());
     }
     let tx = conn.transaction()?;
+    upsert_contacts_in_tx(&tx, contacts)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn upsert_contacts_in_tx(tx: &Transaction<'_>, contacts: &[ContactItem]) -> Result<()> {
+    let mut stmt = tx.prepare_cached(
+        "
+        INSERT INTO contacts (
+            id, display_name, given_name, surname, emails_json,
+            mobile_phone, business_phones_json, company_name, job_title,
+            department, notes, source
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        ON CONFLICT(id) DO UPDATE SET
+            display_name = excluded.display_name,
+            given_name = excluded.given_name,
+            surname = excluded.surname,
+            emails_json = excluded.emails_json,
+            mobile_phone = excluded.mobile_phone,
+            business_phones_json = excluded.business_phones_json,
+            company_name = excluded.company_name,
+            job_title = excluded.job_title,
+            department = excluded.department,
+            notes = excluded.notes,
+            source = excluded.source
+        ",
+    )?;
+    for c in contacts {
+        let emails_json = serde_json::to_string(&c.email_addresses)?;
+        let business_phones_json = serde_json::to_string(&c.business_phones)?;
+        stmt.execute(params![
+            c.id,
+            c.display_name,
+            c.given_name,
+            c.surname,
+            emails_json,
+            c.mobile_phone,
+            business_phones_json,
+            c.company_name,
+            c.job_title,
+            c.department,
+            c.notes,
+            c.source,
+        ])?;
+    }
+    Ok(())
+}
+
+/// Atomically reconciles personal Outlook contacts (`source = 'contact'`) against a complete
+/// `/me/contacts` snapshot while preserving cached directory entries.
+pub fn replace_personal_contacts(conn: &mut Connection, contacts: &[ContactItem]) -> Result<()> {
+    let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare_cached(
-            "
-            INSERT INTO contacts (
-                id, display_name, given_name, surname, emails_json,
-                mobile_phone, business_phones_json, company_name, job_title,
-                department, notes, source
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-            ON CONFLICT(id) DO UPDATE SET
-                display_name = excluded.display_name,
-                given_name = excluded.given_name,
-                surname = excluded.surname,
-                emails_json = excluded.emails_json,
-                mobile_phone = excluded.mobile_phone,
-                business_phones_json = excluded.business_phones_json,
-                company_name = excluded.company_name,
-                job_title = excluded.job_title,
-                department = excluded.department,
-                notes = excluded.notes,
-                source = excluded.source
-            ",
-        )?;
-        for c in contacts {
-            let emails_json = serde_json::to_string(&c.email_addresses)?;
-            let business_phones_json = serde_json::to_string(&c.business_phones)?;
-            stmt.execute(params![
-                c.id,
-                c.display_name,
-                c.given_name,
-                c.surname,
-                emails_json,
-                c.mobile_phone,
-                business_phones_json,
-                c.company_name,
-                c.job_title,
-                c.department,
-                c.notes,
-                c.source,
-            ])?;
+        upsert_contacts_in_tx(&tx, contacts)?;
+        let keep: HashSet<&str> = contacts.iter().map(|c| c.id.as_str()).collect();
+        let existing_ids: Vec<String> = {
+            let mut sel =
+                tx.prepare_cached("SELECT id FROM contacts WHERE source = 'contact'")?;
+            let rows = sel.query_map([], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut del = tx.prepare_cached("DELETE FROM contacts WHERE id = ?1")?;
+        for id in existing_ids {
+            if !keep.contains(id.as_str()) {
+                del.execute(params![id])?;
+            }
         }
     }
     tx.commit()?;
@@ -1124,26 +1585,54 @@ pub fn upsert_todo_lists(conn: &mut Connection, lists: &[TodoList]) -> Result<()
         return Ok(());
     }
     let tx = conn.transaction()?;
+    upsert_todo_lists_in_tx(&tx, lists)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn upsert_todo_lists_in_tx(tx: &Transaction<'_>, lists: &[TodoList]) -> Result<()> {
+    let mut stmt = tx.prepare_cached(
+        "
+        INSERT INTO todo_lists (id, display_name, wellknown_list_name, is_owner, is_shared)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(id) DO UPDATE SET
+            display_name = excluded.display_name,
+            wellknown_list_name = COALESCE(excluded.wellknown_list_name, todo_lists.wellknown_list_name),
+            is_owner = excluded.is_owner,
+            is_shared = excluded.is_shared
+        ",
+    )?;
+    for list in lists {
+        stmt.execute(params![
+            list.id,
+            list.display_name,
+            list.wellknown_list_name,
+            bool_to_i32(list.is_owner),
+            bool_to_i32(list.is_shared),
+        ])?;
+    }
+    Ok(())
+}
+
+/// Atomically reconciles cached To Do lists against a complete snapshot, deleting lists
+/// (and their orphaned tasks) removed remotely.
+pub fn replace_todo_lists(conn: &mut Connection, lists: &[TodoList]) -> Result<()> {
+    let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare_cached(
-            "
-            INSERT INTO todo_lists (id, display_name, wellknown_list_name, is_owner, is_shared)
-            VALUES (?1, ?2, ?3, ?4, ?5)
-            ON CONFLICT(id) DO UPDATE SET
-                display_name = excluded.display_name,
-                wellknown_list_name = COALESCE(excluded.wellknown_list_name, todo_lists.wellknown_list_name),
-                is_owner = excluded.is_owner,
-                is_shared = excluded.is_shared
-            ",
-        )?;
-        for list in lists {
-            stmt.execute(params![
-                list.id,
-                list.display_name,
-                list.wellknown_list_name,
-                bool_to_i32(list.is_owner),
-                bool_to_i32(list.is_shared),
-            ])?;
+        upsert_todo_lists_in_tx(&tx, lists)?;
+        let keep: HashSet<&str> = lists.iter().map(|l| l.id.as_str()).collect();
+        let existing_ids: Vec<String> = {
+            let mut sel = tx.prepare_cached("SELECT id FROM todo_lists")?;
+            let rows = sel.query_map([], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut del_list = tx.prepare_cached("DELETE FROM todo_lists WHERE id = ?1")?;
+        let mut del_tasks = tx.prepare_cached("DELETE FROM todo_tasks WHERE list_id = ?1")?;
+        for id in existing_ids {
+            if !keep.contains(id.as_str()) {
+                del_tasks.execute(params![id])?;
+                del_list.execute(params![id])?;
+            }
         }
     }
     tx.commit()?;
@@ -1180,40 +1669,78 @@ pub fn upsert_todo_tasks(conn: &mut Connection, tasks: &[TodoTask]) -> Result<()
         return Ok(());
     }
     let tx = conn.transaction()?;
+    upsert_todo_tasks_in_tx(&tx, tasks)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn upsert_todo_tasks_in_tx(tx: &Transaction<'_>, tasks: &[TodoTask]) -> Result<()> {
+    let mut stmt = tx.prepare_cached(
+        "
+        INSERT INTO todo_tasks (
+            id, list_id, title, status, importance, body_plain,
+            due_date_iso, reminder_iso, completed_at, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        ON CONFLICT(id) DO UPDATE SET
+            list_id = excluded.list_id,
+            title = excluded.title,
+            status = excluded.status,
+            importance = excluded.importance,
+            body_plain = excluded.body_plain,
+            due_date_iso = excluded.due_date_iso,
+            reminder_iso = excluded.reminder_iso,
+            completed_at = excluded.completed_at,
+            created_at = COALESCE(excluded.created_at, todo_tasks.created_at),
+            updated_at = COALESCE(excluded.updated_at, todo_tasks.updated_at)
+        ",
+    )?;
+    for t in tasks {
+        stmt.execute(params![
+            t.id,
+            t.list_id,
+            t.title,
+            t.status,
+            t.importance,
+            t.body_plain,
+            t.due_date_iso,
+            t.reminder_iso,
+            t.completed_at,
+            t.created_at,
+            t.updated_at,
+        ])?;
+    }
+    Ok(())
+}
+
+/// Atomically reconciles cached tasks for `list_id` against a complete snapshot.
+/// When `include_completed` is false, completed tasks are left intact and only missing
+/// active tasks are pruned.
+pub fn replace_todo_tasks_for_list(
+    conn: &mut Connection,
+    list_id: &str,
+    include_completed: bool,
+    tasks: &[TodoTask],
+) -> Result<()> {
+    let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare_cached(
-            "
-            INSERT INTO todo_tasks (
-                id, list_id, title, status, importance, body_plain,
-                due_date_iso, reminder_iso, completed_at, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-            ON CONFLICT(id) DO UPDATE SET
-                list_id = excluded.list_id,
-                title = excluded.title,
-                status = excluded.status,
-                importance = excluded.importance,
-                body_plain = excluded.body_plain,
-                due_date_iso = excluded.due_date_iso,
-                reminder_iso = excluded.reminder_iso,
-                completed_at = excluded.completed_at,
-                created_at = COALESCE(excluded.created_at, todo_tasks.created_at),
-                updated_at = COALESCE(excluded.updated_at, todo_tasks.updated_at)
-            ",
-        )?;
-        for t in tasks {
-            stmt.execute(params![
-                t.id,
-                t.list_id,
-                t.title,
-                t.status,
-                t.importance,
-                t.body_plain,
-                t.due_date_iso,
-                t.reminder_iso,
-                t.completed_at,
-                t.created_at,
-                t.updated_at,
-            ])?;
+        upsert_todo_tasks_in_tx(&tx, tasks)?;
+        let keep: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let existing_ids: Vec<String> = if include_completed {
+            let mut sel = tx.prepare_cached("SELECT id FROM todo_tasks WHERE list_id = ?1")?;
+            let rows = sel.query_map(params![list_id], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            let mut sel = tx.prepare_cached(
+                "SELECT id FROM todo_tasks WHERE list_id = ?1 AND LOWER(status) != 'completed'",
+            )?;
+            let rows = sel.query_map(params![list_id], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut del = tx.prepare_cached("DELETE FROM todo_tasks WHERE id = ?1")?;
+        for id in existing_ids {
+            if !keep.contains(id.as_str()) {
+                del.execute(params![id])?;
+            }
         }
     }
     tx.commit()?;
@@ -1333,19 +1860,23 @@ pub fn upsert_sync_cursor(conn: &Connection, cursor: &SyncCursor) -> Result<()> 
     Ok(())
 }
 
+fn upsert_sync_cursor_in_tx(tx: &Transaction<'_>, cursor: &SyncCursor) -> Result<()> {
+    upsert_sync_cursor(tx, cursor)
+}
+
 fn map_mail_message_row(row: &Row<'_>) -> rusqlite::Result<MailMessage> {
     let from_json: Option<String> = row.get(5)?;
     let to_json: String = row.get(6)?;
     let cc_json: String = row.get(7)?;
     let bcc_json: String = row.get(8)?;
     let reply_to_json: String = row.get(9)?;
-    let is_read_int: i32 = row.get(12)?;
-    let is_draft_int: i32 = row.get(13)?;
-    let flagged_int: i32 = row.get(14)?;
-    let has_att_int: i32 = row.get(17)?;
-    let body_loaded_int: i32 = row.get(18)?;
-    let attachments_json: String = row.get(22)?;
-    let meeting_req_json: Option<String> = row.get(23)?;
+    let is_read_int: i32 = row.get(13)?;
+    let is_draft_int: i32 = row.get(14)?;
+    let flagged_int: i32 = row.get(15)?;
+    let has_att_int: i32 = row.get(18)?;
+    let body_loaded_int: i32 = row.get(19)?;
+    let attachments_json: String = row.get(23)?;
+    let meeting_req_json: Option<String> = row.get(24)?;
 
     let from: Option<EmailRecipient> = from_json.and_then(|s| serde_json::from_str(&s).ok());
     let to_recipients: Vec<EmailRecipient> = serde_json::from_str(&to_json).unwrap_or_default();
@@ -1370,31 +1901,32 @@ fn map_mail_message_row(row: &Row<'_>) -> rusqlite::Result<MailMessage> {
         reply_to,
         received_at: row.get(10)?,
         sent_at: row.get(11)?,
+        last_modified_at: row.get(12)?,
         is_read: is_read_int != 0,
         is_draft: is_draft_int != 0,
         flagged: flagged_int != 0,
-        importance: row.get(15)?,
-        inference_classification: row.get(16)?,
+        importance: row.get(16)?,
+        inference_classification: row.get(17)?,
         has_attachments: has_att_int != 0,
         body_loaded: body_loaded_int != 0,
-        preview: row.get(19)?,
-        body_html: row.get(20)?,
-        body_plain: row.get(21)?,
+        preview: row.get(20)?,
+        body_html: row.get(21)?,
+        body_plain: row.get(22)?,
         attachments,
         meeting_request,
-        web_link: row.get(24)?,
+        web_link: row.get(25)?,
     })
 }
 
 fn map_mail_summary_row(row: &Row<'_>) -> rusqlite::Result<MailMessage> {
     let from_json: Option<String> = row.get(5)?;
     let first_to_json: Option<String> = row.get(6)?;
-    let is_read_int: i32 = row.get(9)?;
-    let is_draft_int: i32 = row.get(10)?;
-    let flagged_int: i32 = row.get(11)?;
-    let has_att_int: i32 = row.get(14)?;
-    let body_loaded_int: i32 = row.get(15)?;
-    let meeting_req_json: Option<String> = row.get(17)?;
+    let is_read_int: i32 = row.get(10)?;
+    let is_draft_int: i32 = row.get(11)?;
+    let flagged_int: i32 = row.get(12)?;
+    let has_att_int: i32 = row.get(15)?;
+    let body_loaded_int: i32 = row.get(16)?;
+    let meeting_req_json: Option<String> = row.get(18)?;
 
     let from: Option<EmailRecipient> = from_json.and_then(|s| serde_json::from_str(&s).ok());
     let to_recipients: Vec<EmailRecipient> = first_to_json
@@ -1417,19 +1949,20 @@ fn map_mail_summary_row(row: &Row<'_>) -> rusqlite::Result<MailMessage> {
         reply_to: Vec::new(),
         received_at: row.get(7)?,
         sent_at: row.get(8)?,
+        last_modified_at: row.get(9)?,
         is_read: is_read_int != 0,
         is_draft: is_draft_int != 0,
         flagged: flagged_int != 0,
-        importance: row.get(12)?,
-        inference_classification: row.get(13)?,
+        importance: row.get(13)?,
+        inference_classification: row.get(14)?,
         has_attachments: has_att_int != 0,
         body_loaded: body_loaded_int != 0,
-        preview: row.get(16)?,
+        preview: row.get(17)?,
         body_html: String::new(),
         body_plain: String::new(),
         attachments: Vec::new(),
         meeting_request,
-        web_link: row.get(18)?,
+        web_link: row.get(19)?,
     })
 }
 

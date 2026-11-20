@@ -1433,6 +1433,7 @@ mod tests {
             reply_to: vec![],
             received_at: "2026-11-20T00:00:00Z".into(),
             sent_at: None,
+            last_modified_at: None,
             is_read: false,
             is_draft: false,
             flagged: false,

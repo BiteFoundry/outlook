@@ -433,7 +433,7 @@ async fn get_message_handler(
         "importance": "normal",
         "inferenceClassification": "focused",
         "hasAttachments": true,
-        "bodyPreview": "Hi Alice, here are the Q4 results",
+        "bodyPreview": "See Q4 latency table",
         "body": {
             "contentType": "html",
             "content": rich_cid_message_html()

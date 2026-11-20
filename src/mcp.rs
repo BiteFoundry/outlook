@@ -311,23 +311,24 @@ async fn call_tool(
         "list_mail_folders" => {
             let offline = args.optional_bool("offline")?.unwrap_or(false);
             let refresh = args.optional_bool("refresh")?.unwrap_or(false);
-            let cached = with_storage(storage, |s| s.list_mail_folders())
-                .await
-                .map_err(format_error)?;
-            let folders = if !offline && (refresh || cached.is_empty()) {
+            let ttl = cli::cli_cache_ttl_secs(config);
+            let (cached, fresh) = with_storage(storage, move |s| {
+                let folders = s.list_mail_folders()?;
+                let is_fresh = cli::is_cursor_fresh(s, &["cli:mail_folders"], ttl);
+                Ok((folders, is_fresh))
+            })
+            .await
+            .map_err(format_error)?;
+            let folders = if !offline && (refresh || cached.is_empty() || !fresh) {
                 let fetched = map_graph_result(graph, graph.list_mail_folders().await).await?;
                 let fetched_clone = fetched.clone();
-                let stored = with_storage(storage, move |s| {
-                    s.upsert_mail_folders(&fetched_clone)?;
+                with_storage(storage, move |s| {
+                    s.replace_mail_folders(&fetched_clone)?;
+                    cli::record_cli_sync_cursor(s, "cli:mail_folders");
                     s.list_mail_folders()
                 })
                 .await
-                .map_err(format_error)?;
-                if stored.is_empty() {
-                    fetched
-                } else {
-                    stored
-                }
+                .map_err(format_error)?
             } else {
                 cached
             };
@@ -365,14 +366,19 @@ async fn call_tool(
                 .await
                 .map_err(format_error)?
             } else {
-                let fetched = map_graph_result(
+                let outcome = map_graph_result(
                     graph,
-                    graph.list_mail_messages(&folder_id, fetch_limit, false).await,
+                    crate::sync::sync_mail_folder_delta(&folder_id, graph, storage, None, false)
+                        .await,
                 )
                 .await?;
-                let fetched_clone = fetched.clone();
-                let _ = with_storage(storage, move |s| s.upsert_mail_messages(&fetched_clone)).await;
-                fetched
+                let fid = outcome.folder_id;
+                with_storage(storage, move |s| {
+                    cli::record_cli_sync_cursor(s, &format!("cli:mail:{fid}"));
+                    s.list_mail_messages(Some(&fid), false, false, false, fetch_limit)
+                })
+                .await
+                .map_err(format_error)?
             };
 
             let filtered =
@@ -407,14 +413,10 @@ async fn call_tool(
             };
 
             if !offline && mark_read && !msg.is_read {
-                if graph.set_mail_read(&msg.id, true).await.is_ok() {
-                    msg.is_read = true;
-                    let msg_clone = msg.clone();
-                    let _ = with_storage(storage, move |s| {
-                        s.upsert_mail_messages(std::slice::from_ref(&msg_clone))
-                    })
-                    .await;
-                }
+                map_graph_result(graph, graph.set_mail_read(&msg.id, true).await).await?;
+                msg.is_read = true;
+                let mid = msg.id.clone();
+                let _ = with_storage(storage, move |s| s.set_mail_read_local(&mid, true)).await;
             }
 
             Ok(json!({ "message": msg }))
@@ -532,14 +534,11 @@ async fn call_tool(
 
             let mid_clone = message_id.clone();
             let _ = with_storage(storage, move |s| {
-                if let Some(mut cached) = s.get_mail_message(&mid_clone)? {
-                    if let Some(r) = is_read {
-                        cached.is_read = r;
-                    }
-                    if let Some(f) = flagged {
-                        cached.flagged = f;
-                    }
-                    s.upsert_mail_messages(&[cached])?;
+                if let Some(r) = is_read {
+                    s.set_mail_read_local(&mid_clone, r)?;
+                }
+                if let Some(f) = flagged {
+                    s.set_mail_flagged_local(&mid_clone, f)?;
                 }
                 Ok(())
             })
@@ -553,8 +552,9 @@ async fn call_tool(
                 )
                 .await?;
                 let moved_clone = moved.clone();
+                let old_id_clone = message_id.clone();
                 let _ = with_storage(storage, move |s| {
-                    s.upsert_mail_messages(std::slice::from_ref(&moved_clone))
+                    s.replace_moved_mail_local(&old_id_clone, &moved_clone)
                 })
                 .await;
                 Some(moved)
@@ -697,14 +697,25 @@ async fn call_tool(
                 .await
                 .map_err(format_error)?
             } else {
-                let fetched = map_graph_result(
+                let (fetched, reached_end) = map_graph_result(
                     graph,
-                    graph.list_calendar_view(&start_iso, &end_iso, limit).await,
+                    graph
+                        .list_calendar_view_complete(&start_iso, &end_iso, limit)
+                        .await,
                 )
                 .await?;
                 let fetched_clone = fetched.clone();
-                let _ =
-                    with_storage(storage, move |s| s.upsert_calendar_events(&fetched_clone)).await;
+                let s_iso = start_iso.clone();
+                let e_iso = end_iso.clone();
+                let _ = with_storage(storage, move |s| {
+                    if reached_end {
+                        s.replace_calendar_events_in_window(&s_iso, &e_iso, &fetched_clone)?;
+                        Ok(())
+                    } else {
+                        s.upsert_calendar_events(&fetched_clone)
+                    }
+                })
+                .await;
                 fetched
             };
 
@@ -768,6 +779,12 @@ async fn call_tool(
                     .await,
             )
             .await?;
+            let eid_clone = event_id.clone();
+            let status = cli::rsvp_action_to_graph_status(normalized);
+            let _ = with_storage(storage, move |s| {
+                s.update_event_response_local(&eid_clone, status)
+            })
+            .await;
 
             Ok(json!({
                 "ok": true,
@@ -792,23 +809,24 @@ async fn call_tool(
         "list_todo_lists" => {
             let offline = args.optional_bool("offline")?.unwrap_or(false);
             let refresh = args.optional_bool("refresh")?.unwrap_or(false);
-            let cached = with_storage(storage, |s| s.list_todo_lists())
-                .await
-                .map_err(format_error)?;
-            let lists = if !offline && (refresh || cached.is_empty()) {
+            let ttl = cli::cli_cache_ttl_secs(config);
+            let (cached, fresh) = with_storage(storage, move |s| {
+                let lists = s.list_todo_lists()?;
+                let is_fresh = cli::is_cursor_fresh(s, &["cli:todo_lists"], ttl);
+                Ok((lists, is_fresh))
+            })
+            .await
+            .map_err(format_error)?;
+            let lists = if !offline && (refresh || cached.is_empty() || !fresh) {
                 let fetched = map_graph_result(graph, graph.list_todo_lists().await).await?;
                 let fetched_clone = fetched.clone();
-                let stored = with_storage(storage, move |s| {
-                    s.upsert_todo_lists(&fetched_clone)?;
+                with_storage(storage, move |s| {
+                    s.replace_todo_lists(&fetched_clone)?;
+                    cli::record_cli_sync_cursor(s, "cli:todo_lists");
                     s.list_todo_lists()
                 })
                 .await
-                .map_err(format_error)?;
-                if stored.is_empty() {
-                    fetched
-                } else {
-                    stored
-                }
+                .map_err(format_error)?
             } else {
                 cached
             };
@@ -838,15 +856,23 @@ async fn call_tool(
                 .await
                 .map_err(format_error)?
             } else {
-                let fetched = map_graph_result(
+                let (fetched, reached_end) = map_graph_result(
                     graph,
                     graph
-                        .list_todo_tasks(&list_id, include_completed, limit)
+                        .list_todo_tasks_complete(&list_id, include_completed, limit)
                         .await,
                 )
                 .await?;
                 let fetched_clone = fetched.clone();
-                let _ = with_storage(storage, move |s| s.upsert_todo_tasks(&fetched_clone)).await;
+                let lid_clone = list_id.clone();
+                let _ = with_storage(storage, move |s| {
+                    if reached_end {
+                        s.replace_todo_tasks_for_list(&lid_clone, include_completed, &fetched_clone)
+                    } else {
+                        s.upsert_todo_tasks(&fetched_clone)
+                    }
+                })
+                .await;
                 fetched
             };
             tasks.truncate(limit);
@@ -948,9 +974,17 @@ async fn call_tool(
                 let _ = with_storage(storage, move |s| s.upsert_contacts(&fetched_clone)).await;
                 fetched
             } else {
-                let fetched = map_graph_result(graph, graph.list_contacts(limit).await).await?;
+                let (fetched, reached_end) =
+                    map_graph_result(graph, graph.list_contacts_complete(limit).await).await?;
                 let fetched_clone = fetched.clone();
-                let _ = with_storage(storage, move |s| s.upsert_contacts(&fetched_clone)).await;
+                let _ = with_storage(storage, move |s| {
+                    if reached_end {
+                        s.replace_personal_contacts(&fetched_clone)
+                    } else {
+                        s.upsert_contacts(&fetched_clone)
+                    }
+                })
+                .await;
                 fetched
             };
 
@@ -1903,6 +1937,7 @@ mod tests {
                     reply_to: Vec::new(),
                     received_at: "2026-11-15T10:00:00Z".to_string(),
                     sent_at: None,
+                    last_modified_at: None,
                     is_read: true,
                     is_draft: false,
                     flagged: false,
@@ -1930,6 +1965,7 @@ mod tests {
                     reply_to: Vec::new(),
                     received_at: "2026-11-16T10:00:00Z".to_string(),
                     sent_at: None,
+                    last_modified_at: None,
                     is_read: false,
                     is_draft: false,
                     flagged: true,
@@ -2066,6 +2102,7 @@ mod tests {
                 reply_to: Vec::new(),
                 received_at: "2026-11-19T12:00:00Z".to_string(),
                 sent_at: None,
+                last_modified_at: None,
                 is_read: true,
                 is_draft: false,
                 flagged: false,

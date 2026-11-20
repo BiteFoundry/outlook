@@ -106,6 +106,8 @@ pub struct MailMessage {
     pub reply_to: Vec<EmailRecipient>,
     pub received_at: String,
     pub sent_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_modified_at: Option<String>,
     pub is_read: bool,
     pub is_draft: bool,
     pub flagged: bool,
@@ -230,6 +232,14 @@ impl EventRsvpAction {
             Self::Accept => "accept",
             Self::TentativelyAccept => "tentativelyAccept",
             Self::Decline => "decline",
+        }
+    }
+
+    pub fn as_graph_status(self) -> &'static str {
+        match self {
+            Self::Accept => "accepted",
+            Self::TentativelyAccept => "tentativelyAccepted",
+            Self::Decline => "declined",
         }
     }
 }
@@ -501,6 +511,7 @@ mod tests {
             reply_to: Vec::new(),
             received_at: "2026-11-18T00:00:00Z".to_string(),
             sent_at: None,
+            last_modified_at: None,
             is_read: false,
             is_draft: false,
             flagged: false,

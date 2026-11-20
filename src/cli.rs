@@ -1298,7 +1298,7 @@ fn parse_cli_cache_secs(raw: Option<&str>) -> u64 {
     raw.and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0)
 }
 
-fn cli_cache_ttl_secs(cfg: &AppConfig) -> u64 {
+pub(crate) fn cli_cache_ttl_secs(cfg: &AppConfig) -> u64 {
     if let Ok(raw) = std::env::var("OUTLOOK_CLI_CACHE_SECS") {
         if let Ok(parsed) = raw.trim().parse::<u64>() {
             return parsed;
@@ -1307,7 +1307,7 @@ fn cli_cache_ttl_secs(cfg: &AppConfig) -> u64 {
     cfg.cli_cache_ttl_secs
 }
 
-fn is_cursor_fresh(storage: &Storage, scope_keys: &[&str], ttl_secs: u64) -> bool {
+pub(crate) fn is_cursor_fresh(storage: &Storage, scope_keys: &[&str], ttl_secs: u64) -> bool {
     if ttl_secs == 0 {
         return false;
     }
@@ -1325,7 +1325,7 @@ fn is_cursor_fresh(storage: &Storage, scope_keys: &[&str], ttl_secs: u64) -> boo
     false
 }
 
-fn record_cli_sync_cursor(storage: &Storage, scope_key: &str) {
+pub(crate) fn record_cli_sync_cursor(storage: &Storage, scope_key: &str) {
     let cursor = SyncCursor {
         scope_key: scope_key.to_string(),
         delta_link: None,
@@ -1333,6 +1333,15 @@ fn record_cli_sync_cursor(storage: &Storage, scope_key: &str) {
         last_synced_at: Utc::now().to_rfc3339(),
     };
     let _ = storage.save_sync_cursor(&cursor);
+}
+
+pub(crate) fn rsvp_action_to_graph_status(normalized: &str) -> &'static str {
+    match normalized {
+        "accept" => "accepted",
+        "tentativelyAccept" => "tentativelyAccepted",
+        "decline" => "declined",
+        _ => "notResponded",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2041,19 +2050,17 @@ async fn cmd_folders(
 
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
     let cached_folders = storage.list_mail_folders()?;
-    let folders = if refresh || cached_folders.is_empty() {
+    let should_fetch = refresh
+        || cached_folders.is_empty()
+        || (!cached && !daemon_warm && !is_cursor_fresh(&storage, &["cli:mail_folders"], ttl));
+    let folders = if should_fetch {
         let fetched = match graph.list_mail_folders().await {
             Ok(items) => items,
             Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
         };
-        storage.upsert_mail_folders(&fetched)?;
+        storage.replace_mail_folders(&fetched)?;
         record_cli_sync_cursor(&storage, "cli:mail_folders");
-        let stored = storage.list_mail_folders()?;
-        if stored.is_empty() {
-            fetched
-        } else {
-            stored
-        }
+        storage.list_mail_folders()?
     } else {
         cached_folders
     };
@@ -2206,22 +2213,28 @@ async fn cmd_mail_list(
     };
 
     let cached_msgs = load_cached_mail_list(&storage, &resolved.id, fetch_limit, json_out)?;
-    let messages = if refresh || cached_msgs.is_empty() {
-        let fetched = match graph
-            .list_mail_messages(&resolved.id, fetch_limit, !json_out)
-            .await
+    let cli_key = format!("cli:mail:{}", resolved.id);
+    let delta_key = format!("mail_delta:{}", resolved.id);
+    let should_fetch = refresh
+        || cached_msgs.is_empty()
+        || (!cached
+            && !daemon_warm
+            && !is_cursor_fresh(&storage, &[cli_key.as_str(), delta_key.as_str()], ttl));
+    let messages = if should_fetch {
+        let sync_res = match crate::sync::sync_mail_folder_delta(
+            &resolved.id,
+            &graph,
+            &storage,
+            None,
+            false,
+        )
+        .await
         {
-            Ok(items) => items,
+            Ok(outcome) => outcome,
             Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
         };
-        storage.upsert_mail_messages(&fetched)?;
-        record_cli_sync_cursor(&storage, &format!("cli:mail:{}", resolved.id));
-        let stored = load_cached_mail_list(&storage, &resolved.id, fetch_limit, json_out)?;
-        if stored.is_empty() {
-            fetched
-        } else {
-            stored
-        }
+        record_cli_sync_cursor(&storage, &format!("cli:mail:{}", sync_res.folder_id));
+        load_cached_mail_list(&storage, &sync_res.folder_id, fetch_limit, json_out)?
     } else {
         cached_msgs
     };
@@ -2334,10 +2347,7 @@ async fn cmd_mail_read(
     if !offline && cached && !mark_read && !preview_images {
         if let Ok(storage) = open_storage_only(cfg) {
             if let Some(msg) = storage.get_mail_message(mail_id)? {
-                if msg.body_loaded
-                    || !msg.body_html.trim().is_empty()
-                    || !msg.body_plain.trim().is_empty()
-                {
+                if msg.body_loaded {
                     if json_out {
                         println!(
                             "{}",
@@ -2356,10 +2366,11 @@ async fn cmd_mail_read(
     let mut msg = load_mail_message(&storage, &graph, mail_id, offline).await?;
 
     if !offline && mark_read && !msg.is_read {
-        if graph.set_mail_read(&msg.id, true).await.is_ok() {
-            msg.is_read = true;
-            let _ = storage.upsert_mail_messages(std::slice::from_ref(&msg));
+        if let Err(err) = graph.set_mail_read(&msg.id, true).await {
+            return Err(wrap_graph_permission_error(&graph, err).await);
         }
+        msg.is_read = true;
+        let _ = storage.set_mail_read_local(&msg.id, true);
     }
 
     if json_out {
@@ -2594,14 +2605,11 @@ async fn cmd_mail_mark(
             return Err(wrap_graph_permission_error(&graph, err).await);
         }
     }
-    if let Ok(Some(mut msg)) = storage.get_mail_message(mail_id) {
-        if let Some(read_val) = is_read {
-            msg.is_read = read_val;
-        }
-        if let Some(flag_val) = flagged {
-            msg.flagged = flag_val;
-        }
-        let _ = storage.upsert_mail_messages(&[msg]);
+    if let Some(read_val) = is_read {
+        let _ = storage.set_mail_read_local(mail_id, read_val);
+    }
+    if let Some(flag_val) = flagged {
+        let _ = storage.set_mail_flagged_local(mail_id, flag_val);
     }
 
     if json_out {
@@ -2635,7 +2643,7 @@ async fn cmd_mail_move(
         Ok(m) => m,
         Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
     };
-    let _ = storage.upsert_mail_messages(std::slice::from_ref(&moved));
+    storage.replace_moved_mail_local(mail_id, &moved)?;
 
     if json_out {
         println!(
@@ -2873,11 +2881,18 @@ async fn cmd_calendar_list(
     }
 
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let events = match graph.list_calendar_view(&start_iso, &end_iso, limit).await {
+    let (events, reached_end) = match graph
+        .list_calendar_view_complete(&start_iso, &end_iso, limit)
+        .await
+    {
         Ok(ev) => ev,
         Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
     };
-    let _ = storage.upsert_calendar_events(&events);
+    if reached_end {
+        let _ = storage.replace_calendar_events_in_window(&start_iso, &end_iso, &events);
+    } else {
+        let _ = storage.upsert_calendar_events(&events);
+    }
     record_cli_sync_cursor(&storage, "cli:cal");
 
     print_cal_events_output(&start_iso, &end_iso, &events, json_out)
@@ -3021,13 +3036,14 @@ async fn cmd_event_rsvp(
     json_out: bool,
 ) -> Result<()> {
     let normalized = normalize_rsvp_response(response)?;
-    let (_auth, graph, _storage) = open_runtime(cfg, true).await?;
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
     if let Err(err) = graph
         .respond_calendar_event(event_id, normalized, comment)
         .await
     {
         return Err(wrap_graph_permission_error(&graph, err).await);
     }
+    let _ = storage.update_event_response_local(event_id, rsvp_action_to_graph_status(normalized));
 
     if json_out {
         println!(
@@ -3165,19 +3181,17 @@ async fn cmd_todo_lists(
 
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
     let cached_lists = storage.list_todo_lists()?;
-    let lists = if refresh || cached_lists.is_empty() {
+    let should_fetch = refresh
+        || cached_lists.is_empty()
+        || (!cached && !daemon_warm && !is_cursor_fresh(&storage, &["cli:todo_lists"], ttl));
+    let lists = if should_fetch {
         let fetched = match graph.list_todo_lists().await {
             Ok(l) => l,
             Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
         };
-        storage.upsert_todo_lists(&fetched)?;
+        storage.replace_todo_lists(&fetched)?;
         record_cli_sync_cursor(&storage, "cli:todo_lists");
-        let stored = storage.list_todo_lists()?;
-        if stored.is_empty() {
-            fetched
-        } else {
-            stored
-        }
+        storage.list_todo_lists()?
     } else {
         cached_lists
     };
@@ -3227,22 +3241,25 @@ async fn cmd_todo_tasks(
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
     let resolved = resolver::resolve_todo_list(&graph, &storage, list, false).await?;
     let cached_tasks = storage.list_todo_tasks(Some(&resolved.id), include_completed)?;
-    let mut tasks = if refresh || cached_tasks.is_empty() {
-        let fetched = match graph
-            .list_todo_tasks(&resolved.id, include_completed, limit)
+    let cursor_key = format!("cli:todo_tasks:{}", resolved.id);
+    let should_fetch = refresh
+        || cached_tasks.is_empty()
+        || (!cached && !daemon_warm && !is_cursor_fresh(&storage, &[cursor_key.as_str()], ttl));
+    let mut tasks = if should_fetch {
+        let (fetched, reached_end) = match graph
+            .list_todo_tasks_complete(&resolved.id, include_completed, limit)
             .await
         {
             Ok(t) => t,
             Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
         };
-        storage.upsert_todo_tasks(&fetched)?;
-        record_cli_sync_cursor(&storage, &format!("cli:todo_tasks:{}", resolved.id));
-        let stored = storage.list_todo_tasks(Some(&resolved.id), include_completed)?;
-        if stored.is_empty() {
-            fetched
+        if reached_end {
+            storage.replace_todo_tasks_for_list(&resolved.id, include_completed, &fetched)?;
         } else {
-            stored
+            storage.upsert_todo_tasks(&fetched)?;
         }
+        record_cli_sync_cursor(&storage, &cursor_key);
+        storage.list_todo_tasks(Some(&resolved.id), include_completed)?
     } else {
         cached_tasks
     };
@@ -3465,20 +3482,24 @@ async fn cmd_contacts(
             fetched
         }
     } else {
+        let ttl = cli_cache_ttl_secs(cfg);
+        let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
         let cached_contacts = storage.list_contacts(None, limit)?;
-        if refresh || cached_contacts.is_empty() {
-            let fetched = match graph.list_contacts(limit).await {
+        let should_fetch = refresh
+            || cached_contacts.is_empty()
+            || (!cached && !daemon_warm && !is_cursor_fresh(&storage, &["cli:contacts"], ttl));
+        if should_fetch {
+            let (fetched, reached_end) = match graph.list_contacts_complete(limit).await {
                 Ok(c) => c,
                 Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
             };
-            storage.upsert_contacts(&fetched)?;
-            record_cli_sync_cursor(&storage, "cli:contacts");
-            let stored = storage.list_contacts(None, limit)?;
-            if stored.is_empty() {
-                fetched
+            if reached_end {
+                storage.replace_personal_contacts(&fetched)?;
             } else {
-                stored
+                storage.upsert_contacts(&fetched)?;
             }
+            record_cli_sync_cursor(&storage, "cli:contacts");
+            storage.list_contacts(None, limit)?
         } else {
             cached_contacts
         }
@@ -3496,12 +3517,11 @@ async fn cmd_sync(cfg: &AppConfig, days: i64, limit: usize, json_out: bool) -> R
     let limit = clamp_limit(limit);
     let (start_iso, end_iso) = default_calendar_window(None, None, days)?;
 
-    let (folders_res, inbox_res, cal_res, lists_res, contacts_res) = tokio::join!(
+    let (folders_res, cal_res, lists_res, contacts_res) = tokio::join!(
         graph.list_mail_folders(),
-        graph.list_mail_messages("inbox", limit, false),
-        graph.list_calendar_view(&start_iso, &end_iso, limit),
+        graph.list_calendar_view_complete(&start_iso, &end_iso, limit),
         graph.list_todo_lists(),
-        graph.list_contacts(limit),
+        graph.list_contacts_complete(limit),
     );
 
     let mut errors = Vec::new();
@@ -3515,7 +3535,7 @@ async fn cmd_sync(cfg: &AppConfig, days: i64, limit: usize, json_out: bool) -> R
     match folders_res {
         Ok(folders) => {
             folder_count = folders.len();
-            storage.upsert_mail_folders(&folders)?;
+            storage.replace_mail_folders(&folders)?;
             record_cli_sync_cursor(&storage, "cli:mail_folders");
         }
         Err(err) => errors.push(format!(
@@ -3524,11 +3544,13 @@ async fn cmd_sync(cfg: &AppConfig, days: i64, limit: usize, json_out: bool) -> R
         )),
     }
 
-    match inbox_res {
-        Ok(messages) => {
-            message_count = messages.len();
-            storage.upsert_mail_messages(&messages)?;
-            record_cli_sync_cursor(&storage, "cli:mail:inbox");
+    match crate::sync::sync_mail_folder_delta("inbox", &graph, &storage, None, false).await {
+        Ok(outcome) => {
+            record_cli_sync_cursor(&storage, &format!("cli:mail:{}", outcome.folder_id));
+            message_count = storage
+                .list_mail_summaries(Some(&outcome.folder_id), limit)
+                .map(|v| v.len())
+                .unwrap_or(0);
         }
         Err(err) => errors.push(format!(
             "inbox: {:#}",
@@ -3537,9 +3559,13 @@ async fn cmd_sync(cfg: &AppConfig, days: i64, limit: usize, json_out: bool) -> R
     }
 
     match cal_res {
-        Ok(events) => {
+        Ok((events, reached_end)) => {
             event_count = events.len();
-            storage.upsert_calendar_events(&events)?;
+            if reached_end {
+                storage.replace_calendar_events_in_window(&start_iso, &end_iso, &events)?;
+            } else {
+                storage.upsert_calendar_events(&events)?;
+            }
             record_cli_sync_cursor(&storage, "cli:cal");
         }
         Err(err) => errors.push(format!(
@@ -3551,13 +3577,17 @@ async fn cmd_sync(cfg: &AppConfig, days: i64, limit: usize, json_out: bool) -> R
     match lists_res {
         Ok(lists) => {
             todo_list_count = lists.len();
-            storage.upsert_todo_lists(&lists)?;
+            storage.replace_todo_lists(&lists)?;
             record_cli_sync_cursor(&storage, "cli:todo_lists");
             for list in &lists {
-                match graph.list_todo_tasks(&list.id, true, limit).await {
-                    Ok(tasks) => {
+                match graph.list_todo_tasks_complete(&list.id, true, limit).await {
+                    Ok((tasks, reached_end)) => {
                         todo_task_count += tasks.len();
-                        let _ = storage.upsert_todo_tasks(&tasks);
+                        if reached_end {
+                            let _ = storage.replace_todo_tasks_for_list(&list.id, true, &tasks);
+                        } else {
+                            let _ = storage.upsert_todo_tasks(&tasks);
+                        }
                         record_cli_sync_cursor(&storage, &format!("cli:todo_tasks:{}", list.id));
                     }
                     Err(err) => errors.push(format!("todo_tasks({}): {err:#}", list.display_name)),
@@ -3571,9 +3601,13 @@ async fn cmd_sync(cfg: &AppConfig, days: i64, limit: usize, json_out: bool) -> R
     }
 
     match contacts_res {
-        Ok(contacts) => {
+        Ok((contacts, reached_end)) => {
             contact_count = contacts.len();
-            storage.upsert_contacts(&contacts)?;
+            if reached_end {
+                storage.replace_personal_contacts(&contacts)?;
+            } else {
+                storage.upsert_contacts(&contacts)?;
+            }
             record_cli_sync_cursor(&storage, "cli:contacts");
         }
         Err(err) => errors.push(format!(
