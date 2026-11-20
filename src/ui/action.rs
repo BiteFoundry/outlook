@@ -15,6 +15,7 @@ use super::composer;
 use super::hitmap::{ButtonId, HitTarget};
 use super::nav_pane::{NavRow, TAB_CALENDAR, TAB_COUNT, TAB_MAIL, TAB_TASKS};
 use super::overlays::context_menu::{ContextMenu, ContextTarget};
+use super::overlays::html_preview::{self, HtmlPreviewOverlay};
 use super::overlays::image_preview::ImagePreviewOverlay;
 use super::overlays::links::LinkExtractorOverlay;
 use super::overlays::mail_compose::{MailComposeMode, MailComposeOverlay};
@@ -173,7 +174,7 @@ pub enum Action {
     },
     ShowToast(String),
 
-    // Inline images & updater
+    // Inline images, HTML preview & updater
     ToggleInlineImages,
     OpenImagePreview,
     OpenMailImagePreview {
@@ -183,6 +184,12 @@ pub enum Action {
     LoadPreviewImage,
     CycleImageProtocol,
     DownloadPreviewImage,
+    OpenHtmlPreview,
+    OpenMailHtmlAttachment {
+        msg_id: String,
+        attach_index: usize,
+    },
+    ServeHtmlPreview,
     CheckForUpdates,
     ApplySelfUpdate,
 }
@@ -217,10 +224,10 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             }
             OverlayOutcome::Dispatch(next) => {
                 ui.overlays.push(top);
-                return dispatch(next, app, ui);
+                return dispatch_core(next, app, ui);
             }
             OverlayOutcome::CloseAndDispatch(next) => {
-                return dispatch(next, app, ui);
+                return dispatch_core(next, app, ui);
             }
             OverlayOutcome::NotHandled => {
                 ui.overlays.push(top);
@@ -228,8 +235,15 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
     }
 
+    dispatch_core(action, app, ui)
+}
+
+fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
     match action {
-        Action::Quit => unreachable!(),
+        Action::Quit => {
+            stash_open_compose(app, ui);
+            return true;
+        }
         Action::QuitConfirm => {
             if let Some(Overlay::MailCompose(c)) = ui.overlays.last() {
                 if c.has_unsent_content() {
@@ -592,7 +606,8 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             );
         }
         Action::SaveMailDraft => {
-            if let Some(Overlay::MailCompose(compose)) = ui.overlays.last().cloned() {
+            if let Some(Overlay::MailCompose(compose)) = ui.overlays.last() {
+                let compose = compose.clone();
                 app.save_mail_draft(ui, &compose);
             }
         }
@@ -774,6 +789,9 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 OverlayKind::ImagePreview => {
                     let _ = dispatch(Action::OpenImagePreview, app, ui);
                 }
+                OverlayKind::HtmlPreview => {
+                    let _ = dispatch(Action::OpenHtmlPreview, app, ui);
+                }
                 _ => {}
             }
         }
@@ -856,6 +874,43 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 }
             }
         }
+        Action::OpenHtmlPreview => {
+            if let Some(msg) = app.active_mail().cloned() {
+                let title = msg.effective_subject().to_string();
+                let html = if !msg.body_html.trim().is_empty() {
+                    Some(msg.body_html)
+                } else if !msg.body_plain.trim().is_empty() {
+                    Some(format!("<pre>{}</pre>", escape_html_text(&msg.body_plain)))
+                } else if !msg.preview.trim().is_empty() {
+                    Some(format!("<pre>{}</pre>", escape_html_text(&msg.preview)))
+                } else {
+                    None
+                };
+                if let Some(html) = html {
+                    ui.close_overlays_of(OverlayKind::HtmlPreview);
+                    let mut overlay = HtmlPreviewOverlay::new(Some(title), html);
+                    overlay.show_link_urls = ui.show_link_urls;
+                    ui.push_overlay(Overlay::html_preview(overlay));
+                } else {
+                    ui.info("Selected email has no HTML content");
+                }
+            } else {
+                ui.info("Select an email to open HTML preview");
+            }
+        }
+        Action::OpenMailHtmlAttachment {
+            msg_id,
+            attach_index,
+        } => {
+            app.open_mail_html_attachment(ui, msg_id, attach_index);
+        }
+        Action::ServeHtmlPreview => {
+            if let Some(Overlay::HtmlPreview(preview)) = ui.overlays.last() {
+                let title = preview.title_or_default();
+                let html = preview.session.raw_html().to_string();
+                app.serve_html_in_browser(ui, title, html);
+            }
+        }
         Action::CheckForUpdates => app.check_for_updates(ui, true, false),
         Action::ApplySelfUpdate => app.check_for_updates(ui, false, false),
         Action::OpenContextMenuAt { column, row } => {
@@ -889,6 +944,12 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
     }
 
     false
+}
+
+fn escape_html_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn stash_open_compose(app: &mut AppState, ui: &UiState) {
@@ -1170,6 +1231,26 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
     if !ui.overlays.is_empty() {
         match hit {
             Some(HitTarget::OverlayBody) => return false,
+            Some(HitTarget::HtmlPreviewBody) => {
+                let outcome =
+                    if let Some(Overlay::HtmlPreview(ref mut preview)) = ui.overlays.last_mut() {
+                        preview.click_at_screen(column, row)
+                    } else {
+                        OverlayOutcome::Handled
+                    };
+                return match outcome {
+                    OverlayOutcome::Dispatch(next) => dispatch_core(next, app, ui),
+                    OverlayOutcome::Close => {
+                        let _ = ui.close_top_overlay();
+                        false
+                    }
+                    OverlayOutcome::CloseAndDispatch(next) => {
+                        let _ = ui.close_top_overlay();
+                        dispatch_core(next, app, ui)
+                    }
+                    OverlayOutcome::Handled | OverlayOutcome::NotHandled => false,
+                };
+            }
             Some(HitTarget::OverlayItem { index }) => {
                 if let Some(top) = ui.overlays.last_mut() {
                     top.select(index);
@@ -1281,6 +1362,16 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
             if let Some(msg) = target_msg {
                 let eff = parser::effective_mail_attachments(&msg);
                 if let Some(att) = eff.get(attach_index) {
+                    if html_preview::is_html_mime_or_name(&att.content_type, Some(&att.name)) {
+                        return dispatch(
+                            Action::OpenMailHtmlAttachment {
+                                msg_id: msg.id,
+                                attach_index,
+                            },
+                            app,
+                            ui,
+                        );
+                    }
                     if img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name)) {
                         return dispatch(
                             Action::OpenMailImagePreview {
@@ -1372,6 +1463,15 @@ fn handle_button(btn: ButtonId, app: &mut AppState, ui: &mut UiState) -> bool {
         ButtonId::MailMove => dispatch(Action::OpenFolderPicker, app, ui),
         ButtonId::Attachments => dispatch(Action::OpenOverlay(OverlayKind::Attachments), app, ui),
         ButtonId::ImagePreview => dispatch(Action::OpenImagePreview, app, ui),
+        ButtonId::HtmlPreview => dispatch(Action::OpenHtmlPreview, app, ui),
+        ButtonId::HtmlToggleRaw => {
+            if let Some(Overlay::HtmlPreview(ref mut preview)) = ui.overlays.last_mut() {
+                preview.session.toggle_raw_mode();
+                preview.session.scroll_y = 0;
+            }
+            false
+        }
+        ButtonId::HtmlOpenBrowser => dispatch(Action::ServeHtmlPreview, app, ui),
         ButtonId::ExpandQuoted => dispatch(Action::ToggleQuotedHistory, app, ui),
         ButtonId::NewEvent => dispatch(Action::OpenEventForm, app, ui),
         ButtonId::JoinMeeting => dispatch(Action::OpenActiveLink, app, ui),

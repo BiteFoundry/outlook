@@ -30,7 +30,11 @@ pub enum ButtonId {
     MailMove,
     Attachments,
     ImagePreview,
+    HtmlPreview,
     ExpandQuoted,
+    // HTML preview modal buttons
+    HtmlToggleRaw,
+    HtmlOpenBrowser,
     // Calendar toolbar actions
     NewEvent,
     JoinMeeting,
@@ -94,6 +98,8 @@ pub enum HitTarget {
     ComposeContactSuggestion(usize),
     /// Modal / overlay outer frame (prevents clicks inside modal padding from closing the modal).
     OverlayBody,
+    /// Clickable HTML document body inside `HtmlPreviewOverlay`.
+    HtmlPreviewBody,
     /// Item inside the top overlay.
     OverlayItem { index: usize },
 }

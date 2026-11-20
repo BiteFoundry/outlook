@@ -51,6 +51,7 @@ fn palette_commands() -> Vec<PaletteItem> {
             Action::ToggleDensity,
         ),
         ("Preview Image Attachment", "v / Alt+v", Action::OpenImagePreview),
+        ("Open Interactive HTML Preview", "H", Action::OpenHtmlPreview),
         ("Extract Links from Item", "u", Action::OpenLinkExtractor),
         ("Toggle Inline Link URLs (href)", "h", Action::ToggleShowLinkUrls),
         ("Attach File (File Picker)", "Ctrl+F", Action::OpenFilePicker),

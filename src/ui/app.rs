@@ -32,6 +32,7 @@ use super::nav_pane::{
     find_folder_by_wellknown, TAB_MAIL, VIRTUAL_FLAGGED_FOLDER, VIRTUAL_UNREAD_FOLDER,
 };
 use super::notification;
+use super::overlays::html_preview::HtmlPreviewOverlay;
 use super::overlays::image_preview::PreviewTarget;
 use super::overlays::mail_compose::{MailComposeMode, MailComposeOverlay};
 use super::overlays::{Overlay, OverlayKind};
@@ -191,6 +192,18 @@ pub enum UiMsg {
         owner_id: String,
         att_id: String,
         error: String,
+    },
+    ImageFetchReturnedHtml {
+        cache_key: String,
+        owner_id: String,
+        att_id: String,
+        title: String,
+        html: String,
+        from_preview: bool,
+    },
+    HtmlAttachmentLoaded {
+        title: String,
+        html: String,
     },
     UpdateChecked(crate::models::UpdateCheckResult),
     DaemonAttached {
@@ -421,6 +434,7 @@ pub struct AppState {
     pub image_raw_cache: HashMap<String, Arc<[u8]>>,
     pub image_raw_order: VecDeque<String>,
     pub image_raw_bytes: usize,
+    pub html_server: bitefoundry_html::NativeHtmlServer,
     pub ui_tx: mpsc::UnboundedSender<UiMsg>,
 }
 
@@ -487,6 +501,7 @@ impl AppState {
             image_raw_cache: HashMap::new(),
             image_raw_order: VecDeque::new(),
             image_raw_bytes: 0,
+            html_server: bitefoundry_html::NativeHtmlServer::new(),
             ui_tx,
         }
     }
@@ -1995,8 +2010,18 @@ impl AppState {
         let att_id = att.id.clone();
 
         tokio::spawn(async move {
-            let raw_bytes: anyhow::Result<Arc<[u8]>> = match cached_raw {
-                Some(bytes) => Ok(bytes),
+            let from_preview = caps.is_some();
+            let att_title = if att.name.trim().is_empty() {
+                att_id.clone()
+            } else {
+                att.name.clone()
+            };
+            let fetched: anyhow::Result<(Arc<[u8]>, Option<String>, bool)> = match cached_raw {
+                Some(bytes) => {
+                    let mime = (!att.content_type.trim().is_empty())
+                        .then(|| att.content_type.clone());
+                    Ok((bytes, mime, false))
+                }
                 None => {
                     if let Some(b64) = att
                         .content_bytes_b64
@@ -2007,40 +2032,52 @@ impl AppState {
                         let cleaned: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
                         match B64_STANDARD.decode(cleaned) {
                             Ok(bytes) => {
-                                let arc: Arc<[u8]> = Arc::from(bytes);
-                                let _ = tx.send(UiMsg::ImageBytesFetched {
-                                    raw_key,
-                                    bytes: Arc::clone(&arc),
-                                });
-                                Ok(arc)
+                                let mime = (!att.content_type.trim().is_empty())
+                                    .then(|| att.content_type.clone());
+                                Ok((Arc::from(bytes), mime, true))
                             }
                             Err(e) => Err(anyhow::anyhow!("Invalid base64 image: {e}")),
                         }
                     } else if att.id.starts_with("https://") || att.id.starts_with("http://") {
                         match graph.http().get(&att.id).send().await {
-                            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                                Ok(b) => {
-                                    let arc: Arc<[u8]> = Arc::from(b.to_vec());
-                                    let _ = tx.send(UiMsg::ImageBytesFetched {
-                                        raw_key,
-                                        bytes: Arc::clone(&arc),
-                                    });
-                                    Ok(arc)
+                            Ok(resp) if resp.status().is_success() => {
+                                let resp_ct = resp
+                                    .headers()
+                                    .get(reqwest::header::CONTENT_TYPE)
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("")
+                                    .split(';')
+                                    .next()
+                                    .unwrap_or("")
+                                    .trim()
+                                    .to_ascii_lowercase();
+                                if resp_ct == "image/svg+xml" || resp_ct.contains("svg") {
+                                    Err(anyhow::anyhow!(
+                                        "SVG vector images ({resp_ct}) are not supported for raster terminal preview"
+                                    ))
+                                } else {
+                                    match resp.bytes().await {
+                                        Ok(b) => {
+                                            let mime = (!resp_ct.is_empty()).then_some(resp_ct);
+                                            Ok((Arc::from(b.to_vec()), mime, true))
+                                        }
+                                        Err(e) => Err(anyhow::anyhow!(e)),
+                                    }
                                 }
-                                Err(e) => Err(anyhow::anyhow!(e)),
-                            },
+                            }
                             Ok(resp) => Err(anyhow::anyhow!("HTTP {}", resp.status())),
                             Err(e) => Err(anyhow::anyhow!(e)),
                         }
                     } else {
                         match graph.fetch_mail_attachment_bytes(&msg_id, &att.id).await {
-                            Ok((_, _, bytes)) => {
-                                let arc: Arc<[u8]> = Arc::from(bytes);
-                                let _ = tx.send(UiMsg::ImageBytesFetched {
-                                    raw_key,
-                                    bytes: Arc::clone(&arc),
-                                });
-                                Ok(arc)
+                            Ok((_, ct, bytes)) => {
+                                let mime = (!ct.trim().is_empty())
+                                    .then_some(ct)
+                                    .or_else(|| {
+                                        (!att.content_type.trim().is_empty())
+                                            .then(|| att.content_type.clone())
+                                    });
+                                Ok((Arc::from(bytes), mime, true))
                             }
                             Err(err) => Err(err),
                         }
@@ -2048,8 +2085,41 @@ impl AppState {
                 }
             };
 
-            match raw_bytes {
-                Ok(bytes) => {
+            match fetched {
+                Ok((bytes, mime_hint, is_fresh)) => {
+                    let kind = bitefoundry_html::sniff_content_kind(
+                        mime_hint.as_deref(),
+                        Some(&att.name),
+                        Some(&bytes),
+                    );
+                    if kind == bitefoundry_html::ContentKind::Html {
+                        let html = String::from_utf8_lossy(&bytes).into_owned();
+                        let _ = tx.send(UiMsg::ImageFetchReturnedHtml {
+                            cache_key: key,
+                            owner_id: msg_id,
+                            att_id,
+                            title: att_title,
+                            html,
+                            from_preview,
+                        });
+                        return;
+                    }
+                    if kind == bitefoundry_html::ContentKind::Svg {
+                        let _ = tx.send(UiMsg::ImageDecodeFailed {
+                            cache_key: key,
+                            owner_id: msg_id,
+                            att_id,
+                            error: "SVG vector images are not supported for raster terminal preview"
+                                .to_string(),
+                        });
+                        return;
+                    }
+                    if is_fresh {
+                        let _ = tx.send(UiMsg::ImageBytesFetched {
+                            raw_key,
+                            bytes: Arc::clone(&bytes),
+                        });
+                    }
                     let decode_res = tokio::task::spawn_blocking(move || match caps {
                         Some(c) => img_preview::decode_and_render_for_protocol(&bytes, cols, rows, bg, c),
                         None => img_preview::decode_and_render_halfblocks(&bytes, cols, rows, bg),
@@ -2131,6 +2201,171 @@ impl AppState {
                 );
             }
         }
+    }
+
+    pub fn open_mail_html_attachment(
+        &mut self,
+        ui: &mut UiState,
+        msg_id: String,
+        attach_index: usize,
+    ) {
+        let Some(msg) = self
+            .mail_messages
+            .iter()
+            .find(|m| m.id == msg_id)
+            .or_else(|| self.pinned_mail.as_ref().filter(|m| m.id == msg_id))
+            .cloned()
+        else {
+            ui.info("Email not found");
+            return;
+        };
+        let eff = parser::effective_mail_attachments(&msg);
+        let Some(att) = eff.get(attach_index).cloned() else {
+            ui.info("Attachment not found");
+            return;
+        };
+        let title = if att.name.trim().is_empty() {
+            "attachment.html".to_string()
+        } else {
+            att.name.clone()
+        };
+
+        if let Some(b64) = att
+            .content_bytes_b64
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let cleaned: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+            match B64_STANDARD.decode(cleaned) {
+                Ok(bytes) => {
+                    let html = String::from_utf8_lossy(&bytes).into_owned();
+                    ui.close_overlays_of(OverlayKind::HtmlPreview);
+                    ui.push_overlay(Overlay::html_preview(HtmlPreviewOverlay::new(
+                        Some(title),
+                        html,
+                    )));
+                    return;
+                }
+                Err(err) => {
+                    ui.error(format!("Invalid HTML attachment encoding: {err}"));
+                    return;
+                }
+            }
+        }
+
+        let raw_key = Self::raw_image_cache_key(&msg_id, &att.id);
+        if let Some(bytes) = self.touch_raw_image_cache(&raw_key) {
+            let html = String::from_utf8_lossy(&bytes).into_owned();
+            ui.close_overlays_of(OverlayKind::HtmlPreview);
+            ui.push_overlay(Overlay::html_preview(HtmlPreviewOverlay::new(
+                Some(title),
+                html,
+            )));
+            return;
+        }
+
+        if tokio::runtime::Handle::try_current().is_err() {
+            ui.error("Cannot fetch HTML attachment without async runtime");
+            return;
+        }
+
+        let task_label = format!("Load HTML {title}");
+        ui.tasks.begin(task_label.clone());
+        let graph = self.graph.clone();
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            let res: anyhow::Result<Vec<u8>> =
+                if att.id.starts_with("https://") || att.id.starts_with("http://") {
+                    match graph.http().get(&att.id).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            resp.bytes().await.map(|b| b.to_vec()).map_err(Into::into)
+                        }
+                        Ok(resp) => Err(anyhow::anyhow!("HTTP {}", resp.status())),
+                        Err(err) => Err(err.into()),
+                    }
+                } else {
+                    graph
+                        .fetch_mail_attachment_bytes(&msg_id, &att.id)
+                        .await
+                        .map(|(_, _, b)| b)
+                };
+
+            match res {
+                Ok(bytes) => {
+                    let html = String::from_utf8_lossy(&bytes).into_owned();
+                    let _ = tx.send(UiMsg::HtmlAttachmentLoaded { title, html });
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: None,
+                        toast: None,
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: Some(err.to_string()),
+                        toast: Some((
+                            format!("Failed to load HTML attachment: {err}"),
+                            ToastKind::Error,
+                        )),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Serves an HTML document on the lazy localhost Axum server (`0 MB` idle) and returns its URL.
+    pub async fn serve_html_document(&self, title: &str, html: &str) -> anyhow::Result<String> {
+        self.html_server.serve_html(title, html).await
+    }
+
+    /// Serves `html` via `NativeHtmlServer::serve_html` and opens the localhost URL in the default browser.
+    pub fn serve_html_in_browser(&self, ui: &mut UiState, title: String, html: String) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            ui.error("Cannot start native HTML server without async runtime");
+            return;
+        }
+        let task_label = "Serve HTML in browser".to_string();
+        ui.tasks.begin(task_label.clone());
+        let server = self.html_server.clone();
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            match server.serve_html(&title, &html).await {
+                Ok(url) => match open::that(&url) {
+                    Ok(()) => {
+                        let _ = tx.send(UiMsg::TaskDone {
+                            label: task_label,
+                            error: None,
+                            toast: Some((
+                                format!("Opened in browser: {url}"),
+                                ToastKind::Success,
+                            )),
+                        });
+                    }
+                    Err(err) => {
+                        let _ = tx.send(UiMsg::TaskDone {
+                            label: task_label,
+                            error: Some(err.to_string()),
+                            toast: Some((
+                                format!("Served at {url} (open failed: {err})"),
+                                ToastKind::Error,
+                            )),
+                        });
+                    }
+                },
+                Err(err) => {
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: Some(err.to_string()),
+                        toast: Some((
+                            format!("Failed to serve HTML: {err}"),
+                            ToastKind::Error,
+                        )),
+                    });
+                }
+            }
+        });
     }
 
     pub fn check_for_updates(&mut self, ui: &mut UiState, check_only: bool, force: bool) {
@@ -2605,6 +2840,46 @@ impl AppState {
                         }
                     }
                 }
+            }
+            UiMsg::ImageFetchReturnedHtml {
+                cache_key,
+                owner_id,
+                att_id,
+                title,
+                html,
+                from_preview,
+            } => {
+                self.image_pending.remove(&cache_key);
+                self.insert_image_error(
+                    cache_key,
+                    "HTML content auto-routed to HTML Preview".to_string(),
+                );
+                let matching_preview = matches!(
+                    ui.overlays.last(),
+                    Some(Overlay::ImagePreview(preview))
+                        if preview
+                            .current()
+                            .is_some_and(|c| c.owner_id() == owner_id && c.att_id() == att_id)
+                );
+                if matching_preview
+                    || (from_preview
+                        && matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_)) | None))
+                {
+                    ui.close_overlays_of(OverlayKind::ImagePreview);
+                    ui.close_overlays_of(OverlayKind::HtmlPreview);
+                    ui.push_overlay(Overlay::html_preview(HtmlPreviewOverlay::new(
+                        Some(title),
+                        html,
+                    )));
+                    ui.info("Received HTML content — opened in interactive HTML Preview");
+                }
+            }
+            UiMsg::HtmlAttachmentLoaded { title, html } => {
+                ui.close_overlays_of(OverlayKind::HtmlPreview);
+                ui.push_overlay(Overlay::html_preview(HtmlPreviewOverlay::new(
+                    Some(title),
+                    html,
+                )));
             }
             UiMsg::UpdateChecked(_) => {}
             UiMsg::DaemonAttached { pid, sync_busy } => {

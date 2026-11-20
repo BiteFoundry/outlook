@@ -7,6 +7,7 @@ pub mod context_menu;
 pub mod event_form;
 pub mod file_picker;
 pub mod folder_picker;
+pub mod html_preview;
 pub mod image_preview;
 pub mod links;
 pub mod mail_compose;
@@ -30,7 +31,8 @@ use crate::ui::{
     overlays::{
         attachments::AttachmentsState, command_palette::CommandPalette, confirm::ConfirmDialog,
         context_menu::ContextMenu, event_form::EventFormOverlay, file_picker::FilePickerOverlay,
-        folder_picker::FolderPickerOverlay, image_preview::ImagePreviewOverlay,
+        folder_picker::FolderPickerOverlay, html_preview::HtmlPreviewOverlay,
+        image_preview::ImagePreviewOverlay,
         links::LinkExtractorOverlay, mail_compose::MailComposeOverlay, path_input::PathInputState,
         quick_input::QuickInputOverlay, search::SearchOverlay, settings::SettingsState,
     },
@@ -51,6 +53,7 @@ pub enum OverlayKind {
     FolderPicker,
     QuickInput,
     ImagePreview,
+    HtmlPreview,
     Help,
     Confirm,
 }
@@ -64,7 +67,7 @@ pub enum OverlayOutcome {
     NotHandled,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Overlay {
     ContextMenu(ContextMenu),
     CommandPalette(CommandPalette),
@@ -79,6 +82,7 @@ pub enum Overlay {
     FolderPicker(FolderPickerOverlay),
     QuickInput(QuickInputOverlay),
     ImagePreview(ImagePreviewOverlay),
+    HtmlPreview(HtmlPreviewOverlay),
     Help(HelpOverlay),
     Confirm(ConfirmDialog),
 }
@@ -99,6 +103,7 @@ impl Overlay {
             Overlay::FolderPicker(_) => OverlayKind::FolderPicker,
             Overlay::QuickInput(_) => OverlayKind::QuickInput,
             Overlay::ImagePreview(_) => OverlayKind::ImagePreview,
+            Overlay::HtmlPreview(_) => OverlayKind::HtmlPreview,
             Overlay::Help(_) => OverlayKind::Help,
             Overlay::Confirm(_) => OverlayKind::Confirm,
         }
@@ -114,6 +119,7 @@ impl Overlay {
             | Overlay::QuickInput(_) => true,
             Overlay::MailCompose(c) => c.field <= 4,
             Overlay::EventForm(e) => e.field <= 4 || e.field == 6,
+            Overlay::HtmlPreview(h) => h.is_editing_input(),
             _ => false,
         }
     }
@@ -166,6 +172,10 @@ impl Overlay {
         Overlay::QuickInput(quick)
     }
 
+    pub fn html_preview(preview: HtmlPreviewOverlay) -> Self {
+        Overlay::HtmlPreview(preview)
+    }
+
     pub fn help() -> Self {
         Overlay::Help(HelpOverlay)
     }
@@ -210,6 +220,7 @@ impl Overlay {
             Overlay::FolderPicker(picker) => picker.handle(action, app),
             Overlay::QuickInput(input) => input.handle(action),
             Overlay::ImagePreview(preview) => preview.handle(action),
+            Overlay::HtmlPreview(preview) => preview.handle(action),
             Overlay::Help(_) => match action {
                 Action::CloseOverlay | Action::Activate | Action::Input('q') => {
                     OverlayOutcome::Close
@@ -235,6 +246,7 @@ impl Overlay {
             Overlay::FolderPicker(picker) => picker.select(index),
             Overlay::QuickInput(_)
             | Overlay::ImagePreview(_)
+            | Overlay::HtmlPreview(_)
             | Overlay::PathInput(_)
             | Overlay::Help(_)
             | Overlay::Confirm(_) => {}
@@ -299,6 +311,10 @@ impl Overlay {
                 preview.draw(frame, area, app, ui, hitmap);
                 None
             }
+            Overlay::HtmlPreview(preview) => {
+                preview.draw(frame, area, ui, hitmap);
+                None
+            }
             Overlay::Help(_) => {
                 draw_help(frame, area, ui, hitmap);
                 None
@@ -339,7 +355,7 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
             ("r / R / f", "Reply / Reply All / Forward"),
             ("e / Del / #", "Archive / Delete email"),
             ("u (List / Read) / g", "Toggle Read/Unread (List) / Links (Read) / Flag"),
-            ("h", "Toggle inline (https://...) hrefs on links"),
+            ("H / h", "Interactive HTML preview / toggle inline hrefs"),
             ("m", "Move email to folder"),
             ("t / F / U", "Thread grouping / Focused / Unread filter"),
             ("z / v / Alt+v", "Toggle quoted reply / HD image preview"),

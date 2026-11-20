@@ -63,6 +63,7 @@ impl ContextMenu {
                     MenuItem::new("Toggle Flag", Some("g"), Action::MailToggleFlag),
                     MenuItem::new("Archive", Some("e"), Action::MailArchive),
                     MenuItem::new("Move to Folder…", Some("m"), Action::OpenFolderPicker),
+                    MenuItem::new("Interactive HTML Preview", Some("H"), Action::OpenHtmlPreview),
                     MenuItem::new("Delete", Some("Del"), Action::DeleteItem),
                 ];
                 if app

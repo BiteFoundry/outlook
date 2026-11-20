@@ -764,12 +764,27 @@ impl MailComposeOverlay {
 
         // Action buttons row
         if y < inner.bottom() {
-            let btn_specs = [
+            let full_specs = [
                 (" [Send (Ctrl+Enter)] ", ButtonId::ComposeSend),
                 (" [+ Attach (Ctrl+F)] ", ButtonId::ComposeAttach),
                 (" [Save Draft (Ctrl+S)] ", ButtonId::ComposeSaveDraft),
                 (" [Cancel (Esc)] ", ButtonId::ComposeCancel),
             ];
+            let compact_specs = [
+                ("[Send]", ButtonId::ComposeSend),
+                ("[+Attach]", ButtonId::ComposeAttach),
+                ("[Draft]", ButtonId::ComposeSaveDraft),
+                ("[Cancel]", ButtonId::ComposeCancel),
+            ];
+            let full_w: u16 = full_specs
+                .iter()
+                .map(|(label, _)| UnicodeWidthStr::width(*label) as u16 + 1)
+                .sum();
+            let btn_specs = if full_w <= inner.width.saturating_sub(1) {
+                &full_specs
+            } else {
+                &compact_specs
+            };
             let mut bx = inner.x.saturating_add(1);
             for (idx, (label, btn_id)) in btn_specs.iter().enumerate() {
                 let w = UnicodeWidthStr::width(*label) as u16;

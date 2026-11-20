@@ -264,14 +264,9 @@ fn draw_detail_toolbar(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut
         Rect::new(area.x, area.y, area.width, 1),
     );
 
-    let buttons = [
-        ("[Space Toggle]", ButtonId::NewTodoList), // handled below via actual ButtonId? Wait: let's add a Toggle or keep clean
-    ];
-    let _ = buttons;
-
     let toolbar = [
         ("[n New Task]", ButtonId::NewTodoTask),
-        ("[n New List]", ButtonId::NewTodoList),
+        ("[N New List]", ButtonId::NewTodoList),
         ("[Del Delete]", ButtonId::DeleteTodoTask),
     ];
     let mut x = area.x + 1;

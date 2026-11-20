@@ -16,7 +16,7 @@ use crate::{
         action::Action,
         app::{AppState, UiState},
         hitmap::{HitMap, HitTarget},
-        overlays::{centered_rect, OverlayOutcome},
+        overlays::{centered_rect, html_preview, OverlayOutcome},
     },
 };
 
@@ -29,12 +29,15 @@ pub struct MailAttachmentRow {
     pub content_type: String,
     pub size: u64,
     pub is_image: bool,
+    pub is_html: bool,
 }
 
 impl MailAttachmentRow {
     pub fn icon(&self) -> &'static str {
         if self.is_image {
             "[IMG]"
+        } else if self.is_html {
+            "[HTML]"
         } else {
             "[FILE]"
         }
@@ -66,6 +69,8 @@ pub fn rows_from_mail(msg: &MailMessage) -> Vec<MailAttachmentRow> {
             };
             let is_image =
                 img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name));
+            let is_html = !is_image
+                && html_preview::is_html_mime_or_name(&att.content_type, Some(&att.name));
             MailAttachmentRow {
                 msg_id: msg.id.clone(),
                 attach_index,
@@ -74,6 +79,7 @@ pub fn rows_from_mail(msg: &MailMessage) -> Vec<MailAttachmentRow> {
                 content_type: att.content_type.clone(),
                 size: att.size,
                 is_image,
+                is_html,
             }
         })
         .collect()
@@ -115,7 +121,23 @@ impl AttachmentsState {
                 self.move_down(items.len());
                 OverlayOutcome::Handled
             }
-            Action::Activate | Action::Input('d') => {
+            Action::Activate => {
+                let idx = self.selected.min(items.len().saturating_sub(1));
+                match items.get(idx) {
+                    Some(row) if row.is_html => {
+                        OverlayOutcome::CloseAndDispatch(Action::OpenMailHtmlAttachment {
+                            msg_id: row.msg_id.clone(),
+                            attach_index: row.attach_index,
+                        })
+                    }
+                    Some(row) => OverlayOutcome::Dispatch(Action::DownloadMailAttachment {
+                        msg_id: row.msg_id.clone(),
+                        attach_index: row.attach_index,
+                    }),
+                    None => OverlayOutcome::Handled,
+                }
+            }
+            Action::Input('d') => {
                 let idx = self.selected.min(items.len().saturating_sub(1));
                 match items.get(idx) {
                     Some(row) => OverlayOutcome::Dispatch(Action::DownloadMailAttachment {
@@ -125,9 +147,18 @@ impl AttachmentsState {
                     None => OverlayOutcome::Handled,
                 }
             }
-            Action::Input('v') | Action::OpenImagePreview => {
+            Action::Input('v')
+            | Action::OpenImagePreview
+            | Action::OpenHtmlPreview
+            | Action::Input('H') => {
                 let idx = self.selected.min(items.len().saturating_sub(1));
                 match items.get(idx) {
+                    Some(row) if row.is_html => {
+                        OverlayOutcome::CloseAndDispatch(Action::OpenMailHtmlAttachment {
+                            msg_id: row.msg_id.clone(),
+                            attach_index: row.attach_index,
+                        })
+                    }
                     Some(row) if row.is_image => {
                         OverlayOutcome::CloseAndDispatch(Action::OpenMailImagePreview {
                             msg_id: row.msg_id.clone(),
@@ -165,7 +196,7 @@ impl AttachmentsState {
             .border_type(BorderType::Rounded)
             .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
             .title(Line::from(Span::styled(
-                " Attachments · Enter/d Download · v Preview Image · Esc Close ",
+                " Attachments · Enter Open/Download · v/H Preview · d Save · Esc Close ",
                 theme.title(true),
             )))
             .border_style(theme.border_style(true));

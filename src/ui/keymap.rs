@@ -107,6 +107,7 @@ impl Keymap {
                 map.bind(Some(focus), Char('u'), M::NONE, Action::OpenLinkExtractor);
             }
             map.bind(Some(focus), Char('h'), M::NONE, Action::ToggleShowLinkUrls);
+            map.bind(Some(focus), Char('H'), M::SHIFT, Action::OpenHtmlPreview);
             map.bind(Some(focus), Char('g'), M::NONE, Action::MailToggleFlag);
             map.bind(Some(focus), Char('m'), M::NONE, Action::OpenFolderPicker);
             map.bind(Some(focus), Char('d'), M::NONE, Action::DownloadLatestAttachment);
@@ -366,6 +367,14 @@ mod tests {
         assert_eq!(
             map.resolve(Focus::Reader, key(KeyCode::Char('h'), KeyModifiers::NONE)),
             Some(Action::ToggleShowLinkUrls)
+        );
+        assert_eq!(
+            map.resolve(Focus::Reader, key(KeyCode::Char('H'), KeyModifiers::SHIFT)),
+            Some(Action::OpenHtmlPreview)
+        );
+        assert_eq!(
+            map.resolve(Focus::List, key(KeyCode::Char('H'), KeyModifiers::SHIFT)),
+            Some(Action::OpenHtmlPreview)
         );
         assert_eq!(
             map.resolve(Focus::Overlay, key(KeyCode::Char('f'), KeyModifiers::CONTROL)),

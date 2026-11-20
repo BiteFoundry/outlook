@@ -735,27 +735,51 @@ fn draw_reader_toolbar(
     );
 
     let mail_opt = app.active_mail();
-    let has_img = mail_opt.is_some_and(|m| {
-        parser::effective_mail_attachments(m)
-            .iter()
+    let eff_attachments = mail_opt.map(parser::effective_mail_attachments);
+    let has_attachments = mail_opt.is_some_and(|m| m.has_attachments)
+        || eff_attachments.as_ref().is_some_and(|a| !a.is_empty());
+    let has_img = eff_attachments.as_ref().is_some_and(|atts| {
+        atts.iter()
             .any(|a| img_preview::is_image_mime_or_name(&a.content_type, Some(&a.name)))
     });
-    let mut buttons: Vec<(&str, ButtonId)> = vec![
-        ("[r Reply]", ButtonId::MailReply),
-        ("[R All]", ButtonId::MailReplyAll),
-        ("[f Fwd]", ButtonId::MailForward),
-        ("[e Archive]", ButtonId::MailArchive),
-        ("[u Read]", ButtonId::MailToggleRead),
-        ("[g Flag]", ButtonId::MailToggleFlag),
-        ("[m Move]", ButtonId::MailMove),
-        ("[Del]", ButtonId::MailDelete),
+    let has_quoted = mail_opt.is_some_and(|m| {
+        !m.body_html.trim().is_empty()
+            && parser::parse_message_blocks_arc(&m.body_html, &m.attachments)
+                .iter()
+                .any(|b| matches!(b, RichBlock::QuotedHistory { .. }))
+    });
+    let mut buttons: Vec<(&str, &str, ButtonId)> = vec![
+        ("[r Reply]", "[r]", ButtonId::MailReply),
+        ("[R All]", "[R]", ButtonId::MailReplyAll),
+        ("[f Fwd]", "[f]", ButtonId::MailForward),
+        ("[e Archive]", "[e]", ButtonId::MailArchive),
+        ("[u Read]", "[u]", ButtonId::MailToggleRead),
+        ("[g Flag]", "[g]", ButtonId::MailToggleFlag),
+        ("[m Move]", "[m]", ButtonId::MailMove),
+        ("[Del]", "[Del]", ButtonId::MailDelete),
     ];
+    if mail_opt.is_some() {
+        buttons.push(("[H: HTML]", "[H: HTML]", ButtonId::HtmlPreview));
+    }
+    if has_attachments {
+        buttons.push(("[A Attach]", "[A]", ButtonId::Attachments));
+    }
     if has_img {
-        buttons.push(("[v Image]", ButtonId::ImagePreview));
+        buttons.push(("[v Image]", "[v]", ButtonId::ImagePreview));
+    }
+    if has_quoted {
+        buttons.push(("[z Quote]", "[z]", ButtonId::ExpandQuoted));
     }
 
+    let full_w: u16 = buttons
+        .iter()
+        .map(|(full, _, _)| UnicodeWidthStr::width(*full) as u16 + 1)
+        .sum();
+    let use_compact = full_w > area.width.saturating_sub(1);
+
     let mut x = area.x + 1;
-    for (label, btn_id) in buttons {
+    for (full, compact, btn_id) in buttons {
+        let label = if use_compact { compact } else { full };
         let w = UnicodeWidthStr::width(label) as u16;
         if x.saturating_add(w) > area.right() {
             break;
@@ -961,7 +985,18 @@ pub fn build_reader_lines_with_opts(
                 }
                 let is_img =
                     img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name));
-                let tag = if is_img { "IMG" } else { "FILE" };
+                let is_html = !is_img
+                    && crate::ui::overlays::html_preview::is_html_mime_or_name(
+                        &att.content_type,
+                        Some(&att.name),
+                    );
+                let tag = if is_img {
+                    "IMG"
+                } else if is_html {
+                    "HTML"
+                } else {
+                    "FILE"
+                };
                 let name = if att.name.trim().is_empty() {
                     "attachment"
                 } else {

@@ -85,9 +85,16 @@ fn collect_inline_image_attachments(
                     let mime = guess_image_mime(&fname);
                     (format!("cid:{cid}"), fname, mime)
                 } else {
+                    let lower_src = src.trim().to_ascii_lowercase();
                     let fname = filename_from_src(src)
                         .unwrap_or_else(|| format!("inline-image-{}.png", index + 1));
-                    let mime = guess_image_mime(&fname);
+                    let mime = if lower_src.starts_with("data:image/svg+xml") {
+                        "image/svg+xml".to_string()
+                    } else if lower_src.starts_with("data:text/html") {
+                        "text/html".to_string()
+                    } else {
+                        guess_image_mime(&fname)
+                    };
                     (src.clone(), fname, mime)
                 };
 
@@ -124,13 +131,22 @@ fn filename_from_src(src: &str) -> Option<String> {
 }
 
 fn guess_image_mime(name: &str) -> String {
-    let lower = name.to_ascii_lowercase();
+    let lower = name
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(name)
+        .trim()
+        .to_ascii_lowercase();
     if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
         "image/jpeg".to_string()
     } else if lower.ends_with(".gif") {
         "image/gif".to_string()
     } else if lower.ends_with(".webp") {
         "image/webp".to_string()
+    } else if lower.ends_with(".svg") || lower.ends_with(".svgz") {
+        "image/svg+xml".to_string()
+    } else if lower.ends_with(".html") || lower.ends_with(".htm") || lower.ends_with(".xhtml") {
+        "text/html".to_string()
     } else {
         "image/png".to_string()
     }
@@ -229,6 +245,23 @@ mod tests {
         assert_eq!(eff_mixed[1].name, "banner.jpg");
         assert_eq!(eff_mixed[1].content_type, "image/jpeg");
         assert!(eff_mixed[1].is_inline);
+
+        // Case 3: Inline SVG / HTML redirect URLs must never be misclassified as raster images
+        let msg_non_raster = sample_mail_with_html(
+            r#"<img src="https://cdn.example.com/logo.svg?v=2"><img src="https://track.example.com/pixel.html"><img src="data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=">"#,
+            Vec::new(),
+        );
+        let eff_non_raster = effective_mail_attachments(&msg_non_raster);
+        assert_eq!(eff_non_raster.len(), 3);
+        assert_eq!(eff_non_raster[0].content_type, "image/svg+xml");
+        assert_eq!(eff_non_raster[1].content_type, "text/html");
+        assert_eq!(eff_non_raster[2].content_type, "image/svg+xml");
+        for att in eff_non_raster.iter() {
+            assert!(
+                !crate::img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name)),
+                "non-raster inline img must not be classified as raster image: {att:?}"
+            );
+        }
     }
 
     #[test]
