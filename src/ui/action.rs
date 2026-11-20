@@ -473,6 +473,7 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             ui.group_threads = !ui.group_threads;
             app.config.group_threads = ui.group_threads;
             let _ = app.config.save();
+            app.sync_displayed_mail_details(ui.group_threads, true);
             ui.info(if ui.group_threads {
                 "Thread grouping: On"
             } else {
@@ -747,10 +748,12 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     }
                     app.pinned_mail = Some(msg.clone());
                     if !app.mail_messages.iter().any(|m| m.id == msg.id) {
-                        app.mail_messages.insert(0, msg);
+                        app.mail_messages.insert(0, AppState::mail_summary_from(&msg));
                     }
+                    app.cache_loaded_mail_detail(msg);
                 }
                 app.active_mail_id = Some(hit.id.clone());
+                app.sync_displayed_mail_details(ui.group_threads, false);
                 app.push_focus_to_sync();
                 if needs_hydrate {
                     app.sync_ctrl.request(SyncCommand::HydrateMessage {
@@ -832,8 +835,8 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             msg_id,
             attach_index,
         } => {
-            if let Some(msg) = app.mail_messages.iter().find(|m| m.id == msg_id) {
-                if let Some(overlay) = ImagePreviewOverlay::from_mail_message(msg, attach_index) {
+            if let Some(msg) = app.resolve_mail_for_action(&msg_id) {
+                if let Some(overlay) = ImagePreviewOverlay::from_mail_message(&msg, attach_index) {
                     ui.close_overlays_of(OverlayKind::ImagePreview);
                     ui.push_overlay(Overlay::ImagePreview(overlay));
                     load_current_preview_image(app, ui);
@@ -863,8 +866,8 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 if let Some(cur) = preview.current() {
                     let msg_id = cur.owner_id().to_string();
                     let att_id = cur.att_id().to_string();
-                    if let Some(msg) = app.mail_messages.iter().find(|m| m.id == msg_id) {
-                        if let Some(idx) = parser::effective_mail_attachments(msg)
+                    if let Some(msg) = app.resolve_mail_for_action(&msg_id) {
+                        if let Some(idx) = parser::effective_mail_attachments(&msg)
                             .iter()
                             .position(|a| a.id == att_id)
                         {
@@ -1333,21 +1336,24 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
             false
         }
         HitTarget::ThreadItem(thread_pos) => {
-            if let Some(selected) = app.active_mail() {
-                if let Some(cid) = selected.conversation_id.as_deref() {
-                    let mut msgs: Vec<_> = app
-                        .mail_messages
-                        .iter()
-                        .filter(|m| m.conversation_id.as_deref() == Some(cid))
-                        .collect();
-                    msgs.sort_by(|a, b| a.received_at.cmp(&b.received_at));
-                    if let Some(target_msg) = msgs.get(thread_pos) {
-                        let id = target_msg.id.clone();
-                        if !app.expanded_thread_ids.remove(&id) {
-                            app.expanded_thread_ids.insert(id);
-                        }
-                    }
-                }
+            let toggle_id = app.active_mail().and_then(|selected| {
+                let cid = selected.conversation_id.as_deref()?;
+                let mut msgs: Vec<_> = app
+                    .mail_messages
+                    .iter()
+                    .filter(|m| m.conversation_id.as_deref() == Some(cid))
+                    .collect();
+                msgs.sort_by(|a, b| a.received_at.cmp(&b.received_at));
+                msgs.get(thread_pos).map(|m| m.id.clone())
+            });
+            if let Some(id) = toggle_id {
+                let expanded = if app.expanded_thread_ids.remove(&id) {
+                    false
+                } else {
+                    app.expanded_thread_ids.insert(id);
+                    true
+                };
+                app.sync_displayed_mail_details(ui.group_threads, expanded);
             }
             false
         }
@@ -1429,7 +1435,11 @@ fn resolve_thread_msg(
                 .collect();
             list.sort_by(|a, b| a.received_at.cmp(&b.received_at));
             if let Some(found) = list.get(thread_pos) {
-                return Some(found.clone());
+                return Some(
+                    app.mail_detail(&found.id)
+                        .cloned()
+                        .unwrap_or_else(|| found.clone()),
+                );
             }
         }
     }

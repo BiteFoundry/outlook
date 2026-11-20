@@ -17,9 +17,14 @@ const MAIL_SELECT_COLS: &str = "
     m.meeting_request_json, m.web_link
 ";
 
-const MAIL_SUMMARY_SELECT_COLS: &str = "
+pub(crate) const MAIL_SUMMARY_SELECT_COLS: &str = "
     m.id, m.internet_message_id, m.conversation_id, m.folder_id, m.subject,
-    m.from_json, m.received_at, m.sent_at, m.is_read, m.is_draft,
+    m.from_json,
+    CASE
+        WHEN m.to_json != '[]' AND json_valid(m.to_json) THEN json_extract(m.to_json, '$[0]')
+        ELSE NULL
+    END,
+    m.received_at, m.sent_at, m.is_read, m.is_draft,
     m.flagged, m.importance, m.inference_classification, m.has_attachments,
     m.body_loaded, m.preview, m.meeting_request_json, m.web_link
 ";
@@ -556,8 +561,10 @@ pub fn upsert_mail_messages(conn: &mut Connection, messages: &[MailMessage]) -> 
     Ok(changed_count)
 }
 
-pub fn list_mail_messages(
+fn query_mail_rows(
     conn: &Connection,
+    select_cols: &str,
+    mapper: fn(&Row<'_>) -> rusqlite::Result<MailMessage>,
     folder_id: Option<&str>,
     unread_only: bool,
     flagged_only: bool,
@@ -585,7 +592,7 @@ pub fn list_mail_messages(
     if let Some(folder) = filter {
         let sql = format!(
             "
-            SELECT {MAIL_SELECT_COLS}
+            SELECT {select_cols}
             FROM mail_messages m
             WHERE {FOLDER_FILTER_PREDICATE}
               {extra_clauses}
@@ -594,12 +601,12 @@ pub fn list_mail_messages(
             "
         );
         let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(params![folder, limit as i64], map_mail_message_row)?;
+        let rows = stmt.query_map(params![folder, limit as i64], mapper)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     } else {
         let sql = format!(
             "
-            SELECT {MAIL_SELECT_COLS}
+            SELECT {select_cols}
             FROM mail_messages m
             WHERE 1 = 1
               {extra_clauses}
@@ -608,9 +615,51 @@ pub fn list_mail_messages(
             "
         );
         let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(params![limit as i64], map_mail_message_row)?;
+        let rows = stmt.query_map(params![limit as i64], mapper)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
+}
+
+pub fn list_mail_messages(
+    conn: &Connection,
+    folder_id: Option<&str>,
+    unread_only: bool,
+    flagged_only: bool,
+    focused_only: bool,
+    limit: usize,
+) -> Result<Vec<MailMessage>> {
+    query_mail_rows(
+        conn,
+        MAIL_SELECT_COLS,
+        map_mail_message_row,
+        folder_id,
+        unread_only,
+        flagged_only,
+        focused_only,
+        limit,
+    )
+}
+
+/// Lightweight header-only mail list projection with full filter/order parity
+/// (skips large body/recipient/attachment columns while retaining the first `to` recipient for Sent/Drafts).
+pub fn list_mail_summaries_filtered(
+    conn: &Connection,
+    folder_id_or_wellknown: Option<&str>,
+    unread_only: bool,
+    flagged_only: bool,
+    focused_only: bool,
+    limit: usize,
+) -> Result<Vec<MailMessage>> {
+    query_mail_rows(
+        conn,
+        MAIL_SUMMARY_SELECT_COLS,
+        map_mail_summary_row,
+        folder_id_or_wellknown,
+        unread_only,
+        flagged_only,
+        focused_only,
+        limit,
+    )
 }
 
 /// Lightweight header-only mail list projection (skips large body/recipient/attachment columns).
@@ -619,39 +668,7 @@ pub fn list_mail_summaries(
     folder_id_or_wellknown: Option<&str>,
     limit: usize,
 ) -> Result<Vec<MailMessage>> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    let filter = folder_id_or_wellknown
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-
-    if let Some(folder) = filter {
-        let sql = format!(
-            "
-            SELECT {MAIL_SUMMARY_SELECT_COLS}
-            FROM mail_messages m
-            WHERE {FOLDER_FILTER_PREDICATE}
-            ORDER BY m.received_at DESC, m.id DESC
-            LIMIT ?2
-            "
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(params![folder, limit as i64], map_mail_summary_row)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
-    } else {
-        let sql = format!(
-            "
-            SELECT {MAIL_SUMMARY_SELECT_COLS}
-            FROM mail_messages m
-            ORDER BY m.received_at DESC, m.id DESC
-            LIMIT ?1
-            "
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(params![limit as i64], map_mail_summary_row)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
-    }
+    list_mail_summaries_filtered(conn, folder_id_or_wellknown, false, false, false, limit)
 }
 
 pub fn get_mail_message(conn: &Connection, message_id: &str) -> Result<Option<MailMessage>> {
@@ -1371,14 +1388,19 @@ fn map_mail_message_row(row: &Row<'_>) -> rusqlite::Result<MailMessage> {
 
 fn map_mail_summary_row(row: &Row<'_>) -> rusqlite::Result<MailMessage> {
     let from_json: Option<String> = row.get(5)?;
-    let is_read_int: i32 = row.get(8)?;
-    let is_draft_int: i32 = row.get(9)?;
-    let flagged_int: i32 = row.get(10)?;
-    let has_att_int: i32 = row.get(13)?;
-    let body_loaded_int: i32 = row.get(14)?;
-    let meeting_req_json: Option<String> = row.get(16)?;
+    let first_to_json: Option<String> = row.get(6)?;
+    let is_read_int: i32 = row.get(9)?;
+    let is_draft_int: i32 = row.get(10)?;
+    let flagged_int: i32 = row.get(11)?;
+    let has_att_int: i32 = row.get(14)?;
+    let body_loaded_int: i32 = row.get(15)?;
+    let meeting_req_json: Option<String> = row.get(17)?;
 
     let from: Option<EmailRecipient> = from_json.and_then(|s| serde_json::from_str(&s).ok());
+    let to_recipients: Vec<EmailRecipient> = first_to_json
+        .and_then(|s| serde_json::from_str::<EmailRecipient>(&s).ok())
+        .into_iter()
+        .collect();
     let meeting_request: Option<MeetingRequestInfo> =
         meeting_req_json.and_then(|s| serde_json::from_str(&s).ok());
 
@@ -1389,25 +1411,25 @@ fn map_mail_summary_row(row: &Row<'_>) -> rusqlite::Result<MailMessage> {
         folder_id: row.get(3)?,
         subject: row.get(4)?,
         from,
-        to_recipients: Vec::new(),
+        to_recipients,
         cc_recipients: Vec::new(),
         bcc_recipients: Vec::new(),
         reply_to: Vec::new(),
-        received_at: row.get(6)?,
-        sent_at: row.get(7)?,
+        received_at: row.get(7)?,
+        sent_at: row.get(8)?,
         is_read: is_read_int != 0,
         is_draft: is_draft_int != 0,
         flagged: flagged_int != 0,
-        importance: row.get(11)?,
-        inference_classification: row.get(12)?,
+        importance: row.get(12)?,
+        inference_classification: row.get(13)?,
         has_attachments: has_att_int != 0,
         body_loaded: body_loaded_int != 0,
-        preview: row.get(15)?,
+        preview: row.get(16)?,
         body_html: String::new(),
         body_plain: String::new(),
         attachments: Vec::new(),
         meeting_request,
-        web_link: row.get(17)?,
+        web_link: row.get(18)?,
     })
 }
 

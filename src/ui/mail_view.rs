@@ -599,6 +599,8 @@ pub fn draw_reader(
         );
     }
 
+    app.ensure_displayed_mail_details_local(ui);
+
     draw_reader_toolbar(frame, area, app, ui, hitmap);
 
     let body_area = Rect::new(
@@ -636,6 +638,18 @@ pub fn draw_reader(
                 .cloned()
                 .collect();
             list.sort_by(|a, b| a.received_at.cmp(&b.received_at));
+            let total = list.len();
+            for (pos, msg) in list.iter_mut().enumerate() {
+                let is_expanded = pos + 1 == total || app.expanded_thread_ids.contains(&msg.id);
+                if is_expanded {
+                    if let Some(full) = app.mail_detail_cache.get(&msg.id) {
+                        *msg = full.clone();
+                    } else if let Some(pinned) = app.pinned_mail.as_ref().filter(|p| p.id == msg.id)
+                    {
+                        *msg = pinned.clone();
+                    }
+                }
+            }
             if list.is_empty() {
                 vec![selected_mail]
             } else {
@@ -2197,5 +2211,79 @@ mod tests {
             !shown_text.contains("(https://bare.example.com)"),
             "bare URL should not be duplicated in parens, got:\n{shown_text}"
         );
+    }
+
+    #[test]
+    fn reader_and_list_render_summaries_with_lazy_loaded_expanded_thread() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let cfg = crate::config::AppConfig::default();
+        let auth = crate::auth::AuthManager::new(cfg.clone()).unwrap();
+        let graph = crate::graph::GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = crate::storage::Storage::open_in_memory().unwrap();
+        let (focus_tx, _) = tokio::sync::watch::channel(crate::sync::FocusTarget::default());
+        let (cmd_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let sync_ctrl = crate::sync::SyncController::from_channels(focus_tx, cmd_tx);
+        let (ui_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+        ui.group_threads = true;
+
+        app.storage
+            .upsert_mail_folders(&[crate::models::MailFolder {
+                id: "f-inbox".into(),
+                display_name: "Inbox".into(),
+                well_known_name: Some("inbox".into()),
+                parent_folder_id: None,
+                child_folder_count: 0,
+                unread_item_count: 1,
+                total_item_count: 2,
+            }])
+            .unwrap();
+
+        let mut older = sample_mail("m-old", "conv-1", "<p>OLDER_LAZY_BODY_TOKEN</p>");
+        older.folder_id = Some("f-inbox".into());
+        older.received_at = "2026-11-19T08:00:00Z".into();
+        older.preview = "Older collapsed preview".into();
+        older.meeting_request = None;
+
+        let mut newer = sample_mail("m-new", "conv-1", "<p>NEWER_LAZY_BODY_TOKEN</p>");
+        newer.folder_id = Some("f-inbox".into());
+        newer.received_at = "2026-11-19T10:00:00Z".into();
+        newer.preview = "Newer preview".into();
+        newer.meeting_request = None;
+
+        app.storage.upsert_mail_messages(&[older, newer]).unwrap();
+        app.select_mail_folder(&mut ui, "f-inbox".into());
+        assert!(app.mail_messages.iter().all(|m| m.body_html.is_empty()));
+
+        let render_reader_text = |app: &mut AppState, ui: &mut UiState| -> String {
+            let backend = TestBackend::new(100, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut hitmap = HitMap::default();
+            terminal
+                .draw(|f| draw_reader(f, f.area(), app, ui, &mut hitmap))
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let mut s = String::new();
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    s.push_str(buf[(x, y)].symbol());
+                }
+                s.push('\n');
+            }
+            s
+        };
+
+        let collapsed = render_reader_text(&mut app, &mut ui);
+        assert!(collapsed.contains("NEWER_LAZY_BODY_TOKEN"));
+        assert!(collapsed.contains("Older collapsed preview"));
+        assert!(!collapsed.contains("OLDER_LAZY_BODY_TOKEN"));
+
+        // Expanding older thread item lazily loads and renders its body
+        app.expanded_thread_ids.insert("m-old".into());
+        let expanded = render_reader_text(&mut app, &mut ui);
+        assert!(expanded.contains("NEWER_LAZY_BODY_TOKEN"));
+        assert!(expanded.contains("OLDER_LAZY_BODY_TOKEN"));
     }
 }

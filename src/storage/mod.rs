@@ -214,6 +214,25 @@ impl Storage {
         outlook::list_mail_summaries(&conn, folder_id, limit)
     }
 
+    pub fn list_mail_summaries_filtered(
+        &self,
+        folder_id: Option<&str>,
+        unread_only: bool,
+        flagged_only: bool,
+        focused_only: bool,
+        limit: usize,
+    ) -> Result<Vec<MailMessage>> {
+        let conn = self.read_conn()?;
+        outlook::list_mail_summaries_filtered(
+            &conn,
+            folder_id,
+            unread_only,
+            flagged_only,
+            focused_only,
+            limit,
+        )
+    }
+
     pub fn get_mail_message(&self, id: &str) -> Result<Option<MailMessage>> {
         let conn = self.read_conn()?;
         outlook::get_mail_message(&conn, id)
@@ -697,5 +716,142 @@ mod tests {
             storage.get_sync_cursor("mail_delta:inbox").unwrap(),
             Some(cursor)
         );
+    }
+
+    #[test]
+    fn test_list_mail_summaries_filtered_projection_order_and_first_recipient() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_mail_folders(&[
+                MailFolder {
+                    id: "fld-inbox".to_string(),
+                    display_name: "Inbox".to_string(),
+                    well_known_name: Some("inbox".to_string()),
+                    parent_folder_id: None,
+                    child_folder_count: 0,
+                    unread_item_count: 2,
+                    total_item_count: 4,
+                },
+                MailFolder {
+                    id: "fld-sent".to_string(),
+                    display_name: "Sent Items".to_string(),
+                    well_known_name: Some("sentitems".to_string()),
+                    parent_folder_id: None,
+                    child_folder_count: 0,
+                    unread_item_count: 0,
+                    total_item_count: 1,
+                },
+            ])
+            .unwrap();
+
+        let cols_lower = outlook::MAIL_SUMMARY_SELECT_COLS.to_ascii_lowercase();
+        for forbidden in [
+            "body_html",
+            "body_plain",
+            "attachments_json",
+            "cc_json",
+            "bcc_json",
+            "reply_to_json",
+        ] {
+            assert!(
+                !cols_lower.contains(forbidden),
+                "MAIL_SUMMARY_SELECT_COLS must not select {forbidden}: {}",
+                outlook::MAIL_SUMMARY_SELECT_COLS
+            );
+        }
+
+        let make = |id: &str, folder: &str, ts: &str, read: bool, flagged: bool, focused: bool| {
+            let mut m = sample_mail(
+                id,
+                folder,
+                &format!("Subject {id}"),
+                "Alice",
+                "alice@example.com",
+                ts,
+                true,
+                &format!("<p>Large body for {id} {}</p>", "X".repeat(2048)),
+                &format!("Large plain for {id}"),
+            );
+            m.is_read = read;
+            m.flagged = flagged;
+            m.inference_classification = Some(if focused { "focused" } else { "other" }.into());
+            m.to_recipients = vec![
+                EmailRecipient {
+                    name: Some("Bob First".into()),
+                    address: "bob@example.com".into(),
+                },
+                EmailRecipient {
+                    name: Some("Carol Second".into()),
+                    address: "carol@example.com".into(),
+                },
+            ];
+            m.cc_recipients = vec![EmailRecipient {
+                name: Some("Dan Cc".into()),
+                address: "dan@example.com".into(),
+            }];
+            m.has_attachments = true;
+            m.attachments = vec![MailAttachment {
+                id: format!("att-{id}"),
+                name: "deck.pdf".into(),
+                content_type: "application/pdf".into(),
+                size: 1234,
+                is_inline: false,
+                content_id: None,
+                content_bytes_b64: Some("QUJD".into()),
+            }];
+            m.web_link = Some(format!("https://outlook.office.com/mail/{id}"));
+            m
+        };
+
+        // 2 older unread+flagged messages and 3 newer read+unflagged messages
+        let msgs = vec![
+            make("m1", "fld-inbox", "2026-11-10T10:00:00Z", false, true, true),
+            make("m2", "fld-inbox", "2026-11-11T10:00:00Z", false, true, false),
+            make("m3", "fld-inbox", "2026-11-12T10:00:00Z", true, false, true),
+            make("m4", "fld-inbox", "2026-11-13T10:00:00Z", true, false, true),
+            make("m5", "fld-sent", "2026-11-14T10:00:00Z", true, false, true),
+        ];
+        storage.upsert_mail_messages(&msgs).unwrap();
+
+        // Filters and ORDER BY received_at DESC must apply BEFORE LIMIT 2
+        let unread = storage
+            .list_mail_summaries_filtered(None, true, false, false, 2)
+            .unwrap();
+        let unread_ids: Vec<&str> = unread.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(unread_ids, vec!["m2", "m1"]);
+
+        let flagged_focused = storage
+            .list_mail_summaries_filtered(Some("inbox"), false, true, true, 2)
+            .unwrap();
+        assert_eq!(flagged_focused.len(), 1);
+        assert_eq!(flagged_focused[0].id, "m1");
+
+        // Summary omits heavy columns, preserves body_loaded and web_link, and keeps ONLY the first to_recipient
+        let sent = storage
+            .list_mail_summaries_filtered(Some("sentitems"), false, false, false, 10)
+            .unwrap();
+        assert_eq!(sent.len(), 1);
+        let s = &sent[0];
+        assert_eq!(s.id, "m5");
+        assert!(s.body_loaded);
+        assert!(s.has_attachments);
+        assert!(s.body_html.is_empty());
+        assert!(s.body_plain.is_empty());
+        assert!(s.attachments.is_empty());
+        assert!(s.cc_recipients.is_empty());
+        assert_eq!(
+            s.web_link.as_deref(),
+            Some("https://outlook.office.com/mail/m5")
+        );
+        assert_eq!(s.to_recipients.len(), 1);
+        assert_eq!(s.to_recipients[0].short_display(), "Bob First");
+
+        // Full lookup still loads complete body, recipients, attachments, and matching web_link
+        let full = storage.get_mail_message("m5").unwrap().unwrap();
+        assert!(full.body_html.contains("Large body for m5"));
+        assert_eq!(full.to_recipients.len(), 2);
+        assert_eq!(full.cc_recipients.len(), 1);
+        assert_eq!(full.attachments.len(), 1);
+        assert_eq!(full.web_link, s.web_link);
     }
 }

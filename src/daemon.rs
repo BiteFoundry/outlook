@@ -1193,7 +1193,7 @@ async fn run_initial_bootstrap(
             }
             let st_msgs = storage.clone();
             if let Ok(Ok(messages)) = tokio::task::spawn_blocking(move || {
-                st_msgs.list_mail_messages(Some("inbox"), false, false, false, 100)
+                st_msgs.list_mail_summaries_filtered(Some("inbox"), false, false, false, 100)
             })
             .await
             {

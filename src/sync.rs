@@ -996,7 +996,13 @@ async fn prefetch_unread_bodies(
 ) -> Result<usize> {
     let fid = folder_id.to_string();
     let unread_ids: Vec<String> = run_storage(storage, move |st| {
-        let msgs = st.list_mail_messages(Some(&fid), true, false, false, max_count.saturating_mul(4).max(10))?;
+        let msgs = st.list_mail_summaries_filtered(
+            Some(&fid),
+            true,
+            false,
+            false,
+            max_count.saturating_mul(4).max(10),
+        )?;
         Ok(msgs
             .into_iter()
             .filter(|m| !m.body_loaded)
@@ -1089,7 +1095,7 @@ async fn load_older_mail_page(
             history_next_link: final_next_link.or_else(|| Some(HISTORY_EOF_MARKER.to_string())),
             last_synced_at: chrono::Utc::now().to_rfc3339(),
         })?;
-        st.list_mail_messages(Some(&fid_owned), false, false, false, 500)
+        st.list_mail_summaries_filtered(Some(&fid_owned), false, false, false, 500)
     })
     .await?;
 
@@ -1141,7 +1147,7 @@ async fn sync_mail_folder_via_page(
             })?;
         }
         let list = if changed > 0 || !is_periodic {
-            st.list_mail_messages(Some(&fid_clone), false, false, false, 100)?
+            st.list_mail_summaries_filtered(Some(&fid_clone), false, false, false, 100)?
         } else {
             Vec::new()
         };
@@ -1260,7 +1266,7 @@ async fn sync_mail_folder(
             last_synced_at: chrono::Utc::now().to_rfc3339(),
         })?;
         let list = if changed > 0 || had_deleted || !is_periodic {
-            st.list_mail_messages(Some(&fid_clone), false, false, false, 100)?
+            st.list_mail_summaries_filtered(Some(&fid_clone), false, false, false, 100)?
         } else {
             Vec::new()
         };

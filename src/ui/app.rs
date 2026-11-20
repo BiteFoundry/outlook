@@ -394,6 +394,8 @@ pub struct AppState {
     pub mail_folders: Vec<MailFolder>,
     pub active_folder_id: String,
     pub mail_messages: Vec<MailMessage>,
+    pub mail_detail_cache: HashMap<String, MailMessage>,
+    mail_detail_missing: HashSet<String>,
     pub active_mail_id: Option<String>,
     pub expanded_thread_ids: HashSet<String>,
     pub expanded_quoted_ids: HashSet<String>,
@@ -461,6 +463,8 @@ impl AppState {
             mail_folders: Vec::new(),
             active_folder_id: "inbox".to_string(),
             mail_messages: Vec::new(),
+            mail_detail_cache: HashMap::new(),
+            mail_detail_missing: HashSet::new(),
             active_mail_id: None,
             expanded_thread_ids: HashSet::new(),
             expanded_quoted_ids: HashSet::new(),
@@ -515,13 +519,20 @@ impl AppState {
                 self.active_folder_id = inbox.id.clone();
             }
         }
-        if let Ok(msgs) =
-            self.storage
-                .list_mail_messages(Some(&self.active_folder_id), false, false, false, 150)
-        {
+        if let Ok(msgs) = self.storage.list_mail_summaries_filtered(
+            Some(&self.active_folder_id),
+            false,
+            false,
+            false,
+            150,
+        ) {
             self.mail_messages = msgs;
-            if let Some(first) = self.mail_messages.first() {
-                self.active_mail_id = Some(first.id.clone());
+            self.clear_mail_detail_cache();
+            if let Some(first_id) = self.mail_messages.first().map(|m| m.id.clone()) {
+                self.active_mail_id = Some(first_id.clone());
+                self.load_mail_detail(&first_id, true);
+            } else {
+                self.active_mail_id = None;
             }
         }
         if let Ok(events) = self.storage.list_calendar_events(None, None, 200) {
@@ -658,20 +669,170 @@ impl AppState {
         rows
     }
 
+    pub(crate) fn mail_summary_from(msg: &MailMessage) -> MailMessage {
+        MailMessage {
+            id: msg.id.clone(),
+            internet_message_id: msg.internet_message_id.clone(),
+            conversation_id: msg.conversation_id.clone(),
+            folder_id: msg.folder_id.clone(),
+            subject: msg.subject.clone(),
+            from: msg.from.clone(),
+            to_recipients: msg.to_recipients.first().cloned().into_iter().collect(),
+            cc_recipients: Vec::new(),
+            bcc_recipients: Vec::new(),
+            reply_to: Vec::new(),
+            received_at: msg.received_at.clone(),
+            sent_at: msg.sent_at.clone(),
+            is_read: msg.is_read,
+            is_draft: msg.is_draft,
+            flagged: msg.flagged,
+            importance: msg.importance.clone(),
+            inference_classification: msg.inference_classification.clone(),
+            has_attachments: msg.has_attachments || !msg.attachments.is_empty(),
+            body_loaded: msg.body_loaded,
+            preview: msg.preview.clone(),
+            body_html: String::new(),
+            body_plain: String::new(),
+            attachments: Vec::new(),
+            meeting_request: msg.meeting_request.clone(),
+            web_link: msg.web_link.clone(),
+        }
+    }
+
+    pub fn mail_detail(&self, id: &str) -> Option<&MailMessage> {
+        self.mail_detail_cache
+            .get(id)
+            .or_else(|| self.pinned_mail.as_ref().filter(|m| m.id == id))
+            .or_else(|| self.mail_messages.iter().find(|m| m.id == id))
+    }
+
     pub fn active_mail(&self) -> Option<&MailMessage> {
         let id = self.active_mail_id.as_deref()?;
-        self.mail_messages
-            .iter()
-            .find(|m| m.id == id)
-            .or_else(|| self.pinned_mail.as_ref().filter(|m| m.id == id))
+        self.mail_detail(id)
     }
 
     pub fn active_mail_mut(&mut self) -> Option<&mut MailMessage> {
         let id = self.active_mail_id.as_deref()?.to_string();
+        if self.mail_detail_cache.contains_key(&id) {
+            return self.mail_detail_cache.get_mut(&id);
+        }
+        if self.pinned_mail.as_ref().is_some_and(|m| m.id == id) {
+            return self.pinned_mail.as_mut();
+        }
         if let Some(idx) = self.mail_messages.iter().position(|m| m.id == id) {
             return Some(&mut self.mail_messages[idx]);
         }
-        self.pinned_mail.as_mut().filter(|m| m.id == id)
+        None
+    }
+
+    pub(crate) fn clear_mail_detail_cache(&mut self) {
+        self.mail_detail_cache.clear();
+        self.mail_detail_missing.clear();
+    }
+
+    pub(crate) fn cache_loaded_mail_detail(&mut self, msg: MailMessage) {
+        self.mail_detail_missing.remove(&msg.id);
+        self.mail_detail_cache.insert(msg.id.clone(), msg);
+    }
+
+    pub(crate) fn resolve_mail_for_action(&mut self, id: &str) -> Option<MailMessage> {
+        if let Some(cached) = self.mail_detail_cache.get(id) {
+            return Some(cached.clone());
+        }
+        if let Some(pinned) = self.pinned_mail.as_ref().filter(|m| m.id == id) {
+            return Some(pinned.clone());
+        }
+        if !self.mail_detail_missing.contains(id) {
+            if let Ok(Some(full)) = self.storage.get_mail_message(id) {
+                return Some(full);
+            }
+        }
+        self.mail_messages.iter().find(|m| m.id == id).cloned()
+    }
+
+    fn displayed_mail_ids(&self, group_threads: bool) -> Vec<String> {
+        let Some(active_id) = self.active_mail_id.as_deref() else {
+            return Vec::new();
+        };
+        let mut ids = vec![active_id.to_string()];
+        if !group_threads {
+            return ids;
+        }
+        let conv_id = self
+            .mail_messages
+            .iter()
+            .find(|m| m.id == active_id)
+            .or_else(|| self.pinned_mail.as_ref().filter(|m| m.id == active_id))
+            .or_else(|| self.mail_detail_cache.get(active_id))
+            .and_then(|m| m.conversation_id.as_deref())
+            .filter(|s| !s.is_empty());
+        let Some(cid) = conv_id else {
+            return ids;
+        };
+        let mut thread_refs: Vec<&MailMessage> = self
+            .mail_messages
+            .iter()
+            .filter(|m| m.conversation_id.as_deref() == Some(cid))
+            .collect();
+        thread_refs.sort_by(|a, b| a.received_at.cmp(&b.received_at));
+        if let Some(latest) = thread_refs.last() {
+            if !ids.iter().any(|id| id == &latest.id) {
+                ids.push(latest.id.clone());
+            }
+        }
+        for msg in thread_refs {
+            if self.expanded_thread_ids.contains(&msg.id)
+                && !ids.iter().any(|id| id == &msg.id)
+            {
+                ids.push(msg.id.clone());
+            }
+        }
+        ids
+    }
+
+    fn load_mail_detail(&mut self, id: &str, request_hydrate: bool) {
+        if !self.mail_detail_cache.contains_key(id) && !self.mail_detail_missing.contains(id) {
+            match self.storage.get_mail_message(id) {
+                Ok(Some(full)) => {
+                    self.mail_detail_cache.insert(id.to_string(), full);
+                }
+                Ok(None) => {
+                    self.mail_detail_missing.insert(id.to_string());
+                }
+                Err(_) => {}
+            }
+        }
+        if request_hydrate {
+            if let Some(msg) = self.mail_detail(id) {
+                if !msg.body_loaded {
+                    self.sync_ctrl.request(SyncCommand::HydrateMessage {
+                        message_id: id.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    pub(crate) fn sync_displayed_mail_details(
+        &mut self,
+        group_threads: bool,
+        request_hydrate: bool,
+    ) {
+        let needed = self.displayed_mail_ids(group_threads);
+        self.mail_detail_cache
+            .retain(|id, _| needed.iter().any(|k| k == id));
+        self.mail_detail_missing
+            .retain(|id| needed.iter().any(|k| k == id));
+        for id in needed {
+            self.load_mail_detail(&id, request_hydrate);
+        }
+    }
+
+    pub(crate) fn ensure_displayed_mail_details_local(&mut self, ui: &UiState) {
+        let needed = self.displayed_mail_ids(ui.group_threads);
+        for id in needed {
+            self.load_mail_detail(&id, false);
+        }
     }
 
     fn find_inbox_folder_id(&self) -> Option<String> {
@@ -684,19 +845,13 @@ impl AppState {
             if self.active_mail_id.as_deref() == Some(pinned.id.as_str())
                 && !self.mail_messages.iter().any(|m| m.id == pinned.id)
             {
-                self.mail_messages.push(pinned.clone());
+                self.mail_messages.push(Self::mail_summary_from(pinned));
             }
         }
     }
 
-    fn hydrate_active_mail_if_needed(&self) {
-        if let Some(active) = self.active_mail() {
-            if !active.body_loaded {
-                self.sync_ctrl.request(SyncCommand::HydrateMessage {
-                    message_id: active.id.clone(),
-                });
-            }
-        }
+    fn hydrate_active_mail_if_needed(&mut self, group_threads: bool) {
+        self.sync_displayed_mail_details(group_threads, true);
     }
 
     pub(crate) fn sync_mail_list_selection_to_active(&self, ui: &mut UiState) {
@@ -787,7 +942,7 @@ impl AppState {
                         .map(|f| f.id.clone())
                         .unwrap_or_else(|| "inbox".to_string());
                 let msgs = read_st
-                    .list_mail_messages(Some(&inbox_id), false, false, false, 150)
+                    .list_mail_summaries_filtered(Some(&inbox_id), false, false, false, 150)
                     .unwrap_or_default();
                 let events = read_st
                     .list_calendar_events(None, None, 200)
@@ -869,6 +1024,7 @@ impl AppState {
     pub fn select_mail_folder(&mut self, ui: &mut UiState, folder_id: String) {
         self.active_folder_id = folder_id.clone();
         self.pinned_mail = None;
+        self.clear_mail_detail_cache();
         self.mail_oldest_reached = false;
         self.loading_older_mail = false;
         ui.mail_list_scroll = ScrollState::default();
@@ -884,7 +1040,7 @@ impl AppState {
 
         self.mail_messages = self
             .storage
-            .list_mail_messages(filter_folder, unread_only, flagged_only, false, 150)
+            .list_mail_summaries_filtered(filter_folder, unread_only, flagged_only, false, 150)
             .unwrap_or_default();
 
         self.select_first_visible_mail(ui);
@@ -902,17 +1058,18 @@ impl AppState {
         let rows = self.visible_mail_rows(ui);
         if let Some(first) = rows.first() {
             ui.mail_list_scroll.selected_idx = Some(0);
-            if let Some(msg) = self.mail_messages.get(first.primary_msg_idx) {
-                self.active_mail_id = Some(msg.id.clone());
-                if !msg.body_loaded {
-                    self.sync_ctrl.request(SyncCommand::HydrateMessage {
-                        message_id: msg.id.clone(),
-                    });
-                }
+            if let Some(msg_id) = self
+                .mail_messages
+                .get(first.primary_msg_idx)
+                .map(|m| m.id.clone())
+            {
+                self.active_mail_id = Some(msg_id);
+                self.sync_displayed_mail_details(ui.group_threads, true);
             }
         } else {
             ui.mail_list_scroll.selected_idx = None;
             self.active_mail_id = None;
+            self.clear_mail_detail_cache();
         }
     }
 
@@ -921,27 +1078,28 @@ impl AppState {
         if rows.is_empty() {
             ui.mail_list_scroll.selected_idx = None;
             self.active_mail_id = None;
+            self.clear_mail_detail_cache();
             return;
         }
         let clamped = row_idx.min(rows.len() - 1);
         ui.mail_list_scroll.selected_idx = Some(clamped);
         ui.mail_read_scroll.offset = 0;
 
-        if let Some(msg) = self.mail_messages.get(rows[clamped].primary_msg_idx).cloned() {
+        if let Some(msg_id) = self
+            .mail_messages
+            .get(rows[clamped].primary_msg_idx)
+            .map(|m| m.id.clone())
+        {
             if self
                 .pinned_mail
                 .as_ref()
-                .is_some_and(|p| p.id != msg.id)
+                .is_some_and(|p| p.id != msg_id)
             {
                 self.pinned_mail = None;
             }
-            self.active_mail_id = Some(msg.id.clone());
+            self.active_mail_id = Some(msg_id);
+            self.sync_displayed_mail_details(ui.group_threads, true);
             self.push_focus_to_sync();
-            if !msg.body_loaded {
-                self.sync_ctrl.request(SyncCommand::HydrateMessage {
-                    message_id: msg.id.clone(),
-                });
-            }
         }
 
         // Auto-load older mail when reaching near bottom of folder list
@@ -966,12 +1124,20 @@ impl AppState {
     }
 
     pub fn toggle_mail_read(&mut self, ui: &mut UiState) {
-        let Some(msg) = self.active_mail_mut() else {
+        let Some((id, new_read)) = self.active_mail().map(|m| (m.id.clone(), !m.is_read)) else {
             return;
         };
-        let id = msg.id.clone();
-        let new_read = !msg.is_read;
-        msg.is_read = new_read;
+        if let Some(m) = self.mail_messages.iter_mut().find(|m| m.id == id) {
+            m.is_read = new_read;
+        }
+        if let Some(m) = self.mail_detail_cache.get_mut(&id) {
+            m.is_read = new_read;
+        }
+        if let Some(ref mut m) = self.pinned_mail {
+            if m.id == id {
+                m.is_read = new_read;
+            }
+        }
         let _ = self.storage.set_mail_read_local(&id, new_read);
 
         if tokio::runtime::Handle::try_current().is_err() {
@@ -992,12 +1158,20 @@ impl AppState {
     }
 
     pub fn toggle_mail_flag(&mut self, ui: &mut UiState) {
-        let Some(msg) = self.active_mail_mut() else {
+        let Some((id, new_flag)) = self.active_mail().map(|m| (m.id.clone(), !m.flagged)) else {
             return;
         };
-        let id = msg.id.clone();
-        let new_flag = !msg.flagged;
-        msg.flagged = new_flag;
+        if let Some(m) = self.mail_messages.iter_mut().find(|m| m.id == id) {
+            m.flagged = new_flag;
+        }
+        if let Some(m) = self.mail_detail_cache.get_mut(&id) {
+            m.flagged = new_flag;
+        }
+        if let Some(ref mut m) = self.pinned_mail {
+            if m.id == id {
+                m.flagged = new_flag;
+            }
+        }
         let _ = self.storage.set_mail_flagged_local(&id, new_flag);
         ui.info(if new_flag { "Flagged" } else { "Unflagged" });
 
@@ -1028,6 +1202,9 @@ impl AppState {
         let prev_sel = ui.mail_list_scroll.selected_idx.unwrap_or(0);
         if self.active_folder_id != archive_id {
             self.mail_messages.retain(|m| m.id != id);
+            self.mail_detail_cache.remove(&id);
+            self.mail_detail_missing.remove(&id);
+            self.expanded_thread_ids.remove(&id);
             if self.pinned_mail.as_ref().is_some_and(|p| p.id == id) {
                 self.pinned_mail = None;
             }
@@ -1076,6 +1253,9 @@ impl AppState {
 
         let prev_sel = ui.mail_list_scroll.selected_idx.unwrap_or(0);
         self.mail_messages.retain(|m| m.id != id);
+        self.mail_detail_cache.remove(&id);
+        self.mail_detail_missing.remove(&id);
+        self.expanded_thread_ids.remove(&id);
         if self.pinned_mail.as_ref().is_some_and(|p| p.id == id) {
             self.pinned_mail = None;
         }
@@ -1120,6 +1300,12 @@ impl AppState {
             let id_set: HashSet<&str> = message_ids.iter().map(String::as_str).collect();
             self.mail_messages
                 .retain(|m| !id_set.contains(m.id.as_str()));
+            self.mail_detail_cache
+                .retain(|id, _| !id_set.contains(id.as_str()));
+            self.mail_detail_missing
+                .retain(|id| !id_set.contains(id.as_str()));
+            self.expanded_thread_ids
+                .retain(|id| !id_set.contains(id.as_str()));
             if self
                 .pinned_mail
                 .as_ref()
@@ -1164,6 +1350,7 @@ impl AppState {
         if rows.is_empty() {
             ui.mail_list_scroll.selected_idx = None;
             self.active_mail_id = None;
+            self.clear_mail_detail_cache();
         } else {
             let next_idx = prev_sel.min(rows.len() - 1);
             self.select_mail_row(ui, next_idx);
@@ -1325,11 +1512,11 @@ impl AppState {
         msg_id: String,
         attach_index: usize,
     ) {
-        let Some(msg) = self.mail_messages.iter().find(|m| m.id == msg_id) else {
+        let Some(msg) = self.resolve_mail_for_action(&msg_id) else {
             ui.info("Email not found");
             return;
         };
-        let eff = parser::effective_mail_attachments(msg);
+        let eff = parser::effective_mail_attachments(&msg);
         let Some(att) = eff.get(attach_index).cloned() else {
             ui.info("Attachment not found");
             return;
@@ -1548,6 +1735,20 @@ impl AppState {
             ev.response_status = status_str.to_string();
         }
         for m in &mut self.mail_messages {
+            if let Some(ref mut mr) = m.meeting_request {
+                if mr.event_id.as_deref() == Some(event_id.as_str()) {
+                    mr.response_status = Some(status_str.to_string());
+                }
+            }
+        }
+        for m in self.mail_detail_cache.values_mut() {
+            if let Some(ref mut mr) = m.meeting_request {
+                if mr.event_id.as_deref() == Some(event_id.as_str()) {
+                    mr.response_status = Some(status_str.to_string());
+                }
+            }
+        }
+        if let Some(ref mut m) = self.pinned_mail {
             if let Some(ref mut mr) = m.meeting_request {
                 if mr.event_id.as_deref() == Some(event_id.as_str()) {
                     mr.response_status = Some(status_str.to_string());
@@ -2209,13 +2410,7 @@ impl AppState {
         msg_id: String,
         attach_index: usize,
     ) {
-        let Some(msg) = self
-            .mail_messages
-            .iter()
-            .find(|m| m.id == msg_id)
-            .or_else(|| self.pinned_mail.as_ref().filter(|m| m.id == msg_id))
-            .cloned()
-        else {
+        let Some(msg) = self.resolve_mail_for_action(&msg_id) else {
             ui.info("Email not found");
             return;
         };
@@ -2451,7 +2646,7 @@ impl AppState {
                     if let Some(inbox_id) = self.find_inbox_folder_id() {
                         if inbox_id != self.active_folder_id {
                             self.active_folder_id = inbox_id.clone();
-                            if let Ok(loaded) = self.storage.list_mail_messages(
+                            if let Ok(loaded) = self.storage.list_mail_summaries_filtered(
                                 Some(&inbox_id),
                                 false,
                                 false,
@@ -2460,13 +2655,14 @@ impl AppState {
                             ) {
                                 if !loaded.is_empty() {
                                     self.mail_messages = loaded;
+                                    self.clear_mail_detail_cache();
                                     self.preserve_pinned_mail_in_list();
                                 }
                             }
                             if self.active_mail().is_none() {
                                 self.select_first_visible_mail(ui);
                             } else {
-                                self.hydrate_active_mail_if_needed();
+                                self.hydrate_active_mail_if_needed(ui.group_threads);
                             }
                             self.sync_mail_list_selection_to_active(ui);
                             self.push_focus_to_sync();
@@ -2483,12 +2679,13 @@ impl AppState {
                 if self.active_folder_id == folder_id {
                     self.loading_mail = false;
                     self.loading_older_mail = false;
-                    if let Ok(loaded) = self.storage.list_mail_messages(
+                    let limit = self.mail_messages.len().max(messages.len()).max(150);
+                    if let Ok(loaded) = self.storage.list_mail_summaries_filtered(
                         Some(&folder_id),
                         false,
                         false,
                         false,
-                        self.mail_messages.len().max(150),
+                        limit,
                     ) {
                         if !loaded.is_empty() {
                             self.mail_messages = loaded;
@@ -2498,11 +2695,12 @@ impl AppState {
                     } else if !messages.is_empty() {
                         self.mail_messages = messages;
                     }
+                    self.clear_mail_detail_cache();
                     self.preserve_pinned_mail_in_list();
                     if self.active_mail().is_none() {
                         self.select_first_visible_mail(ui);
                     } else {
-                        self.hydrate_active_mail_if_needed();
+                        self.hydrate_active_mail_if_needed(ui.group_threads);
                     }
                     self.sync_mail_list_selection_to_active(ui);
                 }
@@ -2512,13 +2710,14 @@ impl AppState {
             }
             CoreEvent::MailMessageHydrated(hydrated) => {
                 let hydrated = *hydrated;
+                let summary = Self::mail_summary_from(&hydrated);
                 let mut found_in_list = false;
                 if let Some(existing) = self
                     .mail_messages
                     .iter_mut()
                     .find(|m| m.id == hydrated.id)
                 {
-                    *existing = hydrated.clone();
+                    *existing = summary.clone();
                     found_in_list = true;
                 }
                 if let Some(ref mut pinned) = self.pinned_mail {
@@ -2526,8 +2725,16 @@ impl AppState {
                         *pinned = hydrated.clone();
                     }
                 }
+                let is_displayed = self
+                    .displayed_mail_ids(ui.group_threads)
+                    .iter()
+                    .any(|id| id == &hydrated.id)
+                    || self.mail_detail_cache.contains_key(&hydrated.id);
                 if !found_in_list && self.active_mail_id.as_deref() == Some(hydrated.id.as_str()) {
-                    self.mail_messages.insert(0, hydrated);
+                    self.mail_messages.insert(0, summary);
+                    self.cache_loaded_mail_detail(hydrated);
+                } else if is_displayed {
+                    self.cache_loaded_mail_detail(hydrated);
                 }
             }
             CoreEvent::CalendarEventsUpdated(events) => {
@@ -2603,10 +2810,11 @@ impl AppState {
                 }
                 if !mail_messages.is_empty() {
                     self.mail_messages = mail_messages;
+                    self.clear_mail_detail_cache();
                 } else if self.mail_messages.is_empty()
                     && !self.active_folder_id.eq_ignore_ascii_case("inbox")
                 {
-                    if let Ok(loaded) = self.storage.list_mail_messages(
+                    if let Ok(loaded) = self.storage.list_mail_summaries_filtered(
                         Some(&self.active_folder_id),
                         false,
                         false,
@@ -2615,6 +2823,7 @@ impl AppState {
                     ) {
                         if !loaded.is_empty() {
                             self.mail_messages = loaded;
+                            self.clear_mail_detail_cache();
                         }
                     }
                 }
@@ -2651,7 +2860,7 @@ impl AppState {
                 if self.active_mail().is_none() {
                     self.select_first_visible_mail(ui);
                 } else {
-                    self.hydrate_active_mail_if_needed();
+                    self.hydrate_active_mail_if_needed(ui.group_threads);
                 }
                 self.sync_mail_list_selection_to_active(ui);
                 self.push_focus_to_sync();
@@ -2663,17 +2872,21 @@ impl AppState {
                 if self.active_folder_id == folder_id {
                     self.loading_mail = false;
                     self.mail_messages = messages;
+                    self.clear_mail_detail_cache();
                     self.preserve_pinned_mail_in_list();
                     if self.active_mail().is_none() {
                         self.select_first_visible_mail(ui);
                     } else {
-                        self.hydrate_active_mail_if_needed();
+                        self.hydrate_active_mail_if_needed(ui.group_threads);
                     }
                     self.sync_mail_list_selection_to_active(ui);
                 }
             }
+            UiMsg::MailDraftSaved { saved, .. } => {
+                self.mail_detail_cache.remove(&saved.id);
+                self.mail_detail_missing.remove(&saved.id);
+            }
             UiMsg::MailSent { .. }
-            | UiMsg::MailDraftSaved { .. }
             | UiMsg::MailMoved { .. }
             | UiMsg::MailDeleted { .. }
             | UiMsg::AttachmentDownloaded(_) => {}
@@ -3278,5 +3491,266 @@ mod tests {
         assert!(!app.searching);
         assert!(!app.search_remote_done);
         assert_eq!(app.search_error.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn summary_list_lazy_loads_displayed_conversation_and_expanded_messages() {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _) = tokio::sync::watch::channel(FocusTarget::default());
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+        let (ui_tx, _) = mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+
+        app.storage
+            .upsert_mail_folders(&[
+                MailFolder {
+                    id: "f-inbox".into(),
+                    display_name: "Inbox".into(),
+                    well_known_name: Some("inbox".into()),
+                    parent_folder_id: None,
+                    child_folder_count: 0,
+                    unread_item_count: 1,
+                    total_item_count: 4,
+                },
+                MailFolder {
+                    id: "f-sent".into(),
+                    display_name: "Sent Items".into(),
+                    well_known_name: Some("sentitems".into()),
+                    parent_folder_id: None,
+                    child_folder_count: 0,
+                    unread_item_count: 0,
+                    total_item_count: 1,
+                },
+            ])
+            .unwrap();
+
+        let mut t1_unhydrated =
+            make_mail("m-t1", "conv-thread", "2026-11-19T08:00:00Z", true, false);
+        t1_unhydrated.folder_id = Some("f-inbox".into());
+        t1_unhydrated.body_loaded = false;
+        t1_unhydrated.body_html.clear();
+        t1_unhydrated.body_plain.clear();
+
+        let mut t2_local =
+            make_mail("m-t2", "conv-thread", "2026-11-19T09:00:00Z", true, false);
+        t2_local.folder_id = Some("f-inbox".into());
+        t2_local.body_html = "<p>Local middle body</p>".into();
+        t2_local.body_plain = "Local middle body".into();
+
+        let mut t3_latest =
+            make_mail("m-t3", "conv-thread", "2026-11-19T11:00:00Z", false, true);
+        t3_latest.folder_id = Some("f-inbox".into());
+        t3_latest.body_html = "<p>Latest thread body</p>".into();
+        t3_latest.body_plain = "Latest thread body".into();
+
+        let mut other = make_mail("m-other", "conv-other", "2026-11-19T10:00:00Z", true, false);
+        other.folder_id = Some("f-inbox".into());
+        other.body_html = "<p>Other conversation body</p>".into();
+        other.body_plain = "Other conversation body".into();
+
+        let mut sent = make_mail("m-sent", "conv-sent", "2026-11-19T12:00:00Z", true, false);
+        sent.folder_id = Some("f-sent".into());
+        sent.to_recipients = vec![
+            EmailRecipient {
+                name: Some("Bob".into()),
+                address: "bob@contoso.com".into(),
+            },
+            EmailRecipient {
+                name: Some("Carol".into()),
+                address: "carol@contoso.com".into(),
+            },
+        ];
+        sent.body_html = "<p>Sent body</p>".into();
+        sent.body_plain = "Sent body".into();
+
+        app.storage
+            .upsert_mail_messages(&[t1_unhydrated, t2_local, t3_latest, other, sent])
+            .unwrap();
+
+        // Initial load keeps summaries in mail_messages and lazily loads ONLY the active message
+        app.load_cached_initial();
+        assert_eq!(app.mail_messages.len(), 4);
+        assert!(app.mail_messages.iter().all(|m| m.body_html.is_empty()));
+        assert_eq!(app.active_mail_id.as_deref(), Some("m-t3"));
+        assert_eq!(app.mail_detail_cache.len(), 1);
+        assert_eq!(
+            app.active_mail().map(|m| m.body_html.as_str()),
+            Some("<p>Latest thread body</p>")
+        );
+        // Local body_loaded == true must NOT request Graph hydration
+        assert!(cmd_rx.try_recv().is_err());
+
+        // Expanding a locally cached thread message loads it by ID without Graph hydration
+        app.expanded_thread_ids.insert("m-t2".into());
+        app.sync_displayed_mail_details(true, true);
+        assert_eq!(app.mail_detail_cache.len(), 2);
+        assert_eq!(
+            app.mail_detail("m-t2").map(|m| m.body_html.as_str()),
+            Some("<p>Local middle body</p>")
+        );
+        assert!(cmd_rx.try_recv().is_err());
+
+        // Expanding an unhydrated thread message triggers Graph HydrateMessage
+        app.expanded_thread_ids.insert("m-t1".into());
+        app.sync_displayed_mail_details(true, true);
+        let mut requested_t1 = false;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if matches!(cmd, SyncCommand::HydrateMessage { ref message_id } if message_id == "m-t1")
+            {
+                requested_t1 = true;
+            }
+        }
+        assert!(requested_t1, "unhydrated expanded message must request Graph hydration");
+
+        // Hydrating m-t1 caches full body in mail_detail_cache while mail_messages stays summary-only
+        let mut t1_full = make_mail("m-t1", "conv-thread", "2026-11-19T08:00:00Z", true, false);
+        t1_full.folder_id = Some("f-inbox".into());
+        t1_full.body_html = "<p>Hydrated t1 body</p>".into();
+        t1_full.body_plain = "Hydrated t1 body".into();
+        t1_full.web_link = Some("https://outlook.office.com/mail/m-t1".into());
+        app.handle_core_event(&mut ui, CoreEvent::MailMessageHydrated(Box::new(t1_full)));
+        assert_eq!(
+            app.mail_detail("m-t1").map(|m| m.body_html.as_str()),
+            Some("<p>Hydrated t1 body</p>")
+        );
+        assert!(
+            app.mail_messages
+                .iter()
+                .find(|m| m.id == "m-t1")
+                .is_some_and(|m| m.body_loaded
+                    && m.body_html.is_empty()
+                    && m.web_link.as_deref() == Some("https://outlook.office.com/mail/m-t1")),
+            "mail_messages must keep summary projection with web_link after hydration"
+        );
+
+        // Background hydration of an undisplayed message must NOT retain its body in RAM
+        let mut other_full =
+            make_mail("m-other", "conv-other", "2026-11-19T10:00:00Z", true, false);
+        other_full.folder_id = Some("f-inbox".into());
+        other_full.body_html = "<p>Prefetched undisplayed body</p>".into();
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::MailMessageHydrated(Box::new(other_full)),
+        );
+        assert!(!app.mail_detail_cache.contains_key("m-other"));
+        assert!(app
+            .mail_messages
+            .iter()
+            .find(|m| m.id == "m-other")
+            .unwrap()
+            .body_html
+            .is_empty());
+
+        // Selecting the next conversation evicts old details and loads only m-other
+        app.select_mail_row(&mut ui, 1);
+        assert_eq!(app.active_mail_id.as_deref(), Some("m-other"));
+        assert_eq!(app.mail_detail_cache.len(), 1);
+        assert_eq!(
+            app.active_mail().map(|m| m.body_html.as_str()),
+            Some("<p>Other conversation body</p>")
+        );
+
+        // Switching to Sent retains first to_recipient on summaries and loads active full body
+        app.select_mail_folder(&mut ui, "f-sent".into());
+        assert_eq!(app.mail_messages.len(), 1);
+        assert!(app.mail_messages[0].body_html.is_empty());
+        assert_eq!(app.mail_messages[0].to_recipients.len(), 1);
+        assert_eq!(app.mail_messages[0].to_recipients[0].short_display(), "Bob");
+        assert_eq!(app.active_mail().unwrap().to_recipients.len(), 2);
+        assert_eq!(app.active_mail().unwrap().body_html, "<p>Sent body</p>");
+
+        // Virtual Unread & Flagged folders filter via SQLite summary projection
+        app.select_mail_folder(&mut ui, VIRTUAL_UNREAD_FOLDER.into());
+        assert_eq!(app.mail_messages.len(), 1);
+        assert_eq!(app.mail_messages[0].id, "m-t3");
+        assert!(app.mail_messages[0].body_html.is_empty());
+        assert_eq!(app.active_mail().unwrap().body_html, "<p>Latest thread body</p>");
+
+        app.select_mail_folder(&mut ui, VIRTUAL_FLAGGED_FOLDER.into());
+        assert_eq!(app.mail_messages.len(), 1);
+        assert_eq!(app.mail_messages[0].id, "m-t3");
+    }
+
+    #[test]
+    fn summary_detail_cache_invalidates_and_stays_consistent_on_edits_and_sync() {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _) = tokio::sync::watch::channel(FocusTarget::default());
+        let (cmd_tx, _) = mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+        let (ui_tx, _) = mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+
+        app.storage
+            .upsert_mail_folders(&[MailFolder {
+                id: "f-inbox".into(),
+                display_name: "Inbox".into(),
+                well_known_name: Some("inbox".into()),
+                parent_folder_id: None,
+                child_folder_count: 0,
+                unread_item_count: 2,
+                total_item_count: 2,
+            }])
+            .unwrap();
+
+        let mut m1 = make_mail("m1", "c1", "2026-11-19T09:00:00Z", false, false);
+        m1.folder_id = Some("f-inbox".into());
+        m1.body_html = "<p>Body v1</p>".into();
+        let mut m2 = make_mail("m2", "c2", "2026-11-19T10:00:00Z", false, false);
+        m2.folder_id = Some("f-inbox".into());
+        m2.body_html = "<p>Body m2</p>".into();
+        app.storage
+            .upsert_mail_messages(&[m1.clone(), m2.clone()])
+            .unwrap();
+
+        app.select_mail_folder(&mut ui, "f-inbox".into());
+        assert_eq!(app.active_mail_id.as_deref(), Some("m2"));
+
+        // Read & flag toggles update summary list, detail cache, and SQLite together
+        app.toggle_mail_read(&mut ui);
+        assert!(app.mail_messages.iter().find(|m| m.id == "m2").unwrap().is_read);
+        assert!(app.active_mail().unwrap().is_read);
+        assert!(app.storage.get_mail_message("m2").unwrap().unwrap().is_read);
+
+        app.toggle_mail_flag(&mut ui);
+        assert!(app.mail_messages.iter().find(|m| m.id == "m2").unwrap().flagged);
+        assert!(app.active_mail().unwrap().flagged);
+        assert!(app.storage.get_mail_message("m2").unwrap().unwrap().flagged);
+
+        // Sync update invalidates cached detail and refreshes updated body from SQLite
+        let mut m2_updated = m2.clone();
+        m2_updated.is_read = true;
+        m2_updated.flagged = true;
+        m2_updated.body_html = "<p>Body m2 edited</p>".into();
+        app.storage.upsert_mail_messages(&[m2_updated]).unwrap();
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::MailMessagesUpdated {
+                folder_id: "f-inbox".into(),
+                messages: vec![],
+                notify_candidate: None,
+            },
+        );
+        assert!(app.mail_messages.iter().all(|m| m.body_html.is_empty()));
+        assert_eq!(app.active_mail().unwrap().body_html, "<p>Body m2 edited</p>");
+
+        // Archiving removes old detail and lazily loads next message
+        app.archive_selected_mail(&mut ui);
+        assert!(!app.mail_detail_cache.contains_key("m2"));
+        assert_eq!(app.active_mail_id.as_deref(), Some("m1"));
+        assert_eq!(app.active_mail().unwrap().body_html, "<p>Body v1</p>");
+
+        // Deleting last message clears active selection and detail cache
+        app.delete_selected_mail(&mut ui);
+        assert!(app.active_mail_id.is_none());
+        assert!(app.mail_detail_cache.is_empty());
     }
 }
