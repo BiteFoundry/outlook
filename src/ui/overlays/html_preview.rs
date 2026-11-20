@@ -165,6 +165,16 @@ impl HtmlPreviewOverlay {
                     self.ensure_focused_visible();
                     self.apply_effects(effects)
                 }
+                Action::MouseScroll { delta, .. } => {
+                    if *delta < 0 {
+                        self.session.scroll_y =
+                            self.session.scroll_y.saturating_sub((-*delta) as u16);
+                    } else {
+                        self.session.scroll_y =
+                            self.session.scroll_y.saturating_add(*delta as u16);
+                    }
+                    OverlayOutcome::Handled
+                }
                 _ => OverlayOutcome::Handled,
             };
         }
@@ -642,6 +652,27 @@ mod tests {
         let scrolled = render_overlay_text(&mut overlay, 80, 16);
         assert!(!scrolled.contains("Paragraph line number 1\n"));
         overlay.handle(&Action::Input('g'));
+        assert_eq!(overlay.session.scroll_y, 0);
+
+        // Wheel scroll still works while editing an HTML form input.
+        overlay.session.editing_input = Some(bitefoundry_html::DomNodeId(0));
+        assert_eq!(
+            overlay.handle(&Action::MouseScroll {
+                delta: 3,
+                column: 20,
+                row: 8,
+            }),
+            OverlayOutcome::Handled
+        );
+        assert_eq!(overlay.session.scroll_y, 3);
+        assert_eq!(
+            overlay.handle(&Action::MouseScroll {
+                delta: -3,
+                column: 20,
+                row: 8,
+            }),
+            OverlayOutcome::Handled
+        );
         assert_eq!(overlay.session.scroll_y, 0);
     }
 

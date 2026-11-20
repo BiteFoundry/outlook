@@ -1177,20 +1177,17 @@ fn handle_activate(app: &mut AppState, ui: &mut UiState) {
 
 fn handle_mouse_scroll(app: &mut AppState, ui: &mut UiState, delta: i32, column: u16, row: u16) {
     if !ui.overlays.is_empty() {
-        if let Some(Overlay::ImagePreview(_)) = ui.overlays.last() {
-            let _ = dispatch(
-                Action::MouseScroll {
-                    delta,
-                    column,
-                    row,
-                },
-                app,
-                ui,
-            );
-        }
         return;
     }
     let pos = ratatui::layout::Position::new(column, row);
+    if ui.nav_area.contains(pos) {
+        let step = if delta < 0 { -1 } else { 1 };
+        let prev_focus = ui.focus;
+        ui.focus = Focus::Nav;
+        move_selection(app, ui, step);
+        ui.focus = prev_focus;
+        return;
+    }
     let list_area = match ui.active_nav_tab {
         TAB_CALENDAR => ui.cal_list_scroll.area,
         TAB_TASKS => ui.todo_list_scroll.area,
