@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use serde::Deserialize;
 
 use super::{
@@ -119,6 +120,12 @@ struct GraphCalendarEvent {
     end: Option<GraphDateTimeTimeZone>,
     #[serde(rename = "isAllDay", default)]
     is_all_day: Option<bool>,
+    #[serde(rename = "type", default)]
+    event_type: Option<String>,
+    #[serde(rename = "originalStartTimeZone", default)]
+    original_start_zone: Option<String>,
+    #[serde(rename = "originalEndTimeZone", default)]
+    original_end_zone: Option<String>,
     #[serde(default)]
     location: Option<GraphLocation>,
     #[serde(default)]
@@ -141,6 +148,68 @@ struct GraphCalendarEvent {
     is_cancelled: Option<bool>,
     #[serde(rename = "webLink", default)]
     web_link: Option<String>,
+}
+
+pub(crate) enum CalendarEditTime {
+    Date(NaiveDate),
+    WallClock(NaiveDateTime),
+    Instant(DateTime<Utc>),
+}
+
+impl CalendarEditTime {
+    pub(crate) fn parse(raw: &str) -> Result<Self> {
+        let raw = raw.trim();
+        if let Ok(value) = DateTime::parse_from_rfc3339(raw) {
+            return Ok(Self::Instant(value.with_timezone(&Utc)));
+        }
+        if let Ok(value) = raw.parse::<NaiveDate>() {
+            return Ok(Self::Date(value));
+        }
+        for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M"] {
+            if let Ok(value) = NaiveDateTime::parse_from_str(raw, format) {
+                return Ok(Self::WallClock(value));
+            }
+        }
+        bail!("Invalid event time '{raw}'. Use RFC3339, local YYYY-MM-DDTHH:MM, or YYYY-MM-DD for all-day events.")
+    }
+
+    fn graph_value(&self, event: &GraphCalendarEvent, start: bool) -> Result<serde_json::Value> {
+        let (origin, current) = if start {
+            (&event.original_start_zone, &event.start)
+        } else {
+            (&event.original_end_zone, &event.end)
+        };
+        let event_zone = origin
+            .as_deref()
+            .or_else(|| current.as_ref()?.time_zone.as_deref())
+            .filter(|zone| !zone.is_empty() && *zone != "tzone://Microsoft/Custom");
+        let all_day = event.is_all_day.unwrap_or(false);
+        let date_time;
+        let zone = match self {
+            Self::Date(date) if all_day => {
+                date_time = format!("{date}T00:00:00");
+                event_zone.context("Outlook did not return a supported all-day event time zone.")?
+            }
+            Self::WallClock(time) if !all_day => {
+                date_time = time.format("%Y-%m-%dT%H:%M:%S%.f").to_string();
+                event_zone.context("Outlook did not return a supported event time zone. Use RFC3339 for a single event.")?
+            }
+            Self::Instant(time) if !all_day => {
+                if matches!(
+                    event.event_type.as_deref(),
+                    Some("seriesMaster" | "occurrence" | "exception")
+                ) && !matches!(event_zone, Some("UTC" | "Etc/UTC"))
+                {
+                    bail!("Use local wall-clock times to keep this recurring event in its original time zone.");
+                }
+                date_time = time.format("%Y-%m-%dT%H:%M:%S%.f").to_string();
+                "UTC"
+            }
+            _ if all_day => bail!("Use YYYY-MM-DD when updating an all-day event."),
+            _ => bail!("Use a date and time when updating a timed event."),
+        };
+        Ok(serde_json::json!({ "dateTime": date_time, "timeZone": zone }))
+    }
 }
 
 impl From<GraphCalendarEvent> for CalendarEvent {
@@ -422,9 +491,52 @@ impl GraphClient {
         event_id: &str,
         event: &OutgoingEvent,
     ) -> Result<CalendarEvent> {
-        let path = format!("/me/events/{}", urlencoding::encode(event_id.trim()));
         let payload = build_event_payload(event);
-        let updated: Option<GraphCalendarEvent> = self.patch_json_optional(&path, &payload).await?;
+        self.patch_calendar_event(event_id, &payload).await
+    }
+
+    pub(crate) async fn edit_calendar_event(
+        &self,
+        event_id: &str,
+        subject: Option<&str>,
+        start: Option<&CalendarEditTime>,
+        end: Option<&CalendarEditTime>,
+    ) -> Result<CalendarEvent> {
+        if subject.is_none() && start.is_none() && end.is_none() {
+            bail!("Provide an event subject, start, or end to update.");
+        }
+        let mut payload = serde_json::json!({});
+        if let Some(subject) = subject {
+            payload["subject"] = serde_json::json!(subject);
+        }
+        if start.is_some() || end.is_some() {
+            let path = format!("/me/events/{}?$select=id,start,end,isAllDay,type,originalStartTimeZone,originalEndTimeZone",
+                urlencoding::encode(event_id.trim()));
+            let current: GraphCalendarEvent = self.get_json(&path).await?;
+            if let Some(start) = start {
+                payload["start"] = start.graph_value(&current, true)?;
+            }
+            if let Some(end) = end {
+                payload["end"] = end.graph_value(&current, false)?;
+            }
+            if start.is_some()
+                && end.is_some()
+                && payload["start"]["timeZone"] == payload["end"]["timeZone"]
+                && payload["start"]["dateTime"].as_str() >= payload["end"]["dateTime"].as_str()
+            {
+                bail!("Event end must be after start.");
+            }
+        }
+        self.patch_calendar_event(event_id, &payload).await
+    }
+
+    async fn patch_calendar_event(
+        &self,
+        event_id: &str,
+        payload: &serde_json::Value,
+    ) -> Result<CalendarEvent> {
+        let path = format!("/me/events/{}", urlencoding::encode(event_id.trim()));
+        let updated: Option<GraphCalendarEvent> = self.patch_json_optional(&path, payload).await?;
         match updated {
             Some(ev) => Ok(CalendarEvent::from(ev)),
             None => self.get_calendar_event(event_id).await,
@@ -478,6 +590,41 @@ mod tests {
         collections::HashMap,
         sync::{Arc, Mutex},
     };
+
+    #[test]
+    fn edit_times_keep_series_zone_and_encode_instants_and_dates() {
+        let mut event: GraphCalendarEvent = serde_json::from_value(serde_json::json!({
+            "type": "seriesMaster", "isAllDay": false,
+            "originalStartTimeZone": "Pacific Standard Time",
+            "originalEndTimeZone": "Pacific Standard Time",
+        }))
+        .unwrap();
+        let local = CalendarEditTime::parse("2026-11-23T09:00").unwrap();
+        assert_eq!(
+            local.graph_value(&event, true).unwrap(),
+            serde_json::json!({
+                "dateTime": "2026-11-23T09:00:00", "timeZone": "Pacific Standard Time",
+            })
+        );
+        let instant = CalendarEditTime::parse("2026-11-23T09:00:00+09:00").unwrap();
+        assert!(instant.graph_value(&event, true).is_err());
+        event.event_type = Some("singleInstance".into());
+        assert_eq!(
+            instant.graph_value(&event, true).unwrap(),
+            serde_json::json!({
+                "dateTime": "2026-11-23T00:00:00", "timeZone": "UTC",
+            })
+        );
+        event.is_all_day = Some(true);
+        let date = CalendarEditTime::parse("2026-11-24").unwrap();
+        assert_eq!(
+            date.graph_value(&event, false).unwrap(),
+            serde_json::json!({
+                "dateTime": "2026-11-24T00:00:00", "timeZone": "Pacific Standard Time",
+            })
+        );
+        assert!(local.graph_value(&event, true).is_err());
+    }
 
     #[tokio::test]
     async fn test_list_calendar_view_and_get_event() {

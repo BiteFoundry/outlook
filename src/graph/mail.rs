@@ -13,7 +13,9 @@ use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
 use super::{
-    client::{BatchSubRequest, BatchSubResponse, GraphDeltaPage, GraphListPage},
+    client::{
+        BatchSubRequest, BatchSubResponse, GraphDeltaPage, GraphListPage, MailActionUnconfirmed,
+    },
     media::{
         deduplicate_dest_path, extension_for_content_type, guess_mime_type,
         is_auth_or_forbidden_error, maybe_refine_image_extension, sanitize_filename,
@@ -1141,38 +1143,91 @@ impl GraphClient {
 
     /// Creates a new draft (`POST /me/messages`) or updates an existing draft (`PATCH /me/messages/{draft_id}`).
     pub async fn save_draft(&self, mail: &OutgoingMail) -> Result<MailMessage> {
-        let (staged, total_size, any_over_limit) = stage_file_attachments(&mail.attachments).await?;
-        let mut message = build_outgoing_message_json(mail);
-        message["isDraft"] = serde_json::Value::Bool(true);
+        self.save_draft_with_progress(mail, None, None, |_| {})
+            .await?
+            .context("Graph did not return a saved draft")
+    }
 
-        if let Some(existing_id) = mail
+    pub(crate) async fn save_draft_with_progress(
+        &self,
+        mail: &OutgoingMail,
+        changed_fields: Option<&[&str]>,
+        thread_quote_html: Option<&str>,
+        mut progress: impl FnMut(DraftSaveChange),
+    ) -> Result<Option<MailMessage>> {
+        let (staged, total_size, any_over_limit) = stage_file_attachments(&mail.attachments).await?;
+        let original = if let Some(id) = mail.forward_of_id.as_deref() {
+            Some((id, "createForward"))
+        } else {
+            mail.in_reply_to_id.as_deref().map(|id| {
+                (
+                    id,
+                    if mail.reply_all {
+                        "createReplyAll"
+                    } else {
+                        "createReply"
+                    },
+                )
+            })
+        };
+        let mut existing_id = mail
             .draft_id
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty());
+        if existing_id.is_some()
+            && changed_fields == Some(&[])
+            && staged.is_empty()
+            && mail.inline_images.is_empty()
         {
-            let patch_path = format!("/me/messages/{}", urlencoding::encode(existing_id));
-            let updated: Option<GraphMailMessage> =
-                self.patch_json_optional(&patch_path, &message).await?;
-            let draft_id_enc = urlencoding::encode(existing_id);
-
-            for att_payload in build_inline_image_attachments_json(&mail.inline_images) {
-                self.post_json_empty(
-                    &format!("/me/messages/{draft_id_enc}/attachments"),
-                    &att_payload,
-                )
-                .await?;
-            }
-            for f in staged {
-                self.upload_draft_file_attachment(&draft_id_enc, &f).await?;
-            }
-
-            if !mail.inline_images.is_empty() || !mail.attachments.is_empty() || updated.is_none() {
-                return self.get_mail_message(existing_id).await;
-            }
-            return Ok(updated.unwrap().into_mail_message(true));
+            return Ok(None);
         }
 
+        let mut message = build_outgoing_message_json(mail);
+        message["isDraft"] = serde_json::Value::Bool(true);
+        let created_thread;
+        let mut quote = thread_quote_html;
+        if let (None, Some((source_id, operation))) = (existing_id, original) {
+            let path = format!(
+                "/me/messages/{}/{operation}",
+                urlencoding::encode(source_id)
+            );
+            let payload = if operation == "createForward" {
+                if mail.to.is_empty() {
+                    bail!("Add a To recipient to save a forward to Outlook.");
+                }
+                Some(serde_json::json!({ "toRecipients": recipients_to_json(&mail.to) }))
+            } else {
+                None
+            };
+            let raw: GraphMailMessage = self
+                .post_mail_action(&path, payload)
+                .await?
+                .json()
+                .await
+                .context(MailActionUnconfirmed)?;
+            if raw.id.trim().is_empty() {
+                return Err(
+                    anyhow!("Graph returned an empty draft ID").context(MailActionUnconfirmed)
+                );
+            }
+            let (quoted_html, _) = normalize_outlook_body(raw.body.as_ref(), "");
+            created_thread = (raw.id, quoted_html);
+            progress(DraftSaveChange::ThreadCreated {
+                id: created_thread.0.clone(),
+                quoted_html: created_thread.1.clone(),
+            });
+            existing_id = Some(&created_thread.0);
+            quote = Some(&created_thread.1);
+        }
+        if let Some(quote) = quote.filter(|quote| !quote.is_empty()) {
+            if changed_fields.is_none_or(|fields| fields.contains(&"body")) {
+                message["body"]["content"] = serde_json::Value::String(prepend_to_thread_html(
+                    message["body"]["content"].as_str().unwrap_or_default(),
+                    quote,
+                ));
+            }
+        }
         let inline_total: u64 = mail
             .inline_images
             .iter()
@@ -1181,7 +1236,7 @@ impl GraphClient {
         let combined_size = total_size.saturating_add(inline_total);
         let inline_small = !any_over_limit && combined_size <= MAIL_SMALL_ATTACHMENT_LIMIT;
 
-        if inline_small {
+        if existing_id.is_none() && inline_small {
             let mut atts = build_inline_image_attachments_json(&mail.inline_images);
             for f in staged {
                 let bytes = tokio::fs::read(f.path)
@@ -1198,23 +1253,93 @@ impl GraphClient {
                 message["attachments"] = serde_json::Value::Array(atts);
             }
             let created: GraphMailMessage = self.post_json("/me/messages", &message).await?;
-            return Ok(created.into_mail_message(true));
+            progress(DraftSaveChange::Fields {
+                id: created.id.clone(),
+                included_attachments: true,
+            });
+            return Ok(Some(created.into_mail_message(true)));
         }
 
-        let created: GraphMailMessage = self.post_json("/me/messages", &message).await?;
-        let draft_id = created.id.clone();
+        let draft_id = if let Some(id) = existing_id {
+            if let Some(fields) = changed_fields {
+                if let Some(payload) = message.as_object_mut() {
+                    payload.retain(|name, _| fields.contains(&name.as_str()));
+                }
+            }
+            if changed_fields != Some(&[]) {
+                let patch_path = format!("/me/messages/{}", urlencoding::encode(id));
+                let updated: Option<GraphMailMessage> =
+                    self.patch_json_optional(&patch_path, &message).await?;
+                progress(DraftSaveChange::Fields {
+                    id: id.to_string(),
+                    included_attachments: false,
+                });
+                if changed_fields.is_none() && staged.is_empty() && mail.inline_images.is_empty() {
+                    if let Some(updated) = updated {
+                        return Ok(Some(updated.into_mail_message(true)));
+                    }
+                }
+            }
+            id.to_string()
+        } else {
+            let created: CreatedDraftResponse = self.post_json("/me/messages", &message).await?;
+            progress(DraftSaveChange::Fields {
+                id: created.id.clone(),
+                included_attachments: false,
+            });
+            created.id
+        };
         let draft_id_enc = urlencoding::encode(&draft_id);
-        for att_payload in build_inline_image_attachments_json(&mail.inline_images) {
+        for (img, att_payload) in mail
+            .inline_images
+            .iter()
+            .zip(build_inline_image_attachments_json(&mail.inline_images))
+        {
             self.post_json_empty(
                 &format!("/me/messages/{draft_id_enc}/attachments"),
                 &att_payload,
             )
             .await?;
+            progress(DraftSaveChange::Image(img.content_id.clone()));
         }
         for f in staged {
             self.upload_draft_file_attachment(&draft_id_enc, &f).await?;
+            progress(DraftSaveChange::File(f.path.to_path_buf()));
         }
-        self.get_mail_message(&draft_id).await
+        self.get_mail_message(&draft_id).await.map(Some)
+    }
+
+    pub(crate) async fn send_saved_draft(&self, draft_id: &str) -> Result<()> {
+        let path = format!("/me/messages/{}/send", urlencoding::encode(draft_id));
+        self.post_mail_action(&path, None).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn edit_mail_draft(
+        &self,
+        id: &str,
+        subject: Option<&str>,
+        body_html: Option<&str>,
+    ) -> Result<()> {
+        let mut fields = serde_json::Map::new();
+        if let Some(subject) = subject {
+            fields.insert("subject".into(), serde_json::json!(subject));
+        }
+        if let Some(html) = body_html {
+            fields.insert(
+                "body".into(),
+                serde_json::json!({ "contentType": "HTML", "content": html }),
+            );
+        }
+        if fields.is_empty() {
+            bail!("Provide a draft subject or body to update.");
+        }
+        let path = format!("/me/messages/{}", urlencoding::encode(id.trim()));
+        let original: GraphMailMessage = self.get_json(&format!("{path}?$select=isDraft")).await?;
+        if original.is_draft != Some(true) {
+            bail!("Message '{id}' is not an Outlook draft.");
+        }
+        self.patch_json(&path, &fields).await
     }
 
     async fn upload_draft_file_attachment(
@@ -1596,7 +1721,40 @@ async fn stage_file_attachments(paths: &[std::path::PathBuf]) -> Result<(Vec<Sta
     Ok((staged, total_size, any_over_limit))
 }
 
-fn rewrite_inline_image_cids(body_html: &str, inline_images: &[InlineImageUpload]) -> String {
+pub enum DraftSaveChange {
+    ThreadCreated {
+        id: String,
+        quoted_html: String,
+    },
+    Fields {
+        id: String,
+        included_attachments: bool,
+    },
+    File(std::path::PathBuf),
+    Image(String),
+}
+
+fn prepend_to_thread_html(content: &str, quote: &str) -> String {
+    let lower = quote.to_ascii_lowercase();
+    if let Some(body) = lower.match_indices("<body").find_map(|(index, tag)| {
+        let after = index + tag.len();
+        let suffix = &lower[after..];
+        if suffix.starts_with('>') || suffix.starts_with(char::is_whitespace) {
+            suffix.find('>').map(|end| after + end + 1)
+        } else {
+            None
+        }
+    }) {
+        format!("{}{content}{}", &quote[..body], &quote[body..])
+    } else {
+        format!("{content}{quote}")
+    }
+}
+
+pub(crate) fn rewrite_inline_image_cids(
+    body_html: &str,
+    inline_images: &[InlineImageUpload],
+) -> String {
     if inline_images.is_empty() {
         return body_html.to_string();
     }
@@ -1792,6 +1950,88 @@ pub(crate) mod tests {
             },
         );
         GraphClient::new(cfg, auth).unwrap()
+    }
+
+    #[tokio::test]
+    async fn threaded_draft_keeps_its_id_and_quote_after_patch_failure() {
+        use serde_json::{json, Value};
+
+        #[derive(Default)]
+        struct Recorded {
+            creates: Vec<(String, Value)>,
+            patches: Vec<Value>,
+            sends: Vec<String>,
+        }
+        let state = Arc::new(Mutex::new(Recorded::default()));
+        let quote =
+            "<html><body><table><tr><td>Original <b>format</b></td></tr></table></body></html>";
+        let router = Router::new()
+            .route("/v1.0/me/messages/original/{operation}", post(
+                move |State(state): State<Arc<Mutex<Recorded>>>, AxumPath(op): AxumPath<String>, bytes: Bytes| async move {
+                    let payload = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                    state.lock().unwrap().creates.push((op, payload));
+                    (StatusCode::CREATED, Json(json!({
+                        "id": "thread-draft", "isDraft": true,
+                        "conversationId": "conversation",
+                        "body": { "contentType": "HTML", "content": quote },
+                    })))
+                },
+            ))
+            .route("/v1.0/me/messages/thread-draft", patch(
+                |State(state): State<Arc<Mutex<Recorded>>>, Json(payload): Json<Value>| async move {
+                    let mut state = state.lock().unwrap();
+                    state.patches.push(payload);
+                    if state.patches.len() == 1 { StatusCode::FORBIDDEN } else { StatusCode::NO_CONTENT }
+                },
+            ).get(|| async { Json(json!({ "id": "thread-draft", "isDraft": true, "conversationId": "conversation" })) }))
+            .route("/v1.0/me/messages/thread-draft/send", post(
+                |State(state): State<Arc<Mutex<Recorded>>>| async move {
+                    state.lock().unwrap().sends.push("thread-draft".into());
+                    StatusCode::ACCEPTED
+                },
+            ))
+            .with_state(Arc::clone(&state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let graph = test_graph_client(&format!("http://{}/v1.0", listener.local_addr().unwrap()));
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut outgoing = OutgoingMail {
+            in_reply_to_id: Some("original".into()),
+            reply_all: true,
+            body_html: "<p>New comment</p>".into(),
+            ..Default::default()
+        };
+        let mut created = None;
+        let failure = graph
+            .save_draft_with_progress(&outgoing, Some(&["body"]), None, |change| {
+                if let DraftSaveChange::ThreadCreated { id, quoted_html } = change {
+                    created = Some((id, quoted_html));
+                }
+            })
+            .await;
+        assert!(failure.unwrap_err().to_string().contains("403"));
+        let (id, quoted_html) = created.unwrap();
+        outgoing.draft_id = Some(id.clone());
+        let saved = graph
+            .save_draft_with_progress(&outgoing, Some(&["body"]), Some(&quoted_html), |_| {})
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.conversation_id.as_deref(), Some("conversation"));
+        graph.send_saved_draft(&id).await.unwrap();
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.creates, vec![("createReplyAll".into(), Value::Null)]);
+        assert_eq!(
+            state.patches,
+            vec![
+                json!({ "body": {
+            "contentType": "HTML",
+            "content": quote.replacen("<body>", "<body><p>New comment</p>", 1),
+        } });
+                2
+            ]
+        );
+        assert_eq!(state.sends, vec![id]);
     }
 
     #[tokio::test]

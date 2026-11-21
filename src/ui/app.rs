@@ -4,23 +4,28 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 use std::time::Instant;
 
 use base64::{engine::general_purpose::STANDARD as B64_STANDARD, Engine as _};
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use ratatui::layout::Rect;
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use crate::auth::{self, AuthManager};
-use crate::config::{AppConfig, DensityMode, DraftStore, MailDraftEntry, ThemePreset};
+use crate::config::{
+    drafts_path, AppConfig, DensityMode, DraftStore, MailDraftEntry, MailDraftFields, ThemePreset,
+};
+use crate::graph::client::MailActionUnconfirmed;
+use crate::graph::mail::{rewrite_inline_image_cids, DraftSaveChange};
 use crate::graph::GraphClient;
 use crate::img_preview::{self, RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol};
 use crate::models::{
-    CalendarEvent, ContactItem, CoreEvent, DownloadedFile, EventRsvpAction, InlineImageUpload,
-    MailAttachment, MailFolder, MailMessage, MailSearchHit, NotificationCandidate, OutgoingEvent,
-    OutgoingMail, OutgoingTodoTask, TodoList, TodoTask, UserProfile, POLL_RETRY_SUMMARY,
+    CalendarEvent, ContactItem, CoreEvent, DownloadedFile, EventRsvpAction, MailAttachment,
+    MailFolder, MailMessage, MailSearchHit, NotificationCandidate, OutgoingEvent, OutgoingMail,
+    OutgoingTodoTask, TodoList, TodoTask, UserProfile, POLL_RETRY_SUMMARY,
 };
 use crate::parser;
 use crate::storage::Storage;
@@ -134,10 +139,18 @@ pub enum UiMsg {
     },
     MailSent {
         draft_key: String,
+        compose_id: String,
+    },
+    MailDraftProgress {
+        draft_key: String,
+        compose_id: String,
+        change: DraftSaveChange,
     },
     MailDraftSaved {
         draft_key: String,
-        saved: MailMessage,
+        compose_id: String,
+        result: anyhow::Result<Option<MailMessage>>,
+        send: bool,
     },
     MailMoved {
         moves: Vec<(String, MailMessage)>,
@@ -386,6 +399,13 @@ impl UiState {
     }
 }
 
+struct PendingDraftWrite {
+    fields: MailDraftFields,
+    files: Vec<PathBuf>,
+    images: Vec<String>,
+    queued: Option<MailComposeOverlay>,
+}
+
 pub struct AppState {
     pub config: AppConfig,
     pub auth: AuthManager,
@@ -412,7 +432,8 @@ pub struct AppState {
     pub todo_tasks: Vec<TodoTask>,
     pub active_todo_task_id: Option<String>,
     pub draft_store: DraftStore,
-    pub draft_save_lock: Arc<Mutex<()>>,
+    draft_store_path: PathBuf,
+    draft_writes: HashMap<String, PendingDraftWrite>,
     pub download_dir: PathBuf,
     pub loading_mail: bool,
     pub loading_older_mail: bool,
@@ -456,7 +477,13 @@ impl AppState {
         ui_tx: mpsc::UnboundedSender<UiMsg>,
     ) -> Self {
         let download_dir = config.resolved_download_dir();
-        let draft_store = DraftStore::load();
+        let draft_store_path = drafts_path();
+        let mut draft_store = DraftStore::load_from(&draft_store_path).unwrap_or_default();
+        for entry in draft_store.mail.values_mut() {
+            if entry.compose_id.is_empty() {
+                entry.compose_id = uuid::Uuid::new_v4().to_string();
+            }
+        }
         Self {
             config,
             auth,
@@ -483,7 +510,8 @@ impl AppState {
             todo_tasks: Vec::new(),
             active_todo_task_id: None,
             draft_store,
-            draft_save_lock: Arc::new(Mutex::new(())),
+            draft_store_path,
+            draft_writes: HashMap::new(),
             download_dir,
             loading_mail: false,
             loading_older_mail: false,
@@ -1485,176 +1513,368 @@ impl AppState {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn submit_mail_compose(
-        &mut self,
-        ui: &mut UiState,
-        mode: MailComposeMode,
-        to: Vec<String>,
-        cc: Vec<String>,
-        bcc: Vec<String>,
-        subject: String,
-        body_markdown: String,
-        attachments: Vec<PathBuf>,
-        inline_images: Vec<InlineImageUpload>,
-    ) {
-        let draft_key = mode.draft_key();
-        let (reply_to_id, forward_of_id) = match &mode {
-            MailComposeMode::Reply { message_id } | MailComposeMode::ReplyAll { message_id } => {
-                (Some(message_id.clone()), None)
+    pub fn submit_mail_compose(&mut self, ui: &mut UiState, compose: &MailComposeOverlay) -> bool {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return false;
+        }
+        if self.draft_writes.contains_key(&compose.compose_id) {
+            ui.info("Wait for the draft to finish saving, then send it.");
+            return false;
+        }
+        let entry = match self.store_compose(compose) {
+            Ok(entry) => entry,
+            Err(err) => {
+                Self::show_draft_error(
+                    ui,
+                    &compose.compose_id,
+                    format!("Cannot save draft locally: {err:#}"),
+                );
+                return false;
             }
-            MailComposeMode::Forward { message_id } => (None, Some(message_id.clone())),
-            MailComposeMode::New => (None, None),
         };
-        // Persist the outgoing draft BEFORE sending so send failures never lose user input;
-        // the draft is removed only after Graph confirms send in `UiMsg::MailSent`.
-        self.draft_store.set_mail(
-            draft_key.clone(),
-            MailDraftEntry {
-                to: to.join(", "),
-                cc: cc.join(", "),
-                bcc: bcc.join(", "),
-                subject: subject.clone(),
-                body: body_markdown.clone(),
-                reply_to_id,
-                forward_of_id,
-            },
-        );
-        self.persist_draft_store();
+        if let Some(path) = entry
+            .attachments
+            .iter()
+            .find(|path| !entry.synced.files.contains(path) && !path.is_file())
+        {
+            Self::show_draft_error(
+                ui,
+                &compose.compose_id,
+                format!("Attachment file not found: {}", path.display()),
+            );
+            return false;
+        }
+        if entry.draft_id.is_some() || !matches!(compose.mode, MailComposeMode::New) {
+            return self.start_draft_write(ui, compose, entry, true);
+        }
 
-        let body_html = parser::compile_outgoing_mail_html(&body_markdown, &inline_images, None);
+        let mut outgoing = Self::outgoing_draft(compose, &entry, true);
+        outgoing.save_to_sent_items = true;
+        let draft_key = compose.mode.draft_key();
+        let compose_id = compose.compose_id.clone();
         let task_label = "Send email".to_string();
         ui.tasks.begin(task_label.clone());
 
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-
         let graph = self.graph.clone();
         let tx = self.ui_tx.clone();
-        let has_extras =
-            !cc.is_empty() || !bcc.is_empty() || !attachments.is_empty() || !inline_images.is_empty();
-
         tokio::spawn(async move {
-            let res = match mode {
-                MailComposeMode::Reply { message_id } if !has_extras => {
-                    graph.reply_mail(&message_id, &body_html, false).await
-                }
-                MailComposeMode::ReplyAll { message_id } if !has_extras => {
-                    graph.reply_mail(&message_id, &body_html, true).await
-                }
-                MailComposeMode::Forward { message_id } if !has_extras => {
-                    graph.forward_mail(&message_id, &to, &body_html).await
-                }
-                _ => {
-                    let outgoing = OutgoingMail {
-                        subject,
-                        body_html,
-                        body_markdown: Some(body_markdown),
-                        to,
-                        cc,
-                        bcc,
-                        importance: None,
-                        attachments,
-                        inline_images,
-                        in_reply_to_id: None,
-                        reply_all: false,
-                        forward_of_id: None,
-                        draft_id: None,
-                        save_to_sent_items: true,
-                    };
-                    graph.send_mail(&outgoing).await
-                }
-            };
+            let res = graph.send_mail(&outgoing).await;
 
-            match res {
-                Ok(()) => {
-                    let _ = tx.send(UiMsg::MailSent { draft_key });
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: None,
-                        toast: Some(("Email sent".to_string(), ToastKind::Success)),
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((
-                            format!("Send failed (draft preserved): {err}"),
-                            ToastKind::Error,
-                        )),
-                    });
-                }
+            if res.is_ok() {
+                let _ = tx.send(UiMsg::MailSent {
+                    draft_key,
+                    compose_id,
+                });
             }
+            let (error, toast) = match res {
+                Ok(()) => (None, ("Email sent".to_string(), ToastKind::Success)),
+                Err(err) => (
+                    Some(err.to_string()),
+                    (
+                        format!("Send failed (draft preserved): {err}"),
+                        ToastKind::Error,
+                    ),
+                ),
+            };
+            let _ = tx.send(UiMsg::TaskDone {
+                label: task_label,
+                error,
+                toast: Some(toast),
+            });
         });
+        true
     }
 
-    pub fn stash_compose_draft(&mut self, compose: &MailComposeOverlay) {
-        let key = compose.mode.draft_key();
+    pub fn stash_compose_draft(&mut self, compose: &MailComposeOverlay) -> anyhow::Result<()> {
         if compose.has_unsent_content() {
-            self.draft_store.set_mail(key, compose.to_draft_entry());
+            self.store_compose(compose)?;
         } else {
-            self.draft_store.remove_mail(&key);
+            let key = compose.mode.draft_key();
+            if self.draft_store.get_mail(&key).is_some_and(|d| {
+                d.compose_id == compose.compose_id
+                    && !d.synced.thread_creation_pending
+                    && !d.synced.send_pending
+            }) && !self.draft_writes.contains_key(&compose.compose_id)
+            {
+                self.draft_store.remove_mail(&key);
+                self.persist_draft_store()?;
+            }
         }
-        self.persist_draft_store();
+        Ok(())
+    }
+
+    pub fn has_pending_draft_write(&self) -> bool {
+        !self.draft_writes.is_empty()
+    }
+
+    fn stored_compose_key(&self, key: &str, compose_id: &str) -> Option<String> {
+        if self
+            .draft_store
+            .get_mail(key)
+            .is_some_and(|draft| draft.compose_id == compose_id)
+        {
+            return Some(key.to_string());
+        }
+        let previous_key = format!("{key}:{compose_id}");
+        self.draft_store
+            .get_mail(&previous_key)
+            .map(|_| previous_key)
+    }
+
+    fn store_compose(&mut self, compose: &MailComposeOverlay) -> anyhow::Result<MailDraftEntry> {
+        let key = compose.mode.draft_key();
+        let mut entry = compose.to_draft_entry();
+        if let Some(stored_key) = self.stored_compose_key(&key, &compose.compose_id) {
+            if let Some(previous) = self.draft_store.get_mail(&stored_key) {
+                entry.draft_id.clone_from(&previous.draft_id);
+                entry.synced.clone_from(&previous.synced);
+            }
+            if !matches!(compose.mode, MailComposeMode::New)
+                && entry.draft_id.is_some()
+                && entry.synced.thread_quote_html.is_none()
+            {
+                // Earlier versions bound replies to top-level drafts.
+                entry.draft_id = None;
+                entry.synced = Default::default();
+            }
+            self.draft_store.mail.insert(stored_key, entry.clone());
+        } else {
+            if let Some(mut previous) = self.draft_store.remove_mail(&key) {
+                if previous.compose_id.is_empty() {
+                    previous.compose_id = uuid::Uuid::new_v4().to_string();
+                }
+                self.draft_store
+                    .set_mail(format!("{key}:{}", previous.compose_id), previous);
+            }
+            self.draft_store.set_mail(key, entry.clone());
+        }
+        self.persist_draft_store()?;
+        Ok(entry)
     }
 
     pub fn save_mail_draft(&mut self, ui: &mut UiState, compose: &MailComposeOverlay) {
-        let key = compose.mode.draft_key();
-        self.draft_store
-            .set_mail(key.clone(), compose.to_draft_entry());
-        self.persist_draft_store();
-        ui.success("Draft saved locally");
-
-        if tokio::runtime::Handle::try_current().is_err() {
+        if compose.to_draft_entry().is_empty()
+            && !self.draft_writes.contains_key(&compose.compose_id)
+        {
+            ui.info("Enter draft content before saving.");
             return;
         }
-        let body_html = parser::compile_outgoing_mail_html(
-            compose.body.text(),
-            &compose.body.pending_images,
-            None,
-        );
-        let outgoing = OutgoingMail {
-            subject: compose.subject.trim().to_string(),
+        let entry = match self.store_compose(compose) {
+            Ok(entry) => entry,
+            Err(err) => {
+                Self::show_draft_error(
+                    ui,
+                    &compose.compose_id,
+                    format!("Cannot save draft locally: {err:#}"),
+                );
+                return;
+            }
+        };
+        if let Some(in_flight) = self.draft_writes.get_mut(&compose.compose_id) {
+            in_flight.queued = Some(compose.clone());
+        } else if tokio::runtime::Handle::try_current().is_ok() {
+            if !self.start_draft_write(ui, compose, entry, false) {
+                return;
+            }
+        } else {
+            ui.success("Draft saved locally");
+            return;
+        }
+        ui.info("Draft saved locally. Saving to Outlook…");
+    }
+
+    fn outgoing_draft(
+        compose: &MailComposeOverlay,
+        entry: &MailDraftEntry,
+        include_body: bool,
+    ) -> OutgoingMail {
+        let body_html = if include_body {
+            let html = parser::compile_outgoing_mail_html(&entry.body, &entry.inline_images, None);
+            rewrite_inline_image_cids(&html, &entry.inline_images)
+        } else {
+            String::new()
+        };
+        OutgoingMail {
+            subject: entry.subject.trim().to_string(),
             body_html,
-            body_markdown: Some(compose.body.text().to_string()),
             to: compose.parsed_to(),
             cc: compose.parsed_cc(),
             bcc: compose.parsed_bcc(),
-            importance: None,
-            attachments: compose.attachments.clone(),
-            inline_images: compose.body.pending_images.clone(),
-            in_reply_to_id: None,
-            reply_all: false,
-            forward_of_id: None,
-            draft_id: None,
-            save_to_sent_items: false,
-        };
-        let graph = self.graph.clone();
-        let tx = self.ui_tx.clone();
-        tokio::spawn(async move {
-            if let Ok(saved) = graph.save_draft(&outgoing).await {
-                let _ = tx.send(UiMsg::MailDraftSaved {
-                    draft_key: key,
-                    saved,
-                });
-            }
-        });
+            attachments: entry
+                .attachments
+                .iter()
+                .filter(|p| !entry.synced.files.contains(p))
+                .cloned()
+                .collect(),
+            inline_images: entry
+                .inline_images
+                .iter()
+                .filter(|img| !entry.synced.image_ids.contains(&img.content_id))
+                .cloned()
+                .collect(),
+            draft_id: entry.draft_id.clone(),
+            in_reply_to_id: entry.reply_to_id.clone(),
+            reply_all: matches!(compose.mode, MailComposeMode::ReplyAll { .. }),
+            forward_of_id: entry.forward_of_id.clone(),
+            ..Default::default()
+        }
     }
 
-    fn persist_draft_store(&self) {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            let store = self.draft_store.clone();
-            let lock = Arc::clone(&self.draft_save_lock);
-            tokio::task::spawn_blocking(move || {
-                let _guard = lock.lock();
-                let _ = store.save();
-            });
-        } else {
-            let _guard = self.draft_save_lock.lock();
-            let _ = self.draft_store.save();
+    fn start_draft_write(
+        &mut self,
+        ui: &mut UiState,
+        compose: &MailComposeOverlay,
+        entry: MailDraftEntry,
+        send: bool,
+    ) -> bool {
+        let draft_key = compose.mode.draft_key();
+        let compose_id = compose.compose_id.clone();
+        let creating_thread = !matches!(compose.mode, MailComposeMode::New) && entry.draft_id.is_none();
+        if entry.synced.thread_creation_pending || entry.synced.send_pending {
+            let error = if entry.synced.thread_creation_pending {
+                "Outlook did not confirm draft creation. Check Outlook Drafts for this reply or forward."
+            } else {
+                "Outlook did not confirm the send. Check Outlook Drafts and Sent Items."
+            };
+            Self::show_draft_error(ui, &compose_id, error.into());
+            return false;
         }
+        if creating_thread || send {
+            let Some(key) = self.stored_compose_key(&draft_key, &compose_id) else {
+                return false;
+            };
+            let Some(local) = self.draft_store.mail.get_mut(&key) else { return false };
+            local.synced.thread_creation_pending = creating_thread;
+            local.synced.send_pending = send;
+            if let Err(err) = self.persist_draft_store() {
+                if let Some(local) = self.draft_store.mail.get_mut(&key) {
+                    local.synced.thread_creation_pending = false;
+                    local.synced.send_pending = false;
+                }
+                Self::show_draft_error(
+                    ui,
+                    &compose_id,
+                    format!("Cannot save draft locally: {err:#}"),
+                );
+                return false;
+            }
+        }
+        let image_refs: Vec<_> = entry
+            .inline_images
+            .iter()
+            .map(|img| (&img.temp_id, &img.content_id, &img.file_name))
+            .collect();
+        let body_hash = hex::encode(Sha256::digest(
+            serde_json::to_vec(&(&entry.body, image_refs)).expect("draft body consists of strings"),
+        ));
+        let fields = MailDraftFields {
+            subject: entry.subject.trim().to_string(),
+            to: compose.parsed_to(),
+            cc: compose.parsed_cc(),
+            bcc: compose.parsed_bcc(),
+            body_hash,
+        };
+        let mut changed = Vec::new();
+        if let Some(prior) = entry.synced.fields.as_ref() {
+            for (field, differs) in [
+                ("subject", prior.subject != fields.subject),
+                ("toRecipients", prior.to != fields.to),
+                ("ccRecipients", prior.cc != fields.cc),
+                ("bccRecipients", prior.bcc != fields.bcc),
+                ("body", prior.body_hash != fields.body_hash),
+            ] {
+                if differs {
+                    changed.push(field);
+                }
+            }
+        } else if let Some(defaults) = entry.thread_headers.as_ref() {
+            changed.push("body");
+            for (field, differs) in [
+                ("subject", defaults.subject != fields.subject),
+                ("toRecipients", defaults.to != fields.to),
+                ("ccRecipients", defaults.cc != fields.cc),
+                ("bccRecipients", defaults.bcc != fields.bcc),
+            ] {
+                if differs {
+                    changed.push(field);
+                }
+            }
+        } else {
+            changed.extend([
+                "subject",
+                "toRecipients",
+                "ccRecipients",
+                "bccRecipients",
+                "body",
+            ]);
+        }
+        let outgoing = Self::outgoing_draft(compose, &entry, changed.contains(&"body"));
+        self.draft_writes.insert(
+            compose_id.clone(),
+            PendingDraftWrite {
+                fields,
+                files: outgoing.attachments.clone(),
+                images: outgoing
+                    .inline_images
+                    .iter()
+                    .map(|img| img.content_id.clone())
+                    .collect(),
+                queued: None,
+            },
+        );
+
+        let graph = self.graph.clone();
+        let tx = self.ui_tx.clone();
+        let quote = entry.synced.thread_quote_html;
+        tokio::spawn(async move {
+            let mut result = graph
+                .save_draft_with_progress(&outgoing, Some(&changed), quote.as_deref(), |change| {
+                    let _ = tx.send(UiMsg::MailDraftProgress {
+                        draft_key: draft_key.clone(),
+                        compose_id: compose_id.clone(),
+                        change,
+                    });
+                })
+                .await;
+            if let Ok(saved) = &result {
+                if send {
+                    let id = outgoing
+                        .draft_id
+                        .as_deref()
+                        .or_else(|| saved.as_ref().map(|msg| msg.id.as_str()));
+                    match id {
+                        Some(id) => {
+                            if let Err(err) = graph.send_saved_draft(id).await {
+                                result = Err(err);
+                            }
+                        }
+                        None => result = Err(anyhow::anyhow!("Outlook did not return a draft ID")),
+                    }
+                }
+            }
+            let _ = tx.send(UiMsg::MailDraftSaved {
+                draft_key,
+                compose_id,
+                result,
+                send,
+            });
+        });
+        true
+    }
+
+    fn persist_draft_store(&self) -> anyhow::Result<()> {
+        self.draft_store.save_to(&self.draft_store_path)
+    }
+
+    fn show_draft_error(ui: &mut UiState, compose_id: &str, error: String) {
+        for overlay in &mut ui.overlays {
+            if let Overlay::MailCompose(compose) = overlay {
+                if compose.compose_id == compose_id {
+                    compose.error = Some(error.clone());
+                }
+            }
+        }
+        ui.error(error);
     }
 
     pub fn download_mail_attachment(
@@ -3073,16 +3293,148 @@ impl AppState {
                     self.sync_mail_list_selection_to_active(ui);
                 }
             }
-            UiMsg::MailDraftSaved { saved, .. } => {
-                let _ = self
-                    .storage
-                    .upsert_mail_messages(std::slice::from_ref(&saved));
-                self.mail_detail_cache.remove(&saved.id);
-                self.mail_detail_missing.remove(&saved.id);
+            UiMsg::MailDraftProgress {
+                draft_key,
+                compose_id,
+                change,
+            } => {
+                let Some(write) = self.draft_writes.get(&compose_id) else {
+                    return;
+                };
+                let Some(key) = self.stored_compose_key(&draft_key, &compose_id) else {
+                    return;
+                };
+                let Some(entry) = self.draft_store.mail.get_mut(&key) else {
+                    return;
+                };
+                match change {
+                    DraftSaveChange::ThreadCreated { id, quoted_html } => {
+                        entry.draft_id = Some(id);
+                        entry.synced.thread_quote_html = Some(quoted_html);
+                        entry.synced.thread_creation_pending = false;
+                    }
+                    DraftSaveChange::Fields {
+                        id,
+                        included_attachments,
+                    } => {
+                        entry.draft_id = Some(id.clone());
+                        entry.synced.fields = Some(write.fields.clone());
+                        if included_attachments {
+                            entry.synced.files.extend(write.files.iter().cloned());
+                            entry.synced.image_ids.extend(write.images.iter().cloned());
+                        }
+                    }
+                    DraftSaveChange::File(path) => entry.synced.files.push(path),
+                    DraftSaveChange::Image(id) => entry.synced.image_ids.push(id),
+                }
+                for overlay in &mut ui.overlays {
+                    if let Overlay::MailCompose(compose) = overlay {
+                        if compose.compose_id == compose_id {
+                            compose.draft_id.clone_from(&entry.draft_id);
+                        }
+                    }
+                }
+                if let Err(err) = self.persist_draft_store() {
+                    Self::show_draft_error(
+                        ui,
+                        &compose_id,
+                        format!("Cannot record Outlook draft locally: {err:#}"),
+                    );
+                }
             }
-            UiMsg::MailSent { draft_key } => {
-                self.draft_store.remove_mail(&draft_key);
-                self.persist_draft_store();
+            UiMsg::MailDraftSaved {
+                draft_key,
+                compose_id,
+                result,
+                send,
+            } => {
+                let queued = self
+                    .draft_writes
+                    .remove(&compose_id)
+                    .and_then(|write| write.queued);
+                match result {
+                    Ok(saved) => {
+                        if let Some(saved) = saved {
+                            if !send {
+                                let _ = self
+                                    .storage
+                                    .upsert_mail_messages(std::slice::from_ref(&saved));
+                            }
+                            self.mail_detail_cache.remove(&saved.id);
+                            self.mail_detail_missing.remove(&saved.id);
+                        }
+                        if send {
+                            self.handle_ui_msg(
+                                ui,
+                                UiMsg::MailSent {
+                                    draft_key,
+                                    compose_id,
+                                },
+                            );
+                            ui.success("Email sent");
+                        } else if let Err(err) = self.persist_draft_store() {
+                            Self::show_draft_error(
+                                ui,
+                                &compose_id,
+                                format!("Cannot record Outlook draft locally: {err:#}"),
+                            );
+                        } else if let Some(compose) = queued {
+                            if let Some(entry) = self
+                                .stored_compose_key(&draft_key, &compose_id)
+                                .and_then(|key| self.draft_store.get_mail(&key))
+                            {
+                                let mut next = compose.to_draft_entry();
+                                next.draft_id.clone_from(&entry.draft_id);
+                                next.synced.clone_from(&entry.synced);
+                                self.start_draft_write(ui, &compose, next, false);
+                            }
+                        } else {
+                            for overlay in &mut ui.overlays {
+                                if let Overlay::MailCompose(compose) = overlay {
+                                    if compose.compose_id == compose_id {
+                                        compose.error = None;
+                                    }
+                                }
+                            }
+                            ui.success("Draft saved to Outlook");
+                        }
+                    }
+                    Err(err) => {
+                        if !err.is::<MailActionUnconfirmed>() {
+                            if let Some(entry) = self
+                                .stored_compose_key(&draft_key, &compose_id)
+                                .and_then(|key| self.draft_store.mail.get_mut(&key))
+                            {
+                                if entry.synced.thread_creation_pending || entry.synced.send_pending {
+                                    entry.synced.thread_creation_pending = false;
+                                    entry.synced.send_pending = false;
+                                    if let Err(local_err) = self.persist_draft_store() {
+                                        ui.error(format!(
+                                            "Cannot record Outlook draft locally: {local_err:#}"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        let operation = if send { "Send" } else { "Outlook draft save" };
+                        Self::show_draft_error(
+                            ui,
+                            &compose_id,
+                            format!("{operation} failed (draft preserved locally): {err:#}"),
+                        );
+                    }
+                }
+            }
+            UiMsg::MailSent {
+                draft_key,
+                compose_id,
+            } => {
+                if let Some(key) = self.stored_compose_key(&draft_key, &compose_id) {
+                    self.draft_store.remove_mail(&key);
+                    if let Err(err) = self.persist_draft_store() {
+                        ui.error(format!("Cannot clear sent draft locally: {err:#}"));
+                    }
+                }
             }
             UiMsg::MailMoved { moves } => {
                 if let Ok(folders) = self.storage.list_mail_folders() {
@@ -4061,6 +4413,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_draft_save_uses_created_id_and_patches_only_changed_fields() {
+        use axum::{extract::State, routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let release_post = Arc::new(tokio::sync::Notify::new());
+        let router = Router::new()
+            .route(
+                "/v1.0/me/messages",
+                post({
+                    let release_post = Arc::clone(&release_post);
+                    move |State(writes): State<Arc<std::sync::Mutex<Vec<Value>>>>,
+                          Json(mut body): Json<Value>| async move {
+                        writes.lock().unwrap().push(body.clone());
+                        release_post.notified().await;
+                        body["id"] = json!("same-id");
+                        Json(body)
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/messages/same-id",
+                axum::routing::patch(
+                    |State(writes): State<Arc<std::sync::Mutex<Vec<Value>>>>,
+                     Json(body): Json<Value>| async move {
+                        writes.lock().unwrap().push(body);
+                        axum::http::StatusCode::NO_CONTENT
+                    },
+                )
+                .get(|| async {
+                    Json(json!({ "id": "same-id", "subject": "Revised", "isDraft": true }))
+                }),
+            )
+            .with_state(Arc::clone(&writes));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{}/v1.0", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let auth = AuthManager::from_tokens(
+            cfg.clone(),
+            crate::auth::StoredTokens {
+                access_token: "synthetic-tok".into(),
+                refresh_token: None,
+                expires_at: 9_999_999_999,
+                client_id: "c".into(),
+                tenant_id: "t".into(),
+                user_id: None,
+                user_display_name: None,
+                user_email: None,
+                auth_mode: "access_token".into(),
+            },
+        );
+        let (mut app, mut ui) = make_test_app();
+        app.graph = GraphClient::new(cfg, auth).unwrap();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        app.ui_tx = ui_tx;
+        let profile = tempfile::tempdir().unwrap();
+        app.draft_store_path = profile.path().join("drafts.json");
+        app.draft_store = DraftStore::default();
+        let attachment = profile.path().join("check.txt");
+        std::fs::write(&attachment, "report").unwrap();
+
+        let mut compose = MailComposeOverlay::new_to("bob@example.com");
+        compose.subject = "Original".into();
+        compose.cc = "person@example.com".into();
+        compose.body.load_text("**Review** the file.");
+        compose.attach_file(attachment);
+        app.save_mail_draft(&mut ui, &compose);
+        compose.subject = "Revised".into();
+        ui.push_overlay(Overlay::mail_compose(compose.clone()));
+        app.save_mail_draft(&mut ui, &compose);
+        release_post.notify_one();
+
+        while app.has_pending_draft_write() {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            app.handle_ui_msg(&mut ui, msg);
+        }
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0]["subject"], "Original");
+        assert_eq!(writes[0]["attachments"].as_array().unwrap().len(), 1);
+        assert_eq!(writes[1], json!({ "subject": "Revised" }));
+        let local = DraftStore::load_from(&app.draft_store_path).unwrap();
+        let restored = MailComposeOverlay::from_draft_entry(
+            MailComposeMode::New,
+            local.get_mail("compose:new").unwrap(),
+        );
+        assert_eq!(restored.draft_id.as_deref(), Some("same-id"));
+        assert_eq!(restored.subject, "Revised");
+        assert_eq!(restored.body.text(), "**Review** the file.");
+        let Some(Overlay::MailCompose(open)) = ui.overlays.last() else {
+            panic!("compose closed")
+        };
+        assert_eq!(open.draft_id, restored.draft_id);
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
     async fn submit_mail_compose_preserves_draft_on_send_failure_and_clears_on_success() {
         use axum::{http::StatusCode, routing::post, Json, Router};
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -4115,19 +4569,15 @@ mod tests {
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
         let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
         let mut ui = UiState::from_config(&cfg);
+        let profile = tempfile::tempdir().unwrap();
+        app.draft_store_path = profile.path().join("drafts.json");
+        app.draft_store = DraftStore::default();
+        let mut compose = MailComposeOverlay::new_to("bob@example.com");
+        compose.subject = "Important Proposal".into();
+        compose.body.load_text("Do not lose this body text.");
 
         // 1. Send fails with 500 -> draft MUST remain preserved in draft_store
-        app.submit_mail_compose(
-            &mut ui,
-            MailComposeMode::New,
-            vec!["bob@example.com".into()],
-            vec![],
-            vec![],
-            "Important Proposal".into(),
-            "Do not lose this body text.".into(),
-            vec![],
-            vec![],
-        );
+        assert!(app.submit_mail_compose(&mut ui, &compose));
         let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ui_rx.recv())
             .await
             .expect("received task failure")
@@ -4139,21 +4589,11 @@ mod tests {
             .expect("draft must be preserved after send failure");
         assert_eq!(saved_draft.subject, "Important Proposal");
         assert_eq!(saved_draft.body, "Do not lose this body text.");
-        assert_eq!(saved_draft.to, "bob@example.com");
+        assert_eq!(saved_draft.to, "bob@example.com, ");
 
         // 2. Retry succeeds -> UiMsg::MailSent clears draft
         should_fail.store(false, Ordering::SeqCst);
-        app.submit_mail_compose(
-            &mut ui,
-            MailComposeMode::New,
-            vec!["bob@example.com".into()],
-            vec![],
-            vec![],
-            "Important Proposal".into(),
-            "Do not lose this body text.".into(),
-            vec![],
-            vec![],
-        );
+        assert!(app.submit_mail_compose(&mut ui, &compose));
         for _ in 0..2 {
             let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ui_rx.recv())
                 .await

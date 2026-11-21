@@ -372,6 +372,7 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
     (
         "Mail Compose",
         &[
+            ("c / C", "Resume composition / start a separate draft"),
             ("Ctrl+Enter / Alt+Enter", "Send email"),
             ("Tab / Enter (To/Cc/Bcc)", "Insert autocomplete contact chip"),
             ("Ctrl+V", "Paste text or clipboard image as PNG"),

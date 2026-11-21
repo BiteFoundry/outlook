@@ -17,7 +17,7 @@ use crate::{
         AuthManager, LoginOptions, StoredTokens,
     },
     config::{self, AppConfig, Persona},
-    graph::GraphClient,
+    graph::{calendar::CalendarEditTime, GraphClient},
     img_preview,
     models::{
         CalendarEvent, ContactItem, InlineImageUpload, MailAttachment, MailFolder, MailMessage,
@@ -139,6 +139,9 @@ pub enum Command {
         cached: bool,
         #[arg(long)]
         json: bool,
+        /// With --json, return only list fields for each message
+        #[arg(long, requires = "json")]
+        compact: bool,
     },
     /// Read a mail message with full headers, body, and attachments
     #[command(visible_alias = "cat")]
@@ -160,6 +163,9 @@ pub enum Command {
         cached: bool,
         #[arg(long)]
         json: bool,
+        /// With --json, return mail headers and the complete plain-text body
+        #[arg(long, requires = "json", conflicts_with_all = ["raw_html", "preview_images"])]
+        compact: bool,
     },
     /// Compose and send a new email (supports Markdown, attachments, and inline images)
     #[command(visible_alias = "compose")]
@@ -208,6 +214,21 @@ pub enum Command {
         to: Vec<String>,
         #[arg(value_name = "COMMENT_MD")]
         comment_md: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Edit an existing Outlook draft
+    #[command(group(clap::ArgGroup::new("draft_edit").args(["subject", "body", "body_html"]).multiple(true).required(true)))]
+    EditDraft {
+        message_id: String,
+        #[arg(long)]
+        subject: Option<String>,
+        /// Replace the body with rendered Markdown
+        #[arg(long, conflicts_with = "body_html")]
+        body: Option<String>,
+        /// Replace the body with the supplied HTML
+        #[arg(long)]
+        body_html: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -358,6 +379,21 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Update the subject or times of an existing calendar event
+    #[command(group(clap::ArgGroup::new("event_edit").args(["subject", "start", "end"]).multiple(true).required(true)))]
+    UpdateEvent {
+        event_id: String,
+        #[arg(long, visible_alias = "title")]
+        subject: Option<String>,
+        /// RFC3339, wall-clock time in the event's zone, or an all-day date
+        #[arg(long)]
+        start: Option<String>,
+        /// RFC3339, wall-clock time in the event's zone, or an exclusive all-day end date
+        #[arg(long)]
+        end: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Respond (RSVP) to a calendar event invitation (`accept`, `tentative`, `decline`)
     Rsvp {
         event_id: String,
@@ -430,6 +466,20 @@ pub enum Command {
         list: String,
         #[arg(long)]
         undo: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Update an existing Microsoft To Do task's title or due date
+    #[command(group(clap::ArgGroup::new("task_edit").args(["title", "due"]).multiple(true).required(true)))]
+    UpdateTask {
+        task_id: String,
+        #[arg(long, default_value = "tasks", value_name = "NAME_OR_ID")]
+        list: String,
+        #[arg(long)]
+        title: Option<String>,
+        /// New due date (YYYY-MM-DD at midnight UTC, or RFC3339)
+        #[arg(long)]
+        due: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -633,9 +683,11 @@ async fn dispatch_command(
             offline,
             cached,
             json,
+            compact,
         }) => {
             Box::pin(cmd_mail_list(
                 cfg, &folder, limit, unread, flagged, focused, refresh, offline, cached, json,
+                compact,
             ))
             .await
         }
@@ -647,6 +699,7 @@ async fn dispatch_command(
             offline,
             cached,
             json,
+            compact,
         }) => {
             Box::pin(cmd_mail_read(
                 cfg,
@@ -657,6 +710,7 @@ async fn dispatch_command(
                 offline,
                 cached,
                 json,
+                compact,
             ))
             .await
         }
@@ -702,6 +756,23 @@ async fn dispatch_command(
                 &message_id,
                 to,
                 comment_md.as_deref().unwrap_or(""),
+                json,
+            ))
+            .await
+        }
+        Some(Command::EditDraft {
+            message_id,
+            subject,
+            body,
+            body_html,
+            json,
+        }) => {
+            Box::pin(cmd_edit_draft(
+                cfg,
+                &message_id,
+                subject.as_deref(),
+                body.as_deref(),
+                body_html.as_deref(),
                 json,
             ))
             .await
@@ -845,6 +916,23 @@ async fn dispatch_command(
             ))
             .await
         }
+        Some(Command::UpdateEvent {
+            event_id,
+            subject,
+            start,
+            end,
+            json,
+        }) => {
+            Box::pin(cmd_update_event(
+                cfg,
+                &event_id,
+                subject.as_deref(),
+                start.as_deref(),
+                end.as_deref(),
+                json,
+            ))
+            .await
+        }
         Some(Command::Rsvp {
             event_id,
             response,
@@ -910,6 +998,23 @@ async fn dispatch_command(
             undo,
             json,
         }) => Box::pin(cmd_todo_done(cfg, &task_id, &list, !undo, json)).await,
+        Some(Command::UpdateTask {
+            task_id,
+            list,
+            title,
+            due,
+            json,
+        }) => {
+            Box::pin(cmd_update_task(
+                cfg,
+                &task_id,
+                &list,
+                title.as_deref(),
+                due.as_deref(),
+                json,
+            ))
+            .await
+        }
         Some(Command::DeleteTask {
             task_id,
             list,
@@ -2068,13 +2173,13 @@ async fn cmd_folders(
     print_mail_folders_output(&folders, json_out)
 }
 
-fn load_cached_mail_list(
+pub(crate) fn load_cached_mail_list(
     storage: &Storage,
     folder_id: &str,
     limit: usize,
-    json_out: bool,
+    full: bool,
 ) -> Result<Vec<MailMessage>> {
-    if json_out {
+    if full {
         storage.list_mail_messages(Some(folder_id), false, false, false, limit)
     } else {
         storage.list_mail_summaries(Some(folder_id), limit)
@@ -2101,6 +2206,53 @@ pub(crate) fn filter_mail_messages(
     messages
 }
 
+pub(crate) fn mail_list_json(messages: &[MailMessage], compact: bool) -> serde_json::Value {
+    if !compact {
+        return json!(messages);
+    }
+    serde_json::Value::Array(
+        messages
+            .iter()
+            .map(|msg| {
+                json!({
+                    "id": msg.id,
+                    "subject": msg.subject,
+                    "from": msg.from,
+                    "received_at": msg.received_at,
+                    "is_read": msg.is_read,
+                    "is_draft": msg.is_draft,
+                    "flagged": msg.flagged,
+                    "has_attachments": msg.has_attachments,
+                })
+            })
+            .collect(),
+    )
+}
+
+pub(crate) fn mail_read_json(msg: &MailMessage, compact: bool) -> serde_json::Value {
+    if !compact {
+        return json!({ "message": msg });
+    }
+    json!({
+        "message": {
+            "id": msg.id,
+            "subject": msg.subject,
+            "from": msg.from,
+            "to_recipients": msg.to_recipients,
+            "cc_recipients": msg.cc_recipients,
+            "bcc_recipients": msg.bcc_recipients,
+            "reply_to": msg.reply_to,
+            "received_at": msg.received_at,
+            "sent_at": msg.sent_at,
+            "is_read": msg.is_read,
+            "is_draft": msg.is_draft,
+            "body_loaded": msg.body_loaded,
+            "body_plain": msg.body_plain,
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn print_mail_list_output(
     folder: &str,
     folder_id: &str,
@@ -2110,6 +2262,7 @@ fn print_mail_list_output(
     focused_only: bool,
     limit: usize,
     json_out: bool,
+    compact: bool,
 ) -> Result<()> {
     let messages = filter_mail_messages(messages, unread_only, flagged_only, focused_only, limit);
 
@@ -2118,7 +2271,7 @@ fn print_mail_list_output(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "folder": folder_id,
-                "messages": messages,
+                "messages": mail_list_json(&messages, compact),
             }))?
         );
     } else if messages.is_empty() {
@@ -2152,6 +2305,7 @@ async fn cmd_mail_list(
     offline: bool,
     cached: bool,
     json_out: bool,
+    compact: bool,
 ) -> Result<()> {
     let limit = clamp_limit(limit);
     let fetch_limit = if unread_only || flagged_only || focused_only {
@@ -2160,10 +2314,11 @@ async fn cmd_mail_list(
         limit
     };
 
+    let full = json_out && !compact;
     if offline {
         let storage = open_storage_only(cfg)?;
         let resolved = resolver::resolve_mail_folder_cached(&storage, folder)?;
-        let messages = load_cached_mail_list(&storage, &resolved.id, fetch_limit, json_out)?;
+        let messages = load_cached_mail_list(&storage, &resolved.id, fetch_limit, full)?;
         return print_mail_list_output(
             folder,
             &resolved.id,
@@ -2173,6 +2328,7 @@ async fn cmd_mail_list(
             focused_only,
             limit,
             json_out,
+            compact,
         );
     }
 
@@ -2188,7 +2344,7 @@ async fn cmd_mail_list(
                     || is_cursor_fresh(&storage, &[cli_key.as_str(), delta_key.as_str()], ttl)
                 {
                     let messages =
-                        load_cached_mail_list(&storage, &resolved.id, fetch_limit, json_out)?;
+                        load_cached_mail_list(&storage, &resolved.id, fetch_limit, full)?;
                     if !messages.is_empty() {
                         return print_mail_list_output(
                             folder,
@@ -2199,6 +2355,7 @@ async fn cmd_mail_list(
                             focused_only,
                             limit,
                             json_out,
+                            compact,
                         );
                     }
                 }
@@ -2212,7 +2369,7 @@ async fn cmd_mail_list(
         Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
     };
 
-    let cached_msgs = load_cached_mail_list(&storage, &resolved.id, fetch_limit, json_out)?;
+    let cached_msgs = load_cached_mail_list(&storage, &resolved.id, fetch_limit, full)?;
     let cli_key = format!("cli:mail:{}", resolved.id);
     let delta_key = format!("mail_delta:{}", resolved.id);
     let should_fetch = refresh
@@ -2234,7 +2391,7 @@ async fn cmd_mail_list(
             Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
         };
         record_cli_sync_cursor(&storage, &format!("cli:mail:{}", sync_res.folder_id));
-        load_cached_mail_list(&storage, &sync_res.folder_id, fetch_limit, json_out)?
+        load_cached_mail_list(&storage, &sync_res.folder_id, fetch_limit, full)?
     } else {
         cached_msgs
     };
@@ -2248,6 +2405,7 @@ async fn cmd_mail_list(
         focused_only,
         limit,
         json_out,
+        compact,
     )
 }
 
@@ -2324,6 +2482,7 @@ async fn cmd_mail_read(
     offline: bool,
     cached: bool,
     json_out: bool,
+    compact: bool,
 ) -> Result<()> {
     if offline && !preview_images {
         let storage = open_storage_only(cfg)?;
@@ -2336,7 +2495,7 @@ async fn cmd_mail_read(
         if json_out {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&json!({ "message": msg }))?
+                serde_json::to_string_pretty(&mail_read_json(&msg, compact))?
             );
         } else {
             print_mail_read_text(&msg, raw_html);
@@ -2351,7 +2510,7 @@ async fn cmd_mail_read(
                     if json_out {
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&json!({ "message": msg }))?
+                            serde_json::to_string_pretty(&mail_read_json(&msg, compact))?
                         );
                     } else {
                         print_mail_read_text(&msg, raw_html);
@@ -2376,7 +2535,7 @@ async fn cmd_mail_read(
     if json_out {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "message": msg }))?
+            serde_json::to_string_pretty(&mail_read_json(&msg, compact))?
         );
         return Ok(());
     }
@@ -2580,6 +2739,39 @@ async fn cmd_mail_forward(
         );
     } else {
         println!("Forwarded message {mail_id} -> {}", to.join(", "));
+    }
+    Ok(())
+}
+
+pub(crate) fn draft_edit_html(body: Option<&str>, html: Option<&str>) -> Option<String> {
+    html.map(str::to_owned).or_else(|| {
+        body.map(|markdown| crate::parser::compile_outgoing_mail_html(markdown, &[], None))
+    })
+}
+
+async fn cmd_edit_draft(
+    cfg: &AppConfig,
+    id: &str,
+    subject: Option<&str>,
+    body: Option<&str>,
+    body_html: Option<&str>,
+    json_out: bool,
+) -> Result<()> {
+    let html = draft_edit_html(body, body_html);
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    if let Err(err) = graph.edit_mail_draft(id, subject, html.as_deref()).await {
+        return Err(wrap_graph_permission_error(&graph, err).await);
+    }
+    if let Ok(updated) = graph.get_mail_message(id).await {
+        let _ = storage.upsert_mail_messages(&[updated]);
+    }
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "ok": true, "message_id": id }))?
+        );
+    } else {
+        println!("Updated draft {id}.");
     }
     Ok(())
 }
@@ -3028,6 +3220,36 @@ async fn cmd_event_create(
     Ok(())
 }
 
+async fn cmd_update_event(
+    cfg: &AppConfig,
+    id: &str,
+    subject: Option<&str>,
+    start: Option<&str>,
+    end: Option<&str>,
+    json_out: bool,
+) -> Result<()> {
+    let start = start.map(CalendarEditTime::parse).transpose()?;
+    let end = end.map(CalendarEditTime::parse).transpose()?;
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let event = match graph
+        .edit_calendar_event(id, subject, start.as_ref(), end.as_ref())
+        .await
+    {
+        Ok(updated) => updated,
+        Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+    };
+    let _ = storage.upsert_calendar_events(std::slice::from_ref(&event));
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "ok": true, "event": event }))?
+        );
+    } else {
+        println!("Updated event {} ({}).", event.subject, event.id);
+    }
+    Ok(())
+}
+
 async fn cmd_event_rsvp(
     cfg: &AppConfig,
     event_id: &str,
@@ -3308,6 +3530,47 @@ async fn cmd_todo_add(
         );
     } else {
         println!("Task added: {} ({})", created.title, created.id);
+    }
+    Ok(())
+}
+
+pub(crate) fn normalize_todo_edit_due(due: &str) -> Result<String> {
+    let due = due.trim();
+    if due.parse::<NaiveDate>().is_ok() || DateTime::parse_from_rfc3339(due).is_ok() {
+        return normalize_todo_due_iso(due);
+    }
+    bail!("Use YYYY-MM-DD or an RFC3339 timestamp for the task due date.")
+}
+
+async fn cmd_update_task(
+    cfg: &AppConfig,
+    id: &str,
+    list: &str,
+    title: Option<&str>,
+    due: Option<&str>,
+    json_out: bool,
+) -> Result<()> {
+    let due = due.map(normalize_todo_edit_due).transpose()?;
+    if title.is_some_and(|title| title.trim().is_empty()) {
+        bail!("Task title must not be empty.");
+    }
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let resolved = resolver::resolve_todo_list(&graph, &storage, list, false).await?;
+    let task = match graph
+        .edit_todo_task(&resolved.id, id, title, due.as_deref())
+        .await
+    {
+        Ok(updated) => updated,
+        Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+    };
+    let _ = storage.upsert_todo_tasks(std::slice::from_ref(&task));
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "ok": true, "task": task }))?
+        );
+    } else {
+        println!("Updated task {} ({}).", task.title, task.id);
     }
     Ok(())
 }

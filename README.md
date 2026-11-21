@@ -7,11 +7,11 @@
 [![npm version](https://img.shields.io/npm/v/%40bitefoundry%2Foutlook?color=7aa2f7&label=%40bitefoundry%2Foutlook&logo=npm)](https://www.npmjs.com/package/@bitefoundry/outlook)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-565f89)](docs/NPM.md)
 [![Built with Rust & Ratatui](https://img.shields.io/badge/Rust-Ratatui-e0af68?logo=rust&logoColor=white)](https://ratatui.rs)
-[![License: MIT](https://img.shields.io/badge/License-MIT-9ece6a)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-9ece6a)](https://opensource.org/license/mit)
 
 <br />
 
-![outlook TUI Demo](assets/demo.gif)
+![outlook TUI Demo](https://raw.githubusercontent.com/BiteFoundry/outlook/master/assets/demo.gif)
 
 </div>
 
@@ -24,7 +24,7 @@
 | **Minimal-Chrome TUI** | 3-tier responsive `ratatui` workspace across **Mail** (`1`), **Calendar** (`2`), and **Microsoft To Do** (`3`) with HTML-rendered email preview, inline `href` toggle (`h`), Link Extractor (`u`), quoted-reply folding (`z`), structured Compose modal (`c`), `zoxide` File Picker (`Ctrl+F`), and `Ctrl+K` Omni-Switcher. |
 | **High-Res Terminal Images** | Native inline rendering for attached and `cid:`/`https://` email images across **Kitty**, **iTerm2 (`OSC 1337`)**, **Sixel (`DCS q`)**, and **24-bit Half-Blocks (`▀`)** fallback with live zoom (`+`/`-`/`0`) and protocol cycling (`p`). |
 | **Local SQLite FTS5 + IPC Daemon** | Bundled SQLite WAL + FTS5 cache (`cache.db`) with incremental delta sync, `$batch` neighbor hydration, 0ms optimistic triage (`archive`, `flag`, `mark-read`, `complete`), offline search, and sub-5ms CLI reads via `outlook daemon`. |
-| **4-in-1 Agent Interface** | One static binary (Windows, macOS, Linux **GLIBC 2.28 / AlmaLinux 8+**) delivers **TUI**, scriptable **CLI (`--json`)**, **Axum HTTP REST API (`outlook serve`, `:3939`)**, and **stdio MCP server (`outlook mcp`, 20 tools)**. |
+| **4-in-1 Agent Interface** | One static binary (Windows, macOS, Linux **GLIBC 2.28 / AlmaLinux 8+**) delivers **TUI**, scriptable **CLI (`--json`)**, **Axum HTTP REST API (`outlook serve`, `:3939`)**, and **stdio MCP server (`outlook mcp`, 23 tools)**. |
 
 ---
 
@@ -54,6 +54,7 @@ outlook
 | `j` / `k` / `↑` / `↓` | Global | Navigate folders, message list, calendar agenda, tasks, or reading pane |
 | `Tab` / `Enter` / `Esc` | Global | Cycle pane focus (`Folders ↔ List ↔ Reader`) or close modal |
 | `c` / `r` / `R` / `f` | Mail | **Compose** / **Reply** / **Reply-All** / **Forward** (Markdown + `Ctrl+F` attach + `Ctrl+V` image) |
+| `C` / `Ctrl+S` | Mail / Compose | Start a separate composition / save the current draft to Outlook |
 | `e` / `g` / `m` / `Del` | Mail | **Archive** / **Flag** / **Move to folder** / **Delete** (0ms optimistic updates) |
 | `h` / `u` / `z` | Mail Reader | Toggle inline `href` URLs / open **Link Extractor** / fold quoted reply history |
 | `t` / `F` / `U` | Mail | Toggle **Thread grouping** / **Focused Inbox** / **Unread filter** |
@@ -71,7 +72,8 @@ outlook
 
 ```bash
 # Mail: inspect inbox, read, reply, and send Markdown with attachments
-outlook mail --folder inbox --unread --limit 20 --json
+outlook mail --folder inbox --unread --limit 20 --json --compact
+outlook read AAMkAGI2... --json --compact
 outlook read AAMkAGI2... --mark-read
 outlook send --to elena.park@acme.dev --subject "v2.4 Release" \
   --body "**All canary checks passed.** See attached benchmarks." \
@@ -85,6 +87,21 @@ outlook create-event --subject "Go / No-Go Review" \
 outlook add-task "Promote canary to 100%" --due 2026-11-20 --importance high
 outlook daemon start
 ```
+
+Use `--compact` with `--json` to list message headers or read headers and the complete plain-text body. Use `read --json` for HTML and attachment details.
+
+Use `outlook mark` for read and flag changes, and `outlook move` to change folders. MCP `update_message` supports both. In the TUI, `Ctrl+S` saves the current composition. Reopening and saving reuses the draft ID. Reply, reply-all, and forward drafts retain their source message relationship and quoted HTML.
+
+```sh
+outlook edit-draft DRAFT_ID --subject "Revised release notes" --json
+outlook edit-draft DRAFT_ID --body 'The **final** checklist is attached.' --json
+outlook update-event EVENT_ID --start 2026-11-23T09:00 --end 2026-11-23T09:30 --json
+outlook update-task TASK_ID --list tasks --due 2026-11-25 --json
+```
+
+Each edit sends the specified fields. A draft subject change preserves the original body and its markup. Use `--body-html` to supply replacement HTML directly. Calendar edits leave the body, attendees, and recurrence out of the request. To Do edits leave the body and checklist out of the request. [Message updates](https://learn.microsoft.com/en-us/graph/api/message-update?view=graph-rest-1.0) · [Event updates](https://learn.microsoft.com/en-us/graph/api/event-update?view=graph-rest-1.0) · [To Do updates](https://learn.microsoft.com/en-us/graph/api/todotask-update?view=graph-rest-1.0)
+
+Calendar wall-clock times such as `2026-11-23T09:00` use the event's original Graph time zone. Use date-only values with all-day events and give the exclusive end date. RFC3339 values such as `2026-11-23T09:00:00+09:00` are sent in UTC for timed events. Non-UTC recurring events require wall-clock times. To Do dates use midnight UTC, and RFC3339 To Do timestamps are converted to UTC. [Event time and recurrence](https://learn.microsoft.com/en-us/graph/api/resources/event?view=graph-rest-1.0)
 
 ### Local HTTP REST API (`outlook serve`)
 
@@ -102,7 +119,7 @@ Full endpoint & schema docs: **[docs/API.md](docs/API.md)** · **[docs/openapi.y
 
 ### MCP Server (`outlook mcp`)
 
-Exposes **20 Microsoft Outlook tools** (`whoami`, `list_mail_folders`, `list_messages`, `get_message`, `send_mail`, `reply_mail`, `forward_mail`, `update_message`, `delete_message`, `download_attachment`, `search_mail`, `list_events`, `create_event`, `respond_event`, `delete_event`, `list_todo_lists`, `list_tasks`, `create_task`, `complete_task`, `search_contacts`) over newline-delimited stdio JSON-RPC 2.0:
+Exposes **23 Microsoft Outlook tools** over newline-delimited stdio JSON-RPC 2.0, including `update_draft`, `update_event`, and `update_task`.
 
 ```bash
 # Claude Code
@@ -131,15 +148,15 @@ Full tool schemas & client setups: **[docs/MCP.md](docs/MCP.md)** · **[docs/NPM
 | --- | --- | --- | --- |
 | [`@bitefoundry/teams`](https://github.com/BiteFoundry/teams) | `teams` | Microsoft Teams (Chats, Channels, Threads, Presence) | TUI · CLI · HTTP · MCP |
 | **`@bitefoundry/outlook`** *(this repo)* | `outlook` | Microsoft Outlook (Mail, Calendar, To Do, Contacts) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/onenote`](https://github.com/BiteFoundry/onenote) | `onenote` | Microsoft OneNote (Notebooks, Sections, Pages) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/sharepoint`](https://github.com/BiteFoundry/sharepoint) | `sharepoint` | SharePoint & OneDrive (Sites, Drives, Lists, Files) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/atlassian`](https://github.com/BiteFoundry/atlassian) | `atlassian` | Jira & Confluence (Issues, Boards, Sprints, Wiki) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/notion`](https://github.com/BiteFoundry/notion) | `notion` | Notion (Pages, Databases, Blocks, Comments) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/onenote`](https://github.com/BiteFoundry/onenote) | `onenote`, `note` | Microsoft OneNote (Notebooks, Sections, Pages) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/sharepoint`](https://github.com/BiteFoundry/sharepoint) | `sharepoint`, `sp`, `onedrive`, `od` | SharePoint & OneDrive (Sites, Drives, Lists, Files) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/atlassian`](https://github.com/BiteFoundry/atlassian) | `atlassian`, `jira`, `confluence`, `conf` | Jira & Confluence (Issues, Boards, Sprints, Wiki) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/notion`](https://github.com/BiteFoundry/notion) | `notion`, `nt` | Notion (Pages, Databases, Blocks, Comments) | TUI · CLI · HTTP · MCP |
 
 ---
 
 ## License & Disclaimer
 
-Licensed under the [MIT License](LICENSE).
+Licensed under the [MIT License](https://opensource.org/license/mit).
 
 Unofficial terminal client for Microsoft Outlook. Not affiliated with, endorsed by, or sponsored by Microsoft Corporation.

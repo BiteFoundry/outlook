@@ -279,16 +279,47 @@ impl GraphClient {
         task_id: &str,
         completed: bool,
     ) -> Result<TodoTask> {
+        let status = if completed { "completed" } else { "notStarted" };
+        self.patch_todo_task(list_id, task_id, serde_json::json!({ "status": status }))
+            .await
+    }
+
+    pub(crate) async fn edit_todo_task(
+        &self,
+        list_id: &str,
+        task_id: &str,
+        title: Option<&str>,
+        due_utc: Option<&str>,
+    ) -> Result<TodoTask> {
+        let mut payload = serde_json::json!({});
+        if let Some(title) = title {
+            payload["title"] = serde_json::json!(title);
+        }
+        if let Some(due_utc) = due_utc {
+            payload["dueDateTime"] = serde_json::json!({
+                "dateTime": due_utc.trim_end_matches('Z'),
+                "timeZone": "UTC",
+            });
+        }
+        if title.is_none() && due_utc.is_none() {
+            bail!("Provide a task title or due date to update.");
+        }
+        self.patch_todo_task(list_id, task_id, payload).await
+    }
+
+    async fn patch_todo_task(
+        &self,
+        list_id: &str,
+        task_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<TodoTask> {
         let resolved_id = self.resolve_todo_list_id(list_id).await?;
         let path = format!(
             "/me/todo/lists/{}/tasks/{}",
             urlencoding::encode(&resolved_id),
             urlencoding::encode(task_id.trim())
         );
-        let status = if completed { "completed" } else { "notStarted" };
-        let updated_opt: Option<GraphTodoTask> = self
-            .patch_json_optional(&path, &serde_json::json!({ "status": status }))
-            .await?;
+        let updated_opt: Option<GraphTodoTask> = self.patch_json_optional(&path, &payload).await?;
         let raw = match updated_opt {
             Some(t) => t,
             None => self.get_json(&path).await?,

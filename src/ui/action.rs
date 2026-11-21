@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use chrono::NaiveDate;
 
 use crate::img_preview;
-use crate::models::{EventRsvpAction, InlineImageUpload, OutgoingEvent};
+use crate::models::{EventRsvpAction, OutgoingEvent};
 use crate::parser;
 use crate::sync::SyncCommand;
 
@@ -65,6 +65,7 @@ pub enum Action {
     // Mail actions
     SelectMailFolder(String),
     OpenMailCompose,
+    StartNewMailCompose,
     ComposeTo(String),
     MailReply {
         reply_all: bool,
@@ -97,16 +98,7 @@ pub enum Action {
     LoadOlderMail,
 
     // Mail compose & overlay text editing
-    SubmitMailCompose {
-        mode: MailComposeMode,
-        to: Vec<String>,
-        cc: Vec<String>,
-        bcc: Vec<String>,
-        subject: String,
-        body_markdown: String,
-        attachments: Vec<PathBuf>,
-        inline_images: Vec<InlineImageUpload>,
-    },
+    SubmitMailCompose,
     SaveDraft,
     SaveMailDraft,
     StashMailDraft(Box<MailComposeOverlay>),
@@ -199,8 +191,7 @@ pub enum Action {
 /// Returns `true` when the application should exit.
 pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
     if matches!(action, Action::Quit) {
-        stash_open_compose(app, ui);
-        return true;
+        return quit_with_draft(app, ui);
     }
 
     if let Action::Click { column, row } = action {
@@ -242,8 +233,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
 fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
     match action {
         Action::Quit => {
-            stash_open_compose(app, ui);
-            return true;
+            return quit_with_draft(app, ui);
         }
         Action::QuitConfirm => {
             if let Some(Overlay::MailCompose(c)) = ui.overlays.last() {
@@ -256,7 +246,7 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     return false;
                 }
             }
-            return true;
+            return quit_with_draft(app, ui);
         }
         Action::Noop => {}
 
@@ -414,6 +404,16 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             ui.close_overlays_of(OverlayKind::MailCompose);
             ui.push_overlay(Overlay::mail_compose(compose));
         }
+        Action::StartNewMailCompose => {
+            if let Err(err) = stash_open_compose(app, ui) {
+                ui.error(format!("Cannot save draft locally: {err:#}"));
+                return false;
+            }
+            let mut compose = MailComposeOverlay::new();
+            compose.maybe_request_contacts_sync(app);
+            ui.close_overlays_of(OverlayKind::MailCompose);
+            ui.push_overlay(Overlay::mail_compose(compose));
+        }
         Action::ComposeTo(email) => {
             let compose = MailComposeOverlay::new_to(email);
             ui.close_overlays_of(OverlayKind::MailCompose);
@@ -423,7 +423,7 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             if let Some(mail) = app.active_mail().cloned() {
                 let mut compose = MailComposeOverlay::reply(&mail, reply_all, &app.my_email);
                 if let Some(saved) = app.draft_store.get_mail(&compose.mode.draft_key()) {
-                    compose = MailComposeOverlay::from_draft_entry(compose.mode.clone(), saved);
+                    compose = compose.resume_thread_draft(saved);
                 }
                 compose.maybe_request_contacts_sync(app);
                 ui.close_overlays_of(OverlayKind::MailCompose);
@@ -434,7 +434,7 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             if let Some(mail) = app.active_mail().cloned() {
                 let mut compose = MailComposeOverlay::forward(&mail);
                 if let Some(saved) = app.draft_store.get_mail(&compose.mode.draft_key()) {
-                    compose = MailComposeOverlay::from_draft_entry(compose.mode.clone(), saved);
+                    compose = compose.resume_thread_draft(saved);
                 }
                 compose.maybe_request_contacts_sync(app);
                 ui.close_overlays_of(OverlayKind::MailCompose);
@@ -592,27 +592,13 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
 
         // Compose submission & draft stashing
-        Action::SubmitMailCompose {
-            mode,
-            to,
-            cc,
-            bcc,
-            subject,
-            body_markdown,
-            attachments,
-            inline_images,
-        } => {
-            app.submit_mail_compose(
-                ui,
-                mode,
-                to,
-                cc,
-                bcc,
-                subject,
-                body_markdown,
-                attachments,
-                inline_images,
-            );
+        Action::SubmitMailCompose => {
+            if let Some(Overlay::MailCompose(compose)) = ui.overlays.last() {
+                let compose = compose.clone();
+                if app.submit_mail_compose(ui, &compose) {
+                    ui.close_overlays_of(OverlayKind::MailCompose);
+                }
+            }
         }
         Action::SaveMailDraft => {
             if let Some(Overlay::MailCompose(compose)) = ui.overlays.last() {
@@ -621,7 +607,11 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             }
         }
         Action::StashMailDraft(compose) => {
-            app.stash_compose_draft(&compose);
+            if let Err(err) = app.stash_compose_draft(&compose) {
+                let mut compose = *compose;
+                compose.error = Some(format!("Cannot save draft locally: {err:#}"));
+                ui.push_overlay(Overlay::mail_compose(compose));
+            }
         }
         Action::AttachComposeFile(path) => {
             let name = path
@@ -967,12 +957,25 @@ fn escape_html_text(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn stash_open_compose(app: &mut AppState, ui: &UiState) {
+fn quit_with_draft(app: &mut AppState, ui: &mut UiState) -> bool {
+    if app.has_pending_draft_write() {
+        ui.info("Outlook is saving a draft. Quit after the save completes.");
+        return false;
+    }
+    if let Err(err) = stash_open_compose(app, ui) {
+        ui.error(format!("Cannot save draft locally: {err:#}"));
+        return false;
+    }
+    true
+}
+
+fn stash_open_compose(app: &mut AppState, ui: &UiState) -> anyhow::Result<()> {
     for ov in &ui.overlays {
         if let Overlay::MailCompose(compose) = ov {
-            app.stash_compose_draft(compose);
+            app.stash_compose_draft(compose)?;
         }
     }
+    Ok(())
 }
 
 fn cycle_focus(ui: &mut UiState, forward: bool) {

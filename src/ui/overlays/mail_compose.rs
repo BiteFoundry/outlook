@@ -16,8 +16,8 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    config::MailDraftEntry,
-    models::{ContactItem, InlineImageUpload, MailMessage},
+    config::{MailDraftEntry, MailDraftHeaders},
+    models::{ContactItem, MailMessage},
     ui::{
         action::Action,
         app::{AppState, UiState},
@@ -49,6 +49,9 @@ impl MailComposeMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailComposeOverlay {
     pub mode: MailComposeMode,
+    pub compose_id: String,
+    pub draft_id: Option<String>,
+    pub thread_headers: Option<MailDraftHeaders>,
     pub to: String,
     pub cc: String,
     pub bcc: String,
@@ -75,6 +78,9 @@ impl MailComposeOverlay {
     pub fn new() -> Self {
         Self {
             mode: MailComposeMode::New,
+            compose_id: uuid::Uuid::new_v4().to_string(),
+            draft_id: None,
+            thread_headers: None,
             to: String::new(),
             cc: String::new(),
             bcc: String::new(),
@@ -100,11 +106,18 @@ impl MailComposeOverlay {
     pub fn from_draft_entry(mode: MailComposeMode, draft: &MailDraftEntry) -> Self {
         let mut s = Self::new();
         s.mode = mode;
+        if !draft.compose_id.is_empty() {
+            s.compose_id.clone_from(&draft.compose_id);
+        }
+        s.draft_id.clone_from(&draft.draft_id);
+        s.thread_headers.clone_from(&draft.thread_headers);
         s.to = draft.to.clone();
         s.cc = draft.cc.clone();
         s.bcc = draft.bcc.clone();
         s.subject = draft.subject.clone();
         s.body.load_text(&draft.body);
+        s.body.pending_images.clone_from(&draft.inline_images);
+        s.attachments.clone_from(&draft.attachments);
         s.field = if s.to.trim().is_empty() { 0 } else { 4 };
         s
     }
@@ -125,40 +138,43 @@ impl MailComposeOverlay {
             body: self.body.text().to_string(),
             reply_to_id,
             forward_of_id,
+            compose_id: self.compose_id.clone(),
+            draft_id: self.draft_id.clone(),
+            attachments: self.attachments.clone(),
+            inline_images: self.body.pending_images.clone(),
+            thread_headers: self.thread_headers.clone(),
+            ..Default::default()
         }
     }
 
     pub fn has_unsent_content(&self) -> bool {
-        !self.body.is_empty()
+        self.draft_id.is_some()
+            || !self.body.is_empty()
             || !self.attachments.is_empty()
+            || !self.body.pending_images.is_empty()
+            || (!self.cc.trim().is_empty() && matches!(self.mode, MailComposeMode::New))
+            || (!self.bcc.trim().is_empty() && matches!(self.mode, MailComposeMode::New))
             || (!self.subject.trim().is_empty() && matches!(self.mode, MailComposeMode::New))
             || (!self.to.trim().is_empty() && matches!(self.mode, MailComposeMode::New))
     }
 
     pub fn reply(mail: &MailMessage, reply_all: bool, my_email: &str) -> Self {
-        let sender_addr = mail
-            .from
-            .as_ref()
-            .map(|r| r.address.clone())
-            .unwrap_or_default();
-        let to = if reply_all {
-            let mut list = Vec::new();
-            if !sender_addr.is_empty() {
-                list.push(sender_addr);
-            }
+        let mut recipients: Vec<_> = mail.reply_to.iter().map(|r| r.address.clone()).collect();
+        if recipients.is_empty() {
+            recipients.extend(mail.from.iter().map(|r| r.address.clone()));
+        }
+        if reply_all {
             for r in &mail.to_recipients {
                 let addr = r.address.trim();
                 if !addr.is_empty()
                     && !addr.eq_ignore_ascii_case(my_email.trim())
-                    && !list.iter().any(|x| x.eq_ignore_ascii_case(addr))
+                    && !recipients.iter().any(|x| x.eq_ignore_ascii_case(addr))
                 {
-                    list.push(addr.to_string());
+                    recipients.push(addr.to_string());
                 }
             }
-            list.join(", ")
-        } else {
-            sender_addr
-        };
+        }
+        let to = recipients.join(", ");
         let cc = if reply_all {
             mail.cc_recipients
                 .iter()
@@ -188,6 +204,7 @@ impl MailComposeOverlay {
         s.cc = cc;
         s.subject = subject;
         s.field = 4; // focus Body directly
+        s.thread_headers = Some(s.headers());
         s
     }
 
@@ -197,26 +214,29 @@ impl MailComposeOverlay {
         } else {
             format!("Fwd: {}", mail.subject)
         };
-        let plain = mail.body_plain.trim();
-        let quoted_body = if plain.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\n\n---------- Forwarded message ----------\nFrom: {}\nDate: {}\nSubject: {}\n\n{}",
-                mail.from_display(),
-                mail.received_at,
-                mail.effective_subject(),
-                plain
-            )
-        };
         let mut s = Self::new();
         s.mode = MailComposeMode::Forward {
             message_id: mail.id.clone(),
         };
         s.subject = subject;
-        s.body.load_text_cursor_start(&quoted_body);
         s.field = 0; // focus To:
+        s.thread_headers = Some(s.headers());
         s
+    }
+
+    pub fn headers(&self) -> MailDraftHeaders {
+        MailDraftHeaders {
+            subject: self.subject.trim().to_string(),
+            to: self.parsed_to(),
+            cc: self.parsed_cc(),
+            bcc: self.parsed_bcc(),
+        }
+    }
+
+    pub fn resume_thread_draft(self, draft: &MailDraftEntry) -> Self {
+        let mut restored = Self::from_draft_entry(self.mode, draft);
+        restored.thread_headers = restored.thread_headers.or(self.thread_headers);
+        restored
     }
 
     pub fn title(&self) -> &'static str {
@@ -369,23 +389,7 @@ impl MailComposeOverlay {
                 }
             }
         }
-        for path in &self.attachments {
-            if !path.is_file() {
-                self.error = Some(format!("Attachment file not found: {}", path.display()));
-                return OverlayOutcome::Handled;
-            }
-        }
-        let inline_images: Vec<InlineImageUpload> = self.body.pending_images.clone();
-        OverlayOutcome::CloseAndDispatch(Action::SubmitMailCompose {
-            mode: self.mode.clone(),
-            to,
-            cc,
-            bcc,
-            subject: self.subject.trim().to_string(),
-            body_markdown: self.body.text().to_string(),
-            attachments: self.attachments.clone(),
-            inline_images,
-        })
+        OverlayOutcome::Dispatch(Action::SubmitMailCompose)
     }
 
     pub fn maybe_request_contacts_sync(&mut self, app: &AppState) {
@@ -1050,7 +1054,7 @@ mod tests {
         let send_outcome = compose.handle(&Action::OverlaySubmit, &app);
         assert!(matches!(
             send_outcome,
-            OverlayOutcome::CloseAndDispatch(Action::SubmitMailCompose { .. })
+            OverlayOutcome::Dispatch(Action::SubmitMailCompose)
         ));
 
         app.sync_ctrl.request(SyncCommand::Shutdown);

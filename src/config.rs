@@ -576,6 +576,41 @@ pub struct MailDraftEntry {
     pub body: String,
     pub reply_to_id: Option<String>,
     pub forward_of_id: Option<String>,
+    pub compose_id: String,
+    pub draft_id: Option<String>,
+    pub attachments: Vec<PathBuf>,
+    pub inline_images: Vec<crate::models::InlineImageUpload>,
+    pub thread_headers: Option<MailDraftHeaders>,
+    pub synced: MailDraftSync,
+}
+
+/// Last acknowledged Graph write for this composition.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MailDraftSync {
+    pub fields: Option<MailDraftFields>,
+    pub files: Vec<PathBuf>,
+    pub image_ids: Vec<String>,
+    pub thread_quote_html: Option<String>,
+    pub thread_creation_pending: bool,
+    pub send_pending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailDraftHeaders {
+    pub subject: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailDraftFields {
+    pub subject: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub body_hash: String,
 }
 
 impl MailDraftEntry {
@@ -585,6 +620,9 @@ impl MailDraftEntry {
             && self.bcc.trim().is_empty()
             && self.subject.trim().is_empty()
             && self.body.trim().is_empty()
+            && self.draft_id.is_none()
+            && self.attachments.is_empty()
+            && self.inline_images.is_empty()
     }
 }
 
@@ -611,7 +649,8 @@ impl DraftStore {
             return Ok(Self::default());
         }
         if let Ok(store) = serde_json::from_str::<Self>(&raw) {
-            if !store.mail.is_empty() || !store.text.is_empty() {
+            let object: HashMap<String, serde_json::Value> = serde_json::from_str(&raw)?;
+            if object.contains_key("mail") || object.contains_key("text") {
                 return Ok(store);
             }
         }
@@ -950,6 +989,8 @@ mod tests {
                 body: "Hello Alice".to_string(),
                 reply_to_id: Some("msg-1".to_string()),
                 forward_of_id: None,
+                draft_id: Some("draft-graph-id".to_string()),
+                ..Default::default()
             },
         );
         store.set_text("quick", "Note");
@@ -957,6 +998,11 @@ mod tests {
 
         let reloaded = DraftStore::load_from(&drafts_file).unwrap();
         assert_eq!(reloaded, store);
+        DraftStore::default().save_to(&drafts_file).unwrap();
+        assert_eq!(
+            DraftStore::load_from(&drafts_file).unwrap(),
+            DraftStore::default()
+        );
 
         let legacy_drafts_file = dir.path().join("sub/legacy_drafts.json");
         let mut raw_map = HashMap::new();

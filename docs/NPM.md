@@ -22,7 +22,7 @@ outlook --version
 
 # project-local
 npm install @bitefoundry/outlook
-npx outlook mail list
+npx outlook mail --folder inbox
 ```
 
 All workflows share the same Microsoft Entra ID login (or automatic M365 shared-session

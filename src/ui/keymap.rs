@@ -86,6 +86,12 @@ impl Keymap {
             map.bind(Some(focus), Char('c'), M::NONE, Action::OpenMailCompose);
             map.bind(
                 Some(focus),
+                Char('C'),
+                M::SHIFT,
+                Action::StartNewMailCompose,
+            );
+            map.bind(
+                Some(focus),
                 Char('r'),
                 M::NONE,
                 Action::MailReply { reply_all: false },
@@ -145,7 +151,18 @@ impl Keymap {
 
         // Nav also allows 'n' for New List / New Event, 'c' for Compose
         map.bind(Some(Focus::Nav), Char('n'), M::NONE, Action::ContextNew);
-        map.bind(Some(Focus::Nav), Char('c'), M::NONE, Action::OpenMailCompose);
+        map.bind(
+            Some(Focus::Nav),
+            Char('c'),
+            M::NONE,
+            Action::OpenMailCompose,
+        );
+        map.bind(
+            Some(Focus::Nav),
+            Char('C'),
+            M::SHIFT,
+            Action::StartNewMailCompose,
+        );
         map.bind(Some(Focus::Nav), Char('l'), M::NONE, Action::Activate);
         map.bind(Some(Focus::Nav), Right, M::NONE, Action::Activate);
 

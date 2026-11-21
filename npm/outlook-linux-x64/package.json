@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/outlook-linux-x64",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Prebuilt outlook binary for Linux x64",
   "repository": {
     "type": "git",

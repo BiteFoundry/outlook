@@ -128,11 +128,23 @@ impl From<GraphUser> for UserProfile {
 enum RequestBody {
     Empty,
     Json(serde_json::Value),
+    MailAction(Option<serde_json::Value>),
     Bytes {
         data: Arc<[u8]>,
         content_type: Option<String>,
     },
 }
+
+#[derive(Debug)]
+pub(crate) struct MailActionUnconfirmed;
+
+impl std::fmt::Display for MailActionUnconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Graph did not confirm the mail action")
+    }
+}
+
+impl std::error::Error for MailActionUnconfirmed {}
 
 impl GraphClient {
     pub(crate) fn resolve_url(&self, path_or_url: &str) -> String {
@@ -276,6 +288,22 @@ impl GraphClient {
         )
         .await?;
         Ok(())
+    }
+
+    pub(crate) async fn post_mail_action(
+        &self,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<reqwest::Response> {
+        self.execute_with_retry(
+            Method::POST,
+            &self.resolve_url(path),
+            RequestBody::MailAction(body),
+            &[],
+            true,
+            STANDARD_REQUEST_TIMEOUT,
+        )
+        .await
     }
 
     pub async fn patch_json<B: Serialize + ?Sized>(
@@ -618,6 +646,7 @@ impl GraphClient {
         use_bearer: bool,
         timeout: Duration,
     ) -> Result<reqwest::Response> {
+        let mail_action = matches!(&body, RequestBody::MailAction(_));
         let mut unauthorized_retried = false;
         let mut throttle_attempt = 0usize;
         let mut transport_retried = false;
@@ -637,8 +666,8 @@ impl GraphClient {
             }
 
             match &body {
-                RequestBody::Empty => {}
-                RequestBody::Json(val) => {
+                RequestBody::Empty | RequestBody::MailAction(None) => {}
+                RequestBody::Json(val) | RequestBody::MailAction(Some(val)) => {
                     req = req.json(val);
                 }
                 RequestBody::Bytes { data, content_type } => {
@@ -661,8 +690,14 @@ impl GraphClient {
                         tokio::time::sleep(Duration::from_millis(100 + jitter_ms)).await;
                         continue;
                     }
-                    return Err(err)
-                        .with_context(|| format!("Graph HTTP request failed ({method} {url})"));
+                    let uncertain = mail_action && !err.is_connect();
+                    let error = anyhow::Error::new(err)
+                        .context(format!("Graph HTTP request failed ({method} {url})"));
+                    return Err(if uncertain {
+                        error.context(MailActionUnconfirmed)
+                    } else {
+                        error
+                    });
                 }
             };
             let status = resp.status();
@@ -679,13 +714,15 @@ impl GraphClient {
                 }
             }
 
-            if matches!(
-                status,
-                StatusCode::TOO_MANY_REQUESTS
-                    | StatusCode::SERVICE_UNAVAILABLE
-                    | StatusCode::BAD_GATEWAY
-                    | StatusCode::GATEWAY_TIMEOUT
-            ) && throttle_attempt < MAX_THROTTLE_RETRIES
+            if (status == StatusCode::TOO_MANY_REQUESTS
+                || (!mail_action
+                    && matches!(
+                        status,
+                        StatusCode::SERVICE_UNAVAILABLE
+                            | StatusCode::BAD_GATEWAY
+                            | StatusCode::GATEWAY_TIMEOUT
+                    )))
+                && throttle_attempt < MAX_THROTTLE_RETRIES
             {
                 let delay_secs = parse_retry_after_secs(resp.headers(), throttle_attempt);
                 throttle_attempt += 1;
@@ -700,7 +737,19 @@ impl GraphClient {
             if !status.is_success() {
                 let err_body = resp.text().await.unwrap_or_default();
                 let detail = format_graph_error(status, &err_body);
-                bail!("{}{method} {url}): {detail}", crate::graph::GRAPH_API_ERROR_PREFIX);
+                let error = anyhow::anyhow!(
+                    "{}{method} {url}): {detail}",
+                    crate::graph::GRAPH_API_ERROR_PREFIX
+                );
+                return Err(
+                    if mail_action
+                        && (status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT)
+                    {
+                        error.context(MailActionUnconfirmed)
+                    } else {
+                        error
+                    },
+                );
             }
 
             return Ok(resp);

@@ -44,7 +44,7 @@ curl http://127.0.0.1:3939/health
 {
   "ok": true,
   "user_id": "00000000-0000-0000-0000-000000000000",
-  "version": "0.1.0"
+  "version": "0.1.5"
 }
 ```
 
@@ -187,6 +187,8 @@ curl -X POST http://127.0.0.1:3939/v1/mail/messages/AAMkAGI2.../forward \
 #### `PATCH /v1/mail/messages/{id}`
 
 Updates read status (`is_read`), flag status (`flagged`), and/or moves the message to `destination_folder_id` (alias `destination_folder`, accepting folder name, alias such as `"archive"`, or folder ID). At least one field must be provided.
+
+To edit an existing draft's subject or body, use `outlook edit-draft` or MCP `update_draft`. To edit an active composition, use the TUI.
 
 ```bash
 curl -X PATCH http://127.0.0.1:3939/v1/mail/messages/AAMkAGI2... \

@@ -17,7 +17,7 @@ use crate::{
     auth::diagnose_access_token_scopes,
     cli,
     config::AppConfig,
-    graph::GraphClient,
+    graph::{calendar::CalendarEditTime, GraphClient},
     models::{OutgoingEvent, OutgoingMail, OutgoingTodoTask},
     resolver,
     storage::Storage,
@@ -349,6 +349,7 @@ async fn call_tool(
             let flagged = args.optional_bool("flagged")?.unwrap_or(false);
             let focused = args.optional_bool("focused")?.unwrap_or(false);
             let offline = args.optional_bool("offline")?.unwrap_or(false);
+            let compact = args.optional_bool("compact")?.unwrap_or(false);
 
             let resolved = resolve_mail_folder_mcp(storage, graph, &folder, offline).await?;
             let folder_id = resolved.id.clone();
@@ -361,7 +362,7 @@ async fn call_tool(
             let messages = if offline {
                 let fid = folder_id.clone();
                 with_storage(storage, move |s| {
-                    s.list_mail_messages(Some(&fid), false, false, false, fetch_limit)
+                    cli::load_cached_mail_list(s, &fid, fetch_limit, !compact)
                 })
                 .await
                 .map_err(format_error)?
@@ -375,7 +376,7 @@ async fn call_tool(
                 let fid = outcome.folder_id;
                 with_storage(storage, move |s| {
                     cli::record_cli_sync_cursor(s, &format!("cli:mail:{fid}"));
-                    s.list_mail_messages(Some(&fid), false, false, false, fetch_limit)
+                    cli::load_cached_mail_list(s, &fid, fetch_limit, !compact)
                 })
                 .await
                 .map_err(format_error)?
@@ -386,7 +387,7 @@ async fn call_tool(
 
             Ok(json!({
                 "folder": resolved,
-                "messages": filtered,
+                "messages": cli::mail_list_json(&filtered, compact),
             }))
         }
 
@@ -394,6 +395,7 @@ async fn call_tool(
             let message_id = args.required_str("message_id")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
             let mark_read = args.optional_bool("mark_read")?.unwrap_or(false);
+            let compact = args.optional_bool("compact")?.unwrap_or(false);
 
             let mut msg = if offline {
                 let id_owned = message_id.clone();
@@ -419,7 +421,7 @@ async fn call_tool(
                 let _ = with_storage(storage, move |s| s.set_mail_read_local(&mid, true)).await;
             }
 
-            Ok(json!({ "message": msg }))
+            Ok(cli::mail_read_json(&msg, compact))
         }
 
         "send_mail" => {
@@ -508,6 +510,70 @@ async fn call_tool(
                 "message_id": message_id,
                 "to": to,
             }))
+        }
+
+        "update_draft" => {
+            let id = args.required_str("message_id")?;
+            let subject = args.optional_text("subject")?;
+            let body = args.optional_text("body")?;
+            let body_html = args.optional_text("body_html")?;
+            let html = cli::draft_edit_html(body, body_html);
+            map_graph_result(
+                graph,
+                graph.edit_mail_draft(&id, subject, html.as_deref()).await,
+            )
+            .await?;
+            if let Ok(updated) = graph.get_mail_message(&id).await {
+                let _ = with_storage(storage, move |s| s.upsert_mail_messages(&[updated])).await;
+            }
+            Ok(json!({ "ok": true, "message_id": id }))
+        }
+
+        "update_event" => {
+            let id = args.required_str("event_id")?;
+            let subject = args.optional_text("subject")?;
+            let start = args
+                .optional_text("start")?
+                .map(CalendarEditTime::parse)
+                .transpose()
+                .map_err(format_error)?;
+            let end = args
+                .optional_text("end")?
+                .map(CalendarEditTime::parse)
+                .transpose()
+                .map_err(format_error)?;
+            let updated = map_graph_result(
+                graph,
+                graph
+                    .edit_calendar_event(&id, subject, start.as_ref(), end.as_ref())
+                    .await,
+            )
+            .await?;
+            let cached = updated.clone();
+            let _ = with_storage(storage, move |s| s.upsert_calendar_events(&[cached])).await;
+            Ok(json!({ "ok": true, "event": updated }))
+        }
+
+        "update_task" => {
+            let id = args.required_str("task_id")?;
+            let list = args.optional_str("list")?;
+            let title = args.optional_text("title")?;
+            let due = args
+                .optional_text("due")?
+                .map(cli::normalize_todo_edit_due)
+                .transpose()
+                .map_err(format_error)?;
+            let resolved = resolve_todo_list_mcp(storage, graph, list.as_deref(), false).await?;
+            let updated = map_graph_result(
+                graph,
+                graph
+                    .edit_todo_task(&resolved.id, &id, title, due.as_deref())
+                    .await,
+            )
+            .await?;
+            let cached = updated.clone();
+            let _ = with_storage(storage, move |s| s.upsert_todo_tasks(&[cached])).await;
+            Ok(json!({ "ok": true, "task": updated }))
         }
 
         "update_message" => {
@@ -1146,18 +1212,20 @@ pub fn tool_catalog() -> Vec<Value> {
                     "unread": { "type": "boolean" },
                     "flagged": { "type": "boolean" },
                     "focused": { "type": "boolean" },
+                    "compact": { "type": "boolean", "description": "Return list fields without bodies or attachments" },
                     "offline": { "type": "boolean" }
                 }
             }
         }),
         json!({
             "name": "get_message",
-            "description": "Read full email headers, body, and attachment metadata by message ID.",
+            "description": "Read an email by ID. Use compact for headers and complete plain text.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "message_id": { "type": "string" },
                     "mark_read": { "type": "boolean" },
+                    "compact": { "type": "boolean", "description": "Return headers and plain text without HTML or attachments" },
                     "offline": { "type": "boolean" }
                 },
                 "required": ["message_id"]
@@ -1212,11 +1280,14 @@ pub fn tool_catalog() -> Vec<Value> {
             "description": "Update an email's read/unread status, flag status, or move it to another folder.",
             "inputSchema": {
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
                     "message_id": { "type": "string" },
                     "is_read": { "type": "boolean" },
                     "flagged": { "type": "boolean" },
-                    "destination_folder": { "type": "string", "description": "Target folder name, alias (e.g. 'archive'), or ID" }
+                    "destination_folder": { "type": "string", "description": "Target folder name, alias (e.g. 'archive'), or ID" },
+                    "destination_folder_id": { "type": "string", "description": "Alias for destination_folder" },
+                    "move_to_folder": { "type": "string", "description": "Alias for destination_folder" }
                 },
                 "required": ["message_id"]
             }
@@ -1384,6 +1455,45 @@ pub fn tool_catalog() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "name": "update_draft",
+            "description": "Edit subject and/or body of an existing Outlook draft. Provide Markdown body or raw body_html for a body replacement.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": false, "required": ["message_id"],
+                "properties": {
+                    "message_id": { "type": "string" },
+                    "subject": { "type": "string" },
+                    "body": { "type": "string", "description": "Replacement body in Markdown" },
+                    "body_html": { "type": "string", "description": "Replacement body in HTML" }
+                }
+            }
+        }),
+        json!({
+            "name": "update_event",
+            "description": "Edit subject and/or times of an existing calendar event.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": false, "required": ["event_id"],
+                "properties": {
+                    "event_id": { "type": "string" },
+                    "subject": { "type": "string" },
+                    "start": { "type": "string", "description": "RFC3339 instant, wall-clock time in the event's zone, or all-day date" },
+                    "end": { "type": "string", "description": "RFC3339 instant, wall-clock time in the event's zone, or exclusive all-day end date" }
+                }
+            }
+        }),
+        json!({
+            "name": "update_task",
+            "description": "Edit title and/or due date of an existing Microsoft To Do task.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": false, "required": ["task_id"],
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "list": { "type": "string", "description": "To Do list name, alias, or ID (default tasks)" },
+                    "title": { "type": "string" },
+                    "due": { "type": "string", "description": "YYYY-MM-DD at midnight UTC, or RFC3339" }
+                }
+            }
+        }),
     ]
 }
 
@@ -1410,6 +1520,7 @@ pub fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             args.optional_bool("unread")?;
             args.optional_bool("flagged")?;
             args.optional_bool("focused")?;
+            args.optional_bool("compact")?;
             args.optional_bool("offline")?;
             Ok(())
         }
@@ -1417,6 +1528,7 @@ pub fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             args.required_str("message_id")?;
             args.optional_bool("mark_read")?;
             args.optional_bool("offline")?;
+            args.optional_bool("compact")?;
             Ok(())
         }
         "send_mail" => {
@@ -1444,7 +1556,73 @@ pub fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             args.optional_str("comment")?;
             Ok(())
         }
+        "update_draft" => {
+            args.only(name, &["message_id", "subject", "body", "body_html"])?;
+            args.required_str("message_id")?;
+            let subject = args.optional_text("subject")?;
+            let body = args.optional_text("body")?;
+            let html = args.optional_text("body_html")?;
+            if body.is_some() && html.is_some() {
+                return Err("Provide either body or body_html.".into());
+            }
+            if subject.is_none() && body.is_none() && html.is_none() {
+                return Err("Provide a draft subject or body to update.".into());
+            }
+            Ok(())
+        }
+        "update_event" => {
+            args.only(name, &["event_id", "subject", "start", "end"])?;
+            args.required_str("event_id")?;
+            let subject = args.optional_text("subject")?;
+            let start = args
+                .optional_text("start")?
+                .map(CalendarEditTime::parse)
+                .transpose()
+                .map_err(format_error)?;
+            let end = args
+                .optional_text("end")?
+                .map(CalendarEditTime::parse)
+                .transpose()
+                .map_err(format_error)?;
+            if subject.is_none() && start.is_none() && end.is_none() {
+                return Err("Provide an event subject, start, or end to update.".into());
+            }
+            Ok(())
+        }
+        "update_task" => {
+            args.only(name, &["task_id", "list", "title", "due"])?;
+            args.required_str("task_id")?;
+            args.optional_str("list")?;
+            let title = args.optional_text("title")?;
+            let due = args
+                .optional_text("due")?
+                .map(cli::normalize_todo_edit_due)
+                .transpose()
+                .map_err(format_error)?;
+            if title.is_some_and(|title| title.trim().is_empty()) {
+                return Err("Task title must not be empty.".into());
+            }
+            if title.is_none() && due.is_none() {
+                return Err("Provide a task title or due date to update.".into());
+            }
+            Ok(())
+        }
         "update_message" => {
+            const SUPPORTED: &[&str] = &[
+                "message_id",
+                "is_read",
+                "flagged",
+                "destination_folder",
+                "destination_folder_id",
+                "move_to_folder",
+            ];
+            if let Some(field) = args
+                .object()?
+                .keys()
+                .find(|key| !SUPPORTED.contains(&key.as_str()))
+            {
+                return Err(format!("unsupported argument for update_message: {field}"));
+            }
             args.required_str("message_id")?;
             let is_read = args.optional_bool("is_read")?;
             let flagged = args.optional_bool("flagged")?;
@@ -1590,6 +1768,25 @@ impl<'a> Args<'a> {
         self.0
             .as_object()
             .ok_or_else(|| "arguments must be a JSON object".to_string())
+    }
+
+    fn only(&self, tool: &str, fields: &[&str]) -> Result<(), String> {
+        if let Some(key) = self
+            .object()?
+            .keys()
+            .find(|key| !fields.contains(&key.as_str()))
+        {
+            return Err(format!("unsupported argument for {tool}: {key}"));
+        }
+        Ok(())
+    }
+
+    fn optional_text(&self, key: &str) -> Result<Option<&str>, String> {
+        match self.object()?.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(text)) => Ok(Some(text)),
+            Some(_) => Err(format!("{key} must be a string")),
+        }
     }
 
     fn optional_str(&self, key: &str) -> Result<Option<String>, String> {
@@ -1777,7 +1974,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_exposes_exact_20_outlook_tools() {
+    async fn tools_list_exposes_outlook_tools() {
         let (cfg, graph, storage) = test_ctx();
         let resp = handle_rpc_line(
             &cfg,
@@ -1813,6 +2010,9 @@ mod tests {
                 "create_task",
                 "complete_task",
                 "search_contacts",
+                "update_draft",
+                "update_event",
+                "update_task",
             ]
         );
 
@@ -1865,6 +2065,39 @@ mod tests {
     }
 
     #[test]
+    fn edit_tools_validate_field_sets_and_time_formats() {
+        assert!(validate_tool_args(
+            "update_draft",
+            &json!({"message_id":"draft", "body_html":""})
+        )
+        .is_ok());
+        assert!(validate_tool_args(
+            "update_draft",
+            &json!({"message_id":"draft", "body":"text", "body_html":"<p>text</p>"})
+        )
+        .is_err());
+        assert!(validate_tool_args(
+            "update_event",
+            &json!({"event_id":"event", "subject":"new", "attendees":[]})
+        )
+        .is_err());
+        assert!(validate_tool_args(
+            "update_event",
+            &json!({"event_id":"event", "start":"2026-11-24T09:00"})
+        )
+        .is_ok());
+        assert!(
+            validate_tool_args("update_task", &json!({"task_id":"task", "due":"tomorrow"}))
+                .is_err()
+        );
+        assert!(validate_tool_args(
+            "update_task",
+            &json!({"task_id":"task", "due":"2026-11-24"})
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn argument_validation_covers_outlook_tools() {
         assert!(validate_tool_args(
             "send_mail",
@@ -1886,6 +2119,23 @@ mod tests {
         )
         .is_err());
         assert!(validate_tool_args("update_message", &json!({ "message_id": "m1" })).is_err());
+        assert_eq!(
+            validate_tool_args(
+                "update_message",
+                &json!({
+                    "message_id": "m1", "flagged": true, "subject": "unsupported"
+                })
+            )
+            .unwrap_err(),
+            "unsupported argument for update_message: subject"
+        );
+        assert!(validate_tool_args(
+            "get_message",
+            &json!({
+                "message_id": "m1", "compact": "true"
+            })
+        )
+        .is_err());
         assert!(validate_tool_args(
             "update_message",
             &json!({ "message_id": "m1", "destination_folder": "archive" })
@@ -2006,6 +2256,21 @@ mod tests {
             serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(payload["messages"].as_array().unwrap().len(), 1);
         assert_eq!(payload["messages"][0]["id"], "msg-2");
+        let listed = call_tool(
+            &cfg,
+            &graph,
+            &storage,
+            "list_messages",
+            &json!({
+                "folder": "inbox", "unread": true, "flagged": true,
+                "focused": true, "offline": true, "compact": true, "limit": 1,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(listed["messages"][0]["id"], payload["messages"][0]["id"]);
+        assert!(listed["messages"][0].get("body_plain").is_none());
+        assert!(listed["messages"][0].get("attachments").is_none());
 
         // get_message (offline)
         let resp = handle_rpc_line(
@@ -2029,6 +2294,23 @@ mod tests {
         let payload: Value =
             serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(payload["message"]["subject"], "Weekly Status");
+        let detail = call_tool(
+            &cfg,
+            &graph,
+            &storage,
+            "get_message",
+            &json!({
+                "message_id": "msg-1", "offline": true, "compact": true,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            detail["message"]["body_plain"],
+            payload["message"]["body_plain"]
+        );
+        assert!(detail["message"].get("body_html").is_none());
+        assert!(detail["message"].get("attachments").is_none());
 
         // search_mail (offline)
         let resp = handle_rpc_line(

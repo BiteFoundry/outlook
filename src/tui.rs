@@ -1318,7 +1318,7 @@ pub async fn run_with_persona(
     }
 
     if let Some(ui::overlays::Overlay::MailCompose(c)) = ui.overlays.last() {
-        app.stash_compose_draft(c);
+        app.stash_compose_draft(c)?;
     }
     let _ = sync_ctrl.request(SyncCommand::Shutdown);
     drop(guard);
