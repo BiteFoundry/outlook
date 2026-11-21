@@ -618,7 +618,9 @@ mod tests {
         picker.enter_zoxide_with_dirs(parsed);
         assert_eq!(picker.mode, FilePickerMode::ZoxideJump);
 
-        picker.handle(&Action::Input('b'));
+        for ch in beta.to_string_lossy().chars() {
+            picker.handle(&Action::Input(ch));
+        }
         assert_eq!(picker.filtered_zoxide_dirs().len(), 1);
         assert_eq!(picker.handle(&Action::Activate), OverlayOutcome::Handled);
         assert_eq!(picker.mode, FilePickerMode::Browse);

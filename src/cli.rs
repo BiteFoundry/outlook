@@ -8,7 +8,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde_json::json;
 
 use crate::{
@@ -580,6 +580,271 @@ pub enum DaemonCommand {
     Run,
 }
 
+fn hyphen_text_arg_ids(subcommand: &str) -> (&'static [&'static str], &'static [&'static str]) {
+    match subcommand {
+        "send" => (&["subject", "body"], &[]),
+        "reply" => (&[], &["body_md"]),
+        "forward" => (&[], &["comment_md"]),
+        "edit-draft" => (&["subject", "body"], &[]),
+        "search" => (&[], &["query"]),
+        "create-event" => (&["subject", "location", "body"], &[]),
+        "update-event" => (&["subject"], &[]),
+        "rsvp" => (&["comment"], &[]),
+        "add-task" => (&["notes"], &["title"]),
+        "update-task" => (&["title"], &[]),
+        "contacts" => (&["query"], &[]),
+        _ => (&[], &[]),
+    }
+}
+
+fn starts_with_hyphen(arg: &std::ffi::OsStr) -> bool {
+    arg.as_encoded_bytes().starts_with(b"-")
+}
+
+fn is_generic_flag_like_token(arg: &std::ffi::OsStr) -> bool {
+    let Some(s) = arg.to_str() else {
+        return false;
+    };
+    if s == "--" {
+        return true;
+    }
+    if let Some(rest) = s.strip_prefix("--") {
+        let name = rest.split_once('=').map_or(rest, |(k, _)| k);
+        return !name.is_empty()
+            && name.as_bytes()[0].is_ascii_alphanumeric()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    }
+    if let Some(rest) = s.strip_prefix('-') {
+        if rest.is_empty() {
+            return false;
+        }
+        if rest.len() == 1 && rest.as_bytes()[0].is_ascii_alphabetic() {
+            return true;
+        }
+        if rest.chars().all(|ch| ch == 'h' || ch == 'V') {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_flag_like_token(arg: &std::ffi::OsStr, cmd: &clap::Command) -> bool {
+    if is_generic_flag_like_token(arg) {
+        return true;
+    }
+    if let Some(rest) = arg.to_str().and_then(|s| s.strip_prefix('-')) {
+        if !rest.is_empty() && !rest.starts_with('-') {
+            return rest.chars().all(|ch| {
+                ch == 'h' || ch == 'V' || cmd.get_arguments().any(|a| a.get_short() == Some(ch))
+            });
+        }
+    }
+    false
+}
+
+fn has_potential_hyphen_text(args: &[std::ffi::OsString]) -> bool {
+    for tok in args {
+        if tok == "--" {
+            break;
+        }
+        if starts_with_hyphen(tok) && tok != "-" && !is_generic_flag_like_token(tok) {
+            return true;
+        }
+    }
+    false
+}
+
+fn parse_with_cmd(
+    mut cmd: clap::Command,
+    args: &[std::ffi::OsString],
+) -> std::result::Result<Cli, clap::Error> {
+    let matches = cmd.try_get_matches_from_mut(args)?;
+    Cli::from_arg_matches(&matches).map_err(|err| err.format(&mut cmd))
+}
+
+fn find_long_arg<'a>(sub: &'a clap::Command, name: &str) -> Option<&'a clap::Arg> {
+    sub.get_arguments().find(|arg| {
+        arg.get_long() == Some(name)
+            || arg
+                .get_all_aliases()
+                .is_some_and(|aliases| aliases.contains(&name))
+    })
+}
+
+fn is_known_subcommand_short_flag(arg: &std::ffi::OsStr, sub: &clap::Command) -> bool {
+    let Some(rest) = arg.to_str().and_then(|s| s.strip_prefix('-')) else {
+        return false;
+    };
+    !rest.is_empty()
+        && !rest.starts_with('-')
+        && rest
+            .chars()
+            .all(|ch| ch == 'h' || sub.get_arguments().any(|a| a.get_short() == Some(ch)))
+}
+
+/// Parses `outlook` CLI arguments while allowing separate hyphen-prefixed text literals
+/// (such as `"- 목록 항목"` or `"- first\n- second"`) for free-text options and positionals,
+/// without swallowing real flags, `--help`/`-h`, `--`, or flag-like tokens such as `--dry-run`.
+pub fn parse_cli_from<I, S>(args: I) -> std::result::Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString>,
+{
+    let raw: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+    if raw.len() <= 2 || !has_potential_hyphen_text(&raw[2..]) {
+        return Cli::try_parse_from(&raw);
+    }
+
+    let Some(first_sub) = raw[1].to_str() else {
+        return Cli::try_parse_from(&raw);
+    };
+
+    let mut cmd = <Cli as CommandFactory>::command();
+    let rewrite = {
+        cmd.get_subcommands()
+            .find(|sc| sc.get_name() == first_sub || sc.get_all_aliases().any(|a| a == first_sub))
+            .and_then(|sub| {
+                let (affected_opts, affected_pos) = hyphen_text_arg_ids(sub.get_name());
+                if affected_opts.is_empty() && affected_pos.is_empty() {
+                    return None;
+                }
+
+                let mut rewritten = Vec::with_capacity(raw.len());
+                rewritten.push(raw[0].clone());
+                rewritten.push(raw[1].clone());
+
+                let mut enable_pos_hyphen: Vec<&'static str> = Vec::new();
+                let mut block_pos_hyphen = false;
+                let mut pos_index: usize = 1;
+                let mut i = 2usize;
+
+                while i < raw.len() {
+                    let tok = &raw[i];
+                    if tok == "--" {
+                        rewritten.extend_from_slice(&raw[i..]);
+                        break;
+                    }
+
+                    if let Some(long_rest) = tok.to_str().and_then(|s| s.strip_prefix("--")) {
+                        if let Some((name, _)) = long_rest.split_once('=') {
+                            if find_long_arg(sub, name).is_some() {
+                                rewritten.push(tok.clone());
+                                i += 1;
+                                continue;
+                            }
+                            if is_flag_like_token(tok, sub) {
+                                block_pos_hyphen = true;
+                                rewritten.push(tok.clone());
+                                i += 1;
+                                continue;
+                            }
+                        } else if long_rest == "help" {
+                            rewritten.push(tok.clone());
+                            i += 1;
+                            continue;
+                        } else if let Some(arg) = find_long_arg(sub, long_rest) {
+                            if arg.get_action().takes_values() {
+                                if let Some(next) = raw.get(i + 1) {
+                                    let arg_id = arg.get_id().as_str();
+                                    if affected_opts.contains(&arg_id) {
+                                        if starts_with_hyphen(next)
+                                            && !is_flag_like_token(next, sub)
+                                        {
+                                            let mut attached = std::ffi::OsString::with_capacity(
+                                                tok.len() + 1 + next.len(),
+                                            );
+                                            attached.push(tok);
+                                            attached.push("=");
+                                            attached.push(next);
+                                            rewritten.push(attached);
+                                            i += 2;
+                                            continue;
+                                        }
+                                        if starts_with_hyphen(next) {
+                                            block_pos_hyphen = true;
+                                            rewritten.push(tok.clone());
+                                            i += 1;
+                                            continue;
+                                        }
+                                        rewritten.push(tok.clone());
+                                        rewritten.push(next.clone());
+                                        i += 2;
+                                        continue;
+                                    }
+                                    if starts_with_hyphen(next) {
+                                        block_pos_hyphen = true;
+                                        rewritten.push(tok.clone());
+                                        i += 1;
+                                        continue;
+                                    }
+                                    rewritten.push(tok.clone());
+                                    rewritten.push(next.clone());
+                                    i += 2;
+                                    continue;
+                                }
+                                block_pos_hyphen = true;
+                                rewritten.push(tok.clone());
+                                i += 1;
+                                continue;
+                            }
+                            rewritten.push(tok.clone());
+                            i += 1;
+                            continue;
+                        } else if is_flag_like_token(tok, sub) {
+                            block_pos_hyphen = true;
+                            rewritten.push(tok.clone());
+                            i += 1;
+                            continue;
+                        }
+                    } else if starts_with_hyphen(tok) && tok != "-" && is_flag_like_token(tok, sub)
+                    {
+                        if !is_known_subcommand_short_flag(tok, sub) {
+                            block_pos_hyphen = true;
+                        }
+                        rewritten.push(tok.clone());
+                        i += 1;
+                        continue;
+                    }
+
+                    if starts_with_hyphen(tok) && tok != "-" && !block_pos_hyphen {
+                        if let Some(pos_arg) = sub.get_positionals().nth(pos_index - 1) {
+                            if let Some(&id) = affected_pos
+                                .iter()
+                                .find(|&&id| id == pos_arg.get_id().as_str())
+                            {
+                                if !enable_pos_hyphen.contains(&id) {
+                                    enable_pos_hyphen.push(id);
+                                }
+                            }
+                        }
+                    }
+                    rewritten.push(tok.clone());
+                    pos_index += 1;
+                    i += 1;
+                }
+
+                Some((sub.get_name().to_string(), rewritten, enable_pos_hyphen))
+            })
+    };
+
+    let Some((sub_name, rewritten, enable_pos_hyphen)) = rewrite else {
+        return parse_with_cmd(cmd, &raw);
+    };
+
+    if !enable_pos_hyphen.is_empty() {
+        cmd = cmd.mut_subcommand(&sub_name, |mut sc| {
+            for arg_id in &enable_pos_hyphen {
+                sc = sc.mut_arg(*arg_id, |arg| arg.allow_hyphen_values(true));
+            }
+            sc
+        });
+    }
+
+    parse_with_cmd(cmd, &rewritten)
+}
+
 /// Synchronously handles `--help`, `-h`, `--version`, `-V`, and `help` before Tokio/rustls/Keyring/SQLite init.
 pub fn try_fast_help_or_version() -> Option<Result<()>> {
     try_fast_help_or_version_from(std::env::args_os(), Persona::detect())
@@ -604,7 +869,7 @@ where
     }
 
     let err = match persona {
-        Persona::Outlook => Cli::try_parse_from(&raw).err()?,
+        Persona::Outlook => parse_cli_from(&raw).err()?,
     };
     if matches!(
         err.kind(),
@@ -618,7 +883,7 @@ where
 
 pub async fn run_from_env() -> Result<()> {
     let persona = Persona::detect();
-    let cli = Cli::parse();
+    let cli = parse_cli_from(std::env::args_os()).unwrap_or_else(|err| err.exit());
     let mut cfg = AppConfig::load();
     Box::pin(dispatch_command(&mut cfg, persona, cli.command)).await
 }
@@ -4689,5 +4954,559 @@ mod tests {
         let lines = format_mail_folders_lines(&folders);
         assert_eq!(lines[0], "Inbox [inbox]  unread=2/10  (f-inbox)");
         assert_eq!(lines[1], "Inbox / Projects  unread=1/4  (f-proj)");
+    }
+
+    #[test]
+    fn parses_hyphen_text_and_markdown_values_across_all_audit_paths() {
+        let samples = ["- 목록 항목", "- first\n- second", "- 첫째\n- 둘째", "---"];
+
+        for sample in samples {
+            // 1. send --body (and --subject)
+            let cli = parse_cli_from([
+                "outlook",
+                "send",
+                "--to",
+                "audit@example.invalid",
+                "--subject",
+                sample,
+                "--body",
+                sample,
+                "--json",
+            ])
+            .unwrap();
+            assert!(matches!(
+                cli.command.unwrap(),
+                Command::Send {
+                    subject,
+                    body: Some(body),
+                    json: true,
+                    ..
+                } if subject == sample && body == sample
+            ));
+
+            // compose alias + stdin mode (omitted --body)
+            let cli = parse_cli_from([
+                "outlook",
+                "compose",
+                "--to",
+                "audit@example.invalid",
+                "--subject",
+                sample,
+                "--json",
+            ])
+            .unwrap();
+            assert!(matches!(
+                cli.command.unwrap(),
+                Command::Send {
+                    subject,
+                    body: None,
+                    json: true,
+                    ..
+                } if subject == sample
+            ));
+
+            // 2. reply body_md + --all before and after
+            let cli = parse_cli_from(["outlook", "reply", "id", sample, "--all", "--json"]).unwrap();
+            assert!(matches!(
+                cli.command.unwrap(),
+                Command::Reply {
+                    message_id,
+                    body_md,
+                    all: true,
+                    json: true,
+                } if message_id == "id" && body_md == sample
+            ));
+            let cli = parse_cli_from(["outlook", "reply", "id", "--all", sample]).unwrap();
+            assert!(matches!(
+                cli.command.unwrap(),
+                Command::Reply {
+                    message_id,
+                    body_md,
+                    all: true,
+                    json: false,
+                } if message_id == "id" && body_md == sample
+            ));
+
+            // 3. forward comment_md before and after --to, plus omitted comment
+            let cli = parse_cli_from([
+                "outlook",
+                "forward",
+                "id",
+                sample,
+                "--to",
+                "audit@example.invalid",
+                "--json",
+            ])
+            .unwrap();
+            assert!(matches!(
+                cli.command.unwrap(),
+                Command::Forward {
+                    message_id,
+                    to,
+                    comment_md: Some(comment),
+                    json: true,
+                } if message_id == "id" && to == vec!["audit@example.invalid"] && comment == sample
+            ));
+            let cli = parse_cli_from([
+                "outlook",
+                "forward",
+                "id",
+                "--to",
+                "audit@example.invalid",
+                sample,
+            ])
+            .unwrap();
+            assert!(matches!(
+                cli.command.unwrap(),
+                Command::Forward {
+                    comment_md: Some(comment),
+                    ..
+                } if comment == sample
+            ));
+
+            // 4. edit-draft --body and --subject
+            let cli = parse_cli_from(["outlook", "edit-draft", "id", "--body", sample, "--json"])
+                .unwrap();
+            assert!(matches!(
+                cli.command.unwrap(),
+                Command::EditDraft {
+                    message_id,
+                    subject: None,
+                    body: Some(body),
+                    body_html: None,
+                    json: true,
+                } if message_id == "id" && body == sample
+            ));
+            let cli =
+                parse_cli_from(["outlook", "edit-draft", "id", "--subject", sample, "--json"])
+                    .unwrap();
+            assert!(matches!(
+                cli.command.unwrap(),
+                Command::EditDraft {
+                    subject: Some(subject),
+                    body: None,
+                    json: true,
+                    ..
+                } if subject == sample
+            ));
+
+            // 5. create-event --body, --subject, --location
+            let cli = parse_cli_from([
+                "outlook",
+                "create-event",
+                "--subject",
+                sample,
+                "--start",
+                "2026-12-01T10:00",
+                "--end",
+                "2026-12-01T11:00",
+                "--location",
+                sample,
+                "--body",
+                sample,
+                "--json",
+            ])
+            .unwrap();
+            assert!(matches!(
+                cli.command.unwrap(),
+                Command::CreateEvent {
+                    subject,
+                    location: Some(loc),
+                    body: Some(body),
+                    json: true,
+                    ..
+                } if subject == sample && loc == sample && body == sample
+            ));
+
+            // 6. add-task title + --notes and --body alias
+            let cli = parse_cli_from(["outlook", "add-task", sample, "--notes", sample, "--json"])
+                .unwrap();
+            assert!(matches!(
+                cli.command.unwrap(),
+                Command::AddTask {
+                    title,
+                    notes: Some(notes),
+                    json: true,
+                    ..
+                } if title == sample && notes == sample
+            ));
+            let cli = parse_cli_from(["outlook", "add-task", "Test", "--body", sample, "--json"])
+                .unwrap();
+            assert!(matches!(
+                cli.command.unwrap(),
+                Command::AddTask {
+                    title,
+                    notes: Some(notes),
+                    json: true,
+                    ..
+                } if title == "Test" && notes == sample
+            ));
+
+            // 7. rsvp --comment
+            let cli =
+                parse_cli_from(["outlook", "rsvp", "id", "accept", "--comment", sample, "--json"])
+                    .unwrap();
+            assert!(matches!(
+                cli.command.unwrap(),
+                Command::Rsvp {
+                    event_id,
+                    response,
+                    comment: Some(comment),
+                    json: true,
+                } if event_id == "id" && response == "accept" && comment == sample
+            ));
+
+            // 9. update-task --title (and sibling update-event --subject/--title)
+            let cli =
+                parse_cli_from(["outlook", "update-task", "id", "--title", sample, "--json"])
+                    .unwrap();
+            assert!(matches!(
+                cli.command.unwrap(),
+                Command::UpdateTask {
+                    task_id,
+                    title: Some(title),
+                    json: true,
+                    ..
+                } if task_id == "id" && title == sample
+            ));
+            let cli =
+                parse_cli_from(["outlook", "update-event", "id", "--title", sample, "--json"])
+                    .unwrap();
+            assert!(matches!(
+                cli.command.unwrap(),
+                Command::UpdateEvent {
+                    event_id,
+                    subject: Some(subject),
+                    json: true,
+                    ..
+                } if event_id == "id" && subject == sample
+            ));
+
+            // 10. search <QUERY> (and sibling contacts --query/--q)
+            let cli = parse_cli_from(["outlook", "search", sample, "--remote", "--json"]).unwrap();
+            assert!(matches!(
+                cli.command.unwrap(),
+                Command::Search {
+                    query,
+                    remote: true,
+                    json: true,
+                    ..
+                } if query == sample
+            ));
+            let cli = parse_cli_from(["outlook", "contacts", "--q", sample, "--json"]).unwrap();
+            assert!(matches!(
+                cli.command.unwrap(),
+                Command::Contacts {
+                    query: Some(query),
+                    json: true,
+                    ..
+                } if query == sample
+            ));
+        }
+
+        // Omitted comment on forward still works cleanly
+        let cli = parse_cli_from([
+            "outlook",
+            "forward",
+            "id",
+            "--to",
+            "audit@example.invalid",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Forward {
+                message_id,
+                to,
+                comment_md: None,
+                json: true,
+            } if message_id == "id" && to == vec!["audit@example.invalid"]
+        ));
+    }
+
+    #[test]
+    fn preserves_equals_positional_separator_flags_missing_values_and_help() {
+        // Explicit equals accepts flag-looking text on options
+        for literal in ["--dry-run", "--json", "-h", "--", "- 목록 항목"] {
+            let body_arg = format!("--body={literal}");
+            let cli = parse_cli_from([
+                "outlook",
+                "send",
+                "--to",
+                "audit@example.invalid",
+                "--subject",
+                "Test",
+                &body_arg,
+                "--json",
+            ])
+            .unwrap();
+            assert!(matches!(
+                cli.command.unwrap(),
+                Command::Send {
+                    body: Some(body),
+                    json: true,
+                    ..
+                } if body == literal
+            ));
+            assert!(
+                try_fast_help_or_version_from(
+                    [
+                        "outlook",
+                        "send",
+                        "--to",
+                        "audit@example.invalid",
+                        "--subject",
+                        "Test",
+                        &body_arg,
+                    ],
+                    Persona::Outlook,
+                )
+                .is_none(),
+                "attached value {body_arg} must not trigger fast help"
+            );
+        }
+
+        // Positional `--` accepts flag-looking text on positionals
+        for literal in ["--dry-run", "--all", "--json", "-h", "--", "- 목록 항목"] {
+            let cli = parse_cli_from(["outlook", "reply", "id", "--json", "--", literal]).unwrap();
+            assert!(matches!(
+                cli.command.unwrap(),
+                Command::Reply {
+                    body_md,
+                    all: false,
+                    json: true,
+                    ..
+                } if body_md == literal
+            ));
+
+            let cli = parse_cli_from([
+                "outlook",
+                "forward",
+                "id",
+                "--to",
+                "audit@example.invalid",
+                "--",
+                literal,
+            ])
+            .unwrap();
+            assert!(matches!(
+                cli.command.unwrap(),
+                Command::Forward {
+                    comment_md: Some(comment),
+                    ..
+                } if comment == literal
+            ));
+
+            let cli = parse_cli_from(["outlook", "search", "--", literal]).unwrap();
+            assert!(matches!(
+                cli.command.unwrap(),
+                Command::Search {
+                    query,
+                    remote: false,
+                    json: false,
+                    ..
+                } if query == literal
+            ));
+            assert!(
+                try_fast_help_or_version_from(["outlook", "search", "--", literal], Persona::Outlook)
+                    .is_none(),
+                "escaped positional {literal} must not trigger fast help"
+            );
+        }
+
+        // Missing option values (including `--help`/`-h` immediately after a value-taking option)
+        // or flag-looking tokens must NOT be swallowed as values
+        let must_fail: &[&[&str]] = &[
+            &["outlook", "send", "--to", "a@b", "--subject", "Test", "--body", "--json"],
+            &["outlook", "send", "--to", "a@b", "--subject", "Test", "--body", "--dry-run"],
+            &["outlook", "send", "--to", "a@b", "--subject", "Test", "--body", "--help"],
+            &["outlook", "send", "--to", "a@b", "--subject", "Test", "--body", "-h"],
+            &["outlook", "send", "--to", "a@b", "--subject", "Test", "--body", "--"],
+            &["outlook", "send", "--to", "a@b", "--subject", "Test", "--body", "-a"],
+            &["outlook", "send", "--to", "a@b", "--subject", "--body", "Hi"],
+            &["outlook", "edit-draft", "id", "--body", "--json"],
+            &["outlook", "edit-draft", "id", "--body", "--dry-run"],
+            &["outlook", "edit-draft", "id", "--body", "--help"],
+            &["outlook", "edit-draft", "id", "--body", "-h"],
+            &["outlook", "edit-draft", "id", "--body", "--"],
+            &["outlook", "edit-draft", "id", "--body", "--subject", "New"],
+            &["outlook", "edit-draft", "id", "--subject", "--json"],
+            &[
+                "outlook",
+                "create-event",
+                "--subject",
+                "Test",
+                "--start",
+                "2026-12-01T10:00",
+                "--end",
+                "2026-12-01T11:00",
+                "--body",
+                "--dry-run",
+            ],
+            &["outlook", "add-task", "Test", "--notes", "--json"],
+            &["outlook", "add-task", "Test", "--body", "--dry-run"],
+            &["outlook", "rsvp", "id", "accept", "--comment", "--json"],
+            &["outlook", "rsvp", "id", "accept", "--comment", "--dry-run"],
+            &["outlook", "update-task", "id", "--title", "--json"],
+            &["outlook", "update-task", "id", "--title", "--dry-run"],
+            &["outlook", "reply", "id", "--all"],
+            &["outlook", "reply", "id", "--json"],
+            &["outlook", "reply", "id", "--dry-run"],
+            &["outlook", "reply", "id", "-a"],
+            &["outlook", "reply", "id", "--dry-run", "- 목록 항목"],
+            &["outlook", "forward", "id", "--to", "a@b", "--dry-run"],
+            &["outlook", "forward", "id", "--dry-run", "- 목록 항목", "--to", "a@b"],
+            &["outlook", "search", "--json"],
+            &["outlook", "search", "--remote"],
+            &["outlook", "search", "--dry-run"],
+            &["outlook", "search", "-r"],
+            &["outlook", "search", "--folder", "- 목록 항목", "- 쿼리"],
+            &["outlook", "add-task", "--json"],
+            &["outlook", "add-task", "--dry-run"],
+            // Non-text parsers (IDs, emails, dates, enums, numbers) stay unchanged
+            &["outlook", "reply", "- 목록 항목", "body"],
+            &["outlook", "rsvp", "id", "- 목록 항목"],
+            &["outlook", "send", "--to", "- 목록 항목", "--subject", "Test"],
+            &[
+                "outlook",
+                "create-event",
+                "--subject",
+                "Test",
+                "--start",
+                "- 목록 항목",
+                "--end",
+                "2026-12-01T11:00",
+            ],
+            &["outlook", "update-task", "- 목록 항목", "--title", "Test"],
+            &["outlook", "mail", "--limit", "-1"],
+        ];
+        for argv in must_fail {
+            let err = parse_cli_from(*argv).expect_err(&format!("expected parse failure for {argv:?}"));
+            assert!(
+                !matches!(
+                    err.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ),
+                "unexpected help/version error for {argv:?}: {err}"
+            );
+        }
+
+        // Actual help invocations (standalone and after a completed hyphen value)
+        let help_cases: &[&[&str]] = &[
+            &["outlook", "send", "--help"],
+            &["outlook", "send", "-h"],
+            &["outlook", "send", "--to", "a@b", "--subject", "Test", "--body", "- 목록 항목", "--help"],
+            &["outlook", "reply", "id", "- 목록 항목", "--help"],
+            &["outlook", "reply", "id", "--help"],
+            &["outlook", "reply", "id", "-h"],
+            &["outlook", "forward", "id", "- 목록 항목", "--to", "a@b", "--help"],
+            &["outlook", "edit-draft", "--help"],
+            &["outlook", "edit-draft", "-h"],
+            &["outlook", "edit-draft", "id", "--body", "- 목록 항목", "--help"],
+            &[
+                "outlook",
+                "create-event",
+                "--subject",
+                "Test",
+                "--start",
+                "2026-12-01T10:00",
+                "--end",
+                "2026-12-01T11:00",
+                "--body",
+                "- 목록 항목",
+                "--help",
+            ],
+            &["outlook", "add-task", "Test", "--notes", "- 목록 항목", "--help"],
+            &["outlook", "rsvp", "id", "accept", "--comment", "- 목록 항목", "--help"],
+            &["outlook", "send", "--to", "a@b", "--subject", "- 목록 항목", "--help"],
+            &["outlook", "update-task", "id", "--title", "- 목록 항목", "--help"],
+            &["outlook", "search", "- 목록 항목", "--help"],
+            &["outlook", "search", "--help"],
+            &["outlook", "search", "-h"],
+        ];
+        for argv in help_cases {
+            let err = parse_cli_from(*argv).expect_err(&format!("expected help for {argv:?}"));
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayHelp,
+                "expected DisplayHelp for {argv:?}, got {err}"
+            );
+            assert!(
+                try_fast_help_or_version_from(*argv, Persona::Outlook).is_some(),
+                "fast help must handle {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_commands_skip_rewrite_tree_and_preserve_bare_dash() {
+        let to_os = |items: &[&str]| -> Vec<std::ffi::OsString> {
+            items.iter().map(std::ffi::OsString::from).collect()
+        };
+
+        // Normal commands, attached `=`, `--` escaped positionals, flags, and bare `-`
+        // bypass the hyphen-rewrite inspection and parse in a single clap Command tree.
+        assert!(!has_potential_hyphen_text(&to_os(&[
+            "--folder", "inbox", "--limit", "30", "--json"
+        ])));
+        assert!(!has_potential_hyphen_text(&to_os(&[
+            "--to",
+            "audit@example.invalid",
+            "--subject",
+            "Test",
+            "--body",
+            "Hello world",
+            "--json",
+        ])));
+        assert!(!has_potential_hyphen_text(&to_os(&[
+            "--body=- 목록 항목",
+            "--json"
+        ])));
+        assert!(!has_potential_hyphen_text(&to_os(&[
+            "id",
+            "--",
+            "- 목록 항목"
+        ])));
+        assert!(!has_potential_hyphen_text(&to_os(&[
+            "id",
+            "--body",
+            "--dry-run"
+        ])));
+        assert!(!has_potential_hyphen_text(&to_os(&["--help"])));
+        assert!(!has_potential_hyphen_text(&to_os(&["-h"])));
+        assert!(!has_potential_hyphen_text(&to_os(&["--body", "-"])));
+
+        // Separate hyphen-prefixed free text triggers the single-tree rewrite path.
+        assert!(has_potential_hyphen_text(&to_os(&["--body", "- 목록 항목"])));
+        assert!(has_potential_hyphen_text(&to_os(&["id", "- first\n- second"])));
+        assert!(has_potential_hyphen_text(&to_os(&["---"])));
+        assert!(has_potential_hyphen_text(&to_os(&["-- note"])));
+        assert!(has_potential_hyphen_text(&to_os(&["--limit", "-1"])));
+
+        // Bare `-` still parses cleanly through the fast path on both options and positionals.
+        let cli = parse_cli_from([
+            "outlook",
+            "send",
+            "--to",
+            "audit@example.invalid",
+            "--subject",
+            "Test",
+            "--body",
+            "-",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Send {
+                body: Some(body),
+                ..
+            } if body == "-"
+        ));
+        let cli = parse_cli_from(["outlook", "search", "-"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Search { query, .. } if query == "-"
+        ));
     }
 }
