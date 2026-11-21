@@ -2,12 +2,14 @@
 
 # `outlook`
 
-**Blazing-fast Microsoft Outlook terminal client & AI agent toolkit — Mail, Calendar, To Do, and Contacts in one native Rust binary.**
+**Manage Outlook mail, calendar events, contacts, and Microsoft To Do from the terminal.**
 
 [![npm version](https://img.shields.io/npm/v/%40bitefoundry%2Foutlook?color=7aa2f7&label=%40bitefoundry%2Foutlook&logo=npm)](https://www.npmjs.com/package/@bitefoundry/outlook)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-565f89)](docs/NPM.md)
 [![Built with Rust & Ratatui](https://img.shields.io/badge/Rust-Ratatui-e0af68?logo=rust&logoColor=white)](https://ratatui.rs)
-[![License: MIT](https://img.shields.io/badge/License-MIT-9ece6a)](https://opensource.org/license/mit)
+[![License: MIT](https://img.shields.io/badge/License-MIT-9ece6a)](LICENSE)
+
+[BiteFoundry](https://bitefoundry.dev/#app-outlook) · [Latest release notes](https://github.com/BiteFoundry/outlook/releases/latest)
 
 <br />
 
@@ -23,7 +25,7 @@
 | --- | --- |
 | **Minimal-Chrome TUI** | 3-tier responsive `ratatui` workspace across **Mail** (`1`), **Calendar** (`2`), and **Microsoft To Do** (`3`) with HTML-rendered email preview, inline `href` toggle (`h`), Link Extractor (`u`), quoted-reply folding (`z`), structured Compose modal (`c`), `zoxide` File Picker (`Ctrl+F`), and `Ctrl+K` Omni-Switcher. |
 | **High-Res Terminal Images** | Native inline rendering for attached and `cid:`/`https://` email images across **Kitty**, **iTerm2 (`OSC 1337`)**, **Sixel (`DCS q`)**, and **24-bit Half-Blocks (`▀`)** fallback with live zoom (`+`/`-`/`0`) and protocol cycling (`p`). |
-| **Local SQLite FTS5 + IPC Daemon** | Bundled SQLite WAL + FTS5 cache (`cache.db`) with incremental delta sync, `$batch` neighbor hydration, 0ms optimistic triage (`archive`, `flag`, `mark-read`, `complete`), offline search, and sub-5ms CLI reads via `outlook daemon`. |
+| **Local SQLite FTS5 + IPC Daemon** | Bundled SQLite WAL + FTS5 cache (`cache.db`) with incremental delta sync, `$batch` neighbor hydration, optimistic triage (`archive`, `flag`, `mark-read`, `complete`), offline search, and cached CLI reads via `outlook daemon`. |
 | **4-in-1 Agent Interface** | One static binary (Windows, macOS, Linux **GLIBC 2.28 / AlmaLinux 8+**) delivers **TUI**, scriptable **CLI (`--json`)**, **Axum HTTP REST API (`outlook serve`, `:3939`)**, and **stdio MCP server (`outlook mcp`, 23 tools)**. |
 
 ---
@@ -31,7 +33,7 @@
 ## Quick Start
 
 ```bash
-# 1. Install globally via npm (links prebuilt native binary, zero Node runtime overhead)
+# 1. Install the native CLI via npm
 npm i -g @bitefoundry/outlook
 
 # 2. Authenticate with Microsoft Entra ID (or automatically reuse your @bitefoundry/teams M365 session!)
@@ -41,9 +43,17 @@ outlook login
 outlook
 ```
 
+```sh
+outlook read MESSAGE_ID --json
+```
+
+Read a message and its attachment metadata. To save a file, use `outlook download MESSAGE_ID --attachment ATTACHMENT_ID --dir .`. For full detail, add `--full` in the CLI or pass `compact: false` to `get_message` in MCP.
+
 For a company registration, use `outlook login --client-id YOUR_CLIENT_ID --tenant-id YOUR_TENANT_ID`. Without an override, Outlook uses the Microsoft Graph Command Line Tools client for its own interactive login. [Register a desktop app](https://github.com/BiteFoundry/teams/blob/master/docs/ENTERPRISE.md) · [Outlook delegated permissions](docs/NPM.md#required-microsoft-graph-delegated-scopes)
 
-> **Shared M365 Session & Token Brokers:** When `share_m365_auth = true` (default), `outlook` seamlessly reuses or upgrades an existing `@bitefoundry/teams` session without a second browser login. Also supports `--device-code`, `OUTLOOK_ACCESS_TOKEN`, `OUTLOOK_TOKEN_FILE`, `OUTLOOK_TOKEN_REFRESH_CMD` (`az account get-access-token`), and custom Entra ID apps. Run `outlook whoami` or `outlook doctor --online` for JWT scope diagnostics, and `outlook update` for one-click SHA-256 verified self-updates.
+> **Shared M365 Session & Token Brokers:** When `share_m365_auth = true` (default), `outlook` seamlessly reuses or upgrades an existing `@bitefoundry/teams` session without a second browser login. Also supports `--device-code`, `OUTLOOK_ACCESS_TOKEN`, `OUTLOOK_TOKEN_FILE`, `OUTLOOK_TOKEN_REFRESH_CMD` (`az account get-access-token`), and custom Entra ID apps. Run `outlook whoami` or `outlook doctor --online` for JWT scope diagnostics.
+
+Update a global npm install with `npm install -g @bitefoundry/outlook@latest`. For a standalone binary from [GitHub Releases](https://github.com/BiteFoundry/outlook/releases), use `outlook update`.
 
 ---
 
@@ -57,7 +67,7 @@ For a company registration, use `outlook login --client-id YOUR_CLIENT_ID --tena
 | `Tab` / `Enter` / `Esc` | Global | Cycle pane focus (`Folders ↔ List ↔ Reader`) or close modal |
 | `c` / `r` / `R` / `f` | Mail | **Compose** / **Reply** / **Reply-All** / **Forward** (Markdown + `Ctrl+F` attach + `Ctrl+V` image) |
 | `C` / `Ctrl+S` | Mail / Compose | Start a separate composition / save the current draft to Outlook |
-| `e` / `g` / `m` / `Del` | Mail | **Archive** / **Flag** / **Move to folder** / **Delete** (0ms optimistic updates) |
+| `e` / `g` / `m` / `Del` | Mail | **Archive** / **Flag** / **Move to folder** / **Delete** (optimistic updates) |
 | `h` / `u` / `z` | Mail Reader | Toggle inline `href` URLs / open **Link Extractor** / fold quoted reply history |
 | `t` / `F` / `U` | Mail | Toggle **Thread grouping** / **Focused Inbox** / **Unread filter** |
 | `v` / `Alt+v` / `d` | Mail Reader | High-res **Inline Image Preview** / download latest attachment (`A` for picker) |
