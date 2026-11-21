@@ -140,6 +140,7 @@ pub enum UiMsg {
     MailSent {
         draft_key: String,
         compose_id: String,
+        draft_id: Option<String>,
     },
     MailDraftProgress {
         draft_key: String,
@@ -151,9 +152,15 @@ pub enum UiMsg {
         compose_id: String,
         result: anyhow::Result<Option<MailMessage>>,
         send: bool,
+        sent_draft_id: Option<String>,
     },
     MailMoved {
         moves: Vec<(String, MailMessage)>,
+    },
+    MailDeleteFailed {
+        original_id: String,
+        original_message: Option<MailMessage>,
+        error: String,
     },
     MailDeleted {
         message_ids: Vec<String>,
@@ -877,6 +884,27 @@ impl AppState {
             .map(|f| f.id.clone())
     }
 
+    fn find_trash_folder_id(&self) -> Option<String> {
+        find_folder_by_wellknown(
+            &self.mail_folders,
+            "deleteditems",
+            &["Deleted Items", "Trash", "지운 편지함"],
+        )
+        .map(|f| f.id.clone())
+    }
+
+    fn is_deleted_items_folder(&self, folder_id: &str) -> bool {
+        let trimmed = folder_id.trim();
+        if trimmed.eq_ignore_ascii_case("deleteditems")
+            || trimmed.eq_ignore_ascii_case("trash")
+            || trimmed.eq_ignore_ascii_case("deleted")
+        {
+            return true;
+        }
+        self.find_trash_folder_id()
+            .is_some_and(|trash_id| trash_id == trimmed)
+    }
+
     fn folder_matches_active(&self, event_folder_id: &str) -> bool {
         if self.active_folder_id == event_folder_id {
             return true;
@@ -884,7 +912,7 @@ impl AppState {
         if self.active_folder_id == VIRTUAL_UNREAD_FOLDER
             || self.active_folder_id == VIRTUAL_FLAGGED_FOLDER
         {
-            return true;
+            return !self.is_deleted_items_folder(event_folder_id);
         }
         if event_folder_id.eq_ignore_ascii_case("inbox") {
             if let Some(inbox_id) = self.find_inbox_folder_id() {
@@ -894,6 +922,41 @@ impl AppState {
             }
         }
         false
+    }
+
+    fn message_matches_active_folder(&self, msg: &MailMessage) -> bool {
+        let Some(fid) = msg.folder_id.as_deref() else {
+            return false;
+        };
+        if !self.folder_matches_active(fid) {
+            return false;
+        }
+        if self.active_folder_id == VIRTUAL_UNREAD_FOLDER {
+            return !msg.is_read;
+        }
+        if self.active_folder_id == VIRTUAL_FLAGGED_FOLDER {
+            return msg.flagged;
+        }
+        true
+    }
+
+    fn load_folder_summaries(
+        &self,
+        folder_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MailMessage>> {
+        if folder_id == VIRTUAL_UNREAD_FOLDER {
+            let trash_id = self.find_trash_folder_id();
+            self.storage
+                .list_smart_folder_summaries(true, false, trash_id.as_deref(), limit)
+        } else if folder_id == VIRTUAL_FLAGGED_FOLDER {
+            let trash_id = self.find_trash_folder_id();
+            self.storage
+                .list_smart_folder_summaries(false, true, trash_id.as_deref(), limit)
+        } else {
+            self.storage
+                .list_mail_summaries_filtered(Some(folder_id), false, false, false, limit)
+        }
     }
 
     fn preserve_pinned_mail_in_list(&mut self) {
@@ -1147,17 +1210,8 @@ impl AppState {
         ui.mail_list_scroll = ScrollState::default();
         ui.mail_read_scroll = ScrollState::default();
 
-        let (filter_folder, unread_only, flagged_only) = if folder_id == VIRTUAL_UNREAD_FOLDER {
-            (None, true, false)
-        } else if folder_id == VIRTUAL_FLAGGED_FOLDER {
-            (None, false, true)
-        } else {
-            (Some(folder_id.as_str()), false, false)
-        };
-
         self.mail_messages = self
-            .storage
-            .list_mail_summaries_filtered(filter_folder, unread_only, flagged_only, false, 150)
+            .load_folder_summaries(&folder_id, 150)
             .unwrap_or_default();
 
         self.select_first_visible_mail(ui);
@@ -1337,16 +1391,23 @@ impl AppState {
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
-            match graph.move_mail_message(&id, &archive_id).await {
-                Ok(moved) => {
+            match graph.move_mail_message_with_meta(&id, &archive_id).await {
+                Ok((moved, attachments_expanded)) => {
                     let old_id = id.clone();
                     let moved_for_db = moved.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        storage.replace_moved_mail_local(&old_id, &moved_for_db)
+                    let persisted = tokio::task::spawn_blocking(move || {
+                        storage.replace_moved_mail_local_ex(
+                            &old_id,
+                            &moved_for_db,
+                            attachments_expanded,
+                        )
                     })
-                    .await;
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or(moved);
                     let _ = tx.send(UiMsg::MailMoved {
-                        moves: vec![(id, moved)],
+                        moves: vec![(id, persisted)],
                     });
                 }
                 Err(err) => {
@@ -1364,15 +1425,19 @@ impl AppState {
         let Some(id) = self.active_mail_id.clone() else {
             return;
         };
-        let trash_id = find_folder_by_wellknown(
-            &self.mail_folders,
-            "deleteditems",
-            &["Deleted Items", "Trash", "지운 편지함"],
-        )
-        .map(|f| f.id.clone())
-        .unwrap_or_else(|| "deleteditems".to_string());
+        let trash_id = self
+            .find_trash_folder_id()
+            .unwrap_or_else(|| "deleteditems".to_string());
         let in_trash = self.active_folder_id == trash_id
             || self.active_folder_id.eq_ignore_ascii_case("deleteditems");
+
+        let prev_msg = self
+            .storage
+            .get_mail_message(&id)
+            .ok()
+            .flatten()
+            .or_else(|| self.mail_messages.iter().find(|m| m.id == id).cloned());
+        let prev_folder_id = prev_msg.as_ref().and_then(|m| m.folder_id.clone());
 
         let prev_sel = ui.mail_list_scroll.selected_idx.unwrap_or(0);
         self.mail_messages.retain(|m| m.id != id);
@@ -1387,6 +1452,9 @@ impl AppState {
         } else {
             let _ = self.storage.move_mail_folder_local(&id, &trash_id);
         }
+        if let Ok(folders) = self.storage.list_mail_folders() {
+            self.mail_folders = folders;
+        }
         self.reselect_after_removal(ui, prev_sel);
         ui.info(if in_trash { "Deleted permanently" } else { "Moved to Trash" });
 
@@ -1399,30 +1467,53 @@ impl AppState {
         tokio::spawn(async move {
             if in_trash {
                 if let Err(err) = graph.delete_mail_message(&id).await {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: "Delete email".to_string(),
-                        error: Some(err.to_string()),
-                        toast: Some((format!("Delete failed: {err}"), ToastKind::Error)),
+                    if let Some(ref restore_msg) = prev_msg {
+                        let st = storage.clone();
+                        let restore_clone = restore_msg.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            st.upsert_mail_messages(std::slice::from_ref(&restore_clone))
+                        })
+                        .await;
+                    }
+                    let _ = tx.send(UiMsg::MailDeleteFailed {
+                        original_id: id,
+                        original_message: prev_msg,
+                        error: err.to_string(),
                     });
                 }
             } else {
-                match graph.move_mail_message(&id, &trash_id).await {
-                    Ok(moved) => {
+                match graph.move_mail_message_with_meta(&id, &trash_id).await {
+                    Ok((moved, attachments_expanded)) => {
                         let old_id = id.clone();
                         let moved_for_db = moved.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            storage.replace_moved_mail_local(&old_id, &moved_for_db)
+                        let persisted = tokio::task::spawn_blocking(move || {
+                            storage.replace_moved_mail_local_ex(
+                                &old_id,
+                                &moved_for_db,
+                                attachments_expanded,
+                            )
                         })
-                        .await;
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or(moved);
                         let _ = tx.send(UiMsg::MailMoved {
-                            moves: vec![(id, moved)],
+                            moves: vec![(id, persisted)],
                         });
                     }
                     Err(err) => {
-                        let _ = tx.send(UiMsg::TaskDone {
-                            label: "Delete email".to_string(),
-                            error: Some(err.to_string()),
-                            toast: Some((format!("Delete failed: {err}"), ToastKind::Error)),
+                        if let Some(orig_fid) = prev_folder_id {
+                            let st = storage.clone();
+                            let restore_id = id.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                st.move_mail_folder_local(&restore_id, &orig_fid)
+                            })
+                            .await;
+                        }
+                        let _ = tx.send(UiMsg::MailDeleteFailed {
+                            original_id: id,
+                            original_message: prev_msg,
+                            error: err.to_string(),
                         });
                     }
                 }
@@ -1473,16 +1564,26 @@ impl AppState {
         tokio::spawn(async move {
             let mut moves = Vec::with_capacity(message_ids.len());
             for id in &message_ids {
-                match graph.move_mail_message(id, &destination_folder_id).await {
-                    Ok(moved) => {
+                match graph
+                    .move_mail_message_with_meta(id, &destination_folder_id)
+                    .await
+                {
+                    Ok((moved, attachments_expanded)) => {
                         let st = storage.clone();
                         let old_id = id.clone();
                         let moved_for_db = moved.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            st.replace_moved_mail_local(&old_id, &moved_for_db)
+                        let persisted = tokio::task::spawn_blocking(move || {
+                            st.replace_moved_mail_local_ex(
+                                &old_id,
+                                &moved_for_db,
+                                attachments_expanded,
+                            )
                         })
-                        .await;
-                        moves.push((id.clone(), moved));
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or(moved);
+                        moves.push((id.clone(), persisted));
                     }
                     Err(err) => {
                         if !moves.is_empty() {
@@ -1564,6 +1665,7 @@ impl AppState {
                 let _ = tx.send(UiMsg::MailSent {
                     draft_key,
                     compose_id,
+                    draft_id: None,
                 });
             }
             let (error, toast) = match res {
@@ -1836,16 +1938,20 @@ impl AppState {
                     });
                 })
                 .await;
+            let mut sent_draft_id: Option<String> = None;
             if let Ok(saved) = &result {
                 if send {
                     let id = outgoing
                         .draft_id
                         .as_deref()
-                        .or_else(|| saved.as_ref().map(|msg| msg.id.as_str()));
+                        .or_else(|| saved.as_ref().map(|msg| msg.id.as_str()))
+                        .map(str::to_string);
                     match id {
                         Some(id) => {
-                            if let Err(err) = graph.send_saved_draft(id).await {
+                            if let Err(err) = graph.send_saved_draft(&id).await {
                                 result = Err(err);
+                            } else {
+                                sent_draft_id = Some(id);
                             }
                         }
                         None => result = Err(anyhow::anyhow!("Outlook did not return a draft ID")),
@@ -1857,9 +1963,39 @@ impl AppState {
                 compose_id,
                 result,
                 send,
+                sent_draft_id,
             });
         });
         true
+    }
+
+    fn remove_sent_draft_locally(&mut self, ui: &mut UiState, draft_id: &str) {
+        let id = draft_id.trim();
+        if id.is_empty() {
+            return;
+        }
+        let id_owned = id.to_string();
+        let _ = self
+            .storage
+            .delete_mail_messages_by_ids(std::slice::from_ref(&id_owned));
+        if let Ok(folders) = self.storage.list_mail_folders() {
+            self.mail_folders = folders;
+        }
+
+        let prev_sel = ui.mail_list_scroll.selected_idx.unwrap_or(0);
+        let was_in_list = self.mail_messages.iter().any(|m| m.id == id);
+        let was_active = self.active_mail_id.as_deref() == Some(id);
+        self.mail_messages.retain(|m| m.id != id);
+        self.mail_detail_cache.remove(id);
+        self.mail_detail_missing.remove(id);
+        self.expanded_thread_ids.remove(id);
+        if self.pinned_mail.as_ref().is_some_and(|p| p.id == id) {
+            self.pinned_mail = None;
+        }
+        self.search_results.retain(|h| h.id != id);
+        if was_in_list || was_active {
+            self.reselect_after_removal(ui, prev_sel);
+        }
     }
 
     fn persist_draft_store(&self) -> anyhow::Result<()> {
@@ -3061,23 +3197,13 @@ impl AppState {
                         }
                     } else {
                         let limit = self.mail_messages.len().max(messages.len()).max(150);
-                        let (filter_folder, unread_only, flagged_only) =
-                            if self.active_folder_id == VIRTUAL_UNREAD_FOLDER {
-                                (None, true, false)
-                            } else if self.active_folder_id == VIRTUAL_FLAGGED_FOLDER {
-                                (None, false, true)
-                            } else {
-                                (Some(self.active_folder_id.as_str()), false, false)
-                            };
-                        if let Ok(loaded) = self.storage.list_mail_summaries_filtered(
-                            filter_folder,
-                            unread_only,
-                            flagged_only,
-                            false,
-                            limit,
-                        ) {
+                        let is_virtual = self.active_folder_id == VIRTUAL_UNREAD_FOLDER
+                            || self.active_folder_id == VIRTUAL_FLAGGED_FOLDER;
+                        if let Ok(loaded) =
+                            self.load_folder_summaries(&self.active_folder_id, limit)
+                        {
                             self.replace_mail_list(ui, loaded);
-                        } else if !messages.is_empty() && filter_folder.is_some() {
+                        } else if !messages.is_empty() && !is_virtual {
                             self.replace_mail_list(ui, messages);
                         }
                     }
@@ -3347,6 +3473,7 @@ impl AppState {
                 compose_id,
                 result,
                 send,
+                sent_draft_id,
             } => {
                 let queued = self
                     .draft_writes
@@ -3354,6 +3481,7 @@ impl AppState {
                     .and_then(|write| write.queued);
                 match result {
                     Ok(saved) => {
+                        let saved_id = saved.as_ref().map(|m| m.id.clone());
                         if let Some(saved) = saved {
                             if !send {
                                 let _ = self
@@ -3369,6 +3497,7 @@ impl AppState {
                                 UiMsg::MailSent {
                                     draft_key,
                                     compose_id,
+                                    draft_id: sent_draft_id.or(saved_id),
                                 },
                             );
                             ui.success("Email sent");
@@ -3428,12 +3557,23 @@ impl AppState {
             UiMsg::MailSent {
                 draft_key,
                 compose_id,
+                draft_id,
             } => {
-                if let Some(key) = self.stored_compose_key(&draft_key, &compose_id) {
+                let stored_key = self.stored_compose_key(&draft_key, &compose_id);
+                let resolved_draft_id = draft_id.or_else(|| {
+                    stored_key
+                        .as_deref()
+                        .and_then(|key| self.draft_store.get_mail(key))
+                        .and_then(|entry| entry.draft_id.clone())
+                });
+                if let Some(key) = stored_key {
                     self.draft_store.remove_mail(&key);
                     if let Err(err) = self.persist_draft_store() {
                         ui.error(format!("Cannot clear sent draft locally: {err:#}"));
                     }
+                }
+                if let Some(id) = resolved_draft_id {
+                    self.remove_sent_draft_locally(ui, &id);
                 }
             }
             UiMsg::MailMoved { moves } => {
@@ -3442,23 +3582,20 @@ impl AppState {
                 }
                 for (old_id, moved) in moves {
                     let moved_id = moved.id.clone();
-                    if self.active_mail_id.as_deref() == Some(old_id.as_str()) {
-                        self.active_mail_id = Some(moved_id.clone());
-                    }
+                    let moved_in_active_folder = self.message_matches_active_folder(&moved);
                     self.mail_detail_cache.remove(&old_id);
                     self.mail_detail_missing.remove(&old_id);
                     self.mail_detail_missing.remove(&moved_id);
-                    if self.expanded_thread_ids.remove(&old_id) {
+                    if self.expanded_thread_ids.remove(&old_id) && moved_in_active_folder {
                         self.expanded_thread_ids.insert(moved_id.clone());
                     }
-                    if self.pinned_mail.as_ref().is_some_and(|p| p.id == old_id) {
-                        self.pinned_mail = Some(moved.clone());
-                    }
-                    let moved_in_active_folder = moved
-                        .folder_id
-                        .as_deref()
-                        .is_some_and(|fid| self.folder_matches_active(fid));
                     if moved_in_active_folder {
+                        if self.active_mail_id.as_deref() == Some(old_id.as_str()) {
+                            self.active_mail_id = Some(moved_id.clone());
+                        }
+                        if self.pinned_mail.as_ref().is_some_and(|p| p.id == old_id) {
+                            self.pinned_mail = Some(moved.clone());
+                        }
                         let summary = Self::mail_summary_from(&moved);
                         if let Some(pos) = self.mail_messages.iter().position(|m| m.id == old_id) {
                             self.mail_messages[pos] = summary;
@@ -3479,10 +3616,50 @@ impl AppState {
                         if self.active_mail_id.as_deref() == Some(moved_id.as_str()) {
                             self.cache_loaded_mail_detail(moved);
                         }
+                        self.sync_mail_list_selection_to_active(ui);
                     } else {
-                        self.mail_messages.retain(|m| m.id != old_id);
+                        let prev_sel = ui.mail_list_scroll.selected_idx.unwrap_or(0);
+                        let was_present_or_active = self
+                            .mail_messages
+                            .iter()
+                            .any(|m| m.id == old_id || m.id == moved_id)
+                            || self.active_mail_id.as_deref() == Some(old_id.as_str())
+                            || self.active_mail_id.as_deref() == Some(moved_id.as_str());
+                        self.mail_messages
+                            .retain(|m| m.id != old_id && m.id != moved_id);
+                        if self
+                            .pinned_mail
+                            .as_ref()
+                            .is_some_and(|p| p.id == old_id || p.id == moved_id)
+                        {
+                            self.pinned_mail = None;
+                        }
+                        if was_present_or_active {
+                            self.reselect_after_removal(ui, prev_sel);
+                        }
                     }
                 }
+            }
+            UiMsg::MailDeleteFailed {
+                original_id,
+                original_message,
+                error,
+            } => {
+                if let Ok(folders) = self.storage.list_mail_folders() {
+                    self.mail_folders = folders;
+                }
+                if let Some(msg) = original_message {
+                    if self.message_matches_active_folder(&msg)
+                        && !self.mail_messages.iter().any(|m| m.id == msg.id)
+                    {
+                        self.mail_messages.push(Self::mail_summary_from(&msg));
+                    }
+                    self.active_mail_id = Some(original_id);
+                    self.sync_displayed_mail_details(ui.group_threads, false);
+                    self.sync_mail_list_selection_to_active(ui);
+                }
+                ui.tasks.finish("Delete email", Some(error.clone()));
+                ui.toasts.error(format!("Delete failed: {error}"));
             }
             UiMsg::MailDeleted { .. } | UiMsg::AttachmentDownloaded(_) => {}
             UiMsg::SearchResults { query, hits } => {
@@ -4830,5 +5007,532 @@ mod tests {
             }
         }
         assert_eq!(hydrated_reqs, vec!["m-open".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn regression_outlook_outlook_14_removes_sent_draft_from_sqlite_and_ui() {
+        use axum::{
+            extract::Path as AxumPath,
+            http::StatusCode,
+            routing::post,
+            Json, Router,
+        };
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Mutex,
+        };
+
+        let created_count = Arc::new(AtomicUsize::new(0));
+        let send_should_fail = Arc::new(AtomicBool::new(true));
+        let sent_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let created_c = Arc::clone(&created_count);
+        let fail_c = Arc::clone(&send_should_fail);
+        let sent_c = Arc::clone(&sent_ids);
+
+        let router = Router::new()
+            .route(
+                "/v1.0/me/messages",
+                post(move |Json(payload): Json<serde_json::Value>| {
+                    let count = created_c.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        let id = if count == 0 { "draft-a" } else { "draft-b" };
+                        let subject = payload
+                            .get("subject")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let body = payload
+                            .get("body")
+                            .and_then(|b| b.get("content"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        Json(serde_json::json!({
+                            "id": id,
+                            "parentFolderId": "f-drafts",
+                            "subject": subject,
+                            "receivedDateTime": if count == 0 { "2026-11-21T10:00:00Z" } else { "2026-11-21T09:00:00Z" },
+                            "isRead": false,
+                            "isDraft": true,
+                            "bodyPreview": subject,
+                            "body": { "contentType": "html", "content": body }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/messages/{id}",
+                axum::routing::get(|AxumPath(id): AxumPath<String>| async move {
+                    Json(serde_json::json!({
+                        "id": id,
+                        "parentFolderId": "f-drafts",
+                        "subject": "Draft A AlphaDraftToken Ready",
+                        "receivedDateTime": "2026-11-21T10:00:00Z",
+                        "isRead": false,
+                        "isDraft": true,
+                        "bodyPreview": "AlphaDraftToken updated",
+                        "body": { "contentType": "html", "content": "<p>AlphaDraftToken updated</p>" }
+                    }))
+                })
+                .patch(
+                    |AxumPath(id): AxumPath<String>, Json(payload): Json<serde_json::Value>| async move {
+                        let subject = payload
+                            .get("subject")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Draft A AlphaDraftToken")
+                            .to_string();
+                        Json(serde_json::json!({
+                            "id": id,
+                            "parentFolderId": "f-drafts",
+                            "subject": subject,
+                            "receivedDateTime": "2026-11-21T10:00:00Z",
+                            "isRead": false,
+                            "isDraft": true,
+                            "bodyPreview": subject,
+                            "body": { "contentType": "html", "content": "<p>AlphaDraftToken updated</p>" }
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/v1.0/me/messages/{id}/send",
+                post(move |AxumPath(id): AxumPath<String>| {
+                    let fail = fail_c.load(Ordering::SeqCst);
+                    let sent = Arc::clone(&sent_c);
+                    async move {
+                        if fail {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": { "code": "ErrorInvalidRecipients", "message": "send failed" }
+                                })),
+                            )
+                        } else {
+                            sent.lock().unwrap().push(id);
+                            (StatusCode::ACCEPTED, Json(serde_json::json!({})))
+                        }
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tok = crate::auth::StoredTokens {
+            access_token: "synthetic-tok".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("u1".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tok);
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _) = tokio::sync::watch::channel(FocusTarget::default());
+        let (nudge_tx, _nudge_rx) = mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+        let profile = tempfile::tempdir().unwrap();
+        app.draft_store_path = profile.path().join("drafts.json");
+        app.draft_store = DraftStore::default();
+
+        app.mail_folders = vec![
+            MailFolder {
+                id: "f-drafts".into(),
+                display_name: "Drafts".into(),
+                well_known_name: Some("drafts".into()),
+                parent_folder_id: None,
+                child_folder_count: 0,
+                unread_item_count: 2,
+                total_item_count: 2,
+            },
+            MailFolder {
+                id: "f-sent".into(),
+                display_name: "Sent Items".into(),
+                well_known_name: Some("sentitems".into()),
+                parent_folder_id: None,
+                child_folder_count: 0,
+                unread_item_count: 0,
+                total_item_count: 1,
+            },
+        ];
+        app.storage.upsert_mail_folders(&app.mail_folders).unwrap();
+
+        let mut sent_existing = make_mail(
+            "sent-existing-1",
+            "conv-sent-1",
+            "2026-11-20T08:00:00Z",
+            true,
+            false,
+        );
+        sent_existing.folder_id = Some("f-sent".into());
+        sent_existing.subject = "Existing Sent Mail".into();
+        app.storage.upsert_mail_messages(&[sent_existing]).unwrap();
+
+        // Save Draft A (Ctrl+S)
+        let mut compose_a = MailComposeOverlay::new_to("alice@example.com");
+        compose_a.subject = "Draft A AlphaDraftToken".into();
+        compose_a.body.load_text("AlphaDraftToken body");
+        ui.overlays.push(Overlay::MailCompose(compose_a.clone()));
+        app.save_mail_draft(&mut ui, &compose_a);
+        while app.has_pending_draft_write() {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ui_rx.recv())
+                .await
+                .expect("save draft A event")
+                .unwrap();
+            app.handle_ui_msg(&mut ui, msg);
+        }
+        let compose_a = match ui.overlays.pop().unwrap() {
+            Overlay::MailCompose(c) => c,
+            _ => unreachable!(),
+        };
+        assert_eq!(compose_a.draft_id.as_deref(), Some("draft-a"));
+
+        // Save Draft B (Ctrl+S) and close it without sending
+        let mut compose_b = MailComposeOverlay::new_to("bob@example.com");
+        compose_b.subject = "Draft B KeepMe".into();
+        compose_b.body.load_text("KeepMe body");
+        ui.overlays.push(Overlay::MailCompose(compose_b.clone()));
+        app.save_mail_draft(&mut ui, &compose_b);
+        while app.has_pending_draft_write() {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ui_rx.recv())
+                .await
+                .expect("save draft B event")
+                .unwrap();
+            app.handle_ui_msg(&mut ui, msg);
+        }
+        let compose_b = match ui.overlays.pop().unwrap() {
+            Overlay::MailCompose(c) => c,
+            _ => unreachable!(),
+        };
+        assert_eq!(compose_b.draft_id.as_deref(), Some("draft-b"));
+        app.stash_compose_draft(&compose_b).unwrap();
+
+        // Open Drafts folder and populate search results containing draft-a
+        app.select_mail_folder(&mut ui, "f-drafts".into());
+        assert_eq!(app.mail_messages.len(), 2);
+        app.search_results = app.storage.search_mail("AlphaDraftToken", None, 10).unwrap();
+        assert_eq!(app.search_results.len(), 1);
+        assert_eq!(app.search_results[0].id, "draft-a");
+
+        // Control 1: Send failure preserves draft-a in SQLite, Drafts list, and draft_store (re-editable)
+        ui.overlays.push(Overlay::MailCompose(compose_a.clone()));
+        assert!(app.submit_mail_compose(&mut ui, &compose_a));
+        while app.has_pending_draft_write() {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ui_rx.recv())
+                .await
+                .expect("failed send draft A event")
+                .unwrap();
+            app.handle_ui_msg(&mut ui, msg);
+        }
+        assert!(
+            app.storage.get_mail_message("draft-a").unwrap().is_some(),
+            "failed send must NOT delete draft-a from SQLite"
+        );
+        assert_eq!(app.mail_messages.len(), 2);
+        let key_a = app
+            .stored_compose_key(&compose_a.mode.draft_key(), &compose_a.compose_id)
+            .expect("draft-a must stay in draft_store for re-editing");
+        assert!(
+            !app.draft_store.get_mail(&key_a).unwrap().synced.send_pending,
+            "failed send must clear send_pending so draft-a can be edited and resent"
+        );
+
+        // Acceptance: Re-edit draft-a and send successfully -> immediately removed before any folder resync
+        send_should_fail.store(false, Ordering::SeqCst);
+        let mut compose_a_retry = compose_a.clone();
+        compose_a_retry.subject = "Draft A AlphaDraftToken Ready".into();
+        assert!(app.submit_mail_compose(&mut ui, &compose_a_retry));
+        while app.has_pending_draft_write() {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ui_rx.recv())
+                .await
+                .expect("send draft A success event")
+                .unwrap();
+            app.handle_ui_msg(&mut ui, msg);
+        }
+        while let Ok(msg) = ui_rx.try_recv() {
+            app.handle_ui_msg(&mut ui, msg);
+        }
+
+        assert_eq!(*sent_ids.lock().unwrap(), vec!["draft-a".to_string()]);
+        assert!(
+            app.storage.get_mail_message("draft-a").unwrap().is_none(),
+            "sent draft-a must be removed from SQLite immediately after POST /send succeeds"
+        );
+        let db_drafts = app
+            .storage
+            .list_mail_messages(Some("f-drafts"), false, false, false, 20)
+            .unwrap();
+        let db_draft_ids: Vec<&str> = db_drafts.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(db_draft_ids, vec!["draft-b"]);
+
+        let ui_draft_ids: Vec<&str> = app.mail_messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ui_draft_ids, vec!["draft-b"]);
+        assert_eq!(app.active_mail_id.as_deref(), Some("draft-b"));
+        assert_eq!(
+            app.active_mail().map(|m| m.id.as_str()),
+            Some("draft-b")
+        );
+        assert!(
+            app.storage
+                .search_mail("AlphaDraftToken", None, 10)
+                .unwrap()
+                .is_empty(),
+            "sent draft-a must be removed from mail_fts"
+        );
+        assert!(
+            !app.search_results.iter().any(|h| h.id == "draft-a"),
+            "sent draft-a must be removed from TUI search_results"
+        );
+        let drafts_folder = app
+            .mail_folders
+            .iter()
+            .find(|f| f.id == "f-drafts")
+            .unwrap();
+        assert_eq!(drafts_folder.total_item_count, 1);
+        assert_eq!(drafts_folder.unread_item_count, 1);
+
+        // Control 2: Draft B (saved only) and existing Sent Items row remain untouched
+        assert!(app.storage.get_mail_message("draft-b").unwrap().is_some());
+        assert!(app
+            .storage
+            .get_mail_message("sent-existing-1")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn regression_outlook_outlook_07_smart_folder_delete_does_not_reinsert() {
+        use axum::{extract::Path as AxumPath, http::StatusCode, routing::post, Json, Router};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let move_should_fail = Arc::new(AtomicBool::new(false));
+        let fail_c = Arc::clone(&move_should_fail);
+
+        let router = Router::new().route(
+            "/v1.0/me/messages/{id}/move",
+            post(move |AxumPath(id): AxumPath<String>, Json(_payload): Json<serde_json::Value>| {
+                let fail = fail_c.load(Ordering::SeqCst);
+                async move {
+                    if fail {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": { "code": "ErrorInternalServerError", "message": "move failed" }
+                            })),
+                        );
+                    }
+                    let flagged = id.contains("flagged");
+                    let is_read = id.contains("flagged");
+                    let new_id = format!("{id}-moved");
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "id": new_id,
+                            "conversationId": format!("conv-{id}"),
+                            "parentFolderId": "f-deleted",
+                            "subject": format!("Subject {id}"),
+                            "receivedDateTime": "2026-11-21T10:00:00Z",
+                            "isRead": is_read,
+                            "isDraft": false,
+                            "flag": { "flagStatus": if flagged { "flagged" } else { "notFlagged" } },
+                            "bodyPreview": format!("Body {id}"),
+                            "body": { "contentType": "html", "content": format!("<p>Body {id}</p>") }
+                        })),
+                    )
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tok = crate::auth::StoredTokens {
+            access_token: "synthetic-tok".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("u1".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tok);
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _) = tokio::sync::watch::channel(FocusTarget::default());
+        let (nudge_tx, _nudge_rx) = mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+        ui.group_threads = false;
+
+        app.mail_folders = vec![
+            MailFolder {
+                id: "f-inbox".into(),
+                display_name: "Inbox".into(),
+                well_known_name: Some("inbox".into()),
+                parent_folder_id: None,
+                child_folder_count: 0,
+                unread_item_count: 2,
+                total_item_count: 4,
+            },
+            MailFolder {
+                id: "f-deleted".into(),
+                display_name: "Deleted Items".into(),
+                well_known_name: Some("deleteditems".into()),
+                parent_folder_id: None,
+                child_folder_count: 0,
+                unread_item_count: 0,
+                total_item_count: 0,
+            },
+        ];
+        app.storage.upsert_mail_folders(&app.mail_folders).unwrap();
+
+        let mut u1 = make_mail("m-unread-del", "c-u1", "2026-11-21T10:00:00Z", false, false);
+        u1.folder_id = Some("f-inbox".into());
+        let mut u2 = make_mail("m-unread-keep", "c-u2", "2026-11-21T09:00:00Z", false, false);
+        u2.folder_id = Some("f-inbox".into());
+        let mut f1 = make_mail("m-flagged-del", "c-f1", "2026-11-21T08:00:00Z", true, true);
+        f1.folder_id = Some("f-inbox".into());
+        let mut f2 = make_mail("m-flagged-keep", "c-f2", "2026-11-21T07:00:00Z", true, true);
+        f2.folder_id = Some("f-inbox".into());
+        app.storage
+            .upsert_mail_messages(&[u1, u2, f1, f2])
+            .unwrap();
+
+        // 1. Control: delete request failure preserves original selection and badges
+        app.select_mail_folder(&mut ui, VIRTUAL_UNREAD_FOLDER.into());
+        assert_eq!(app.mail_messages.len(), 2);
+        assert_eq!(app.active_mail_id.as_deref(), Some("m-unread-del"));
+        move_should_fail.store(true, Ordering::SeqCst);
+        app.delete_selected_mail(&mut ui);
+        let fail_msg = tokio::time::timeout(std::time::Duration::from_secs(2), ui_rx.recv())
+            .await
+            .expect("delete fail event")
+            .unwrap();
+        app.handle_ui_msg(&mut ui, fail_msg);
+        while let Ok(extra) = ui_rx.try_recv() {
+            app.handle_ui_msg(&mut ui, extra);
+        }
+        assert_eq!(
+            app.active_mail_id.as_deref(),
+            Some("m-unread-del"),
+            "failed delete must preserve original selection"
+        );
+        assert_eq!(
+            app.active_mail().map(|m| m.id.as_str()),
+            Some("m-unread-del"),
+            "failed delete must preserve reader mail"
+        );
+        assert_eq!(
+            app.mail_messages.iter().filter(|m| !m.is_read).count(),
+            2,
+            "failed delete must preserve Unread badge count"
+        );
+        assert_eq!(
+            app.mail_folders
+                .iter()
+                .find(|f| f.id == "f-inbox")
+                .unwrap()
+                .unread_item_count,
+            2,
+            "failed delete must preserve Inbox unread badge"
+        );
+
+        // 2. Acceptance (Unread): delete selected unread mail -> after MailMoved and after re-entering Unread, only remaining 1 shown and selection == reader
+        move_should_fail.store(false, Ordering::SeqCst);
+        app.delete_selected_mail(&mut ui);
+        let moved_msg = tokio::time::timeout(std::time::Duration::from_secs(2), ui_rx.recv())
+            .await
+            .expect("delete move event")
+            .unwrap();
+        app.handle_ui_msg(&mut ui, moved_msg);
+
+        let unread_ids_after_move: Vec<&str> =
+            app.mail_messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            unread_ids_after_move,
+            vec!["m-unread-keep"],
+            "deleted mail must NOT be re-inserted into Unread smart folder after MailMoved"
+        );
+        assert_eq!(app.active_mail_id.as_deref(), Some("m-unread-keep"));
+        assert_eq!(
+            app.active_mail().map(|m| m.id.as_str()),
+            Some("m-unread-keep")
+        );
+        assert_eq!(ui.mail_list_scroll.selected_idx, Some(0));
+
+        // Re-enter Unread smart folder: deleted item still excluded
+        app.select_mail_folder(&mut ui, VIRTUAL_UNREAD_FOLDER.into());
+        let unread_ids_reenter: Vec<&str> =
+            app.mail_messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            unread_ids_reenter,
+            vec!["m-unread-keep"],
+            "re-entering Unread smart folder must exclude Deleted Items"
+        );
+        assert_eq!(app.active_mail_id.as_deref(), Some("m-unread-keep"));
+        assert_eq!(
+            app.active_mail().map(|m| m.id.as_str()),
+            Some("m-unread-keep")
+        );
+
+        // 3. Acceptance (Flagged): delete selected flagged mail -> after MailMoved and re-entry, only remaining 1 shown
+        app.select_mail_folder(&mut ui, VIRTUAL_FLAGGED_FOLDER.into());
+        assert_eq!(app.mail_messages.len(), 2);
+        assert_eq!(app.active_mail_id.as_deref(), Some("m-flagged-del"));
+        app.delete_selected_mail(&mut ui);
+        let moved_flag_msg = tokio::time::timeout(std::time::Duration::from_secs(2), ui_rx.recv())
+            .await
+            .expect("flagged delete move event")
+            .unwrap();
+        app.handle_ui_msg(&mut ui, moved_flag_msg);
+
+        let flagged_ids_after: Vec<&str> =
+            app.mail_messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(flagged_ids_after, vec!["m-flagged-keep"]);
+        assert_eq!(app.active_mail_id.as_deref(), Some("m-flagged-keep"));
+        assert_eq!(
+            app.active_mail().map(|m| m.id.as_str()),
+            Some("m-flagged-keep")
+        );
+
+        app.select_mail_folder(&mut ui, VIRTUAL_FLAGGED_FOLDER.into());
+        let flagged_ids_reenter: Vec<&str> =
+            app.mail_messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(flagged_ids_reenter, vec!["m-flagged-keep"]);
+        assert_eq!(app.active_mail_id.as_deref(), Some("m-flagged-keep"));
+        assert_eq!(
+            app.active_mail().map(|m| m.id.as_str()),
+            Some("m-flagged-keep")
+        );
+
+        // 4. Control: opening Trash directly DOES show the moved messages
+        app.select_mail_folder(&mut ui, "f-deleted".into());
+        let trash_ids: Vec<&str> = app.mail_messages.iter().map(|m| m.id.as_str()).collect();
+        assert!(
+            trash_ids.contains(&"m-unread-del-moved") && trash_ids.contains(&"m-flagged-del-moved"),
+            "Trash folder must show moved messages, got {trash_ids:?}"
+        );
     }
 }

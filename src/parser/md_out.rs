@@ -1,6 +1,6 @@
 //! Outgoing Markdown + inline `cid:` images + quoted reply -> email-client-safe HTML compiler.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::{models::InlineImageUpload, parser::html_in::normalize_content_id};
 
@@ -11,18 +11,38 @@ pub fn compile_outgoing_mail_html(
     inline_images: &[InlineImageUpload],
     quoted_reply_html: Option<&str>,
 ) -> String {
-    let (body_html, referenced_cids) = render_markdown_to_html(markdown);
+    let mut cid_aliases: HashMap<String, String> = HashMap::new();
+    for img in inline_images {
+        let cid = normalize_content_id(&img.content_id);
+        let temp_id = normalize_content_id(&img.temp_id);
+        let canonical = if cid.is_empty() {
+            temp_id.clone()
+        } else {
+            cid
+        };
+        if canonical.is_empty() {
+            continue;
+        }
+        cid_aliases.insert(canonical.to_ascii_lowercase(), canonical.clone());
+        if !temp_id.is_empty() {
+            cid_aliases
+                .entry(temp_id.to_ascii_lowercase())
+                .or_insert_with(|| canonical.clone());
+        }
+    }
+
+    let (body_html, referenced_cids) = render_markdown_to_html(markdown, &cid_aliases);
     let mut out = String::with_capacity(body_html.len() + 256);
     out.push_str(&body_html);
 
     for img in inline_images {
         let cid = normalize_content_id(&img.content_id);
-        let fallback_id = if cid.is_empty() {
-            img.temp_id.trim().to_string()
-        } else {
-            cid
-        };
-        if fallback_id.is_empty() || referenced_cids.contains(&fallback_id.to_ascii_lowercase()) {
+        let temp_id = normalize_content_id(&img.temp_id);
+        let fallback_id = if cid.is_empty() { temp_id.clone() } else { cid };
+        if fallback_id.is_empty()
+            || referenced_cids.contains(&fallback_id.to_ascii_lowercase())
+            || (!temp_id.is_empty() && referenced_cids.contains(&temp_id.to_ascii_lowercase()))
+        {
             continue;
         }
         let alt = if img.file_name.trim().is_empty() {
@@ -46,7 +66,10 @@ pub fn compile_outgoing_mail_html(
     out
 }
 
-fn render_markdown_to_html(markdown: &str) -> (String, HashSet<String>) {
+fn render_markdown_to_html(
+    markdown: &str,
+    cid_aliases: &HashMap<String, String>,
+) -> (String, HashSet<String>) {
     let normalized: std::borrow::Cow<'_, str> = if markdown.contains('\r') {
         std::borrow::Cow::Owned(markdown.replace("\r\n", "\n"))
     } else {
@@ -103,7 +126,7 @@ fn render_markdown_to_html(markdown: &str) -> (String, HashSet<String>) {
         if let Some((level, heading_text)) = parse_atx_heading(line) {
             blocks.push(format!(
                 "<h{level}>{}</h{level}>",
-                render_inline(heading_text, &mut referenced_cids)
+                render_inline(heading_text, cid_aliases, &mut referenced_cids)
             ));
             i += 1;
             continue;
@@ -117,7 +140,7 @@ fn render_markdown_to_html(markdown: &str) -> (String, HashSet<String>) {
                     .strip_prefix("> ")
                     .or_else(|| lines[i].strip_prefix('>'))
                     .unwrap_or("");
-                quote_lines.push(render_inline(content, &mut referenced_cids));
+                quote_lines.push(render_inline(content, cid_aliases, &mut referenced_cids));
                 i += 1;
             }
             blocks.push(format!("<blockquote>{}</blockquote>", quote_lines.join("<br>")));
@@ -129,7 +152,10 @@ fn render_markdown_to_html(markdown: &str) -> (String, HashSet<String>) {
             let mut items = Vec::new();
             while i < lines.len() {
                 if let Some(item_text) = parse_unordered_list_item(lines[i]) {
-                    items.push(format!("<li>{}</li>", render_inline(item_text, &mut referenced_cids)));
+                    items.push(format!(
+                        "<li>{}</li>",
+                        render_inline(item_text, cid_aliases, &mut referenced_cids)
+                    ));
                     i += 1;
                 } else {
                     break;
@@ -144,7 +170,10 @@ fn render_markdown_to_html(markdown: &str) -> (String, HashSet<String>) {
             let mut items = Vec::new();
             while i < lines.len() {
                 if let Some(item_text) = parse_ordered_list_item(lines[i]) {
-                    items.push(format!("<li>{}</li>", render_inline(item_text, &mut referenced_cids)));
+                    items.push(format!(
+                        "<li>{}</li>",
+                        render_inline(item_text, cid_aliases, &mut referenced_cids)
+                    ));
                     i += 1;
                 } else {
                     break;
@@ -170,7 +199,7 @@ fn render_markdown_to_html(markdown: &str) -> (String, HashSet<String>) {
             {
                 break;
             }
-            para_lines.push(render_inline(cur, &mut referenced_cids));
+            para_lines.push(render_inline(cur, cid_aliases, &mut referenced_cids));
             i += 1;
         }
         if !para_lines.is_empty() {
@@ -234,7 +263,11 @@ fn parse_ordered_list_item(line: &str) -> Option<&str> {
     trimmed[digits..].strip_prefix(". ").map(str::trim)
 }
 
-fn render_inline(input: &str, referenced_cids: &mut HashSet<String>) -> String {
+fn render_inline(
+    input: &str,
+    cid_aliases: &HashMap<String, String>,
+    referenced_cids: &mut HashSet<String>,
+) -> String {
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
     let mut no_closing_backtick = false;
@@ -269,10 +302,14 @@ fn render_inline(input: &str, referenced_cids: &mut HashSet<String>) -> String {
                 Some((alt, src, consumed)) => {
                     if is_safe_image_url(src) {
                         let normalized_src = if src.len() >= 4 && src[..4].eq_ignore_ascii_case("cid:") {
-                            let cid = normalize_content_id(&src[4..]);
-                            if !cid.is_empty() {
-                                referenced_cids.insert(cid.to_ascii_lowercase());
-                                format!("cid:{cid}")
+                            let raw_cid = normalize_content_id(&src[4..]);
+                            if !raw_cid.is_empty() {
+                                let resolved = cid_aliases
+                                    .get(&raw_cid.to_ascii_lowercase())
+                                    .cloned()
+                                    .unwrap_or(raw_cid);
+                                referenced_cids.insert(resolved.to_ascii_lowercase());
+                                format!("cid:{resolved}")
                             } else {
                                 src.to_string()
                             }
@@ -302,7 +339,7 @@ fn render_inline(input: &str, referenced_cids: &mut HashSet<String>) -> String {
                         out.push_str(&format!(
                             "<a href=\"{}\">{}</a>",
                             escape_html_attr(url),
-                            render_inline(label, referenced_cids)
+                            render_inline(label, cid_aliases, referenced_cids)
                         ));
                         i += consumed;
                         continue;
@@ -322,7 +359,7 @@ fn render_inline(input: &str, referenced_cids: &mut HashSet<String>) -> String {
                         if end_idx > 0 {
                             let inner = &after_stars[..end_idx];
                             out.push_str("<strong>");
-                            out.push_str(&render_inline(inner, referenced_cids));
+                            out.push_str(&render_inline(inner, cid_aliases, referenced_cids));
                             out.push_str("</strong>");
                             i += 2 + end_idx + 2;
                             continue;
@@ -343,7 +380,7 @@ fn render_inline(input: &str, referenced_cids: &mut HashSet<String>) -> String {
                         if end_idx > 0 {
                             let inner = &after_tilde[..end_idx];
                             out.push_str("<s>");
-                            out.push_str(&render_inline(inner, referenced_cids));
+                            out.push_str(&render_inline(inner, cid_aliases, referenced_cids));
                             out.push_str("</s>");
                             i += 2 + end_idx + 2;
                             continue;
@@ -363,7 +400,7 @@ fn render_inline(input: &str, referenced_cids: &mut HashSet<String>) -> String {
                     if end_idx > 0 {
                         let inner = &rest[1..1 + end_idx];
                         out.push_str("<em>");
-                        out.push_str(&render_inline(inner, referenced_cids));
+                        out.push_str(&render_inline(inner, cid_aliases, referenced_cids));
                         out.push_str("</em>");
                         i += 1 + end_idx + 1;
                         continue;
@@ -505,7 +542,7 @@ mod tests {
         let payload = format!(
             "{many_ticks}\n\n{many_stars}\n\n{many_double}\n\n{many_tilde}\n\n{many_brackets}\n\n[bad](javascript:alert(1)) [ok](https://example.com)"
         );
-        let (html, _) = render_markdown_to_html(&payload);
+        let (html, _) = render_markdown_to_html(&payload, &HashMap::new());
         assert!(html.contains("<a href=\"https://example.com\">ok</a>"));
         assert!(!html.contains("<a href=\"javascript:"));
     }

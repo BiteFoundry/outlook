@@ -458,7 +458,8 @@ fn upsert_mail_messages_in_tx(tx: &Transaction<'_>, messages: &[MailMessage]) ->
 
             let keep_existing_att = !invalidate_body
                 && (preserve_hydrated
-                    || (attachments_json == "[]"
+                    || (msg.has_attachments
+                        && attachments_json == "[]"
                         && ex.attachments_json != "[]"
                         && !ex.attachments_json.is_empty()));
             let eff_attachments_json = if invalidate_body {
@@ -470,12 +471,7 @@ fn upsert_mail_messages_in_tx(tx: &Transaction<'_>, messages: &[MailMessage]) ->
             };
             let eff_has_attachments = if invalidate_body {
                 has_att_i
-            } else if msg.has_attachments
-                || (preserve_hydrated && ex.has_attachments != 0)
-                || (attachments_json == "[]"
-                    && ex.attachments_json != "[]"
-                    && !ex.attachments_json.is_empty())
-            {
+            } else if msg.has_attachments || (preserve_hydrated && ex.has_attachments != 0) {
                 1i32
             } else {
                 0i32
@@ -742,6 +738,67 @@ pub fn list_mail_summaries(
     list_mail_summaries_filtered(conn, folder_id_or_wellknown, false, false, false, limit)
 }
 
+/// Queries mail summaries for smart folders (`Unread`, `Flagged`), excluding Deleted Items
+/// via well-known folder mapping and an optional explicit excluded folder ID.
+pub fn list_smart_folder_summaries(
+    conn: &Connection,
+    unread_only: bool,
+    flagged_only: bool,
+    excluded_folder_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<MailMessage>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut extra_clauses = String::new();
+    if unread_only {
+        extra_clauses.push_str(" AND m.is_read = 0");
+    }
+    if flagged_only {
+        extra_clauses.push_str(" AND m.flagged = 1");
+    }
+    extra_clauses.push_str(
+        " AND (m.folder_id IS NULL OR (
+            LOWER(m.folder_id) NOT IN ('deleteditems', 'trash', 'deleted')
+            AND m.folder_id NOT IN (
+                SELECT id FROM mail_folders
+                WHERE LOWER(COALESCE(well_known_name, '')) = 'deleteditems'
+            )
+        ))",
+    );
+
+    if let Some(ex_fid) = excluded_folder_id.map(str::trim).filter(|s| !s.is_empty()) {
+        let sql = format!(
+            "
+            SELECT {MAIL_SUMMARY_SELECT_COLS}
+            FROM mail_messages m
+            WHERE 1 = 1
+              {extra_clauses}
+              AND COALESCE(m.folder_id, '') != ?1
+            ORDER BY m.received_at DESC, m.id DESC
+            LIMIT ?2
+            "
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params![ex_fid, limit as i64], map_mail_summary_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    } else {
+        let sql = format!(
+            "
+            SELECT {MAIL_SUMMARY_SELECT_COLS}
+            FROM mail_messages m
+            WHERE 1 = 1
+              {extra_clauses}
+            ORDER BY m.received_at DESC, m.id DESC
+            LIMIT ?1
+            "
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params![limit as i64], map_mail_summary_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+}
+
 /// Reload a folder through the last exposed row, including newer arrivals above it.
 pub(super) fn list_mail_summaries_through(
     conn: &Connection,
@@ -915,8 +972,21 @@ pub fn replace_moved_mail_local(
     old_id: &str,
     moved: &MailMessage,
 ) -> Result<()> {
+    replace_moved_mail_local_ex(conn, old_id, moved, !moved.attachments.is_empty())?;
+    Ok(())
+}
+
+/// Variant of `replace_moved_mail_local` that tracks whether the move response explicitly
+/// expanded `attachments` (distinguishing an omitted field from an explicit `attachments: []`)
+/// and returns the merged persisted `MailMessage`.
+pub fn replace_moved_mail_local_ex(
+    conn: &mut Connection,
+    old_id: &str,
+    moved: &MailMessage,
+    attachments_expanded: bool,
+) -> Result<MailMessage> {
     let tx = conn.transaction()?;
-    {
+    let effective = {
         let old_msg = {
             let sql = format!("SELECT {MAIL_SELECT_COLS} FROM mail_messages m WHERE m.id = ?1");
             let mut stmt = tx.prepare_cached(&sql)?;
@@ -960,10 +1030,6 @@ pub fn replace_moved_mail_local(
                 if effective.body_plain.is_empty() {
                     effective.body_plain = old.body_plain.clone();
                 }
-                if effective.attachments.is_empty() && !old.attachments.is_empty() {
-                    effective.attachments = old.attachments.clone();
-                    effective.has_attachments = old.has_attachments;
-                }
                 if effective.to_recipients.is_empty() {
                     effective.to_recipients = old.to_recipients.clone();
                 }
@@ -976,6 +1042,22 @@ pub fn replace_moved_mail_local(
                 if effective.reply_to.is_empty() {
                     effective.reply_to = old.reply_to.clone();
                 }
+            }
+            if !attachments_expanded
+                && effective.has_attachments
+                && effective.attachments.is_empty()
+                && !old.attachments.is_empty()
+            {
+                effective.attachments = old.attachments.clone();
+            }
+            if effective.from.is_none() {
+                effective.from = old.from.clone();
+            }
+            if effective.preview.is_empty() {
+                effective.preview = old.preview.clone();
+            }
+            if effective.inference_classification.is_none() {
+                effective.inference_classification = old.inference_classification.clone();
             }
             if effective.internet_message_id.is_none() {
                 effective.internet_message_id = old.internet_message_id.clone();
@@ -997,7 +1079,7 @@ pub fn replace_moved_mail_local(
             }
         }
 
-        if old_id != effective.id {
+        if old_id != effective.id || (attachments_expanded && effective.attachments.is_empty()) {
             if let Some(rowid) = old_rowid {
                 let mut del_fts = tx.prepare_cached("DELETE FROM mail_fts WHERE rowid = ?1")?;
                 del_fts.execute(params![rowid])?;
@@ -1042,9 +1124,10 @@ pub fn replace_moved_mail_local(
                 inc_new.execute(params![new_fid, new_read_i])?;
             }
         }
-    }
+        effective
+    };
     tx.commit()?;
-    Ok(())
+    Ok(effective)
 }
 
 fn folder_matches_scope(
@@ -1184,16 +1267,37 @@ pub fn delete_mail_messages_by_ids(conn: &mut Connection, ids: &[String]) -> Res
     }
     let tx = conn.transaction()?;
     {
-        let mut sel_rowid = tx.prepare_cached("SELECT rowid FROM mail_messages WHERE id = ?1")?;
+        let mut sel_row =
+            tx.prepare_cached("SELECT rowid, folder_id, is_read FROM mail_messages WHERE id = ?1")?;
         let mut del_fts = tx.prepare_cached("DELETE FROM mail_fts WHERE rowid = ?1")?;
         let mut del_msg = tx.prepare_cached("DELETE FROM mail_messages WHERE id = ?1")?;
+        let mut dec_folder = tx.prepare_cached(
+            "
+            UPDATE mail_folders
+            SET total_item_count = MAX(0, total_item_count - 1),
+                unread_item_count = CASE
+                    WHEN ?2 = 0 THEN MAX(0, unread_item_count - 1)
+                    ELSE unread_item_count
+                END
+            WHERE id = ?1
+            ",
+        )?;
         for id in ids {
-            if let Some(rowid) = sel_rowid
-                .query_row(params![id], |row| row.get::<_, i64>(0))
+            if let Some((rowid, folder_id, is_read_i)) = sel_row
+                .query_row(params![id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i32>(2)?,
+                    ))
+                })
                 .optional()?
             {
                 del_fts.execute(params![rowid])?;
                 del_msg.execute(params![id])?;
+                if let Some(fid) = folder_id {
+                    dec_folder.execute(params![fid, is_read_i])?;
+                }
             }
         }
     }

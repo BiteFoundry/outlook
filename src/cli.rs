@@ -2441,34 +2441,29 @@ async fn cmd_folders(
 pub(crate) fn load_cached_mail_list(
     storage: &Storage,
     folder_id: &str,
-    limit: usize,
-    full: bool,
-) -> Result<Vec<MailMessage>> {
-    if full {
-        storage.list_mail_messages(Some(folder_id), false, false, false, limit)
-    } else {
-        storage.list_mail_summaries(Some(folder_id), limit)
-    }
-}
-
-pub(crate) fn filter_mail_messages(
-    mut messages: Vec<MailMessage>,
     unread_only: bool,
     flagged_only: bool,
     focused_only: bool,
     limit: usize,
-) -> Vec<MailMessage> {
-    if unread_only {
-        messages.retain(|m| !m.is_read);
+    full: bool,
+) -> Result<Vec<MailMessage>> {
+    if full {
+        storage.list_mail_messages(
+            Some(folder_id),
+            unread_only,
+            flagged_only,
+            focused_only,
+            limit,
+        )
+    } else {
+        storage.list_mail_summaries_filtered(
+            Some(folder_id),
+            unread_only,
+            flagged_only,
+            focused_only,
+            limit,
+        )
     }
-    if flagged_only {
-        messages.retain(|m| m.flagged);
-    }
-    if focused_only {
-        messages.retain(MailMessage::is_focused);
-    }
-    messages.truncate(limit);
-    messages
 }
 
 pub(crate) fn mail_list_json(messages: &[MailMessage], compact: bool) -> serde_json::Value {
@@ -2517,20 +2512,13 @@ pub(crate) fn mail_read_json(msg: &MailMessage, compact: bool) -> serde_json::Va
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn print_mail_list_output(
     folder: &str,
     folder_id: &str,
     messages: Vec<MailMessage>,
-    unread_only: bool,
-    flagged_only: bool,
-    focused_only: bool,
-    limit: usize,
     json_out: bool,
     compact: bool,
 ) -> Result<()> {
-    let messages = filter_mail_messages(messages, unread_only, flagged_only, focused_only, limit);
-
     if json_out {
         println!(
             "{}",
@@ -2573,28 +2561,22 @@ async fn cmd_mail_list(
     compact: bool,
 ) -> Result<()> {
     let limit = clamp_limit(limit);
-    let fetch_limit = if unread_only || flagged_only || focused_only {
-        (limit.saturating_mul(3)).clamp(limit, 500)
-    } else {
-        limit
-    };
-
+    let has_filter = unread_only || flagged_only || focused_only;
     let full = json_out && !compact;
+
     if offline {
         let storage = open_storage_only(cfg)?;
         let resolved = resolver::resolve_mail_folder_cached(&storage, folder)?;
-        let messages = load_cached_mail_list(&storage, &resolved.id, fetch_limit, full)?;
-        return print_mail_list_output(
-            folder,
+        let messages = load_cached_mail_list(
+            &storage,
             &resolved.id,
-            messages,
             unread_only,
             flagged_only,
             focused_only,
             limit,
-            json_out,
-            compact,
-        );
+            full,
+        )?;
+        return print_mail_list_output(folder, &resolved.id, messages, json_out, compact);
     }
 
     let ttl = cli_cache_ttl_secs(cfg);
@@ -2608,17 +2590,22 @@ async fn cmd_mail_list(
                     || daemon_warm
                     || is_cursor_fresh(&storage, &[cli_key.as_str(), delta_key.as_str()], ttl)
                 {
-                    let messages =
-                        load_cached_mail_list(&storage, &resolved.id, fetch_limit, full)?;
-                    if !messages.is_empty() {
-                        return print_mail_list_output(
-                            folder,
+                    let has_any_cached =
+                        !storage.list_mail_summaries(Some(&resolved.id), 1)?.is_empty();
+                    if has_any_cached {
+                        let messages = load_cached_mail_list(
+                            &storage,
                             &resolved.id,
-                            messages,
                             unread_only,
                             flagged_only,
                             focused_only,
                             limit,
+                            full,
+                        )?;
+                        return print_mail_list_output(
+                            folder,
+                            &resolved.id,
+                            messages,
                             json_out,
                             compact,
                         );
@@ -2629,49 +2616,145 @@ async fn cmd_mail_list(
     }
 
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let resolved = match resolver::resolve_mail_folder(&graph, &storage, folder, false).await {
+    let mut resolved = match resolver::resolve_mail_folder(&graph, &storage, folder, false).await {
         Ok(f) => f,
         Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
     };
 
-    let cached_msgs = load_cached_mail_list(&storage, &resolved.id, fetch_limit, full)?;
+    let has_any_cached = !storage.list_mail_summaries(Some(&resolved.id), 1)?.is_empty();
     let cli_key = format!("cli:mail:{}", resolved.id);
     let delta_key = format!("mail_delta:{}", resolved.id);
     let should_fetch = refresh
-        || cached_msgs.is_empty()
+        || !has_any_cached
         || (!cached
             && !daemon_warm
             && !is_cursor_fresh(&storage, &[cli_key.as_str(), delta_key.as_str()], ttl));
     let messages = if should_fetch {
-        let sync_res = match crate::sync::sync_mail_folder_delta(
-            &resolved.id,
-            &graph,
-            &storage,
-            None,
-            false,
-        )
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
-        };
-        record_cli_sync_cursor(&storage, &format!("cli:mail:{}", sync_res.folder_id));
-        load_cached_mail_list(&storage, &sync_res.folder_id, fetch_limit, full)?
+        if has_filter {
+            let (matched, fetched) = match graph
+                .list_mail_messages_filtered(
+                    &resolved.id,
+                    unread_only,
+                    flagged_only,
+                    focused_only,
+                    limit,
+                    true,
+                )
+                .await
+            {
+                Ok(res) => res,
+                Err(err) if resolver::is_graph_not_found_error(&err) => {
+                    match resolver::refresh_mail_folder_after_not_found(
+                        &graph,
+                        &storage,
+                        folder,
+                        &resolved.id,
+                    )
+                    .await
+                    {
+                        Ok(Some(new_folder)) => {
+                            resolved = new_folder;
+                            match graph
+                                .list_mail_messages_filtered(
+                                    &resolved.id,
+                                    unread_only,
+                                    flagged_only,
+                                    focused_only,
+                                    limit,
+                                    true,
+                                )
+                                .await
+                            {
+                                Ok(res) => res,
+                                Err(retry_err) => {
+                                    return Err(wrap_graph_permission_error(&graph, retry_err).await);
+                                }
+                            }
+                        }
+                        Ok(None) => return Err(wrap_graph_permission_error(&graph, err).await),
+                        Err(refresh_err) => {
+                            return Err(wrap_graph_permission_error(&graph, refresh_err).await);
+                        }
+                    }
+                }
+                Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+            };
+            let _ = storage.upsert_mail_messages(&fetched);
+            if full {
+                matched
+                    .into_iter()
+                    .map(|m| {
+                        storage
+                            .get_mail_message(&m.id)
+                            .ok()
+                            .flatten()
+                            .unwrap_or(m)
+                    })
+                    .collect()
+            } else {
+                matched
+            }
+        } else {
+            let sync_res = match crate::sync::sync_mail_folder_delta(
+                &resolved.id,
+                &graph,
+                &storage,
+                None,
+                false,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(err) if resolver::is_graph_not_found_error(&err) => {
+                    match resolver::refresh_mail_folder_after_not_found(
+                        &graph,
+                        &storage,
+                        folder,
+                        &resolved.id,
+                    )
+                    .await
+                    {
+                        Ok(Some(new_folder)) => {
+                            resolved = new_folder;
+                            match crate::sync::sync_mail_folder_delta(
+                                &resolved.id,
+                                &graph,
+                                &storage,
+                                None,
+                                false,
+                            )
+                            .await
+                            {
+                                Ok(outcome) => outcome,
+                                Err(retry_err) => {
+                                    return Err(wrap_graph_permission_error(&graph, retry_err).await);
+                                }
+                            }
+                        }
+                        Ok(None) => return Err(wrap_graph_permission_error(&graph, err).await),
+                        Err(refresh_err) => {
+                            return Err(wrap_graph_permission_error(&graph, refresh_err).await);
+                        }
+                    }
+                }
+                Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+            };
+            record_cli_sync_cursor(&storage, &format!("cli:mail:{}", sync_res.folder_id));
+            load_cached_mail_list(&storage, &sync_res.folder_id, false, false, false, limit, full)?
+        }
     } else {
-        cached_msgs
+        load_cached_mail_list(
+            &storage,
+            &resolved.id,
+            unread_only,
+            flagged_only,
+            focused_only,
+            limit,
+            full,
+        )?
     };
 
-    print_mail_list_output(
-        folder,
-        &resolved.id,
-        messages,
-        unread_only,
-        flagged_only,
-        focused_only,
-        limit,
-        json_out,
-        compact,
-    )
+    print_mail_list_output(folder, &resolved.id, messages, json_out, compact)
 }
 
 fn print_mail_read_text(msg: &MailMessage, raw_html: bool) {
@@ -3096,11 +3179,12 @@ async fn cmd_mail_move(
 ) -> Result<()> {
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
     let folder = resolver::resolve_mail_folder(&graph, &storage, dest_folder, false).await?;
-    let moved = match graph.move_mail_message(mail_id, &folder.id).await {
-        Ok(m) => m,
-        Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
-    };
-    storage.replace_moved_mail_local(mail_id, &moved)?;
+    let (moved, attachments_expanded) =
+        match graph.move_mail_message_with_meta(mail_id, &folder.id).await {
+            Ok(m) => m,
+            Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+        };
+    let moved = storage.replace_moved_mail_local_ex(mail_id, &moved, attachments_expanded)?;
 
     if json_out {
         println!(
@@ -3222,14 +3306,14 @@ async fn cmd_mail_search(
             None => None,
         };
         let hits = storage.search_mail(query, folder_filter.as_deref(), limit)?;
-        let mut msgs = match graph.search_mail_remote(query, limit).await {
+        let msgs = match graph
+            .search_mail_remote_in_folder(query, folder_filter.as_deref(), limit)
+            .await
+        {
             Ok(m) => m,
             Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
         };
         let _ = storage.upsert_mail_messages(&msgs);
-        if let Some(ref fid) = folder_filter {
-            msgs.retain(|m| m.folder_id.as_deref() == Some(fid.as_str()));
-        }
         (hits, msgs)
     };
 
@@ -3315,12 +3399,10 @@ async fn cmd_calendar_list(
 ) -> Result<()> {
     let limit = clamp_limit(limit);
     let (start_iso, end_iso) = default_calendar_window(from, to, days)?;
-    let start_filter = from.map(|_| start_iso.as_str());
-    let end_filter = to.map(|_| end_iso.as_str());
 
     if offline {
         let storage = open_storage_only(cfg)?;
-        let events = storage.list_calendar_events(start_filter, end_filter, limit)?;
+        let events = storage.list_calendar_events(Some(&start_iso), Some(&end_iso), limit)?;
         return print_cal_events_output(&start_iso, &end_iso, &events, json_out);
     }
 
@@ -3329,8 +3411,11 @@ async fn cmd_calendar_list(
     if cached || daemon_warm || ttl > 0 {
         if let Ok(storage) = open_storage_only(cfg) {
             if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:cal"], ttl) {
-                let events = storage.list_calendar_events(start_filter, end_filter, limit)?;
-                if !events.is_empty() {
+                let events =
+                    storage.list_calendar_events(Some(&start_iso), Some(&end_iso), limit)?;
+                let has_any_cached =
+                    !events.is_empty() || !storage.list_calendar_events(None, None, 1)?.is_empty();
+                if !events.is_empty() || (cached && has_any_cached) {
                     return print_cal_events_output(&start_iso, &end_iso, &events, json_out);
                 }
             }
@@ -4441,7 +4526,12 @@ pub(crate) async fn load_mail_attachment_bytes(
     att: &MailAttachment,
     offline: bool,
 ) -> Result<(String, String, Vec<u8>)> {
-    if let Some(ref b64) = att.content_bytes_b64 {
+    if let Some(b64) = att
+        .content_bytes_b64
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         let cleaned: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(cleaned)

@@ -159,10 +159,12 @@ pub(crate) fn html_to_plain_text(html: &str) -> String {
     enum Step<N> {
         Visit(N),
         CloseBlock,
+        CloseCell,
     }
 
     let frag = Html::parse_fragment(html);
     let mut out = String::new();
+    let mut pending_cell_sep = false;
     let mut stack = Vec::new();
     let root = frag.root_element();
     for child in root.children().collect::<Vec<_>>().into_iter().rev() {
@@ -172,21 +174,40 @@ pub(crate) fn html_to_plain_text(html: &str) -> String {
     while let Some(step) = stack.pop() {
         match step {
             Step::CloseBlock => {
+                pending_cell_sep = false;
                 if !out.ends_with('\n') {
                     out.push('\n');
                 }
             }
+            Step::CloseCell => {
+                if !out.is_empty() && !out.ends_with(|c: char| c.is_whitespace()) {
+                    pending_cell_sep = true;
+                }
+            }
             Step::Visit(node) => match node.value() {
-                Node::Text(t) => out.push_str(&t.text),
+                Node::Text(t) => {
+                    let text = t.text.as_ref();
+                    if !text.is_empty() {
+                        if pending_cell_sep {
+                            if !text.starts_with(|c: char| c.is_whitespace()) {
+                                out.push(' ');
+                            }
+                            pending_cell_sep = false;
+                        }
+                        out.push_str(text);
+                    }
+                }
                 Node::Element(el) => {
                     let tag = el.name().to_ascii_lowercase();
                     if matches!(tag.as_str(), "style" | "script" | "head" | "title") {
                         continue;
                     }
                     if tag == "br" {
+                        pending_cell_sep = false;
                         out.push('\n');
                         continue;
                     }
+                    let is_cell = matches!(tag.as_str(), "td" | "th");
                     let is_block = matches!(
                         tag.as_str(),
                         "p" | "div"
@@ -204,11 +225,14 @@ pub(crate) fn html_to_plain_text(html: &str) -> String {
                             | "section"
                             | "article"
                     );
-                    if is_block && !out.ends_with('\n') && !out.is_empty() {
-                        out.push('\n');
-                    }
                     if is_block {
+                        pending_cell_sep = false;
+                        if !out.ends_with('\n') && !out.is_empty() {
+                            out.push('\n');
+                        }
                         stack.push(Step::CloseBlock);
+                    } else if is_cell {
+                        stack.push(Step::CloseCell);
                     }
                     for child in node.children().collect::<Vec<_>>().into_iter().rev() {
                         stack.push(Step::Visit(child));
@@ -431,7 +455,7 @@ struct GraphMailMessage {
     #[serde(default)]
     body: Option<GraphOutlookBody>,
     #[serde(default)]
-    attachments: Vec<GraphMailAttachment>,
+    attachments: Option<Vec<GraphMailAttachment>>,
     #[serde(rename = "webLink", default)]
     web_link: Option<String>,
     #[serde(rename = "meetingMessageType", default)]
@@ -525,6 +549,14 @@ impl GraphMailMessage {
             None
         };
 
+        let attachments: Vec<MailAttachment> = self
+            .attachments
+            .unwrap_or_default()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let has_attachments = self.has_attachments.unwrap_or(!attachments.is_empty());
+
         MailMessage {
             id: self.id,
             internet_message_id: self
@@ -569,12 +601,12 @@ impl GraphMailMessage {
             inference_classification: self
                 .inference_classification
                 .filter(|s| !s.trim().is_empty()),
-            has_attachments: self.has_attachments.unwrap_or(false),
+            has_attachments,
             body_loaded,
             preview,
             body_html,
             body_plain,
-            attachments: self.attachments.into_iter().map(Into::into).collect(),
+            attachments,
             meeting_request,
             web_link: self.web_link.filter(|s| !s.trim().is_empty()),
         }
@@ -864,6 +896,75 @@ impl GraphClient {
             messages.truncate(top);
         }
         Ok(messages)
+    }
+
+    /// Sequentially fetches mail message pages via `list_mail_messages_page` until `limit`
+    /// messages matching all active filters (`unread_only`, `flagged_only`, `focused_only`)
+    /// are collected or `@odata.nextLink` ends.
+    ///
+    /// Returns `(matched, all_fetched)` so callers can upsert fetched rows into SQLite without
+    /// treating a partial filtered scan as a complete folder snapshot.
+    pub async fn list_mail_messages_filtered(
+        &self,
+        folder_id: &str,
+        unread_only: bool,
+        flagged_only: bool,
+        focused_only: bool,
+        limit: usize,
+        header_only: bool,
+    ) -> Result<(Vec<MailMessage>, Vec<MailMessage>)> {
+        if limit == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mut matched = Vec::with_capacity(limit);
+        let mut fetched = Vec::new();
+        let mut next_link: Option<String> = None;
+        let mut seen_urls = HashSet::new();
+        let normalized_folder = normalize_folder_target(folder_id);
+        let page_size = if unread_only || flagged_only || focused_only {
+            limit.clamp(25, 100)
+        } else {
+            limit.min(100)
+        };
+
+        loop {
+            let (page_msgs, next) = self
+                .list_mail_messages_page(folder_id, page_size, next_link.as_deref(), header_only)
+                .await?;
+            if page_msgs.is_empty() {
+                break;
+            }
+            for mut msg in page_msgs {
+                if msg.folder_id.is_none() {
+                    if let Some(ref fid) = normalized_folder {
+                        msg.folder_id = Some(fid.clone());
+                    }
+                }
+                let matches = (!unread_only || !msg.is_read)
+                    && (!flagged_only || msg.flagged)
+                    && (!focused_only || msg.is_focused());
+                if matches && matched.len() < limit {
+                    matched.push(msg.clone());
+                }
+                fetched.push(msg);
+            }
+            if matched.len() >= limit {
+                break;
+            }
+            let Some(next_url) = next
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            else {
+                break;
+            };
+            let key = canonical_pagination_key(&next_url).to_string();
+            if !seen_urls.insert(key) {
+                bail!("Cyclic or repeated @odata.nextLink detected during mail list: {next_url}");
+            }
+            next_link = Some(next_url);
+        }
+
+        Ok((matched, fetched))
     }
 
     /// Fetches a single page of mail messages with `@odata.nextLink` pagination support.
@@ -1458,12 +1559,13 @@ impl GraphClient {
     }
 
     /// Moves a mail message to `destination_folder_id` (supports well-known names such as
-    /// `"archive"`, `"deleteditems"`, `"inbox"`, `"junkemail"`).
-    pub async fn move_mail_message(
+    /// `"archive"`, `"deleteditems"`, `"inbox"`, `"junkemail"`), returning both the moved
+    /// message and whether the Graph response explicitly included an `attachments` array.
+    pub async fn move_mail_message_with_meta(
         &self,
         message_id: &str,
         destination_folder_id: &str,
-    ) -> Result<MailMessage> {
+    ) -> Result<(MailMessage, bool)> {
         let dest = normalize_folder_target(destination_folder_id)
             .ok_or_else(|| anyhow!("Destination folder ID is required to move a mail message."))?;
         let path = format!(
@@ -1474,7 +1576,20 @@ impl GraphClient {
             .post_json(&path, &serde_json::json!({ "destinationId": dest }))
             .await?;
         let has_body = moved.body.is_some();
-        Ok(moved.into_mail_message(has_body))
+        let attachments_expanded = moved.attachments.is_some();
+        Ok((moved.into_mail_message(has_body), attachments_expanded))
+    }
+
+    /// Moves a mail message to `destination_folder_id` (supports well-known names such as
+    /// `"archive"`, `"deleteditems"`, `"inbox"`, `"junkemail"`).
+    pub async fn move_mail_message(
+        &self,
+        message_id: &str,
+        destination_folder_id: &str,
+    ) -> Result<MailMessage> {
+        self.move_mail_message_with_meta(message_id, destination_folder_id)
+            .await
+            .map(|(msg, _)| msg)
     }
 
     pub async fn delete_mail_message(&self, message_id: &str) -> Result<()> {
@@ -1642,8 +1757,15 @@ impl GraphClient {
         self.download_mail_attachment(message_id, &att, dest_dir).await
     }
 
-    /// Searches remote mailbox via `/me/messages?$search="..."` with `ConsistencyLevel: eventual`.
-    pub async fn search_mail_remote(&self, query: &str, limit: usize) -> Result<Vec<MailMessage>> {
+    /// Searches remote mailbox via `/me/messages?$search="..."` (or scoped to
+    /// `/me/mailFolders/{folder_id}/messages?$search="..."` when `folder_id` is given)
+    /// with `ConsistencyLevel: eventual`.
+    pub async fn search_mail_remote_in_folder(
+        &self,
+        query: &str,
+        folder_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MailMessage>> {
         let q = query.trim();
         if limit == 0 || q.is_empty() {
             return Ok(Vec::new());
@@ -1651,8 +1773,13 @@ impl GraphClient {
         let escaped = q.replace('\\', "\\\\").replace('"', "\\\"");
         let search_val = format!("\"{escaped}\"");
         let top = limit.min(50);
+        let normalized_folder = folder_id.and_then(normalize_folder_target);
+        let base_path = match normalized_folder.as_deref() {
+            Some(fid) => format!("/me/mailFolders/{}/messages", urlencoding::encode(fid)),
+            None => "/me/messages".to_string(),
+        };
         let mut next_url = Some(format!(
-            "/me/messages?$search={}&$top={top}&$select={MAIL_HEADER_SELECT_FIELDS}",
+            "{base_path}?$search={}&$top={top}&$select={MAIL_HEADER_SELECT_FIELDS}",
             urlencoding::encode(&search_val)
         ));
         let mut messages = Vec::new();
@@ -1667,7 +1794,13 @@ impl GraphClient {
             let page: GraphListPage<GraphMailMessage> =
                 self.get_json_with_headers(&url, &headers).await?;
             for raw in page.value {
-                messages.push(raw.into_mail_message(false));
+                let mut msg = raw.into_mail_message(false);
+                if msg.folder_id.is_none() {
+                    if let Some(ref fid) = normalized_folder {
+                        msg.folder_id = Some(fid.clone());
+                    }
+                }
+                messages.push(msg);
                 if messages.len() >= limit {
                     return Ok(messages);
                 }
@@ -1676,6 +1809,11 @@ impl GraphClient {
         }
 
         Ok(messages)
+    }
+
+    /// Searches remote mailbox via `/me/messages?$search="..."` with `ConsistencyLevel: eventual`.
+    pub async fn search_mail_remote(&self, query: &str, limit: usize) -> Result<Vec<MailMessage>> {
+        self.search_mail_remote_in_folder(query, None, limit).await
     }
 }
 
@@ -1751,6 +1889,39 @@ fn prepend_to_thread_html(content: &str, quote: &str) -> String {
     }
 }
 
+fn is_cid_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@')
+}
+
+fn replace_bounded_token(input: &str, pattern: &str, replacement: &str) -> String {
+    if pattern.is_empty() || !input.contains(pattern) {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut rest_idx = 0usize;
+    while let Some(rel) = input[rest_idx..].find(pattern) {
+        let start = rest_idx + rel;
+        let end = start + pattern.len();
+        let prev_ok = input[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_cid_token_char(c));
+        let next_ok = input[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_cid_token_char(c));
+        out.push_str(&input[rest_idx..start]);
+        if prev_ok && next_ok {
+            out.push_str(replacement);
+        } else {
+            out.push_str(&input[start..end]);
+        }
+        rest_idx = end;
+    }
+    out.push_str(&input[rest_idx..]);
+    out
+}
+
 pub(crate) fn rewrite_inline_image_cids(
     body_html: &str,
     inline_images: &[InlineImageUpload],
@@ -1780,7 +1951,7 @@ pub(crate) fn rewrite_inline_image_cids(
                 format!("cid:{temp_id}"),
             ] {
                 if html.contains(&pattern) {
-                    html = html.replace(&pattern, &cid_uri);
+                    html = replace_bounded_token(&html, &pattern, &cid_uri);
                 }
             }
             // Replace bare `src="<temp_id>"` or `src='<temp_id>'`

@@ -239,6 +239,23 @@ impl Storage {
         )
     }
 
+    pub fn list_smart_folder_summaries(
+        &self,
+        unread_only: bool,
+        flagged_only: bool,
+        excluded_folder_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MailMessage>> {
+        let conn = self.read_conn()?;
+        outlook::list_smart_folder_summaries(
+            &conn,
+            unread_only,
+            flagged_only,
+            excluded_folder_id,
+            limit,
+        )
+    }
+
     pub(crate) fn list_mail_summaries_through(
         &self,
         folder_id: &str,
@@ -272,6 +289,16 @@ impl Storage {
     pub fn replace_moved_mail_local(&self, old_id: &str, moved: &MailMessage) -> Result<()> {
         let mut conn = self.lock_conn()?;
         outlook::replace_moved_mail_local(&mut conn, old_id, moved)
+    }
+
+    pub fn replace_moved_mail_local_ex(
+        &self,
+        old_id: &str,
+        moved: &MailMessage,
+        attachments_expanded: bool,
+    ) -> Result<MailMessage> {
+        let mut conn = self.lock_conn()?;
+        outlook::replace_moved_mail_local_ex(&mut conn, old_id, moved, attachments_expanded)
     }
 
     pub fn apply_mail_folder_delta_page(

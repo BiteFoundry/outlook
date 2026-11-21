@@ -351,43 +351,133 @@ async fn call_tool(
             let offline = args.optional_bool("offline")?.unwrap_or(false);
             let compact = args.optional_bool("compact")?.unwrap_or(false);
 
-            let resolved = resolve_mail_folder_mcp(storage, graph, &folder, offline).await?;
-            let folder_id = resolved.id.clone();
-            let fetch_limit = if unread || flagged || focused {
-                (limit.saturating_mul(3)).clamp(limit, 500)
-            } else {
-                limit
-            };
+            let mut resolved = resolve_mail_folder_mcp(storage, graph, &folder, offline).await?;
+            let has_filter = unread || flagged || focused;
 
             let messages = if offline {
-                let fid = folder_id.clone();
+                let fid = resolved.id.clone();
                 with_storage(storage, move |s| {
-                    cli::load_cached_mail_list(s, &fid, fetch_limit, !compact)
+                    cli::load_cached_mail_list(s, &fid, unread, flagged, focused, limit, !compact)
+                })
+                .await
+                .map_err(format_error)?
+            } else if has_filter {
+                let (matched, fetched) = match graph
+                    .list_mail_messages_filtered(
+                        &resolved.id,
+                        unread,
+                        flagged,
+                        focused,
+                        limit,
+                        true,
+                    )
+                    .await
+                {
+                    Ok(res) => res,
+                    Err(err) if resolver::is_graph_not_found_error(&err) => {
+                        match map_graph_result(
+                            graph,
+                            resolver::refresh_mail_folder_after_not_found(
+                                graph,
+                                storage,
+                                &folder,
+                                &resolved.id,
+                            )
+                            .await,
+                        )
+                        .await?
+                        {
+                            Some(new_folder) => {
+                                resolved = new_folder;
+                                map_graph_result(
+                                    graph,
+                                    graph
+                                        .list_mail_messages_filtered(
+                                            &resolved.id,
+                                            unread,
+                                            flagged,
+                                            focused,
+                                            limit,
+                                            true,
+                                        )
+                                        .await,
+                                )
+                                .await?
+                            }
+                            None => return Err(map_graph_result(graph, Err::<(), _>(err)).await.unwrap_err()),
+                        }
+                    }
+                    Err(err) => return Err(map_graph_result(graph, Err::<(), _>(err)).await.unwrap_err()),
+                };
+                with_storage(storage, move |s| {
+                    s.upsert_mail_messages(&fetched)?;
+                    if !compact {
+                        Ok(matched
+                            .into_iter()
+                            .map(|m| s.get_mail_message(&m.id).ok().flatten().unwrap_or(m))
+                            .collect())
+                    } else {
+                        Ok(matched)
+                    }
                 })
                 .await
                 .map_err(format_error)?
             } else {
-                let outcome = map_graph_result(
+                let outcome = match crate::sync::sync_mail_folder_delta(
+                    &resolved.id,
                     graph,
-                    crate::sync::sync_mail_folder_delta(&folder_id, graph, storage, None, false)
-                        .await,
+                    storage,
+                    None,
+                    false,
                 )
-                .await?;
+                .await
+                {
+                    Ok(o) => o,
+                    Err(err) if resolver::is_graph_not_found_error(&err) => {
+                        match map_graph_result(
+                            graph,
+                            resolver::refresh_mail_folder_after_not_found(
+                                graph,
+                                storage,
+                                &folder,
+                                &resolved.id,
+                            )
+                            .await,
+                        )
+                        .await?
+                        {
+                            Some(new_folder) => {
+                                resolved = new_folder;
+                                map_graph_result(
+                                    graph,
+                                    crate::sync::sync_mail_folder_delta(
+                                        &resolved.id,
+                                        graph,
+                                        storage,
+                                        None,
+                                        false,
+                                    )
+                                    .await,
+                                )
+                                .await?
+                            }
+                            None => return Err(map_graph_result(graph, Err::<(), _>(err)).await.unwrap_err()),
+                        }
+                    }
+                    Err(err) => return Err(map_graph_result(graph, Err::<(), _>(err)).await.unwrap_err()),
+                };
                 let fid = outcome.folder_id;
                 with_storage(storage, move |s| {
                     cli::record_cli_sync_cursor(s, &format!("cli:mail:{fid}"));
-                    cli::load_cached_mail_list(s, &fid, fetch_limit, !compact)
+                    cli::load_cached_mail_list(s, &fid, false, false, false, limit, !compact)
                 })
                 .await
                 .map_err(format_error)?
             };
 
-            let filtered =
-                cli::filter_mail_messages(messages, unread, flagged, focused, limit);
-
             Ok(json!({
                 "folder": resolved,
-                "messages": cli::mail_list_json(&filtered, compact),
+                "messages": cli::mail_list_json(&messages, compact),
             }))
         }
 
@@ -612,18 +702,21 @@ async fn call_tool(
 
             let moved_message = if let Some(dest) = dest_folder.as_deref() {
                 let folder = resolve_mail_folder_mcp(storage, graph, dest, false).await?;
-                let moved = map_graph_result(
+                let (moved, attachments_expanded) = map_graph_result(
                     graph,
-                    graph.move_mail_message(&message_id, &folder.id).await,
+                    graph
+                        .move_mail_message_with_meta(&message_id, &folder.id)
+                        .await,
                 )
                 .await?;
                 let moved_clone = moved.clone();
                 let old_id_clone = message_id.clone();
-                let _ = with_storage(storage, move |s| {
-                    s.replace_moved_mail_local(&old_id_clone, &moved_clone)
+                let persisted = with_storage(storage, move |s| {
+                    s.replace_moved_mail_local_ex(&old_id_clone, &moved_clone, attachments_expanded)
                 })
-                .await;
-                Some(moved)
+                .await
+                .unwrap_or(moved);
+                Some(persisted)
             } else {
                 None
             };
@@ -682,13 +775,23 @@ async fn call_tool(
             let selected =
                 cli::select_mail_attachment(&mail, attachment_index, attachment.as_deref())
                     .map_err(format_error)?;
-            let downloaded = map_graph_result(
-                graph,
+            let downloaded = if offline {
+                let _ = cli::load_mail_attachment_bytes(graph, &mail.id, selected, true)
+                    .await
+                    .map_err(format_error)?;
                 graph
-                    .download_mail_attachment(&message_id, selected, &output_dir)
-                    .await,
-            )
-            .await?;
+                    .download_mail_attachment(&mail.id, selected, &output_dir)
+                    .await
+                    .map_err(format_error)?
+            } else {
+                map_graph_result(
+                    graph,
+                    graph
+                        .download_mail_attachment(&mail.id, selected, &output_dir)
+                        .await,
+                )
+                .await?
+            };
 
             Ok(cli::format_downloaded_attachment_json(
                 &message_id,
@@ -723,13 +826,15 @@ async fn call_tool(
                 .map_err(format_error)?;
                 Ok(json!({ "query": query, "hits": hits }))
             } else {
-                let mut messages =
-                    map_graph_result(graph, graph.search_mail_remote(&query, limit).await).await?;
+                let messages = map_graph_result(
+                    graph,
+                    graph
+                        .search_mail_remote_in_folder(&query, folder_id.as_deref(), limit)
+                        .await,
+                )
+                .await?;
                 let msgs_clone = messages.clone();
                 let _ = with_storage(storage, move |s| s.upsert_mail_messages(&msgs_clone)).await;
-                if let Some(ref fid) = folder_id {
-                    messages.retain(|m| m.folder_id.as_deref() == Some(fid.as_str()));
-                }
                 Ok(json!({ "query": query, "messages": messages }))
             }
         }
@@ -755,10 +860,10 @@ async fn call_tool(
                     .map_err(format_error)?;
 
             let events = if offline {
-                let s_filter = from.as_ref().map(|_| start_iso.clone());
-                let e_filter = to.as_ref().map(|_| end_iso.clone());
+                let s_filter = start_iso.clone();
+                let e_filter = end_iso.clone();
                 with_storage(storage, move |s| {
-                    s.list_calendar_events(s_filter.as_deref(), e_filter.as_deref(), limit)
+                    s.list_calendar_events(Some(&s_filter), Some(&e_filter), limit)
                 })
                 .await
                 .map_err(format_error)?

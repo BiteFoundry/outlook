@@ -75,7 +75,7 @@ pub fn resolve_mail_folder_from_slice(
         return Ok(exact_id.clone());
     }
 
-    let q_lower = q.to_ascii_lowercase();
+    let q_lower = q.to_lowercase();
 
     if let Some(wk) = canonical_well_known_folder(q) {
         if let Some(matched) = folders.iter().find(|f| {
@@ -204,6 +204,66 @@ pub async fn resolve_mail_folder(
                 Err(err)
             }
         }
+    }
+}
+
+/// Returns `true` when `err` represents a Microsoft Graph HTTP 404 / item-or-folder-not-found
+/// response (strictly excluding 401/403 authentication or authorization errors).
+pub fn is_graph_not_found_error(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    let detail = msg
+        .strip_prefix(crate::graph::GRAPH_API_ERROR_PREFIX)
+        .and_then(|rest| rest.split_once("): ").map(|(_, d)| d))
+        .unwrap_or(&msg);
+    let lower = detail.to_ascii_lowercase();
+    if detail.starts_with("401 ")
+        || detail.starts_with("403 ")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("authorization_requestdenied")
+        || lower.contains("erroraccessdenied")
+        || lower.contains("insufficient privileges")
+    {
+        return false;
+    }
+    detail.starts_with("404 ")
+        || lower.contains("404 not found")
+        || lower.contains("erroritemnotfound")
+        || lower.contains("errorfoldernotfound")
+}
+
+/// Refreshes the mail folder list from Microsoft Graph and re-resolves `folder_query`
+/// when a cached name-resolved folder ID returned HTTP 404 / `ErrorItemNotFound`.
+///
+/// Explicit folder IDs (`folder_query.trim() == previous_folder_id.trim()`) are never
+/// substituted with another folder (`Ok(None)`). Returns `Ok(Some(new_folder))` only when
+/// refreshing yields a different folder ID.
+pub async fn refresh_mail_folder_after_not_found(
+    graph: &GraphClient,
+    storage: &Storage,
+    folder_query: &str,
+    previous_folder_id: &str,
+) -> Result<Option<MailFolder>> {
+    let q = folder_query.trim();
+    if q.is_empty() || q == previous_folder_id.trim() {
+        return Ok(None);
+    }
+    let fetched = graph.list_mail_folders().await?;
+    storage.replace_mail_folders(&fetched)?;
+    let refreshed = match resolve_mail_folder_from_slice(&fetched, q) {
+        Ok(found) => found,
+        Err(err) => {
+            if let Some(wk) = canonical_well_known_folder(q) {
+                synthetic_well_known_folder(wk)
+            } else {
+                return Err(err);
+            }
+        }
+    };
+    if refreshed.id == previous_folder_id {
+        Ok(None)
+    } else {
+        Ok(Some(refreshed))
     }
 }
 

@@ -618,65 +618,151 @@ async fn list_mail_messages(
     Query(query): Query<MailMessagesQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let limit = cli::clamp_limit(query.limit.unwrap_or(30));
-    let fetch_limit = if query.unread || query.flagged || query.focused {
-        (limit.saturating_mul(3)).clamp(limit, 500)
-    } else {
-        limit
-    };
+    let has_filter = query.unread || query.flagged || query.focused;
     let folder_arg = query
         .folder
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("inbox");
-    let resolved_folder = resolve_mail_folder_for_api(&state, folder_arg, query.offline).await?;
+    let mut resolved_folder =
+        resolve_mail_folder_for_api(&state, folder_arg, query.offline).await?;
     let folder_id = resolved_folder.id.clone();
 
     let ttl = cli::cli_cache_ttl_secs(&state.config);
     let fid_for_read = folder_id.clone();
-    let (cached, fresh) = with_storage(&state.storage, move |s| {
+    let unread = query.unread;
+    let flagged = query.flagged;
+    let focused = query.focused;
+    let (cached, has_any_cached, fresh) = with_storage(&state.storage, move |s| {
         let cli_key = format!("cli:mail:{fid_for_read}");
         let delta_key = format!("mail_delta:{fid_for_read}");
         let is_fresh = cli::is_cursor_fresh(s, &[cli_key.as_str(), delta_key.as_str()], ttl);
-        let msgs = s.list_mail_messages(Some(&fid_for_read), false, false, false, fetch_limit)?;
-        Ok((msgs, is_fresh))
+        let has_any = !s.list_mail_summaries(Some(&fid_for_read), 1)?.is_empty();
+        let msgs = s.list_mail_messages(Some(&fid_for_read), unread, flagged, focused, limit)?;
+        Ok((msgs, has_any, is_fresh))
     })
     .await?;
 
-    let messages = if !query.offline && (query.refresh || cached.is_empty() || !fresh) {
-        let outcome = match crate::sync::sync_mail_folder_delta(
-            &folder_id,
-            &state.graph,
-            &state.storage,
-            None,
-            false,
-        )
-        .await
-        {
-            Ok(o) => o,
-            Err(err) => return Err(map_graph_error(&state.graph, err).await),
-        };
-        let fid_for_store = outcome.folder_id;
-        with_storage(&state.storage, move |s| {
-            cli::record_cli_sync_cursor(s, &format!("cli:mail:{fid_for_store}"));
-            s.list_mail_messages(Some(&fid_for_store), false, false, false, fetch_limit)
-        })
-        .await?
+    let messages = if !query.offline && (query.refresh || !has_any_cached || !fresh) {
+        if has_filter {
+            let (matched, fetched) = match state
+                .graph
+                .list_mail_messages_filtered(
+                    &resolved_folder.id,
+                    unread,
+                    flagged,
+                    focused,
+                    limit,
+                    true,
+                )
+                .await
+            {
+                Ok(res) => res,
+                Err(err) if resolver::is_graph_not_found_error(&err) => {
+                    match resolver::refresh_mail_folder_after_not_found(
+                        &state.graph,
+                        &state.storage,
+                        folder_arg,
+                        &resolved_folder.id,
+                    )
+                    .await
+                    {
+                        Ok(Some(new_folder)) => {
+                            resolved_folder = new_folder;
+                            match state
+                                .graph
+                                .list_mail_messages_filtered(
+                                    &resolved_folder.id,
+                                    unread,
+                                    flagged,
+                                    focused,
+                                    limit,
+                                    true,
+                                )
+                                .await
+                            {
+                                Ok(res) => res,
+                                Err(retry_err) => {
+                                    return Err(map_graph_error(&state.graph, retry_err).await);
+                                }
+                            }
+                        }
+                        Ok(None) => return Err(map_graph_error(&state.graph, err).await),
+                        Err(refresh_err) => {
+                            return Err(map_graph_error(&state.graph, refresh_err).await);
+                        }
+                    }
+                }
+                Err(err) => return Err(map_graph_error(&state.graph, err).await),
+            };
+            with_storage(&state.storage, move |s| {
+                s.upsert_mail_messages(&fetched)?;
+                Ok(matched
+                    .into_iter()
+                    .map(|m| s.get_mail_message(&m.id).ok().flatten().unwrap_or(m))
+                    .collect())
+            })
+            .await?
+        } else {
+            let outcome = match crate::sync::sync_mail_folder_delta(
+                &resolved_folder.id,
+                &state.graph,
+                &state.storage,
+                None,
+                false,
+            )
+            .await
+            {
+                Ok(o) => o,
+                Err(err) if resolver::is_graph_not_found_error(&err) => {
+                    match resolver::refresh_mail_folder_after_not_found(
+                        &state.graph,
+                        &state.storage,
+                        folder_arg,
+                        &resolved_folder.id,
+                    )
+                    .await
+                    {
+                        Ok(Some(new_folder)) => {
+                            resolved_folder = new_folder;
+                            match crate::sync::sync_mail_folder_delta(
+                                &resolved_folder.id,
+                                &state.graph,
+                                &state.storage,
+                                None,
+                                false,
+                            )
+                            .await
+                            {
+                                Ok(o) => o,
+                                Err(retry_err) => {
+                                    return Err(map_graph_error(&state.graph, retry_err).await);
+                                }
+                            }
+                        }
+                        Ok(None) => return Err(map_graph_error(&state.graph, err).await),
+                        Err(refresh_err) => {
+                            return Err(map_graph_error(&state.graph, refresh_err).await);
+                        }
+                    }
+                }
+                Err(err) => return Err(map_graph_error(&state.graph, err).await),
+            };
+            let fid_for_store = outcome.folder_id;
+            with_storage(&state.storage, move |s| {
+                cli::record_cli_sync_cursor(s, &format!("cli:mail:{fid_for_store}"));
+                s.list_mail_messages(Some(&fid_for_store), false, false, false, limit)
+            })
+            .await?
+        }
     } else {
         cached
     };
 
-    let filtered = cli::filter_mail_messages(
-        messages,
-        query.unread,
-        query.flagged,
-        query.focused,
-        limit,
-    );
-
     Ok(Json(json!({
         "folder": resolved_folder,
-        "messages": filtered,
+        "messages": messages,
     })))
 }
 
@@ -874,17 +960,19 @@ async fn patch_mail_message(
 
     let moved_message = if let Some(dest) = dest_query {
         let folder = resolve_mail_folder_for_api(&state, dest, false).await?;
-        let moved = match state.graph.move_mail_message(&id, &folder.id).await {
-            Ok(m) => m,
-            Err(err) => return Err(map_graph_error(&state.graph, err).await),
-        };
+        let (moved, attachments_expanded) =
+            match state.graph.move_mail_message_with_meta(&id, &folder.id).await {
+                Ok(m) => m,
+                Err(err) => return Err(map_graph_error(&state.graph, err).await),
+            };
         let moved_clone = moved.clone();
         let old_id_clone = id.clone();
-        let _ = with_storage(&state.storage, move |s| {
-            s.replace_moved_mail_local(&old_id_clone, &moved_clone)
+        let persisted = with_storage(&state.storage, move |s| {
+            s.replace_moved_mail_local_ex(&old_id_clone, &moved_clone, attachments_expanded)
         })
-        .await;
-        Some(moved)
+        .await
+        .unwrap_or(moved);
+        Some(persisted)
     } else {
         None
     };
@@ -976,7 +1064,11 @@ async fn search_mail(
     .await?;
 
     let remote = if query.remote {
-        let mut msgs = match state.graph.search_mail_remote(&q, limit).await {
+        let msgs = match state
+            .graph
+            .search_mail_remote_in_folder(&q, folder_filter.as_deref(), limit)
+            .await
+        {
             Ok(m) => m,
             Err(err) => return Err(map_graph_error(&state.graph, err).await),
         };
@@ -986,9 +1078,6 @@ async fn search_mail(
             Ok(())
         })
         .await;
-        if let Some(ref fid) = folder_filter {
-            msgs.retain(|m| m.folder_id.as_deref() == Some(fid.as_str()));
-        }
         msgs
     } else {
         Vec::new()
@@ -1018,10 +1107,10 @@ async fn list_calendar_events(
     .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
 
     let events = if query.offline {
-        let start_filter = query.from.as_ref().map(|_| start_iso.clone());
-        let end_filter = query.to.as_ref().map(|_| end_iso.clone());
+        let start_filter = start_iso.clone();
+        let end_filter = end_iso.clone();
         with_storage(&state.storage, move |s| {
-            s.list_calendar_events(start_filter.as_deref(), end_filter.as_deref(), limit)
+            s.list_calendar_events(Some(&start_filter), Some(&end_filter), limit)
         })
         .await?
     } else {
@@ -1704,7 +1793,7 @@ mod tests {
 
         // Calendar list & get offline
         let res = client
-            .get(format!("{base}/v1/calendar/events?offline=true"))
+            .get(format!("{base}/v1/calendar/events?offline=true&from=2026-11-19T00:00:00Z&to=2026-11-21T00:00:00Z"))
             .send()
             .await
             .unwrap();
