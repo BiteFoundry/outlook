@@ -551,8 +551,8 @@ async fn built_cli_handles_hyphen_inputs_draft_preservation_and_flag_guards() {
     }
 
     for read_args in [
-        &["read", "draft-rich", "--json"][..],
-        &["read", "draft-rich", "--offline", "--json"][..],
+        &["read", "draft-rich", "--json", "--full"][..],
+        &["read", "draft-rich", "--offline", "--json", "--full"][..],
     ] {
         let read_out = run_outlook(&dir, &base_url, &token, read_args, None);
         assert!(

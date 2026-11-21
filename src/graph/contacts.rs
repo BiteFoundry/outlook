@@ -155,6 +155,11 @@ impl From<GraphDirectoryUser> for ContactItem {
     }
 }
 
+pub struct ContactSearchOutcome {
+    pub contacts: Vec<ContactItem>,
+    pub directory_error: Option<anyhow::Error>,
+}
+
 impl GraphClient {
     pub async fn list_contacts(&self, limit: usize) -> Result<Vec<ContactItem>> {
         let (contacts, _) = self.list_contacts_complete(limit).await?;
@@ -191,8 +196,22 @@ impl GraphClient {
         query: &str,
         limit: usize,
     ) -> Result<Vec<ContactItem>> {
+        Ok(self
+            .search_contacts_and_directory_detailed(query, limit)
+            .await?
+            .contacts)
+    }
+
+    pub async fn search_contacts_and_directory_detailed(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<ContactSearchOutcome> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(ContactSearchOutcome {
+                contacts: Vec::new(),
+                directory_error: None,
+            });
         }
         let q = query.trim();
         let q_lower = q.to_lowercase();
@@ -202,7 +221,8 @@ impl GraphClient {
             .into_iter()
             .filter(|c| q_lower.is_empty() || contact_matches_query(c, &q_lower));
 
-        let directory_items = self.fetch_directory_matches(q, &q_lower, limit).await;
+        let (directory_items, directory_error) =
+            self.fetch_directory_matches(q, &q_lower, limit).await;
 
         let mut merged = Vec::new();
         let mut seen_emails: HashSet<String> = HashSet::new();
@@ -226,7 +246,10 @@ impl GraphClient {
             }
         }
 
-        Ok(merged)
+        Ok(ContactSearchOutcome {
+            contacts: merged,
+            directory_error,
+        })
     }
 
     async fn fetch_directory_matches(
@@ -234,13 +257,13 @@ impl GraphClient {
         query: &str,
         query_lower: &str,
         limit: usize,
-    ) -> Vec<ContactItem> {
+    ) -> (Vec<ContactItem>, Option<anyhow::Error>) {
         let headers = [("ConsistencyLevel", "eventual")];
         if query.is_empty() {
             let path = format!("/users?$top={limit}&$select={DIRECTORY_USER_SELECT}");
             return match self.get_json::<GraphListPage<GraphDirectoryUser>>(&path).await {
-                Ok(page) => page.value.into_iter().map(ContactItem::from).collect(),
-                Err(_) => Vec::new(),
+                Ok(page) => (page.value.into_iter().map(ContactItem::from).collect(), None),
+                Err(e) => (Vec::new(), Some(e)),
             };
         }
 
@@ -255,24 +278,26 @@ impl GraphClient {
             .get_json_with_headers::<GraphListPage<GraphDirectoryUser>>(&search_path, &headers)
             .await
         {
-            return page.value.into_iter().map(ContactItem::from).collect();
+            return (page.value.into_iter().map(ContactItem::from).collect(), None);
         }
 
-        // Graceful fallback when `$search` is unsupported; if `/users` returns 403, return empty.
+        // Graceful fallback when `$search` is unsupported; if `/users` fails, preserve the error.
         let fallback_top = limit.max(100);
         let fallback_path = format!("/users?$top={fallback_top}&$select={DIRECTORY_USER_SELECT}");
         match self
             .get_json::<GraphListPage<GraphDirectoryUser>>(&fallback_path)
             .await
         {
-            Ok(page) => page
-                .value
-                .into_iter()
-                .map(ContactItem::from)
-                .filter(|c| contact_matches_query(c, query_lower))
-                .take(limit)
-                .collect(),
-            Err(_) => Vec::new(),
+            Ok(page) => (
+                page.value
+                    .into_iter()
+                    .map(ContactItem::from)
+                    .filter(|c| contact_matches_query(c, query_lower))
+                    .take(limit)
+                    .collect(),
+                None,
+            ),
+            Err(e) => (Vec::new(), Some(e)),
         }
     }
 

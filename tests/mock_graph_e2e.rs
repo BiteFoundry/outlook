@@ -1779,7 +1779,11 @@ async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
         .unwrap();
     assert!(search_remote_text.contains("Remote KQL hit"));
 
-    // 4. Self-updater mock GitHub release check (outlook-0.2.0-...) + mandatory SHA256SUMS.txt verification
+    // 4. Self-updater check against a newer release and mandatory SHA256SUMS.txt verification.
+    fn next_version() -> String {
+        let major: u64 = env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap();
+        format!("{}.0.0", major + 1)
+    }
     #[derive(Clone)]
     struct MockGhState {
         base_url: String,
@@ -1794,19 +1798,20 @@ async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
         "outlook"
     }
     .to_string();
+    let version = next_version();
     let versioned_asset = match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("windows", "x86_64") => "outlook-0.2.0-x86_64-pc-windows-msvc.zip".to_string(),
-        ("windows", "aarch64") => "outlook-0.2.0-aarch64-pc-windows-msvc.zip".to_string(),
-        ("macos", "x86_64") => "outlook-0.2.0-x86_64-apple-darwin.tar.gz".to_string(),
-        ("macos", "aarch64") => "outlook-0.2.0-aarch64-apple-darwin.tar.gz".to_string(),
-        ("linux", "x86_64") => "outlook-0.2.0-x86_64-unknown-linux-gnu.tar.gz".to_string(),
-        ("linux", "aarch64") => "outlook-0.2.0-aarch64-unknown-linux-gnu.tar.gz".to_string(),
+        ("windows", "x86_64") => format!("outlook-{version}-x86_64-pc-windows-msvc.zip"),
+        ("windows", "aarch64") => format!("outlook-{version}-aarch64-pc-windows-msvc.zip"),
+        ("macos", "x86_64") => format!("outlook-{version}-x86_64-apple-darwin.tar.gz"),
+        ("macos", "aarch64") => format!("outlook-{version}-aarch64-apple-darwin.tar.gz"),
+        ("linux", "x86_64") => format!("outlook-{version}-x86_64-unknown-linux-gnu.tar.gz"),
+        ("linux", "aarch64") => format!("outlook-{version}-aarch64-unknown-linux-gnu.tar.gz"),
         _ => raw_bin_asset.clone(),
     };
-    let new_binary = b"NEW-OUTLOOK-0.2.0-VERIFIED-BINARY".to_vec();
+    let new_binary = b"NEW-OUTLOOK-VERIFIED-BINARY".to_vec();
     let valid_digest = hex::encode(Sha256::digest(&new_binary));
 
-    // 4a. Versioned release check (outlook-0.2.0-...)
+    // 4a. Check the versioned release archive.
     let gh_listener_check = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gh_addr_check = gh_listener_check.local_addr().unwrap();
     let gh_base_check = format!("http://{gh_addr_check}");
@@ -1819,8 +1824,8 @@ async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
             let base = gh_base_clone.clone();
             async move {
                 Json(json!({
-                    "tag_name": "v0.2.0",
-                    "html_url": format!("{base}/BiteFoundry/outlook/releases/tag/v0.2.0"),
+                    "tag_name": format!("v{}", next_version()),
+                    "html_url": format!("{base}/BiteFoundry/outlook/releases/tag/v{}", next_version()),
                     "assets": [
                         {
                             "name": asset_name,
@@ -1851,7 +1856,7 @@ async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
     .expect("check_or_apply_update_with_api_base check_only");
     assert!(check_res.update_available);
     assert!(!check_res.updated);
-    assert_eq!(check_res.latest_version, "0.2.0");
+    assert_eq!(check_res.latest_version, version);
     assert_eq!(check_res.asset_name.as_deref(), Some(versioned_asset.as_str()));
     gh_check_server.abort();
 
@@ -1882,8 +1887,8 @@ async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
                     }));
                 }
                 Json(json!({
-                    "tag_name": "v0.2.0",
-                    "html_url": format!("{}/BiteFoundry/outlook/releases/tag/v0.2.0", st.base_url),
+                    "tag_name": format!("v{}", next_version()),
+                    "html_url": format!("{}/BiteFoundry/outlook/releases/tag/v{}", st.base_url, next_version()),
                     "assets": assets
                 }))
             }),
@@ -1956,7 +1961,7 @@ async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
     .await
     .expect("valid SHA256SUMS update succeeds");
     assert!(applied.updated);
-    assert_eq!(applied.latest_version, "0.2.0");
+    assert_eq!(applied.latest_version, version);
     assert_eq!(std::fs::read(&fake_exe).unwrap(), new_binary);
 
     gh_apply_server.abort();
@@ -2205,7 +2210,7 @@ async fn regression_outlook_outlook_02_preserves_cached_attachments_after_move()
         "m-server-list",
         "m-fail-move",
     ] {
-        let out = run_outlook_cli(&dir, &base_url, &token, &["read", id, "--json"]);
+        let out = run_outlook_cli(&dir, &base_url, &token, &["read", id, "--json", "--full"]);
         assert!(
             out.status.success(),
             "seed read {id} failed: {}",
@@ -2227,7 +2232,7 @@ async fn regression_outlook_outlook_02_preserves_cached_attachments_after_move()
         &dir,
         &base_url,
         &token,
-        &["read", "m-att-1-moved", "--cached", "--json"],
+        &["read", "m-att-1-moved", "--cached", "--json", "--full"],
     );
     assert!(
         read_cached.status.success(),
@@ -2315,7 +2320,7 @@ async fn regression_outlook_outlook_02_preserves_cached_attachments_after_move()
         &dir,
         &base_url,
         &token,
-        &["read", "m-explicit-empty-moved", "--cached", "--json"],
+        &["read", "m-explicit-empty-moved", "--cached", "--json", "--full"],
     );
     assert!(read_empty.status.success());
     let empty_val: Value = serde_json::from_slice(&read_empty.stdout).unwrap();
@@ -2337,7 +2342,7 @@ async fn regression_outlook_outlook_02_preserves_cached_attachments_after_move()
         &dir,
         &base_url,
         &token,
-        &["read", "m-no-att-moved", "--cached", "--json"],
+        &["read", "m-no-att-moved", "--cached", "--json", "--full"],
     );
     assert!(read_no_att.status.success());
     let no_att_val: Value = serde_json::from_slice(&read_no_att.stdout).unwrap();
@@ -2361,7 +2366,7 @@ async fn regression_outlook_outlook_02_preserves_cached_attachments_after_move()
         &dir,
         &base_url,
         &token,
-        &["read", "m-server-list-moved", "--cached", "--json"],
+        &["read", "m-server-list-moved", "--cached", "--json", "--full"],
     );
     assert!(read_srv.status.success());
     let srv_val: Value = serde_json::from_slice(&read_srv.stdout).unwrap();
@@ -2382,7 +2387,7 @@ async fn regression_outlook_outlook_02_preserves_cached_attachments_after_move()
         &dir,
         &base_url,
         &token,
-        &["read", "m-fail-move", "--cached", "--json"],
+        &["read", "m-fail-move", "--cached", "--json", "--full"],
     );
     assert!(read_fail.status.success());
     let fail_val: Value = serde_json::from_slice(&read_fail.stdout).unwrap();
@@ -3862,7 +3867,7 @@ async fn regression_outlook_outlook_11_separates_html_table_cells_and_reindexes(
         &dir,
         &base_url,
         &token,
-        &["read", "m-tbl-compact", "--json"],
+        &["read", "m-tbl-compact", "--json", "--full"],
     );
     assert!(
         out_compact.status.success(),
@@ -4415,6 +4420,2361 @@ async fn regression_outlook_outlook_13_prevents_duplicate_inline_images() {
         );
         assert_eq!(html.matches("src=\"cid:inline-img-1\"").count(), 2);
     }
+
+    server.abort();
+}
+
+// ===========================================================================
+// Fable implementation plan acceptance & control tests (OUTLOOK-01..LIM)
+// ===========================================================================
+
+fn plan_cursor_scope(parts: &[&str]) -> String {
+    let mut h: u32 = 0x811c9dc5;
+    for b in parts.join("\u{1f}").bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    format!("{h:08x}")
+}
+
+fn plan_mcp_runtime(dir: &TempDir, base_url: &str, token: &str) -> (AppConfig, GraphClient, Storage) {
+    let cfg = test_config_for_server(base_url);
+    let now = chrono::Utc::now().timestamp();
+    let tok = StoredTokens {
+        access_token: token.to_string(),
+        refresh_token: None,
+        expires_at: now + 3600,
+        client_id: cfg.client_id.clone(),
+        tenant_id: cfg.tenant_id.clone(),
+        user_id: Some("regression-user".into()),
+        user_display_name: Some("Alice Outlook".into()),
+        user_email: Some("alice@contoso.com".into()),
+        auth_mode: "access_token".into(),
+    };
+    let auth = AuthManager::from_tokens(cfg.clone(), tok);
+    let graph = GraphClient::new(cfg.clone(), auth).unwrap();
+    let storage = Storage::open(&dir.path().join("regression-user").join("cache.db")).unwrap();
+    (cfg, graph, storage)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_outlook_01_detail_json_never_carries_attachment_bytes() {
+    let token = make_regression_jwt();
+    let png_bytes = make_test_png_bytes(16, 16);
+    let png_len = png_bytes.len() as u64;
+    let png_b64 = B64_STANDARD.encode(&png_bytes);
+    let png_ref = png_b64.clone();
+
+    let router = Router::new().route(
+        "/v1.0/me/messages/{id}",
+        get(move |Path(id): Path<String>| {
+            let png = png_ref.clone();
+            async move {
+                Json(json!({
+                    "id": id,
+                    "parentFolderId": "folder-inbox",
+                    "subject": "PNG attachment message",
+                    "from": { "emailAddress": { "name": "Bob", "address": "bob@contoso.com" } },
+                    "receivedDateTime": "2026-11-20T09:00:00Z",
+                    "isRead": false,
+                    "isDraft": false,
+                    "hasAttachments": true,
+                    "bodyPreview": "See chart",
+                    "body": { "contentType": "html", "content": "<p>See chart</p>" },
+                    "attachments": [
+                        {
+                            "id": "att-png-1",
+                            "name": "q4-chart.png",
+                            "contentType": "image/png",
+                            "size": png_len,
+                            "isInline": true,
+                            "contentId": "chart01@contoso",
+                            "contentBytes": png
+                        }
+                    ]
+                }))
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+
+    let out = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["read", "msg-png-1", "--json", "--full"],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout_str.contains("content_bytes_b64"));
+    let val: Value = serde_json::from_str(&stdout_str).unwrap();
+    let att = &val["message"]["attachments"][0];
+    assert_eq!(att["content_cached"], true);
+    assert_eq!(att["name"], "q4-chart.png");
+    assert_eq!(att["size"], png_len);
+
+    let (cfg, graph, storage) = plan_mcp_runtime(&dir, &base_url, &token);
+    let (is_err, mcp_val) = call_mcp_tool_json(
+        &cfg,
+        &graph,
+        &storage,
+        "get_message",
+        json!({ "message_id": "msg-png-1", "compact": false }),
+    )
+    .await;
+    assert!(!is_err, "{mcp_val}");
+    let mcp_str = serde_json::to_string(&mcp_val).unwrap();
+    assert!(!mcp_str.contains("content_bytes_b64"));
+    assert_eq!(mcp_val["message"]["attachments"][0]["content_cached"], true);
+    assert_eq!(mcp_val["message"]["attachments"][0]["name"], "q4-chart.png");
+    assert_eq!(mcp_val["message"]["attachments"][0]["size"], png_len);
+
+    let cached = storage.get_mail_message("msg-png-1").unwrap().unwrap();
+    assert!(cached.attachments[0].content_bytes_b64.is_some());
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_outlook_02_detail_compact_default_and_omitted() {
+    use std::collections::BTreeSet;
+
+    let token = make_regression_jwt();
+    let png_b64 = B64_STANDARD.encode(make_test_png_bytes(8, 8));
+    let png_ref = png_b64.clone();
+
+    let router = Router::new().route(
+        "/v1.0/me/messages/{id}",
+        get(move |Path(id): Path<String>| {
+            let png = png_ref.clone();
+            async move {
+                Json(json!({
+                    "@odata.type": "#microsoft.graph.eventMessageRequest",
+                    "id": id,
+                    "internetMessageId": "<rich-1@contoso.com>",
+                    "conversationId": "conv-rich-1",
+                    "parentFolderId": "folder-inbox",
+                    "subject": "Q4 Architecture Review",
+                    "from": { "emailAddress": { "name": "Bob", "address": "bob@contoso.com" } },
+                    "toRecipients": [{ "emailAddress": { "name": "Alice", "address": "alice@contoso.com" } }],
+                    "receivedDateTime": "2026-11-20T09:00:00Z",
+                    "sentDateTime": "2026-11-20T08:59:55Z",
+                    "lastModifiedDateTime": "2026-11-20T09:01:00Z",
+                    "isRead": false,
+                    "isDraft": false,
+                    "flag": { "flagStatus": "flagged" },
+                    "importance": "high",
+                    "inferenceClassification": "focused",
+                    "hasAttachments": true,
+                    "meetingMessageType": "meetingRequest",
+                    "event": { "id": "evt-001" },
+                    "bodyPreview": "Hi Alice, Q4 notes.",
+                    "body": { "contentType": "html", "content": "<p>Hi Alice, Q4 notes.</p>" },
+                    "webLink": "https://outlook.office.com/mail/rich-1",
+                    "attachments": [
+                        {
+                            "id": "att-1",
+                            "name": "chart.png",
+                            "contentType": "image/png",
+                            "size": 128,
+                            "isInline": false,
+                            "contentBytes": png
+                        }
+                    ]
+                }))
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+
+    let expected_keys: BTreeSet<&str> = [
+        "id",
+        "conversation_id",
+        "folder_id",
+        "subject",
+        "from",
+        "to_recipients",
+        "cc_recipients",
+        "bcc_recipients",
+        "reply_to",
+        "received_at",
+        "sent_at",
+        "is_read",
+        "is_draft",
+        "flagged",
+        "importance",
+        "has_attachments",
+        "meeting_request",
+        "body_loaded",
+        "preview",
+        "body_plain",
+        "omitted",
+        "hint",
+    ]
+    .into_iter()
+    .collect();
+
+    let out_default = run_outlook_cli(&dir, &base_url, &token, &["read", "msg-rich-1", "--json"]);
+    assert!(out_default.status.success(), "{}", String::from_utf8_lossy(&out_default.stderr));
+    let val_default: Value = serde_json::from_slice(&out_default.stdout).unwrap();
+
+    let out_alias = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["read", "msg-rich-1", "--json", "--compact"],
+    );
+    assert!(out_alias.status.success(), "{}", String::from_utf8_lossy(&out_alias.stderr));
+    let val_alias: Value = serde_json::from_slice(&out_alias.stdout).unwrap();
+
+    let (cfg, graph, storage) = plan_mcp_runtime(&dir, &base_url, &token);
+    let (is_err, val_mcp) = call_mcp_tool_json(
+        &cfg,
+        &graph,
+        &storage,
+        "get_message",
+        json!({ "message_id": "msg-rich-1" }),
+    )
+    .await;
+    assert!(!is_err, "{val_mcp}");
+
+    for (label, val) in [
+        ("cli default", &val_default),
+        ("cli --compact", &val_alias),
+        ("mcp default", &val_mcp),
+    ] {
+        let obj = val["message"].as_object().unwrap();
+        let keys: BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        assert_eq!(keys, expected_keys, "keys mismatch for {label}");
+        assert!(obj.get("body_html").is_none());
+        assert_eq!(obj["omitted"]["attachments"], 1);
+        assert_eq!(
+            obj["omitted"]["fields"],
+            json!([
+                "body_html",
+                "internet_message_id",
+                "inference_classification",
+                "last_modified_at",
+                "web_link"
+            ])
+        );
+        assert_eq!(obj["flagged"], true);
+        assert_eq!(obj["importance"], "high");
+        assert_eq!(obj["has_attachments"], true);
+        assert_eq!(obj["conversation_id"], "conv-rich-1");
+        assert_eq!(obj["meeting_request"]["meeting_message_type"], "meetingRequest");
+    }
+
+    assert!(val_default["message"]["hint"].as_str().unwrap().ends_with("--full"));
+    assert!(val_alias["message"]["hint"].as_str().unwrap().ends_with("--full"));
+    assert!(val_mcp["message"]["hint"].as_str().unwrap().contains("compact:false"));
+
+    server.abort();
+}
+
+#[test]
+fn plan_outlook_02_compact_full_conflict_is_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let token = make_regression_jwt();
+    for args in [
+        &["read", "x", "--json", "--compact", "--full"][..],
+        &["mail", "--json", "--compact", "--full"][..],
+        &["read", "x", "--full"][..],
+        &["event", "x", "--json", "--compact", "--full"][..],
+        &["event", "x", "--full"][..],
+    ] {
+        let out = run_outlook_cli(&dir, "http://127.0.0.1:1", &token, args);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "expected exit 2 for {args:?}, stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty(), "expected empty stdout for {args:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_outlook_03_unloaded_message_distinguishes_unknown() {
+    let token = make_regression_jwt();
+    let base_slot: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
+    let base_for_delta = Arc::clone(&base_slot);
+
+    let router = Router::new()
+        .route(
+            "/v1.0/me/mailFolders",
+            get(|| async {
+                Json(json!({
+                    "value": [{
+                        "id": "folder-inbox",
+                        "displayName": "Inbox",
+                        "wellKnownName": "inbox",
+                        "childFolderCount": 0,
+                        "unreadItemCount": 2,
+                        "totalItemCount": 2
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/mailFolders/{fid}/messages/delta",
+            get(move |Path(fid): Path<String>| {
+                let base_s = Arc::clone(&base_for_delta);
+                async move {
+                    let base = base_s.read().unwrap().clone();
+                    Json(json!({
+                        "value": [
+                            {
+                                "id": "msg-with-att",
+                                "parentFolderId": fid,
+                                "subject": "Has Attachment",
+                                "from": { "emailAddress": { "name": "Bob", "address": "bob@contoso.com" } },
+                                "receivedDateTime": "2026-11-20T09:00:00Z",
+                                "isRead": false,
+                                "isDraft": false,
+                                "hasAttachments": true,
+                                "bodyPreview": "Preview with attachment"
+                            },
+                            {
+                                "id": "msg-no-att",
+                                "parentFolderId": fid,
+                                "subject": "No Attachment",
+                                "from": { "emailAddress": { "name": "Bob", "address": "bob@contoso.com" } },
+                                "receivedDateTime": "2026-11-20T08:00:00Z",
+                                "isRead": true,
+                                "isDraft": false,
+                                "hasAttachments": false,
+                                "bodyPreview": "Preview plain only"
+                            }
+                        ],
+                        "@odata.deltaLink": format!("{base}/v1.0/me/mailFolders/{fid}/messages/delta?$deltatoken=d1")
+                    }))
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    *base_slot.write().unwrap() = base_url.clone();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+
+    let seed = run_outlook_cli(&dir, &base_url, &token, &["mail", "--json"]);
+    assert!(seed.status.success(), "{}", String::from_utf8_lossy(&seed.stderr));
+
+    let out_with = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["read", "msg-with-att", "--offline", "--json"],
+    );
+    assert!(out_with.status.success(), "{}", String::from_utf8_lossy(&out_with.stderr));
+    let val_with: Value = serde_json::from_slice(&out_with.stdout).unwrap();
+    assert_eq!(val_with["message"]["body_loaded"], false);
+    assert!(val_with["message"]["body_plain"].is_null());
+    assert_eq!(val_with["message"]["preview"], "Preview with attachment");
+    assert!(val_with["message"]["omitted"]["attachments"].is_null());
+
+    let out_no = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["read", "msg-no-att", "--offline", "--json"],
+    );
+    assert!(out_no.status.success(), "{}", String::from_utf8_lossy(&out_no.stderr));
+    let val_no: Value = serde_json::from_slice(&out_no.stdout).unwrap();
+    assert_eq!(val_no["message"]["body_loaded"], false);
+    assert!(val_no["message"]["body_plain"].is_null());
+    assert_eq!(val_no["message"]["preview"], "Preview plain only");
+    assert_eq!(val_no["message"]["omitted"]["attachments"], 0);
+
+    let out_text = run_outlook_cli(&dir, &base_url, &token, &["read", "msg-with-att", "--offline"]);
+    assert!(out_text.status.success());
+    let stdout_text = String::from_utf8_lossy(&out_text.stdout);
+    let stderr_text = String::from_utf8_lossy(&out_text.stderr);
+    assert!(stdout_text.contains("Preview with attachment"));
+    assert!(stderr_text.contains("body not loaded"));
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_outlook_05_list_size_stable_after_hydration() {
+    use std::collections::BTreeSet;
+
+    let token = make_regression_jwt();
+    let big_bytes = vec![b'A'; 64 * 1024];
+    let big_b64 = B64_STANDARD.encode(&big_bytes);
+    let big_ref = big_b64.clone();
+    let base_slot: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
+    let base_delta = Arc::clone(&base_slot);
+
+    let router = Router::new()
+        .route(
+            "/v1.0/me/mailFolders",
+            get(|| async {
+                Json(json!({
+                    "value": [{
+                        "id": "folder-inbox",
+                        "displayName": "Inbox",
+                        "wellKnownName": "inbox",
+                        "childFolderCount": 0,
+                        "unreadItemCount": 1,
+                        "totalItemCount": 3
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/mailFolders/{fid}/messages/delta",
+            get(move |Path(fid): Path<String>| {
+                let base_s = Arc::clone(&base_delta);
+                async move {
+                    let base = base_s.read().unwrap().clone();
+                    Json(json!({
+                        "value": [
+                            {
+                                "id": "msg-big-3",
+                                "parentFolderId": fid,
+                                "subject": "Big attachment",
+                                "from": { "emailAddress": { "name": "Bob", "address": "bob@contoso.com" } },
+                                "receivedDateTime": "2026-11-20T09:00:00Z",
+                                "isRead": true,
+                                "isDraft": false,
+                                "hasAttachments": true,
+                                "bodyPreview": "Large payload"
+                            },
+                            {
+                                "id": "msg-2",
+                                "parentFolderId": fid,
+                                "subject": "Second",
+                                "from": { "emailAddress": { "name": "Bob", "address": "bob@contoso.com" } },
+                                "receivedDateTime": "2026-11-20T08:00:00Z",
+                                "isRead": true,
+                                "isDraft": false,
+                                "hasAttachments": false,
+                                "bodyPreview": "Second preview"
+                            },
+                            {
+                                "id": "msg-1",
+                                "parentFolderId": fid,
+                                "subject": "First",
+                                "from": { "emailAddress": { "name": "Bob", "address": "bob@contoso.com" } },
+                                "receivedDateTime": "2026-11-20T07:00:00Z",
+                                "isRead": false,
+                                "isDraft": false,
+                                "hasAttachments": false,
+                                "bodyPreview": "First preview"
+                            }
+                        ],
+                        "@odata.deltaLink": format!("{base}/v1.0/me/mailFolders/{fid}/messages/delta?$deltatoken=d1")
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/v1.0/me/messages/msg-big-3",
+            get(move || {
+                let b64 = big_ref.clone();
+                async move {
+                    Json(json!({
+                        "id": "msg-big-3",
+                        "parentFolderId": "folder-inbox",
+                        "subject": "Big attachment",
+                        "from": { "emailAddress": { "name": "Bob", "address": "bob@contoso.com" } },
+                        "receivedDateTime": "2026-11-20T09:00:00Z",
+                        "isRead": true,
+                        "isDraft": false,
+                        "hasAttachments": true,
+                        "bodyPreview": "Large payload",
+                        "body": { "contentType": "html", "content": "<p>Large payload body</p>" },
+                        "attachments": [
+                            {
+                                "id": "att-big",
+                                "name": "archive.bin",
+                                "contentType": "application/octet-stream",
+                                "size": 65536,
+                                "isInline": false,
+                                "contentBytes": b64
+                            }
+                        ]
+                    }))
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    *base_slot.write().unwrap() = base_url.clone();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+
+    let list_before = run_outlook_cli(&dir, &base_url, &token, &["mail", "--json"]);
+    assert!(list_before.status.success(), "{}", String::from_utf8_lossy(&list_before.stderr));
+
+    let read_big = run_outlook_cli(&dir, &base_url, &token, &["read", "msg-big-3", "--json"]);
+    assert!(read_big.status.success(), "{}", String::from_utf8_lossy(&read_big.stderr));
+
+    let list_after = run_outlook_cli(&dir, &base_url, &token, &["mail", "--json"]);
+    assert!(list_after.status.success(), "{}", String::from_utf8_lossy(&list_after.stderr));
+    assert_eq!(list_before.stdout, list_after.stdout);
+
+    let list_full = run_outlook_cli(&dir, &base_url, &token, &["mail", "--json", "--full"]);
+    assert!(list_full.status.success(), "{}", String::from_utf8_lossy(&list_full.stderr));
+    let full_str = String::from_utf8_lossy(&list_full.stdout);
+    assert!(!full_str.contains("content_bytes_b64"));
+    let full_val: Value = serde_json::from_str(&full_str).unwrap();
+    let big_item = full_val["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "msg-big-3")
+        .unwrap();
+    assert_eq!(big_item["body_loaded"], true);
+    assert_eq!(big_item["attachments"][0]["content_cached"], true);
+
+    let (cfg, graph, storage) = plan_mcp_runtime(&dir, &base_url, &token);
+    let (err1, mcp_default) = call_mcp_tool_json(
+        &cfg,
+        &graph,
+        &storage,
+        "list_messages",
+        json!({ "folder": "inbox", "offline": true }),
+    )
+    .await;
+    assert!(!err1, "{mcp_default}");
+    let expected_list_keys: BTreeSet<&str> = [
+        "id",
+        "subject",
+        "from",
+        "received_at",
+        "is_read",
+        "is_draft",
+        "flagged",
+        "has_attachments",
+    ]
+    .into_iter()
+    .collect();
+    for item in mcp_default["messages"].as_array().unwrap() {
+        let keys: BTreeSet<&str> = item.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, expected_list_keys);
+    }
+
+    let (err2, mcp_full) = call_mcp_tool_json(
+        &cfg,
+        &graph,
+        &storage,
+        "list_messages",
+        json!({ "folder": "inbox", "offline": true, "compact": false }),
+    )
+    .await;
+    assert!(!err2, "{mcp_full}");
+    let mcp_full_str = serde_json::to_string(&mcp_full).unwrap();
+    assert!(!mcp_full_str.contains("content_bytes_b64"));
+    let mcp_big = mcp_full["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "msg-big-3")
+        .unwrap();
+    assert_eq!(mcp_big["attachments"][0]["content_cached"], true);
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_outlook_07_mail_list_cursor_walks_cache() {
+    let token = make_regression_jwt();
+    let graph_calls = Arc::new(AtomicUsize::new(0));
+    let calls_f = Arc::clone(&graph_calls);
+    let calls_d = Arc::clone(&graph_calls);
+    let base_slot: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
+    let base_d = Arc::clone(&base_slot);
+
+    let router = Router::new()
+        .route(
+            "/v1.0/me/mailFolders",
+            get(move || {
+                let c = Arc::clone(&calls_f);
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "value": [{
+                            "id": "folder-inbox",
+                            "displayName": "Inbox",
+                            "wellKnownName": "inbox",
+                            "childFolderCount": 0,
+                            "unreadItemCount": 5,
+                            "totalItemCount": 5
+                        }]
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/v1.0/me/mailFolders/{fid}/messages/delta",
+            get(move |Path(fid): Path<String>| {
+                let c = Arc::clone(&calls_d);
+                let base_s = Arc::clone(&base_d);
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    let base = base_s.read().unwrap().clone();
+                    let items = vec![
+                        ("m-top", "2026-11-20T10:00:00Z"),
+                        ("m-tie-c", "2026-11-20T09:00:00Z"),
+                        ("m-tie-a", "2026-11-20T09:00:00Z"),
+                        ("m-tie-b", "2026-11-20T09:00:00Z"),
+                        ("m-old", "2026-11-20T08:00:00Z"),
+                    ];
+                    let value: Vec<Value> = items
+                        .into_iter()
+                        .map(|(id, ts)| {
+                            json!({
+                                "id": id,
+                                "parentFolderId": fid,
+                                "subject": format!("Subject {id}"),
+                                "from": { "emailAddress": { "name": "Bob", "address": "bob@contoso.com" } },
+                                "receivedDateTime": ts,
+                                "isRead": false,
+                                "isDraft": false,
+                                "hasAttachments": false,
+                                "bodyPreview": id
+                            })
+                        })
+                        .collect();
+                    Json(json!({
+                        "value": value,
+                        "@odata.deltaLink": format!("{base}/v1.0/me/mailFolders/{fid}/messages/delta?$deltatoken=d1")
+                    }))
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    *base_slot.write().unwrap() = base_url.clone();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+
+    let p1 = run_outlook_cli(&dir, &base_url, &token, &["mail", "--json", "--limit", "2"]);
+    assert!(p1.status.success(), "{}", String::from_utf8_lossy(&p1.stderr));
+    let v1: Value = serde_json::from_slice(&p1.stdout).unwrap();
+    assert_eq!(v1["returned"], 2);
+    assert_eq!(v1["has_more"], true);
+    let cur1 = v1["next_cursor"].as_str().unwrap().to_string();
+    assert!(cur1.starts_with("c:"));
+
+    let calls_before_cursor = graph_calls.load(Ordering::SeqCst);
+
+    let p2 = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["mail", "--json", "--limit", "2", "--cursor", &cur1],
+    );
+    assert!(p2.status.success(), "{}", String::from_utf8_lossy(&p2.stderr));
+    let v2: Value = serde_json::from_slice(&p2.stdout).unwrap();
+    assert_eq!(v2["returned"], 2);
+    assert_eq!(v2["has_more"], true);
+    let cur2 = v2["next_cursor"].as_str().unwrap().to_string();
+
+    let p3 = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["mail", "--json", "--limit", "2", "--cursor", &cur2],
+    );
+    assert!(p3.status.success(), "{}", String::from_utf8_lossy(&p3.stderr));
+    let v3: Value = serde_json::from_slice(&p3.stdout).unwrap();
+    assert_eq!(v3["returned"], 1);
+    assert_eq!(v3["has_more"], false);
+    assert!(v3["next_cursor"].is_null());
+
+    assert_eq!(
+        graph_calls.load(Ordering::SeqCst),
+        calls_before_cursor,
+        "c: cursor calls must make 0 Graph requests"
+    );
+
+    let mut ids = Vec::new();
+    for v in [&v1, &v2, &v3] {
+        for m in v["messages"].as_array().unwrap() {
+            ids.push(m["id"].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(ids, vec!["m-top", "m-tie-c", "m-tie-b", "m-tie-a", "m-old"]);
+
+    let all5 = run_outlook_cli(&dir, &base_url, &token, &["mail", "--json", "--limit", "5"]);
+    assert!(all5.status.success());
+    let v_all5: Value = serde_json::from_slice(&all5.stdout).unwrap();
+    assert_eq!(v_all5["returned"], 5);
+    assert_eq!(v_all5["has_more"], false);
+    assert!(v_all5["next_cursor"].is_null());
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_outlook_07_empty_folder_page() {
+    let token = make_regression_jwt();
+    let base_slot: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
+    let base_d = Arc::clone(&base_slot);
+
+    let router = Router::new()
+        .route(
+            "/v1.0/me/mailFolders",
+            get(|| async {
+                Json(json!({
+                    "value": [{
+                        "id": "folder-empty",
+                        "displayName": "EmptyBox",
+                        "wellKnownName": null,
+                        "childFolderCount": 0,
+                        "unreadItemCount": 0,
+                        "totalItemCount": 0
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/mailFolders/{fid}/messages/delta",
+            get(move |Path(fid): Path<String>| {
+                let base_s = Arc::clone(&base_d);
+                async move {
+                    let base = base_s.read().unwrap().clone();
+                    Json(json!({
+                        "value": [],
+                        "@odata.deltaLink": format!("{base}/v1.0/me/mailFolders/{fid}/messages/delta?$deltatoken=d1")
+                    }))
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    *base_slot.write().unwrap() = base_url.clone();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+
+    let out = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["mail", "--folder", "EmptyBox", "--json"],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let val: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(val["messages"], json!([]));
+    assert_eq!(val["returned"], 0);
+    assert_eq!(val["has_more"], false);
+    assert!(val["next_cursor"].is_null());
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_outlook_08_remote_search_follows_pages_to_limit() {
+    use std::collections::HashSet;
+
+    let token = make_regression_jwt();
+    let base_slot: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
+    let base_s = Arc::clone(&base_slot);
+
+    let router = Router::new().route(
+        "/v1.0/me/messages",
+        get(move |RawQuery(raw_q): RawQuery| {
+            let base = base_s.read().unwrap().clone();
+            async move {
+                let q = raw_q.unwrap_or_default();
+                let mut top: usize = 50;
+                let mut skip: usize = 0;
+                for pair in q.split('&') {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        if k == "$top" {
+                            top = v.parse().unwrap_or(50);
+                        } else if k == "$skiptoken" {
+                            skip = v.parse().unwrap_or(0);
+                        }
+                    }
+                }
+                let total = 130usize;
+                let end = (skip + top).min(total);
+                let items: Vec<Value> = (skip..end)
+                    .map(|i| {
+                        json!({
+                            "id": format!("sr-{i:03}"),
+                            "parentFolderId": "folder-inbox",
+                            "subject": format!("Search hit {i}"),
+                            "from": { "emailAddress": { "name": "Bob", "address": "bob@contoso.com" } },
+                            "receivedDateTime": "2026-11-20T09:00:00Z",
+                            "isRead": true,
+                            "isDraft": false,
+                            "hasAttachments": false,
+                            "bodyPreview": format!("Hit {i}")
+                        })
+                    })
+                    .collect();
+                let mut body = json!({ "value": items });
+                if end < total {
+                    body["@odata.nextLink"] = json!(format!(
+                        "{base}/v1.0/me/messages?$search=q&$top={top}&$skiptoken={end}"
+                    ));
+                }
+                Json(body)
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    *base_slot.write().unwrap() = base_url.clone();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+
+    let p1 = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["search", "q", "--remote", "--limit", "120", "--json"],
+    );
+    assert!(p1.status.success(), "{}", String::from_utf8_lossy(&p1.stderr));
+    let v1: Value = serde_json::from_slice(&p1.stdout).unwrap();
+    assert_eq!(v1["remote"].as_array().unwrap().len(), 120);
+    assert_eq!(v1["returned"], 120);
+    assert_eq!(v1["has_more"], true);
+    let cur = v1["next_cursor"].as_str().unwrap().to_string();
+
+    let p2 = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["search", "q", "--remote", "--limit", "120", "--json", "--cursor", &cur],
+    );
+    assert!(p2.status.success(), "{}", String::from_utf8_lossy(&p2.stderr));
+    let v2: Value = serde_json::from_slice(&p2.stdout).unwrap();
+    assert_eq!(v2["remote"].as_array().unwrap().len(), 10);
+    assert_eq!(v2["returned"], 10);
+    assert_eq!(v2["hits"], json!([]));
+    assert_eq!(v2["has_more"], false);
+    assert!(v2["next_cursor"].is_null());
+
+    let mut all_ids: HashSet<String> = HashSet::new();
+    for m in v1["remote"].as_array().unwrap() {
+        all_ids.insert(m["id"].as_str().unwrap().to_string());
+    }
+    for m in v2["remote"].as_array().unwrap() {
+        all_ids.insert(m["id"].as_str().unwrap().to_string());
+    }
+    assert_eq!(all_ids.len(), 130);
+
+    let (cfg, graph, storage) = plan_mcp_runtime(&dir, &base_url, &token);
+    let (is_err, mcp_val) = call_mcp_tool_json(
+        &cfg,
+        &graph,
+        &storage,
+        "search_mail",
+        json!({ "query": "q", "limit": 200 }),
+    )
+    .await;
+    assert!(!is_err, "{mcp_val}");
+    assert_eq!(mcp_val["messages"].as_array().unwrap().len(), 130);
+    assert_eq!(mcp_val["returned"], 130);
+    assert_eq!(mcp_val["has_more"], false);
+    assert!(mcp_val["next_cursor"].is_null());
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_outlook_08_remote_search_control_small() {
+    let token = make_regression_jwt();
+    let req_count = Arc::new(AtomicUsize::new(0));
+    let cnt = Arc::clone(&req_count);
+    let base_slot: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
+    let base_s = Arc::clone(&base_slot);
+
+    let router = Router::new().route(
+        "/v1.0/me/messages",
+        get(move |RawQuery(raw_q): RawQuery| {
+            let c = Arc::clone(&cnt);
+            let base = base_s.read().unwrap().clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                let q = raw_q.unwrap_or_default();
+                let top: usize = q
+                    .split('&')
+                    .find_map(|p| p.strip_prefix("$top="))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(50);
+                let skip: usize = q
+                    .split('&')
+                    .find_map(|p| p.strip_prefix("$skiptoken="))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let total = 60usize;
+                let end = (skip + top).min(total);
+                let items: Vec<Value> = (skip..end)
+                    .map(|i| {
+                        json!({
+                            "id": format!("sm-{i:03}"),
+                            "parentFolderId": "folder-inbox",
+                            "subject": format!("Small {i}"),
+                            "from": { "emailAddress": { "name": "Bob", "address": "bob@contoso.com" } },
+                            "receivedDateTime": "2026-11-20T09:00:00Z",
+                            "isRead": true,
+                            "isDraft": false,
+                            "hasAttachments": false,
+                            "bodyPreview": "small"
+                        })
+                    })
+                    .collect();
+                let mut body = json!({ "value": items });
+                if end < total {
+                    body["@odata.nextLink"] = json!(format!(
+                        "{base}/v1.0/me/messages?$search=q&$top={top}&$skiptoken={end}"
+                    ));
+                }
+                Json(body)
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    *base_slot.write().unwrap() = base_url.clone();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+
+    let out = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["search", "q", "--remote", "--limit", "30", "--json"],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let val: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(val["remote"].as_array().unwrap().len(), 30);
+    assert_eq!(val["returned"], 30);
+    assert_eq!(val["has_more"], true);
+    assert_eq!(req_count.load(Ordering::SeqCst), 1);
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_outlook_08_cursor_rejects_foreign_url() {
+    let token = make_regression_jwt();
+    let req_count = Arc::new(AtomicUsize::new(0));
+    let cnt = Arc::clone(&req_count);
+
+    let router = Router::new().fallback(get(move || {
+        let c = Arc::clone(&cnt);
+        async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            Json(json!({ "value": [] }))
+        }
+    }));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    let other_port = if addr.port() == 65535 { addr.port() - 1 } else { addr.port() + 1 };
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (cfg, graph, storage) = plan_mcp_runtime(&dir, &base_url, &token);
+
+    let scope = plan_cursor_scope(&["search", "", "q"]);
+    let bad_urls = [
+        "https://example.invalid/me/messages".to_string(),
+        format!("http://127.0.0.1:{other_port}/v1.0/me/messages"),
+        format!("{base_url}/v2.0/me/messages"),
+        format!("{base_url}/v1.0/users/x/messages"),
+    ];
+
+    for bad_url in bad_urls {
+        let cur = format!("g:{scope}:0|{bad_url}");
+        let out = run_outlook_cli(
+            &dir,
+            &base_url,
+            &token,
+            &["search", "q", "--remote", "--json", "--cursor", &cur],
+        );
+        assert_eq!(out.status.code(), Some(1));
+        assert!(out.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("invalid cursor: url is not a Graph URL for this account"),
+            "unexpected stderr for {bad_url}: {stderr}"
+        );
+
+        let (is_err, mcp_val) = call_mcp_tool_json(
+            &cfg,
+            &graph,
+            &storage,
+            "search_mail",
+            json!({ "query": "q", "cursor": cur }),
+        )
+        .await;
+        assert!(is_err, "expected MCP error for {bad_url}");
+        assert_eq!(
+            mcp_val.as_str(),
+            Some("invalid cursor: url is not a Graph URL for this account")
+        );
+    }
+
+    assert_eq!(req_count.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_outlook_cursor_rejects_changed_folder_or_filter() {
+    use std::collections::HashSet;
+
+    let token = make_regression_jwt();
+    let req_count = Arc::new(AtomicUsize::new(0));
+    let base_slot: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
+
+    let inbox_items: Arc<Vec<Value>> = Arc::new(
+        (0..60)
+            .map(|i| {
+                let ts = chrono::DateTime::parse_from_rfc3339("2026-11-21T12:00:00Z").unwrap()
+                    - chrono::Duration::minutes(i as i64);
+                json!({
+                    "id": format!("inb-{i:03}"),
+                    "parentFolderId": "folder-inbox",
+                    "subject": format!("Inbox {i}"),
+                    "from": { "emailAddress": { "name": "Bob", "address": "bob@contoso.com" } },
+                    "receivedDateTime": ts.to_rfc3339(),
+                    "isRead": i >= 40,
+                    "isDraft": false,
+                    "flag": { "flagStatus": "notFlagged" },
+                    "hasAttachments": false,
+                    "bodyPreview": format!("Inbox {i}")
+                })
+            })
+            .collect(),
+    );
+    let sprint_items: Arc<Vec<Value>> = Arc::new(
+        (0..3)
+            .map(|i| {
+                let ts = chrono::DateTime::parse_from_rfc3339("2026-11-21T10:00:00Z").unwrap()
+                    - chrono::Duration::minutes(i as i64);
+                json!({
+                    "id": format!("spr-{i:03}"),
+                    "parentFolderId": "folder-sprint",
+                    "subject": format!("Sprint {i}"),
+                    "from": { "emailAddress": { "name": "Bob", "address": "bob@contoso.com" } },
+                    "receivedDateTime": ts.to_rfc3339(),
+                    "isRead": false,
+                    "isDraft": false,
+                    "hasAttachments": false,
+                    "bodyPreview": format!("Sprint {i}")
+                })
+            })
+            .collect(),
+    );
+
+    let cnt_f = Arc::clone(&req_count);
+    let cnt_d = Arc::clone(&req_count);
+    let cnt_p = Arc::clone(&req_count);
+    let base_d = Arc::clone(&base_slot);
+    let base_p = Arc::clone(&base_slot);
+    let inb_d = Arc::clone(&inbox_items);
+    let spr_d = Arc::clone(&sprint_items);
+    let inb_p = Arc::clone(&inbox_items);
+    let spr_p = Arc::clone(&sprint_items);
+
+    let router = Router::new()
+        .route(
+            "/v1.0/me/mailFolders",
+            get(move || {
+                let c = Arc::clone(&cnt_f);
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "value": [
+                            { "id": "folder-inbox", "displayName": "Inbox", "wellKnownName": "inbox", "childFolderCount": 0, "unreadItemCount": 40, "totalItemCount": 60 },
+                            { "id": "folder-sprint", "displayName": "Sprint", "wellKnownName": null, "childFolderCount": 0, "unreadItemCount": 3, "totalItemCount": 3 }
+                        ]
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/v1.0/me/mailFolders/{fid}/messages/delta",
+            get(move |Path(fid): Path<String>| {
+                let c = Arc::clone(&cnt_d);
+                let base_s = Arc::clone(&base_d);
+                let inb = Arc::clone(&inb_d);
+                let spr = Arc::clone(&spr_d);
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    let base = base_s.read().unwrap().clone();
+                    let items = if fid == "folder-sprint" {
+                        (*spr).clone()
+                    } else {
+                        (*inb).clone()
+                    };
+                    Json(json!({
+                        "value": items,
+                        "@odata.deltaLink": format!("{base}/v1.0/me/mailFolders/{fid}/messages/delta?$deltatoken=d1")
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/v1.0/me/mailFolders/{fid}/messages",
+            get(move |Path(fid): Path<String>, RawQuery(raw_q): RawQuery| {
+                let c = Arc::clone(&cnt_p);
+                let base_s = Arc::clone(&base_p);
+                let inb = Arc::clone(&inb_p);
+                let spr = Arc::clone(&spr_p);
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    let base = base_s.read().unwrap().clone();
+                    let q = raw_q.unwrap_or_default();
+                    let skip: usize = q
+                        .split('&')
+                        .find_map(|p| p.strip_prefix("$skip="))
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    let all = if fid == "folder-sprint" { &spr } else { &inb };
+                    let page_sz = 25usize;
+                    let end = (skip + page_sz).min(all.len());
+                    let slice = all[skip.min(all.len())..end].to_vec();
+                    let mut body = json!({ "value": slice });
+                    if end < all.len() {
+                        body["@odata.nextLink"] = json!(format!(
+                            "{base}/v1.0/me/mailFolders/{fid}/messages?$top={page_sz}&$skip={end}"
+                        ));
+                    }
+                    Json(body)
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    *base_slot.write().unwrap() = base_url.clone();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+
+    // Acquire c: cursor and g: cursor
+    let c_p1 = run_outlook_cli(&dir, &base_url, &token, &["mail", "--json", "--limit", "2"]);
+    assert!(c_p1.status.success(), "{}", String::from_utf8_lossy(&c_p1.stderr));
+    let c_v1: Value = serde_json::from_slice(&c_p1.stdout).unwrap();
+    let c_cur = c_v1["next_cursor"].as_str().unwrap().to_string();
+    assert!(c_cur.starts_with("c:"));
+    let c_ids1: HashSet<String> = c_v1["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+
+    let g_p1 = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["mail", "--unread", "--limit", "5", "--refresh", "--json"],
+    );
+    assert!(g_p1.status.success(), "{}", String::from_utf8_lossy(&g_p1.stderr));
+    let g_v1: Value = serde_json::from_slice(&g_p1.stdout).unwrap();
+    let g_cur = g_v1["next_cursor"].as_str().unwrap().to_string();
+    assert!(g_cur.starts_with("g:"));
+    let g_ids1: HashSet<String> = g_v1["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+
+    let expected_err = "invalid cursor: issued for a different command, folder, query or filter";
+    let expected_cli_stderr = format!("Error: {expected_err}");
+    let baseline = req_count.load(Ordering::SeqCst);
+
+    // 1..5 CLI mismatches
+    let cli_bad_cases: Vec<Vec<&str>> = vec![
+        vec!["mail", "--folder", "Sprint", "--json", "--limit", "2", "--cursor", &c_cur],
+        vec!["mail", "--unread", "--json", "--limit", "2", "--cursor", &c_cur],
+        vec!["mail", "--folder", "Sprint", "--unread", "--json", "--limit", "5", "--cursor", &g_cur],
+        vec!["mail", "--flagged", "--json", "--limit", "5", "--cursor", &g_cur],
+        vec!["mail", "--json", "--limit", "5", "--cursor", &g_cur],
+    ];
+    for args in cli_bad_cases {
+        let out = run_outlook_cli(&dir, &base_url, &token, &args);
+        assert_eq!(out.status.code(), Some(1), "expected exit 1 for {args:?}");
+        assert!(out.stdout.is_empty(), "expected empty stdout for {args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr).trim(),
+            expected_cli_stderr,
+            "unexpected stderr for {args:?}"
+        );
+    }
+
+    // 6. MCP mismatches repeating (1) and (3)
+    let (cfg, graph, storage) = plan_mcp_runtime(&dir, &base_url, &token);
+    for mcp_args in [
+        json!({ "folder": "Sprint", "limit": 2, "cursor": c_cur }),
+        json!({ "folder": "Sprint", "unread": true, "limit": 5, "cursor": g_cur }),
+    ] {
+        let (is_err, val) =
+            call_mcp_tool_json(&cfg, &graph, &storage, "list_messages", mcp_args).await;
+        assert!(is_err);
+        assert_eq!(val.as_str(), Some(expected_err));
+    }
+
+    assert_eq!(
+        req_count.load(Ordering::SeqCst),
+        baseline,
+        "scope mismatches must make 0 Graph calls"
+    );
+
+    // 7. Positive controls: original args succeed and continue without overlap
+    let c_p2 = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["mail", "--json", "--limit", "2", "--cursor", &c_cur],
+    );
+    assert!(c_p2.status.success(), "{}", String::from_utf8_lossy(&c_p2.stderr));
+    let c_v2: Value = serde_json::from_slice(&c_p2.stdout).unwrap();
+    let c_ids2: Vec<String> = c_v2["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(c_ids2, vec!["inb-002", "inb-003"]);
+    assert!(c_ids2.iter().all(|id| !c_ids1.contains(id)));
+
+    let g_p2 = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["mail", "--unread", "--limit", "5", "--json", "--cursor", &g_cur],
+    );
+    assert!(g_p2.status.success(), "{}", String::from_utf8_lossy(&g_p2.stderr));
+    let g_v2: Value = serde_json::from_slice(&g_p2.stdout).unwrap();
+    let g_ids2: Vec<String> = g_v2["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(g_ids2, vec!["inb-005", "inb-006", "inb-007", "inb-008", "inb-009"]);
+    assert!(g_ids2.iter().all(|id| !g_ids1.contains(id)));
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_outlook_cursor_rejects_changed_query_or_operation() {
+    let token = make_regression_jwt();
+    let req_count = Arc::new(AtomicUsize::new(0));
+    let base_slot: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
+
+    let cnt_m = Arc::clone(&req_count);
+    let cnt_f = Arc::clone(&req_count);
+    let cnt_t = Arc::clone(&req_count);
+    let base_m = Arc::clone(&base_slot);
+
+    let router = Router::new()
+        .route(
+            "/v1.0/me/messages",
+            get(move |RawQuery(raw_q): RawQuery| {
+                let c = Arc::clone(&cnt_m);
+                let base = base_m.read().unwrap().clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    let q = raw_q.unwrap_or_default();
+                    let top: usize = q
+                        .split('&')
+                        .find_map(|p| p.strip_prefix("$top="))
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(50);
+                    let skip: usize = q
+                        .split('&')
+                        .find_map(|p| p.strip_prefix("$skiptoken="))
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    let total = 130usize;
+                    let end = (skip + top).min(total);
+                    let items: Vec<Value> = (skip..end)
+                        .map(|i| {
+                            json!({
+                                "id": format!("alpha-{i:03}"),
+                                "parentFolderId": "folder-inbox",
+                                "subject": format!("Alpha {i}"),
+                                "from": { "emailAddress": { "name": "Bob", "address": "bob@contoso.com" } },
+                                "receivedDateTime": "2026-11-20T09:00:00Z",
+                                "isRead": true,
+                                "isDraft": false,
+                                "hasAttachments": false,
+                                "bodyPreview": format!("Alpha {i}")
+                            })
+                        })
+                        .collect();
+                    let mut body = json!({ "value": items });
+                    if end < total {
+                        body["@odata.nextLink"] = json!(format!(
+                            "{base}/v1.0/me/messages?$search=alpha&$top={top}&$skiptoken={end}"
+                        ));
+                    }
+                    Json(body)
+                }
+            }),
+        )
+        .route(
+            "/v1.0/me/mailFolders",
+            get(move || {
+                let c = Arc::clone(&cnt_f);
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    let mut folders = vec![json!({
+                        "id": "folder-inbox",
+                        "displayName": "Inbox",
+                        "wellKnownName": "inbox",
+                        "childFolderCount": 0,
+                        "unreadItemCount": 0,
+                        "totalItemCount": 0
+                    })];
+                    for i in 1..60 {
+                        folders.push(json!({
+                            "id": format!("fld-{i:03}"),
+                            "displayName": format!("Folder {i:03}"),
+                            "wellKnownName": null,
+                            "childFolderCount": 0,
+                            "unreadItemCount": 0,
+                            "totalItemCount": 0
+                        }));
+                    }
+                    Json(json!({ "value": folders }))
+                }
+            }),
+        )
+        .route(
+            "/v1.0/me/todo/lists",
+            get(move || {
+                let c = Arc::clone(&cnt_t);
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    let lists: Vec<Value> = (0..60)
+                        .map(|i| {
+                            json!({
+                                "id": format!("tl-{i:03}"),
+                                "displayName": format!("List {i:03}"),
+                                "wellknownListName": if i == 0 { json!("defaultList") } else { Value::Null },
+                                "isOwner": true,
+                                "isShared": false
+                            })
+                        })
+                        .collect();
+                    Json(json!({ "value": lists }))
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    *base_slot.write().unwrap() = base_url.clone();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+
+    let s1 = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["search", "alpha", "--remote", "--limit", "50", "--json"],
+    );
+    assert!(s1.status.success(), "{}", String::from_utf8_lossy(&s1.stderr));
+    let s1_val: Value = serde_json::from_slice(&s1.stdout).unwrap();
+    let search_cur = s1_val["next_cursor"].as_str().unwrap().to_string();
+
+    let f1 = run_outlook_cli(&dir, &base_url, &token, &["folders", "--json"]);
+    assert!(f1.status.success());
+    let f1_val: Value = serde_json::from_slice(&f1.stdout).unwrap();
+    let folders_cur = f1_val["next_cursor"].as_str().unwrap().to_string();
+
+    let l1 = run_outlook_cli(&dir, &base_url, &token, &["task-lists", "--json"]);
+    assert!(l1.status.success());
+    let l1_val: Value = serde_json::from_slice(&l1.stdout).unwrap();
+    let lists_cur = l1_val["next_cursor"].as_str().unwrap().to_string();
+
+    let expected_err = "invalid cursor: issued for a different command, folder, query or filter";
+    let expected_cli_stderr = format!("Error: {expected_err}");
+    let baseline = req_count.load(Ordering::SeqCst);
+
+    // 1..4 CLI mismatches
+    let bad_cli: Vec<Vec<&str>> = vec![
+        vec!["search", "beta", "--remote", "--limit", "50", "--json", "--cursor", &search_cur],
+        vec!["search", "ALPHA", "--remote", "--limit", "50", "--json", "--cursor", &search_cur],
+        vec!["mail", "--json", "--cursor", &search_cur],
+        vec!["task-lists", "--json", "--cursor", &folders_cur],
+        vec!["folders", "--json", "--cursor", &lists_cur],
+    ];
+    for args in bad_cli {
+        let out = run_outlook_cli(&dir, &base_url, &token, &args);
+        assert_eq!(out.status.code(), Some(1), "expected exit 1 for {args:?}");
+        assert!(out.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr).trim(),
+            expected_cli_stderr,
+            "unexpected stderr for {args:?}"
+        );
+    }
+
+    // 5. MCP search_mail mismatch
+    let (cfg, graph, storage) = plan_mcp_runtime(&dir, &base_url, &token);
+    let (is_err, mcp_bad) = call_mcp_tool_json(
+        &cfg,
+        &graph,
+        &storage,
+        "search_mail",
+        json!({ "query": "beta", "limit": 50, "cursor": search_cur }),
+    )
+    .await;
+    assert!(is_err);
+    assert_eq!(mcp_bad.as_str(), Some(expected_err));
+
+    assert_eq!(
+        req_count.load(Ordering::SeqCst),
+        baseline,
+        "scope mismatches must make 0 Graph calls"
+    );
+
+    // 6. Controls: whitespace-trimmed query & CLI cursor reused in MCP
+    let s2_cli = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["search", " alpha ", "--remote", "--limit", "20", "--json", "--cursor", &search_cur],
+    );
+    assert!(s2_cli.status.success(), "{}", String::from_utf8_lossy(&s2_cli.stderr));
+    let s2_cli_val: Value = serde_json::from_slice(&s2_cli.stdout).unwrap();
+    assert_eq!(s2_cli_val["returned"], 20);
+    assert_eq!(s2_cli_val["remote"][0]["id"], "alpha-050");
+
+    let (is_err_ok, mcp_ok) = call_mcp_tool_json(
+        &cfg,
+        &graph,
+        &storage,
+        "search_mail",
+        json!({ "query": "alpha", "limit": 20, "cursor": search_cur }),
+    )
+    .await;
+    assert!(!is_err_ok, "{mcp_ok}");
+    assert_eq!(mcp_ok["returned"], 20);
+    assert_eq!(mcp_ok["messages"][0]["id"], "alpha-050");
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_outlook_lim_filter_scan_stops_at_page_cap() {
+    let token = make_regression_jwt();
+    let msg_page_calls = Arc::new(AtomicUsize::new(0));
+    let cnt = Arc::clone(&msg_page_calls);
+    let base_slot: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
+    let base_p = Arc::clone(&base_slot);
+
+    let router = Router::new()
+        .route(
+            "/v1.0/me/mailFolders",
+            get(|| async {
+                Json(json!({
+                    "value": [{
+                        "id": "folder-inbox",
+                        "displayName": "Inbox",
+                        "wellKnownName": "inbox",
+                        "childFolderCount": 0,
+                        "unreadItemCount": 1,
+                        "totalItemCount": 601
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/mailFolders/{fid}/messages",
+            get(move |Path(fid): Path<String>, RawQuery(raw_q): RawQuery| {
+                let c = Arc::clone(&cnt);
+                let base = base_p.read().unwrap().clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    let q = raw_q.unwrap_or_default();
+                    let skip: usize = q
+                        .split('&')
+                        .find_map(|p| p.strip_prefix("$skip="))
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    let total = 601usize;
+                    let page_sz = 25usize;
+                    let end = (skip + page_sz).min(total);
+                    let items: Vec<Value> = (skip..end)
+                        .map(|i| {
+                            json!({
+                                "id": format!("scan-{i:04}"),
+                                "parentFolderId": fid,
+                                "subject": format!("Mail {i}"),
+                                "from": { "emailAddress": { "name": "Bob", "address": "bob@contoso.com" } },
+                                "receivedDateTime": "2026-11-20T09:00:00Z",
+                                "isRead": i < 600,
+                                "isDraft": false,
+                                "hasAttachments": false,
+                                "bodyPreview": "preview"
+                            })
+                        })
+                        .collect();
+                    let mut body = json!({ "value": items });
+                    if end < total {
+                        body["@odata.nextLink"] = json!(format!(
+                            "{base}/v1.0/me/mailFolders/{fid}/messages?$top={page_sz}&$skip={end}"
+                        ));
+                    }
+                    Json(body)
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    *base_slot.write().unwrap() = base_url.clone();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+
+    let p1 = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["mail", "--unread", "--limit", "5", "--refresh", "--json"],
+    );
+    assert!(p1.status.success(), "{}", String::from_utf8_lossy(&p1.stderr));
+    let v1: Value = serde_json::from_slice(&p1.stdout).unwrap();
+    assert_eq!(msg_page_calls.load(Ordering::SeqCst), 20);
+    assert_eq!(v1["messages"], json!([]));
+    assert_eq!(v1["returned"], 0);
+    assert!(v1["has_more"].is_null());
+    let cur = v1["next_cursor"].as_str().unwrap().to_string();
+    let expected_scope = plan_cursor_scope(&["mail", "folder-inbox", "100"]);
+    assert!(
+        cur.starts_with(&format!("g:{expected_scope}:")),
+        "unexpected cursor: {cur}"
+    );
+
+    let p2 = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["mail", "--unread", "--limit", "5", "--json", "--cursor", &cur],
+    );
+    assert!(p2.status.success(), "{}", String::from_utf8_lossy(&p2.stderr));
+    let v2: Value = serde_json::from_slice(&p2.stdout).unwrap();
+    assert_eq!(v2["returned"], 1);
+    assert_eq!(v2["messages"][0]["id"], "scan-0600");
+    assert_eq!(v2["has_more"], false);
+    assert!(v2["next_cursor"].is_null());
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_outlook_lim_folders_and_task_lists_page() {
+    use std::collections::HashSet;
+
+    let token = make_regression_jwt();
+    let router = Router::new()
+        .route(
+            "/v1.0/me/mailFolders",
+            get(|| async {
+                let folders: Vec<Value> = (0..120)
+                    .map(|i| {
+                        json!({
+                            "id": format!("f-{i:03}"),
+                            "displayName": format!("Folder {i:03}"),
+                            "wellKnownName": if i == 0 { json!("inbox") } else { Value::Null },
+                            "childFolderCount": 0,
+                            "unreadItemCount": 0,
+                            "totalItemCount": 0
+                        })
+                    })
+                    .collect();
+                Json(json!({ "value": folders }))
+            }),
+        )
+        .route(
+            "/v1.0/me/todo/lists",
+            get(|| async {
+                let lists: Vec<Value> = (0..120)
+                    .map(|i| {
+                        json!({
+                            "id": format!("tl-{i:03}"),
+                            "displayName": format!("List {i:03}"),
+                            "wellknownListName": if i == 0 { json!("defaultList") } else { Value::Null },
+                            "isOwner": true,
+                            "isShared": false
+                        })
+                    })
+                    .collect();
+                Json(json!({ "value": lists }))
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+
+    // Folders paging: 50 + 50 + 20
+    let mut folder_ids = HashSet::new();
+    let mut page_lens = Vec::new();
+    let mut cur: Option<String> = None;
+    loop {
+        let mut args = vec!["folders", "--json"];
+        if let Some(ref c) = cur {
+            args.push("--cursor");
+            args.push(c);
+        }
+        let out = run_outlook_cli(&dir, &base_url, &token, &args);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let items = v["folders"].as_array().unwrap();
+        page_lens.push(items.len());
+        assert_eq!(v["returned"], items.len());
+        if cur.is_none() {
+            assert_eq!(v["next_cursor"].as_str(), Some("o:f74800ea:50"));
+        }
+        for item in items {
+            assert!(folder_ids.insert(item["id"].as_str().unwrap().to_string()));
+        }
+        if v["has_more"] == true {
+            cur = Some(v["next_cursor"].as_str().unwrap().to_string());
+        } else {
+            assert!(v["next_cursor"].is_null());
+            break;
+        }
+    }
+    assert_eq!(page_lens, vec![50, 50, 20]);
+    assert_eq!(folder_ids.len(), 120);
+
+    let f_all = run_outlook_cli(&dir, &base_url, &token, &["folders", "--json", "--limit", "1000"]);
+    assert!(f_all.status.success());
+    let f_all_val: Value = serde_json::from_slice(&f_all.stdout).unwrap();
+    assert_eq!(f_all_val["returned"], 120);
+    assert_eq!(f_all_val["has_more"], false);
+
+    let f_text = run_outlook_cli(&dir, &base_url, &token, &["folders"]);
+    assert!(f_text.status.success());
+    assert_eq!(String::from_utf8_lossy(&f_text.stdout).lines().count(), 120);
+
+    // Task lists paging: 50 + 50 + 20
+    let mut list_ids = HashSet::new();
+    let mut list_lens = Vec::new();
+    let mut cur: Option<String> = None;
+    loop {
+        let mut args = vec!["task-lists", "--json"];
+        if let Some(ref c) = cur {
+            args.push("--cursor");
+            args.push(c);
+        }
+        let out = run_outlook_cli(&dir, &base_url, &token, &args);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let items = v["lists"].as_array().unwrap();
+        list_lens.push(items.len());
+        assert_eq!(v["returned"], items.len());
+        if cur.is_none() {
+            assert_eq!(v["next_cursor"].as_str(), Some("o:14525d78:50"));
+        }
+        for item in items {
+            assert!(list_ids.insert(item["id"].as_str().unwrap().to_string()));
+        }
+        if v["has_more"] == true {
+            cur = Some(v["next_cursor"].as_str().unwrap().to_string());
+        } else {
+            assert!(v["next_cursor"].is_null());
+            break;
+        }
+    }
+    assert_eq!(list_lens, vec![50, 50, 20]);
+    assert_eq!(list_ids.len(), 120);
+
+    let l_all = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["task-lists", "--json", "--limit", "1000"],
+    );
+    assert!(l_all.status.success());
+    let l_all_val: Value = serde_json::from_slice(&l_all.stdout).unwrap();
+    assert_eq!(l_all_val["returned"], 120);
+    assert_eq!(l_all_val["has_more"], false);
+
+    let l_text = run_outlook_cli(&dir, &base_url, &token, &["task-lists"]);
+    assert!(l_text.status.success());
+    assert_eq!(String::from_utf8_lossy(&l_text.stdout).lines().count(), 120);
+
+    // MCP list_mail_folders & limit bounds
+    let (cfg, graph, storage) = plan_mcp_runtime(&dir, &base_url, &token);
+    let (is_err, mcp_f5) = call_mcp_tool_json(
+        &cfg,
+        &graph,
+        &storage,
+        "list_mail_folders",
+        json!({ "limit": 5 }),
+    )
+    .await;
+    assert!(!is_err, "{mcp_f5}");
+    assert_eq!(mcp_f5["folders"].as_array().unwrap().len(), 5);
+    assert_eq!(mcp_f5["returned"], 5);
+    assert_eq!(mcp_f5["has_more"], true);
+
+    for bad_lim in [0usize, 201usize] {
+        let (err_f, _) = call_mcp_tool_json(
+            &cfg,
+            &graph,
+            &storage,
+            "list_mail_folders",
+            json!({ "limit": bad_lim }),
+        )
+        .await;
+        assert!(err_f, "expected MCP error for limit={bad_lim}");
+        let (err_t, _) = call_mcp_tool_json(
+            &cfg,
+            &graph,
+            &storage,
+            "list_todo_lists",
+            json!({ "limit": bad_lim }),
+        )
+        .await;
+        assert!(err_t, "expected MCP error for limit={bad_lim}");
+    }
+
+    let (err_cr, msg_cr) = call_mcp_tool_json(
+        &cfg,
+        &graph,
+        &storage,
+        "list_mail_folders",
+        json!({ "refresh": true, "cursor": "o:f74800ea:50" }),
+    )
+    .await;
+    assert!(err_cr);
+    assert_eq!(msg_cr.as_str(), Some("cursor cannot be combined with refresh"));
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_outlook_09_10_truncation_is_disclosed() {
+    let token = make_regression_jwt();
+    let router = Router::new()
+        .route(
+            "/v1.0/me/calendarView",
+            get(|| async {
+                Json(json!({
+                    "value": [
+                        {
+                            "id": "ev-1",
+                            "subject": "Event 1",
+                            "start": { "dateTime": "2026-11-22T09:00:00Z", "timeZone": "UTC" },
+                            "end": { "dateTime": "2026-11-22T10:00:00Z", "timeZone": "UTC" }
+                        },
+                        {
+                            "id": "ev-2",
+                            "subject": "Event 2",
+                            "start": { "dateTime": "2026-11-22T11:00:00Z", "timeZone": "UTC" },
+                            "end": { "dateTime": "2026-11-22T12:00:00Z", "timeZone": "UTC" }
+                        },
+                        {
+                            "id": "ev-3",
+                            "subject": "Event 3",
+                            "start": { "dateTime": "2026-11-22T13:00:00Z", "timeZone": "UTC" },
+                            "end": { "dateTime": "2026-11-22T14:00:00Z", "timeZone": "UTC" }
+                        }
+                    ]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/todo/lists",
+            get(|| async {
+                Json(json!({
+                    "value": [{
+                        "id": "tl-default",
+                        "displayName": "Tasks",
+                        "wellknownListName": "defaultList",
+                        "isOwner": true,
+                        "isShared": false
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/todo/lists/{lid}/tasks",
+            get(|| async {
+                let tasks: Vec<Value> = (1..=5)
+                    .map(|i| {
+                        json!({
+                            "id": format!("t-{i}"),
+                            "title": format!("Task {i}"),
+                            "status": "notStarted",
+                            "importance": "normal"
+                        })
+                    })
+                    .collect();
+                Json(json!({ "value": tasks }))
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+
+    // Calendar online limit 2 -> has_more true
+    let cal2 = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &[
+            "calendar",
+            "--from",
+            "2026-11-22T00:00:00Z",
+            "--to",
+            "2026-11-23T00:00:00Z",
+            "--limit",
+            "2",
+            "--json",
+        ],
+    );
+    assert!(cal2.status.success(), "{}", String::from_utf8_lossy(&cal2.stderr));
+    let cal2_v: Value = serde_json::from_slice(&cal2.stdout).unwrap();
+    assert_eq!(cal2_v["returned"], 2);
+    assert_eq!(cal2_v["has_more"], true);
+    assert!(cal2_v.get("start").is_some() && cal2_v.get("end").is_some());
+
+    // Fetch all 3 online via MCP so cache holds all 3, verify has_more=false
+    let (cfg, graph, storage) = plan_mcp_runtime(&dir, &base_url, &token);
+    let (e_m2, mcp_cal2) = call_mcp_tool_json(
+        &cfg,
+        &graph,
+        &storage,
+        "list_events",
+        json!({ "from": "2026-11-22T00:00:00Z", "to": "2026-11-23T00:00:00Z", "limit": 2 }),
+    )
+    .await;
+    assert!(!e_m2, "{mcp_cal2}");
+    assert_eq!(mcp_cal2["returned"], 2);
+    assert_eq!(mcp_cal2["has_more"], true);
+
+    let (e_m3, mcp_cal3) = call_mcp_tool_json(
+        &cfg,
+        &graph,
+        &storage,
+        "list_events",
+        json!({ "from": "2026-11-22T00:00:00Z", "to": "2026-11-23T00:00:00Z", "limit": 3 }),
+    )
+    .await;
+    assert!(!e_m3, "{mcp_cal3}");
+    assert_eq!(mcp_cal3["returned"], 3);
+    assert_eq!(mcp_cal3["has_more"], false);
+
+    // Offline calendar limit 2 (has_more=true) & limit 3 (has_more=false)
+    let cal_off2 = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &[
+            "calendar",
+            "--from",
+            "2026-11-22T00:00:00Z",
+            "--to",
+            "2026-11-23T00:00:00Z",
+            "--limit",
+            "2",
+            "--offline",
+            "--json",
+        ],
+    );
+    assert!(cal_off2.status.success());
+    let cal_off2_v: Value = serde_json::from_slice(&cal_off2.stdout).unwrap();
+    assert_eq!(cal_off2_v["returned"], 2);
+    assert_eq!(cal_off2_v["has_more"], true);
+
+    let cal_off3 = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &[
+            "calendar",
+            "--from",
+            "2026-11-22T00:00:00Z",
+            "--to",
+            "2026-11-23T00:00:00Z",
+            "--limit",
+            "3",
+            "--offline",
+            "--json",
+        ],
+    );
+    assert!(cal_off3.status.success());
+    let cal_off3_v: Value = serde_json::from_slice(&cal_off3.stdout).unwrap();
+    assert_eq!(cal_off3_v["returned"], 3);
+    assert_eq!(cal_off3_v["has_more"], false);
+
+    // Tasks online limit 2 -> has_more true, limit 5 -> has_more false
+    let t2 = run_outlook_cli(&dir, &base_url, &token, &["tasks", "--limit", "2", "--json"]);
+    assert!(t2.status.success(), "{}", String::from_utf8_lossy(&t2.stderr));
+    let t2_v: Value = serde_json::from_slice(&t2.stdout).unwrap();
+    assert_eq!(t2_v["returned"], 2);
+    assert_eq!(t2_v["has_more"], true);
+    assert_eq!(t2_v["list_id"], "tl-default");
+
+    let t5 = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["tasks", "--limit", "5", "--refresh", "--json"],
+    );
+    assert!(t5.status.success(), "{}", String::from_utf8_lossy(&t5.stderr));
+    let t5_v: Value = serde_json::from_slice(&t5.stdout).unwrap();
+    assert_eq!(t5_v["returned"], 5);
+    assert_eq!(t5_v["has_more"], false);
+
+    let t_off2 = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["tasks", "--limit", "2", "--offline", "--json"],
+    );
+    assert!(t_off2.status.success());
+    let t_off2_v: Value = serde_json::from_slice(&t_off2.stdout).unwrap();
+    assert_eq!(t_off2_v["returned"], 2);
+    assert_eq!(t_off2_v["has_more"], true);
+
+    // MCP list_tasks
+    let (e_t2, mcp_t2) =
+        call_mcp_tool_json(&cfg, &graph, &storage, "list_tasks", json!({ "limit": 2 })).await;
+    assert!(!e_t2, "{mcp_t2}");
+    assert_eq!(mcp_t2["returned"], 2);
+    assert_eq!(mcp_t2["has_more"], true);
+    assert_eq!(mcp_t2["list_id"], "tl-default");
+    assert!(mcp_t2.get("list").is_some());
+
+    let (e_t5, mcp_t5) =
+        call_mcp_tool_json(&cfg, &graph, &storage, "list_tasks", json!({ "limit": 5 })).await;
+    assert!(!e_t5, "{mcp_t5}");
+    assert_eq!(mcp_t5["returned"], 5);
+    assert_eq!(mcp_t5["has_more"], false);
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_outlook_11_directory_failure_keeps_personal_results() {
+    let token = make_regression_jwt();
+    let users_status = Arc::new(AtomicUsize::new(200));
+    let u_st = Arc::clone(&users_status);
+
+    let router = Router::new()
+        .route(
+            "/v1.0/me/contacts",
+            get(|| async {
+                Json(json!({
+                    "value": [{
+                        "id": "c-001",
+                        "displayName": "Bob Reviewer",
+                        "givenName": "Bob",
+                        "surname": "Reviewer",
+                        "emailAddresses": [{ "address": "bob@contoso.com" }],
+                        "companyName": "Contoso"
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/users",
+            get(move || {
+                let st = u_st.load(Ordering::SeqCst);
+                async move {
+                    match st {
+                        200 => (
+                            StatusCode::OK,
+                            Json(json!({
+                                "value": [{
+                                    "id": "u-001",
+                                    "displayName": "Carol Lead",
+                                    "mail": "carol@contoso.com",
+                                    "companyName": "Contoso"
+                                }]
+                            })),
+                        )
+                            .into_response(),
+                        403 => (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({
+                                "error": {
+                                    "code": "Authorization_RequestDenied",
+                                    "message": "Insufficient privileges to complete the operation."
+                                }
+                            })),
+                        )
+                            .into_response(),
+                        _ => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({
+                                "error": {
+                                    "code": "InternalServerError",
+                                    "message": "Directory unavailable"
+                                }
+                            })),
+                        )
+                            .into_response(),
+                    }
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+
+    // 200 OK
+    users_status.store(200, Ordering::SeqCst);
+    let out_200 = run_outlook_cli(&dir, &base_url, &token, &["contacts", "--query", "Bob", "--json"]);
+    assert!(out_200.status.success());
+    let v_200: Value = serde_json::from_slice(&out_200.stdout).unwrap();
+    assert_eq!(v_200["directory"]["status"], "ok");
+    assert!(v_200["directory"]["error"].is_null());
+    assert_eq!(v_200["contacts"][0]["display_name"], "Bob Reviewer");
+
+    // 403 Forbidden (CLI JSON, CLI text, MCP)
+    users_status.store(403, Ordering::SeqCst);
+    let out_403 = run_outlook_cli(&dir, &base_url, &token, &["contacts", "--query", "Bob", "--json"]);
+    assert!(out_403.status.success());
+    assert!(out_403.stderr.is_empty());
+    let v_403: Value = serde_json::from_slice(&out_403.stdout).unwrap();
+    assert_eq!(v_403["contacts"].as_array().unwrap().len(), 1);
+    assert_eq!(v_403["contacts"][0]["display_name"], "Bob Reviewer");
+    assert_eq!(v_403["directory"]["status"], "forbidden");
+    assert!(v_403["directory"]["error"].as_str().is_some_and(|s| !s.is_empty()));
+
+    let out_403_txt = run_outlook_cli(&dir, &base_url, &token, &["contacts", "--query", "Bob"]);
+    assert!(out_403_txt.status.success());
+    assert!(String::from_utf8_lossy(&out_403_txt.stdout).contains("Bob Reviewer"));
+    assert!(String::from_utf8_lossy(&out_403_txt.stderr)
+        .contains("warning: directory search failed (forbidden)"));
+
+    let (cfg, graph, storage) = plan_mcp_runtime(&dir, &base_url, &token);
+    let (err_m403, mcp_403) = call_mcp_tool_json(
+        &cfg,
+        &graph,
+        &storage,
+        "search_contacts",
+        json!({ "query": "Bob" }),
+    )
+    .await;
+    assert!(!err_m403, "{mcp_403}");
+    assert_eq!(mcp_403["contacts"][0]["display_name"], "Bob Reviewer");
+    assert_eq!(mcp_403["directory"]["status"], "forbidden");
+
+    // 500 Internal Server Error (CLI JSON, CLI text, MCP)
+    users_status.store(500, Ordering::SeqCst);
+    let out_500 = run_outlook_cli(&dir, &base_url, &token, &["contacts", "--query", "Bob", "--json"]);
+    assert!(out_500.status.success());
+    let v_500: Value = serde_json::from_slice(&out_500.stdout).unwrap();
+    assert_eq!(v_500["contacts"][0]["display_name"], "Bob Reviewer");
+    assert_eq!(v_500["directory"]["status"], "error");
+    assert!(v_500["directory"]["error"].as_str().is_some_and(|s| !s.is_empty()));
+
+    let out_500_txt = run_outlook_cli(&dir, &base_url, &token, &["contacts", "--query", "Bob"]);
+    assert!(out_500_txt.status.success());
+    assert!(String::from_utf8_lossy(&out_500_txt.stdout).contains("Bob Reviewer"));
+    assert!(String::from_utf8_lossy(&out_500_txt.stderr)
+        .contains("warning: directory search failed (error)"));
+
+    let (err_m500, mcp_500) = call_mcp_tool_json(
+        &cfg,
+        &graph,
+        &storage,
+        "search_contacts",
+        json!({ "query": "Bob" }),
+    )
+    .await;
+    assert!(!err_m500, "{mcp_500}");
+    assert_eq!(mcp_500["directory"]["status"], "error");
+
+    // Offline -> not_queried
+    let out_off = run_outlook_cli(&dir, &base_url, &token, &["contacts", "--offline", "--json"]);
+    assert!(out_off.status.success());
+    let v_off: Value = serde_json::from_slice(&out_off.stdout).unwrap();
+    assert_eq!(v_off["directory"]["status"], "not_queried");
+    assert!(v_off["directory"]["error"].is_null());
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_outlook_12_cli_download_offline() {
+    use std::collections::BTreeSet;
+
+    let token = make_regression_jwt();
+    let graph_calls = Arc::new(AtomicUsize::new(0));
+    let cnt = Arc::clone(&graph_calls);
+    let payload_bytes = b"%PDF-1.7 cached offline attachment payload".to_vec();
+    let payload_b64 = B64_STANDARD.encode(&payload_bytes);
+    let b64_ref = payload_b64.clone();
+    let payload_len = payload_bytes.len() as u64;
+
+    let router = Router::new().route(
+        "/v1.0/me/messages/msg-dl-off",
+        get(move || {
+            let c = Arc::clone(&cnt);
+            let b64 = b64_ref.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Json(json!({
+                    "id": "msg-dl-off",
+                    "parentFolderId": "folder-inbox",
+                    "subject": "Offline DL",
+                    "from": { "emailAddress": { "name": "Bob", "address": "bob@contoso.com" } },
+                    "receivedDateTime": "2026-11-20T09:00:00Z",
+                    "isRead": true,
+                    "isDraft": false,
+                    "hasAttachments": true,
+                    "bodyPreview": "Files attached",
+                    "body": { "contentType": "html", "content": "<p>Files attached</p>" },
+                    "attachments": [
+                        {
+                            "id": "att-cached",
+                            "name": "cached.pdf",
+                            "contentType": "application/pdf",
+                            "size": payload_len,
+                            "isInline": false,
+                            "contentBytes": b64
+                        },
+                        {
+                            "id": "att-uncached",
+                            "name": "remote-only.bin",
+                            "contentType": "application/octet-stream",
+                            "size": 1024,
+                            "isInline": false
+                        }
+                    ]
+                }))
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let out_dir_str = out_dir.path().to_string_lossy().to_string();
+
+    // Seed cache via compact read
+    let seed = run_outlook_cli(&dir, &base_url, &token, &["read", "msg-dl-off", "--json"]);
+    assert!(seed.status.success(), "{}", String::from_utf8_lossy(&seed.stderr));
+
+    let calls_before = graph_calls.load(Ordering::SeqCst);
+
+    // 1. Cached attachment offline download -> exit 0, flat 8 keys, 0 Graph calls
+    let ok_dl = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &[
+            "download",
+            "msg-dl-off",
+            "--attachment",
+            "att-cached",
+            "--offline",
+            "--dir",
+            &out_dir_str,
+            "--json",
+        ],
+    );
+    assert!(ok_dl.status.success(), "{}", String::from_utf8_lossy(&ok_dl.stderr));
+    let ok_val: Value = serde_json::from_slice(&ok_dl.stdout).unwrap();
+    let keys: BTreeSet<&str> = ok_val
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let expected_keys: BTreeSet<&str> = [
+        "ok",
+        "message_id",
+        "attachment_id",
+        "path",
+        "file_name",
+        "mime_type",
+        "size_bytes",
+        "is_image",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(keys, expected_keys);
+    assert_eq!(ok_val["ok"], true);
+    assert_eq!(ok_val["size_bytes"], payload_len);
+    assert_eq!(std::fs::read(ok_val["path"].as_str().unwrap()).unwrap(), payload_bytes);
+    assert_eq!(graph_calls.load(Ordering::SeqCst), calls_before);
+
+    // 2. Uncached attachment offline download -> exit 1, explicit error, 0 Graph calls
+    let bad_dl = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &[
+            "download",
+            "msg-dl-off",
+            "--attachment",
+            "att-uncached",
+            "--offline",
+            "--dir",
+            &out_dir_str,
+            "--json",
+        ],
+    );
+    assert_eq!(bad_dl.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&bad_dl.stderr)
+        .contains("Cannot fetch uncached attachment bytes in offline mode"));
+    assert_eq!(graph_calls.load(Ordering::SeqCst), calls_before);
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_outlook_04_event_compact_default() {
+    let token = make_regression_jwt();
+    let router = Router::new().route(
+        "/v1.0/me/events/{id}",
+        get(|Path(id): Path<String>| async move {
+            Json(json!({
+                "id": id,
+                "subject": "Architecture Review",
+                "start": { "dateTime": "2026-11-23T14:00:00Z", "timeZone": "UTC" },
+                "end": { "dateTime": "2026-11-23T15:00:00Z", "timeZone": "UTC" },
+                "isAllDay": false,
+                "location": { "displayName": "Room A" },
+                "organizer": { "emailAddress": { "name": "Alice", "address": "alice@contoso.com" } },
+                "attendees": [
+                    {
+                        "type": "required",
+                        "status": { "response": "accepted" },
+                        "emailAddress": { "name": "Bob", "address": "bob@contoso.com" }
+                    },
+                    {
+                        "type": "optional",
+                        "status": { "response": "tentativelyAccepted" },
+                        "emailAddress": { "name": "Carol", "address": "carol@contoso.com" }
+                    }
+                ],
+                "responseStatus": { "response": "organizer" },
+                "isOnlineMeeting": true,
+                "onlineMeeting": { "joinUrl": "https://teams.microsoft.com/l/meetup-join/test" },
+                "body": { "contentType": "html", "content": "<p>Review slides</p>" },
+                "isCancelled": false,
+                "webLink": "https://outlook.office.com/calendar/ev-compact-1"
+            }))
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+
+    let out_compact = run_outlook_cli(&dir, &base_url, &token, &["event", "ev-compact-1", "--json"]);
+    assert!(out_compact.status.success(), "{}", String::from_utf8_lossy(&out_compact.stderr));
+    let v_compact: Value = serde_json::from_slice(&out_compact.stdout).unwrap();
+    let ev_c = v_compact["event"].as_object().unwrap();
+    assert!(ev_c.get("body_html").is_none());
+    assert_eq!(ev_c["attendees"].as_array().unwrap().len(), 2);
+    assert_eq!(ev_c["omitted"]["fields"], json!(["body_html"]));
+    assert_eq!(ev_c["hint"], "outlook event ev-compact-1 --json --full");
+
+    let out_alias = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["event", "ev-compact-1", "--json", "--compact"],
+    );
+    assert!(out_alias.status.success());
+    assert_eq!(out_alias.stdout, out_compact.stdout);
+
+    let out_full = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["event", "ev-compact-1", "--json", "--full"],
+    );
+    assert!(out_full.status.success(), "{}", String::from_utf8_lossy(&out_full.stderr));
+    let v_full: Value = serde_json::from_slice(&out_full.stdout).unwrap();
+    let ev_f = v_full["event"].as_object().unwrap();
+    assert_eq!(ev_f["body_html"], "<p>Review slides</p>");
+    assert_eq!(ev_f.len(), 17);
+    assert!(ev_f.get("omitted").is_none());
+    assert!(ev_f.get("hint").is_none());
 
     server.abort();
 }

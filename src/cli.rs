@@ -114,6 +114,12 @@ pub enum Command {
         cached: bool,
         #[arg(long)]
         json: bool,
+        /// Maximum number of items to return (with --json the default is 50)
+        #[arg(long, visible_alias = "top")]
+        limit: Option<usize>,
+        /// With --json, continue from a previous response's next_cursor
+        #[arg(long, requires = "json", conflicts_with = "refresh", value_name = "CURSOR")]
+        cursor: Option<String>,
     },
     /// List messages in Inbox or a specified mail folder
     #[command(visible_aliases = ["ls", "inbox"])]
@@ -121,7 +127,7 @@ pub enum Command {
         /// Folder name, well-known alias (inbox/sent/drafts/archive/trash/junk), or ID
         #[arg(long, default_value = "inbox")]
         folder: String,
-        /// Maximum number of messages to fetch
+        /// Maximum number of messages to return (a first online listing of a folder syncs the whole folder once)
         #[arg(long, visible_alias = "top", default_value_t = 30)]
         limit: usize,
         #[arg(long)]
@@ -139,7 +145,13 @@ pub enum Command {
         cached: bool,
         #[arg(long)]
         json: bool,
-        /// With --json, return only list fields for each message
+        /// With --json, return every cached field for each message (no attachment bytes)
+        #[arg(long, requires = "json", conflicts_with = "compact")]
+        full: bool,
+        /// With --json, continue from a previous response's next_cursor
+        #[arg(long, requires = "json", conflicts_with = "refresh", value_name = "CURSOR")]
+        cursor: Option<String>,
+        /// With --json, same as the default list output (kept for compatibility)
         #[arg(long, requires = "json")]
         compact: bool,
     },
@@ -163,7 +175,10 @@ pub enum Command {
         cached: bool,
         #[arg(long)]
         json: bool,
-        /// With --json, return mail headers and the complete plain-text body
+        /// With --json, return every field including HTML and attachment metadata
+        #[arg(long, requires = "json", conflicts_with = "compact")]
+        full: bool,
+        /// With --json, same as the default compact output (kept for compatibility)
         #[arg(long, requires = "json", conflicts_with_all = ["raw_html", "preview_images"])]
         compact: bool,
     },
@@ -281,6 +296,9 @@ pub enum Command {
         limit: usize,
         #[arg(long)]
         json: bool,
+        /// With --remote --json, continue from a previous response's next_cursor
+        #[arg(long, requires_all = ["remote", "json"], value_name = "CURSOR")]
+        cursor: Option<String>,
     },
     /// Download a mail attachment to disk
     #[command(visible_alias = "dl")]
@@ -292,6 +310,9 @@ pub enum Command {
         /// Output directory (defaults to configured download_dir)
         #[arg(long, visible_alias = "out", value_name = "DIR")]
         dir: Option<PathBuf>,
+        /// Use the cached message and cached attachment bytes without calling Graph
+        #[arg(long)]
+        offline: bool,
         #[arg(long)]
         json: bool,
     },
@@ -354,6 +375,12 @@ pub enum Command {
         cached: bool,
         #[arg(long)]
         json: bool,
+        /// With --json, return every field including body_html
+        #[arg(long, requires = "json", conflicts_with = "compact")]
+        full: bool,
+        /// With --json, same as the default compact output (kept for compatibility)
+        #[arg(long, requires = "json")]
+        compact: bool,
     },
     /// Create a new calendar event
     #[command(name = "create-event")]
@@ -443,6 +470,12 @@ pub enum Command {
         cached: bool,
         #[arg(long)]
         json: bool,
+        /// Maximum number of items to return (with --json the default is 50)
+        #[arg(long, visible_alias = "top")]
+        limit: Option<usize>,
+        /// With --json, continue from a previous response's next_cursor
+        #[arg(long, requires = "json", conflicts_with = "refresh", value_name = "CURSOR")]
+        cursor: Option<String>,
     },
     /// Add a new Microsoft To Do task
     #[command(name = "add-task")]
@@ -937,7 +970,20 @@ async fn dispatch_command(
             offline,
             cached,
             json,
-        }) => Box::pin(cmd_folders(cfg, refresh, offline, cached, json)).await,
+            limit,
+            cursor,
+        }) => {
+            Box::pin(cmd_folders(
+                cfg,
+                refresh,
+                offline,
+                cached,
+                json,
+                limit,
+                cursor.as_deref(),
+            ))
+            .await
+        }
         Some(Command::Mail {
             folder,
             limit,
@@ -948,11 +994,23 @@ async fn dispatch_command(
             offline,
             cached,
             json,
-            compact,
+            full,
+            cursor,
+            compact: _,
         }) => {
             Box::pin(cmd_mail_list(
-                cfg, &folder, limit, unread, flagged, focused, refresh, offline, cached, json,
-                compact,
+                cfg,
+                &folder,
+                limit,
+                unread,
+                flagged,
+                focused,
+                refresh,
+                offline,
+                cached,
+                json,
+                !full,
+                cursor.as_deref(),
             ))
             .await
         }
@@ -964,7 +1022,8 @@ async fn dispatch_command(
             offline,
             cached,
             json,
-            compact,
+            full,
+            compact: _,
         }) => {
             Box::pin(cmd_mail_read(
                 cfg,
@@ -975,7 +1034,7 @@ async fn dispatch_command(
                 offline,
                 cached,
                 json,
-                compact,
+                !full,
             ))
             .await
         }
@@ -1085,6 +1144,7 @@ async fn dispatch_command(
             remote,
             limit,
             json,
+            cursor,
         }) => {
             Box::pin(cmd_mail_search(
                 cfg,
@@ -1093,6 +1153,7 @@ async fn dispatch_command(
                 remote,
                 limit,
                 json,
+                cursor.as_deref(),
             ))
             .await
         }
@@ -1100,6 +1161,7 @@ async fn dispatch_command(
             message_id,
             attachment,
             dir,
+            offline,
             json,
         }) => {
             Box::pin(cmd_mail_download(
@@ -1107,6 +1169,7 @@ async fn dispatch_command(
                 &message_id,
                 attachment.as_deref(),
                 dir.as_deref(),
+                offline,
                 json,
             ))
             .await
@@ -1162,7 +1225,9 @@ async fn dispatch_command(
             offline,
             cached,
             json,
-        }) => Box::pin(cmd_event_show(cfg, &event_id, offline, cached, json)).await,
+            full,
+            compact: _,
+        }) => Box::pin(cmd_event_show(cfg, &event_id, offline, cached, json, !full)).await,
         Some(Command::CreateEvent {
             subject,
             start,
@@ -1237,7 +1302,20 @@ async fn dispatch_command(
             offline,
             cached,
             json,
-        }) => Box::pin(cmd_todo_lists(cfg, refresh, offline, cached, json)).await,
+            limit,
+            cursor,
+        }) => {
+            Box::pin(cmd_todo_lists(
+                cfg,
+                refresh,
+                offline,
+                cached,
+                json,
+                limit,
+                cursor.as_deref(),
+            ))
+            .await
+        }
         Some(Command::AddTask {
             title,
             list,
@@ -2376,16 +2454,31 @@ fn format_mail_folders_lines(folders: &[MailFolder]) -> Vec<String> {
         .collect()
 }
 
-fn print_mail_folders_output(folders: &[MailFolder], json_out: bool) -> Result<()> {
+fn print_mail_folders_output(
+    folders: &[MailFolder],
+    json_out: bool,
+    limit: Option<usize>,
+    offset: usize,
+) -> Result<()> {
     if json_out {
+        let lim = limit.map(clamp_limit).unwrap_or(50);
+        let scope = cursor_scope(&["folders"]);
+        let (page, has_more, next_cursor) = offset_page(folders, offset, lim, &scope);
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "folders": folders }))?
+            serde_json::to_string_pretty(&json!({
+                "folders": page,
+                "returned": page.len(),
+                "has_more": has_more,
+                "next_cursor": next_cursor,
+            }))?
         );
     } else if folders.is_empty() {
         println!("No mail folders found.");
     } else {
-        for line in format_mail_folders_lines(folders) {
+        let lines = format_mail_folders_lines(folders);
+        let take_n = limit.map(clamp_limit).unwrap_or(lines.len());
+        for line in lines.into_iter().take(take_n) {
             println!("{line}");
         }
     }
@@ -2398,11 +2491,24 @@ async fn cmd_folders(
     offline: bool,
     cached: bool,
     json_out: bool,
+    limit: Option<usize>,
+    cursor: Option<&str>,
 ) -> Result<()> {
+    if let Some(raw_cursor) = cursor {
+        let parsed = PageCursor::parse(raw_cursor)?;
+        let CursorPos::Offset(offset) = parsed.pos else {
+            bail!("invalid cursor: not valid for this command");
+        };
+        parsed.require_scope(&cursor_scope(&["folders"]))?;
+        let storage = open_storage_only(cfg)?;
+        let folders = storage.list_mail_folders()?;
+        return print_mail_folders_output(&folders, json_out, limit, offset);
+    }
+
     if offline {
         let storage = open_storage_only(cfg)?;
         let folders = storage.list_mail_folders()?;
-        return print_mail_folders_output(&folders, json_out);
+        return print_mail_folders_output(&folders, json_out, limit, 0);
     }
 
     let ttl = cli_cache_ttl_secs(cfg);
@@ -2412,7 +2518,7 @@ async fn cmd_folders(
             if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:mail_folders"], ttl) {
                 let folders = storage.list_mail_folders()?;
                 if !folders.is_empty() {
-                    return print_mail_folders_output(&folders, json_out);
+                    return print_mail_folders_output(&folders, json_out, limit, 0);
                 }
             }
         }
@@ -2435,9 +2541,16 @@ async fn cmd_folders(
         cached_folders
     };
 
-    print_mail_folders_output(&folders, json_out)
+    print_mail_folders_output(&folders, json_out, limit, 0)
 }
 
+pub(crate) struct MailListPage {
+    pub messages: Vec<MailMessage>,
+    pub has_more: Option<bool>,
+    pub next_cursor: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn load_cached_mail_list(
     storage: &Storage,
     folder_id: &str,
@@ -2446,29 +2559,76 @@ pub(crate) fn load_cached_mail_list(
     focused_only: bool,
     limit: usize,
     full: bool,
-) -> Result<Vec<MailMessage>> {
-    if full {
-        storage.list_mail_messages(
+    before: Option<(&str, &str)>,
+    scope: &str,
+) -> Result<MailListPage> {
+    let fetch_limit = limit.saturating_add(1);
+    let mut messages = if full {
+        storage.list_mail_messages_before(
             Some(folder_id),
             unread_only,
             flagged_only,
             focused_only,
-            limit,
-        )
+            fetch_limit,
+            before,
+        )?
     } else {
-        storage.list_mail_summaries_filtered(
+        storage.list_mail_summaries_before(
             Some(folder_id),
             unread_only,
             flagged_only,
             focused_only,
-            limit,
-        )
+            fetch_limit,
+            before,
+        )?
+    };
+    let has_more = messages.len() > limit;
+    if has_more {
+        messages.truncate(limit);
     }
+    let next_cursor = if has_more {
+        messages
+            .last()
+            .map(|last| format!("c:{scope}:{}|{}", last.received_at, last.id))
+    } else {
+        None
+    };
+    Ok(MailListPage {
+        messages,
+        has_more: Some(has_more),
+        next_cursor,
+    })
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Surface {
+    Cli,
+    Mcp,
+}
+
+/// CLI/MCP JSON용 전체 메시지. 첨부 바이트는 싣지 않는다.
+pub(crate) fn mail_message_public_json(msg: &MailMessage) -> serde_json::Value {
+    let mut value = json!(msg);
+    if let Some(atts) = value.get_mut("attachments").and_then(|a| a.as_array_mut()) {
+        for (att, src) in atts.iter_mut().zip(&msg.attachments) {
+            if let Some(obj) = att.as_object_mut() {
+                obj.remove("content_bytes_b64");
+                let cached = src
+                    .content_bytes_b64
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty());
+                obj.insert("content_cached".into(), json!(cached));
+            }
+        }
+    }
+    value
 }
 
 pub(crate) fn mail_list_json(messages: &[MailMessage], compact: bool) -> serde_json::Value {
     if !compact {
-        return json!(messages);
+        return serde_json::Value::Array(
+            messages.iter().map(mail_message_public_json).collect(),
+        );
     }
     serde_json::Value::Array(
         messages
@@ -2489,13 +2649,30 @@ pub(crate) fn mail_list_json(messages: &[MailMessage], compact: bool) -> serde_j
     )
 }
 
-pub(crate) fn mail_read_json(msg: &MailMessage, compact: bool) -> serde_json::Value {
+pub(crate) fn mail_read_json(
+    msg: &MailMessage,
+    compact: bool,
+    surface: Surface,
+) -> serde_json::Value {
     if !compact {
-        return json!({ "message": msg });
+        return json!({ "message": mail_message_public_json(msg) });
     }
+    let omitted_attachments: Option<usize> = if msg.body_loaded {
+        Some(msg.attachments.len())
+    } else if !msg.has_attachments {
+        Some(0)
+    } else {
+        None
+    };
+    let hint = match surface {
+        Surface::Cli => format!("outlook read {} --json --full", msg.id),
+        Surface::Mcp => "Call get_message with compact:false for body_html and attachment metadata; use download_attachment for attachment bytes.".to_string(),
+    };
     json!({
         "message": {
             "id": msg.id,
+            "conversation_id": msg.conversation_id,
+            "folder_id": msg.folder_id,
             "subject": msg.subject,
             "from": msg.from,
             "to_recipients": msg.to_recipients,
@@ -2506,8 +2683,24 @@ pub(crate) fn mail_read_json(msg: &MailMessage, compact: bool) -> serde_json::Va
             "sent_at": msg.sent_at,
             "is_read": msg.is_read,
             "is_draft": msg.is_draft,
+            "flagged": msg.flagged,
+            "importance": msg.importance,
+            "has_attachments": msg.has_attachments,
+            "meeting_request": msg.meeting_request,
             "body_loaded": msg.body_loaded,
-            "body_plain": msg.body_plain,
+            "preview": msg.preview,
+            "body_plain": if msg.body_loaded { json!(msg.body_plain) } else { serde_json::Value::Null },
+            "omitted": {
+                "attachments": omitted_attachments,
+                "fields": [
+                    "body_html",
+                    "internet_message_id",
+                    "inference_classification",
+                    "last_modified_at",
+                    "web_link"
+                ],
+            },
+            "hint": hint,
         }
     })
 }
@@ -2515,7 +2708,7 @@ pub(crate) fn mail_read_json(msg: &MailMessage, compact: bool) -> serde_json::Va
 fn print_mail_list_output(
     folder: &str,
     folder_id: &str,
-    messages: Vec<MailMessage>,
+    page: MailListPage,
     json_out: bool,
     compact: bool,
 ) -> Result<()> {
@@ -2524,13 +2717,16 @@ fn print_mail_list_output(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "folder": folder_id,
-                "messages": mail_list_json(&messages, compact),
+                "messages": mail_list_json(&page.messages, compact),
+                "returned": page.messages.len(),
+                "has_more": page.has_more,
+                "next_cursor": page.next_cursor,
             }))?
         );
-    } else if messages.is_empty() {
+    } else if page.messages.is_empty() {
         println!("No messages found in '{folder}'.");
     } else {
-        for m in &messages {
+        for m in &page.messages {
             let unread_mark = if m.is_read { " " } else { "*" };
             let flag_mark = if m.flagged { "!" } else { " " };
             let att_mark = if m.has_attachments { "@" } else { " " };
@@ -2559,15 +2755,94 @@ async fn cmd_mail_list(
     cached: bool,
     json_out: bool,
     compact: bool,
+    cursor: Option<&str>,
 ) -> Result<()> {
     let limit = clamp_limit(limit);
     let has_filter = unread_only || flagged_only || focused_only;
     let full = json_out && !compact;
 
+    if let Some(raw_cursor) = cursor {
+        let parsed = PageCursor::parse(raw_cursor)?;
+        if matches!(parsed.pos, CursorPos::Offset(_)) {
+            bail!("invalid cursor: not valid for this command");
+        }
+        let storage = open_storage_only(cfg)?;
+        let resolved = resolver::resolve_mail_folder_cached(&storage, folder)?;
+        let scope = mail_cursor_scope(&resolved.id, unread_only, flagged_only, focused_only);
+        parsed.require_scope(&scope)?;
+        match parsed.pos {
+            CursorPos::Cache { received_at, id } => {
+                let page = load_cached_mail_list(
+                    &storage,
+                    &resolved.id,
+                    unread_only,
+                    flagged_only,
+                    focused_only,
+                    limit,
+                    full,
+                    Some((&received_at, &id)),
+                    &scope,
+                )?;
+                return print_mail_list_output(folder, &resolved.id, page, json_out, compact);
+            }
+            CursorPos::Graph { skip, url } => {
+                if offline {
+                    bail!("invalid cursor: this cursor needs online access");
+                }
+                if !crate::graph::client::graph_base_owns_url(&cfg.graph_base_url, &url) {
+                    bail!("invalid cursor: url is not a Graph URL for this account");
+                }
+                drop(storage);
+                let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+                let filtered = match graph
+                    .list_mail_messages_filtered_paged(
+                        &resolved.id,
+                        unread_only,
+                        flagged_only,
+                        focused_only,
+                        limit,
+                        true,
+                        &scope,
+                        Some((skip, url)),
+                        Some(FILTER_SCAN_MAX_PAGES),
+                    )
+                    .await
+                {
+                    Ok(res) => res,
+                    Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+                };
+                let _ = storage.upsert_mail_messages(&filtered.fetched);
+                let messages = if full {
+                    filtered
+                        .matched
+                        .into_iter()
+                        .map(|m| {
+                            storage
+                                .get_mail_message(&m.id)
+                                .ok()
+                                .flatten()
+                                .unwrap_or(m)
+                        })
+                        .collect()
+                } else {
+                    filtered.matched
+                };
+                let page = MailListPage {
+                    messages,
+                    has_more: filtered.has_more,
+                    next_cursor: filtered.next_cursor,
+                };
+                return print_mail_list_output(folder, &resolved.id, page, json_out, compact);
+            }
+            CursorPos::Offset(_) => unreachable!(),
+        }
+    }
+
     if offline {
         let storage = open_storage_only(cfg)?;
         let resolved = resolver::resolve_mail_folder_cached(&storage, folder)?;
-        let messages = load_cached_mail_list(
+        let scope = mail_cursor_scope(&resolved.id, unread_only, flagged_only, focused_only);
+        let page = load_cached_mail_list(
             &storage,
             &resolved.id,
             unread_only,
@@ -2575,8 +2850,10 @@ async fn cmd_mail_list(
             focused_only,
             limit,
             full,
+            None,
+            &scope,
         )?;
-        return print_mail_list_output(folder, &resolved.id, messages, json_out, compact);
+        return print_mail_list_output(folder, &resolved.id, page, json_out, compact);
     }
 
     let ttl = cli_cache_ttl_secs(cfg);
@@ -2593,7 +2870,13 @@ async fn cmd_mail_list(
                     let has_any_cached =
                         !storage.list_mail_summaries(Some(&resolved.id), 1)?.is_empty();
                     if has_any_cached {
-                        let messages = load_cached_mail_list(
+                        let scope = mail_cursor_scope(
+                            &resolved.id,
+                            unread_only,
+                            flagged_only,
+                            focused_only,
+                        );
+                        let page = load_cached_mail_list(
                             &storage,
                             &resolved.id,
                             unread_only,
@@ -2601,11 +2884,13 @@ async fn cmd_mail_list(
                             focused_only,
                             limit,
                             full,
+                            None,
+                            &scope,
                         )?;
                         return print_mail_list_output(
                             folder,
                             &resolved.id,
-                            messages,
+                            page,
                             json_out,
                             compact,
                         );
@@ -2629,16 +2914,20 @@ async fn cmd_mail_list(
         || (!cached
             && !daemon_warm
             && !is_cursor_fresh(&storage, &[cli_key.as_str(), delta_key.as_str()], ttl));
-    let messages = if should_fetch {
+    let page = if should_fetch {
         if has_filter {
-            let (matched, fetched) = match graph
-                .list_mail_messages_filtered(
+            let scope = mail_cursor_scope(&resolved.id, unread_only, flagged_only, focused_only);
+            let filtered = match graph
+                .list_mail_messages_filtered_paged(
                     &resolved.id,
                     unread_only,
                     flagged_only,
                     focused_only,
                     limit,
                     true,
+                    &scope,
+                    None,
+                    Some(FILTER_SCAN_MAX_PAGES),
                 )
                 .await
             {
@@ -2654,14 +2943,23 @@ async fn cmd_mail_list(
                     {
                         Ok(Some(new_folder)) => {
                             resolved = new_folder;
+                            let new_scope = mail_cursor_scope(
+                                &resolved.id,
+                                unread_only,
+                                flagged_only,
+                                focused_only,
+                            );
                             match graph
-                                .list_mail_messages_filtered(
+                                .list_mail_messages_filtered_paged(
                                     &resolved.id,
                                     unread_only,
                                     flagged_only,
                                     focused_only,
                                     limit,
                                     true,
+                                    &new_scope,
+                                    None,
+                                    Some(FILTER_SCAN_MAX_PAGES),
                                 )
                                 .await
                             {
@@ -2679,9 +2977,10 @@ async fn cmd_mail_list(
                 }
                 Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
             };
-            let _ = storage.upsert_mail_messages(&fetched);
-            if full {
-                matched
+            let _ = storage.upsert_mail_messages(&filtered.fetched);
+            let messages = if full {
+                filtered
+                    .matched
                     .into_iter()
                     .map(|m| {
                         storage
@@ -2692,7 +2991,12 @@ async fn cmd_mail_list(
                     })
                     .collect()
             } else {
-                matched
+                filtered.matched
+            };
+            MailListPage {
+                messages,
+                has_more: filtered.has_more,
+                next_cursor: filtered.next_cursor,
             }
         } else {
             let sync_res = match crate::sync::sync_mail_folder_delta(
@@ -2740,9 +3044,21 @@ async fn cmd_mail_list(
                 Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
             };
             record_cli_sync_cursor(&storage, &format!("cli:mail:{}", sync_res.folder_id));
-            load_cached_mail_list(&storage, &sync_res.folder_id, false, false, false, limit, full)?
+            let scope = mail_cursor_scope(&sync_res.folder_id, false, false, false);
+            load_cached_mail_list(
+                &storage,
+                &sync_res.folder_id,
+                false,
+                false,
+                false,
+                limit,
+                full,
+                None,
+                &scope,
+            )?
         }
     } else {
+        let scope = mail_cursor_scope(&resolved.id, unread_only, flagged_only, focused_only);
         load_cached_mail_list(
             &storage,
             &resolved.id,
@@ -2751,10 +3067,12 @@ async fn cmd_mail_list(
             focused_only,
             limit,
             full,
+            None,
+            &scope,
         )?
     };
 
-    print_mail_list_output(folder, &resolved.id, messages, json_out, compact)
+    print_mail_list_output(folder, &resolved.id, page, json_out, compact)
 }
 
 fn print_mail_read_text(msg: &MailMessage, raw_html: bool) {
@@ -2796,6 +3114,12 @@ fn print_mail_read_text(msg: &MailMessage, raw_html: bool) {
             crate::parser::blocks_to_plain(&blocks)
         };
         println!("{body}");
+    }
+    if !msg.body_loaded {
+        eprintln!(
+            "note: body not loaded; showing preview only. Run 'outlook read {} --json --full' online to fetch it.",
+            msg.id
+        );
     }
 }
 
@@ -2843,7 +3167,7 @@ async fn cmd_mail_read(
         if json_out {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&mail_read_json(&msg, compact))?
+                serde_json::to_string_pretty(&mail_read_json(&msg, compact, Surface::Cli))?
             );
         } else {
             print_mail_read_text(&msg, raw_html);
@@ -2858,7 +3182,11 @@ async fn cmd_mail_read(
                     if json_out {
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&mail_read_json(&msg, compact))?
+                            serde_json::to_string_pretty(&mail_read_json(
+                                &msg,
+                                compact,
+                                Surface::Cli
+                            ))?
                         );
                     } else {
                         print_mail_read_text(&msg, raw_html);
@@ -2883,7 +3211,7 @@ async fn cmd_mail_read(
     if json_out {
         println!(
             "{}",
-            serde_json::to_string_pretty(&mail_read_json(&msg, compact))?
+            serde_json::to_string_pretty(&mail_read_json(&msg, compact, Surface::Cli))?
         );
         return Ok(());
     }
@@ -3247,11 +3575,15 @@ async fn cmd_mail_download(
     mail_id: &str,
     attachment_selector: Option<&str>,
     dir: Option<&Path>,
+    offline: bool,
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let mail = load_mail_message(&storage, &graph, mail_id, false).await?;
+    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
+    let mail = load_mail_message(&storage, &graph, mail_id, offline).await?;
     let att = select_mail_attachment(&mail, None, attachment_selector)?;
+    if offline {
+        let _ = load_mail_attachment_bytes(&graph, &mail.id, att, true).await?;
+    }
 
     let out_dir = dir
         .map(Path::to_path_buf)
@@ -3286,19 +3618,64 @@ async fn cmd_mail_search(
     remote: bool,
     limit: usize,
     json_out: bool,
+    cursor: Option<&str>,
 ) -> Result<()> {
     if query.trim().is_empty() {
         bail!("Search query is empty.");
     }
     let limit = clamp_limit(limit);
-    let (hits, remote_messages) = if !remote {
+    let (hits, remote_messages, remote_paging) = if !remote {
         let storage = open_storage_only(cfg)?;
         let folder_filter = match folder.map(str::trim).filter(|s| !s.is_empty()) {
             Some(f) => Some(resolver::resolve_mail_folder_cached(&storage, f)?.id),
             None => None,
         };
         let hits = storage.search_mail(query, folder_filter.as_deref(), limit)?;
-        (hits, Vec::new())
+        (hits, Vec::new(), None)
+    } else if let Some(raw_cursor) = cursor {
+        let parsed = PageCursor::parse(raw_cursor)?;
+        if !matches!(parsed.pos, CursorPos::Graph { .. }) {
+            bail!("invalid cursor: not valid for this command");
+        }
+        let folder_filter = match folder.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(f) => {
+                let storage = open_storage_only(cfg)?;
+                Some(resolver::resolve_mail_folder_cached(&storage, f)?.id)
+            }
+            None => None,
+        };
+        let scope = cursor_scope(&[
+            "search",
+            folder_filter.as_deref().unwrap_or(""),
+            query.trim(),
+        ]);
+        parsed.require_scope(&scope)?;
+        let CursorPos::Graph { skip, url } = parsed.pos else {
+            unreachable!();
+        };
+        if !crate::graph::client::graph_base_owns_url(&cfg.graph_base_url, &url) {
+            bail!("invalid cursor: url is not a Graph URL for this account");
+        }
+        let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+        let page = match graph
+            .search_mail_remote_paged(
+                query,
+                folder_filter.as_deref(),
+                limit,
+                &scope,
+                Some((skip, url)),
+            )
+            .await
+        {
+            Ok(p) => p,
+            Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+        };
+        let _ = storage.upsert_mail_messages(&page.messages);
+        (
+            Vec::new(),
+            page.messages,
+            Some((page.has_more, page.next_cursor)),
+        )
     } else {
         let (_auth, graph, storage) = open_runtime(cfg, true).await?;
         let folder_filter = match folder.map(str::trim).filter(|s| !s.is_empty()) {
@@ -3306,26 +3683,40 @@ async fn cmd_mail_search(
             None => None,
         };
         let hits = storage.search_mail(query, folder_filter.as_deref(), limit)?;
-        let msgs = match graph
-            .search_mail_remote_in_folder(query, folder_filter.as_deref(), limit)
+        let scope = cursor_scope(&[
+            "search",
+            folder_filter.as_deref().unwrap_or(""),
+            query.trim(),
+        ]);
+        let page = match graph
+            .search_mail_remote_paged(query, folder_filter.as_deref(), limit, &scope, None)
             .await
         {
-            Ok(m) => m,
+            Ok(p) => p,
             Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
         };
-        let _ = storage.upsert_mail_messages(&msgs);
-        (hits, msgs)
+        let _ = storage.upsert_mail_messages(&page.messages);
+        (hits, page.messages, Some((page.has_more, page.next_cursor)))
     };
 
     if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
+        let payload = if let Some((has_more, next_cursor)) = remote_paging {
+            json!({
                 "query": query,
                 "hits": hits,
                 "remote": remote_messages,
-            }))?
-        );
+                "returned": remote_messages.len(),
+                "has_more": has_more,
+                "next_cursor": next_cursor,
+            })
+        } else {
+            json!({
+                "query": query,
+                "hits": hits,
+                "remote": remote_messages,
+            })
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
     } else if hits.is_empty() && remote_messages.is_empty() {
         println!("No mail messages matching '{query}'.");
     } else {
@@ -3356,6 +3747,7 @@ fn print_cal_events_output(
     start_iso: &str,
     end_iso: &str,
     events: &[CalendarEvent],
+    has_more: bool,
     json_out: bool,
 ) -> Result<()> {
     if json_out {
@@ -3365,6 +3757,8 @@ fn print_cal_events_output(
                 "start": start_iso,
                 "end": end_iso,
                 "events": events,
+                "returned": events.len(),
+                "has_more": has_more,
             }))?
         );
     } else if events.is_empty() {
@@ -3387,6 +3781,7 @@ fn print_cal_events_output(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_calendar_list(
     cfg: &AppConfig,
     from: Option<&str>,
@@ -3402,8 +3797,13 @@ async fn cmd_calendar_list(
 
     if offline {
         let storage = open_storage_only(cfg)?;
-        let events = storage.list_calendar_events(Some(&start_iso), Some(&end_iso), limit)?;
-        return print_cal_events_output(&start_iso, &end_iso, &events, json_out);
+        let mut events =
+            storage.list_calendar_events(Some(&start_iso), Some(&end_iso), limit.saturating_add(1))?;
+        let has_more = events.len() > limit;
+        if has_more {
+            events.truncate(limit);
+        }
+        return print_cal_events_output(&start_iso, &end_iso, &events, has_more, json_out);
     }
 
     let ttl = cli_cache_ttl_secs(cfg);
@@ -3411,12 +3811,25 @@ async fn cmd_calendar_list(
     if cached || daemon_warm || ttl > 0 {
         if let Ok(storage) = open_storage_only(cfg) {
             if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:cal"], ttl) {
-                let events =
-                    storage.list_calendar_events(Some(&start_iso), Some(&end_iso), limit)?;
+                let mut events = storage.list_calendar_events(
+                    Some(&start_iso),
+                    Some(&end_iso),
+                    limit.saturating_add(1),
+                )?;
+                let has_more = events.len() > limit;
+                if has_more {
+                    events.truncate(limit);
+                }
                 let has_any_cached =
                     !events.is_empty() || !storage.list_calendar_events(None, None, 1)?.is_empty();
                 if !events.is_empty() || (cached && has_any_cached) {
-                    return print_cal_events_output(&start_iso, &end_iso, &events, json_out);
+                    return print_cal_events_output(
+                        &start_iso,
+                        &end_iso,
+                        &events,
+                        has_more,
+                        json_out,
+                    );
                 }
             }
         }
@@ -3437,12 +3850,26 @@ async fn cmd_calendar_list(
     }
     record_cli_sync_cursor(&storage, "cli:cal");
 
-    print_cal_events_output(&start_iso, &end_iso, &events, json_out)
+    print_cal_events_output(&start_iso, &end_iso, &events, !reached_end, json_out)
 }
 
-fn print_event_show_output(ev: &CalendarEvent, json_out: bool) -> Result<()> {
+fn print_event_show_output(ev: &CalendarEvent, json_out: bool, compact: bool) -> Result<()> {
     if json_out {
-        println!("{}", serde_json::to_string_pretty(&json!({ "event": ev }))?);
+        let payload = if compact {
+            let mut val = json!(ev);
+            if let Some(obj) = val.as_object_mut() {
+                obj.remove("body_html");
+                obj.insert("omitted".into(), json!({ "fields": ["body_html"] }));
+                obj.insert(
+                    "hint".into(),
+                    json!(format!("outlook event {} --json --full", ev.id)),
+                );
+            }
+            json!({ "event": val })
+        } else {
+            json!({ "event": ev })
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!("Subject: {}", ev.subject);
         println!("Time: {} ~ {} ({})", ev.start_iso, ev.end_iso, ev.time_zone);
@@ -3481,19 +3908,20 @@ async fn cmd_event_show(
     offline: bool,
     cached: bool,
     json_out: bool,
+    compact: bool,
 ) -> Result<()> {
     if offline {
         let storage = open_storage_only(cfg)?;
         let events = storage.list_calendar_events(None, None, 10_000)?;
         let ev = resolver::resolve_calendar_event_from_slice(&events, event_id)?;
-        return print_event_show_output(&ev, json_out);
+        return print_event_show_output(&ev, json_out, compact);
     }
 
     if cached {
         if let Ok(storage) = open_storage_only(cfg) {
             let events = storage.list_calendar_events(None, None, 10_000)?;
             if let Ok(ev) = resolver::resolve_calendar_event_from_slice(&events, event_id) {
-                return print_event_show_output(&ev, json_out);
+                return print_event_show_output(&ev, json_out, compact);
             }
         }
     }
@@ -3504,7 +3932,7 @@ async fn cmd_event_show(
         Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
     };
     let _ = storage.upsert_calendar_events(std::slice::from_ref(&ev));
-    print_event_show_output(&ev, json_out)
+    print_event_show_output(&ev, json_out, compact)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3674,16 +4102,30 @@ async fn cmd_event_delete(
 // To Do & Contacts commands
 // ---------------------------------------------------------------------------
 
-fn print_todo_lists_output(lists: &[TodoList], json_out: bool) -> Result<()> {
+fn print_todo_lists_output(
+    lists: &[TodoList],
+    json_out: bool,
+    limit: Option<usize>,
+    offset: usize,
+) -> Result<()> {
     if json_out {
+        let lim = limit.map(clamp_limit).unwrap_or(50);
+        let scope = cursor_scope(&["task-lists"]);
+        let (page, has_more, next_cursor) = offset_page(lists, offset, lim, &scope);
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "lists": lists }))?
+            serde_json::to_string_pretty(&json!({
+                "lists": page,
+                "returned": page.len(),
+                "has_more": has_more,
+                "next_cursor": next_cursor,
+            }))?
         );
     } else if lists.is_empty() {
         println!("No To Do lists found.");
     } else {
-        for l in lists {
+        let take_n = limit.map(clamp_limit).unwrap_or(lists.len());
+        for l in lists.iter().take(take_n) {
             let wk = l
                 .wellknown_list_name
                 .as_deref()
@@ -3695,13 +4137,20 @@ fn print_todo_lists_output(lists: &[TodoList], json_out: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_todo_tasks_output(list_id: &str, tasks: &[TodoTask], json_out: bool) -> Result<()> {
+fn print_todo_tasks_output(
+    list_id: &str,
+    tasks: &[TodoTask],
+    has_more: bool,
+    json_out: bool,
+) -> Result<()> {
     if json_out {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "list_id": list_id,
                 "tasks": tasks,
+                "returned": tasks.len(),
+                "has_more": has_more,
             }))?
         );
     } else if tasks.is_empty() {
@@ -3731,11 +4180,24 @@ async fn cmd_todo_lists(
     offline: bool,
     cached: bool,
     json_out: bool,
+    limit: Option<usize>,
+    cursor: Option<&str>,
 ) -> Result<()> {
+    if let Some(raw_cursor) = cursor {
+        let parsed = PageCursor::parse(raw_cursor)?;
+        let CursorPos::Offset(offset) = parsed.pos else {
+            bail!("invalid cursor: not valid for this command");
+        };
+        parsed.require_scope(&cursor_scope(&["task-lists"]))?;
+        let storage = open_storage_only(cfg)?;
+        let lists = storage.list_todo_lists()?;
+        return print_todo_lists_output(&lists, json_out, limit, offset);
+    }
+
     if offline {
         let storage = open_storage_only(cfg)?;
         let lists = storage.list_todo_lists()?;
-        return print_todo_lists_output(&lists, json_out);
+        return print_todo_lists_output(&lists, json_out, limit, 0);
     }
 
     let ttl = cli_cache_ttl_secs(cfg);
@@ -3745,7 +4207,7 @@ async fn cmd_todo_lists(
             if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:todo_lists"], ttl) {
                 let lists = storage.list_todo_lists()?;
                 if !lists.is_empty() {
-                    return print_todo_lists_output(&lists, json_out);
+                    return print_todo_lists_output(&lists, json_out, limit, 0);
                 }
             }
         }
@@ -3768,7 +4230,7 @@ async fn cmd_todo_lists(
         cached_lists
     };
 
-    print_todo_lists_output(&lists, json_out)
+    print_todo_lists_output(&lists, json_out, limit, 0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3787,8 +4249,9 @@ async fn cmd_todo_tasks(
         let storage = open_storage_only(cfg)?;
         let resolved = resolver::resolve_todo_list_cached(&storage, list)?;
         let mut tasks = storage.list_todo_tasks(Some(&resolved.id), include_completed)?;
+        let has_more = tasks.len() > limit;
         tasks.truncate(limit);
-        return print_todo_tasks_output(&resolved.id, &tasks, json_out);
+        return print_todo_tasks_output(&resolved.id, &tasks, has_more, json_out);
     }
 
     let ttl = cli_cache_ttl_secs(cfg);
@@ -3802,8 +4265,9 @@ async fn cmd_todo_tasks(
                     let mut tasks =
                         storage.list_todo_tasks(Some(&resolved.id), include_completed)?;
                     if !tasks.is_empty() {
+                        let has_more = tasks.len() > limit;
                         tasks.truncate(limit);
-                        return print_todo_tasks_output(&resolved.id, &tasks, json_out);
+                        return print_todo_tasks_output(&resolved.id, &tasks, has_more, json_out);
                     }
                 }
             }
@@ -3817,7 +4281,7 @@ async fn cmd_todo_tasks(
     let should_fetch = refresh
         || cached_tasks.is_empty()
         || (!cached && !daemon_warm && !is_cursor_fresh(&storage, &[cursor_key.as_str()], ttl));
-    let mut tasks = if should_fetch {
+    let (mut tasks, has_more) = if should_fetch {
         let (fetched, reached_end) = match graph
             .list_todo_tasks_complete(&resolved.id, include_completed, limit)
             .await
@@ -3831,13 +4295,16 @@ async fn cmd_todo_tasks(
             storage.upsert_todo_tasks(&fetched)?;
         }
         record_cli_sync_cursor(&storage, &cursor_key);
-        storage.list_todo_tasks(Some(&resolved.id), include_completed)?
+        let stored = storage.list_todo_tasks(Some(&resolved.id), include_completed)?;
+        let has_more = !reached_end || stored.len() > limit;
+        (stored, has_more)
     } else {
-        cached_tasks
+        let has_more = cached_tasks.len() > limit;
+        (cached_tasks, has_more)
     };
     tasks.truncate(limit);
 
-    print_todo_tasks_output(&resolved.id, &tasks, json_out)
+    print_todo_tasks_output(&resolved.id, &tasks, has_more, json_out)
 }
 
 async fn cmd_todo_add(
@@ -4023,17 +4490,51 @@ fn print_contact_line(c: &ContactItem) {
     );
 }
 
-fn print_contacts_output(contacts: &[ContactItem], json_out: bool) -> Result<()> {
+pub(crate) fn directory_status_json(
+    queried: bool,
+    error: Option<&anyhow::Error>,
+) -> serde_json::Value {
+    match (queried, error) {
+        (false, _) => json!({ "status": "not_queried", "error": null }),
+        (true, None) => json!({ "status": "ok", "error": null }),
+        (true, Some(e)) if is_forbidden_error(e) => {
+            json!({ "status": "forbidden", "error": format!("{e:#}") })
+        }
+        (true, Some(e)) => json!({ "status": "error", "error": format!("{e:#}") }),
+    }
+}
+
+fn print_contacts_output(
+    contacts: &[ContactItem],
+    directory: serde_json::Value,
+    json_out: bool,
+) -> Result<()> {
     if json_out {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "contacts": contacts }))?
+            serde_json::to_string_pretty(&json!({
+                "contacts": contacts,
+                "directory": directory,
+            }))?
         );
-    } else if contacts.is_empty() {
-        println!("No contacts found.");
     } else {
-        for c in contacts {
-            print_contact_line(c);
+        if let Some(status) = directory.get("status").and_then(|v| v.as_str()) {
+            if matches!(status, "forbidden" | "error") {
+                let err_msg = directory
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                eprintln!(
+                    "warning: directory search failed ({status}); showing personal contacts only: {err_msg}"
+                );
+            }
+        }
+        if contacts.is_empty() {
+            println!("No contacts found.");
+        } else {
+            for c in contacts {
+                print_contact_line(c);
+            }
         }
     }
     Ok(())
@@ -4054,7 +4555,7 @@ async fn cmd_contacts(
     if offline {
         let storage = open_storage_only(cfg)?;
         let contacts = storage.list_contacts(trimmed_q, limit)?;
-        return print_contacts_output(&contacts, json_out);
+        return print_contacts_output(&contacts, directory_status_json(false, None), json_out);
     }
 
     if trimmed_q.is_none() {
@@ -4065,7 +4566,11 @@ async fn cmd_contacts(
                 if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:contacts"], ttl) {
                     let contacts = storage.list_contacts(None, limit)?;
                     if !contacts.is_empty() {
-                        return print_contacts_output(&contacts, json_out);
+                        return print_contacts_output(
+                            &contacts,
+                            directory_status_json(false, None),
+                            json_out,
+                        );
                     }
                 }
             }
@@ -4073,26 +4578,28 @@ async fn cmd_contacts(
     }
 
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let contacts = if let Some(q) = trimmed_q {
+    let (contacts, directory) = if let Some(q) = trimmed_q {
         if cached && !refresh {
             let local = storage.list_contacts(Some(q), limit)?;
             if !local.is_empty() {
-                local
+                (local, directory_status_json(false, None))
             } else {
-                let fetched = match graph.search_contacts_and_directory(q, limit).await {
+                let outcome = match graph.search_contacts_and_directory_detailed(q, limit).await {
                     Ok(c) => c,
                     Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
                 };
-                let _ = storage.upsert_contacts(&fetched);
-                fetched
+                let _ = storage.upsert_contacts(&outcome.contacts);
+                let dir = directory_status_json(true, outcome.directory_error.as_ref());
+                (outcome.contacts, dir)
             }
         } else {
-            let fetched = match graph.search_contacts_and_directory(q, limit).await {
+            let outcome = match graph.search_contacts_and_directory_detailed(q, limit).await {
                 Ok(c) => c,
                 Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
             };
-            let _ = storage.upsert_contacts(&fetched);
-            fetched
+            let _ = storage.upsert_contacts(&outcome.contacts);
+            let dir = directory_status_json(true, outcome.directory_error.as_ref());
+            (outcome.contacts, dir)
         }
     } else {
         let ttl = cli_cache_ttl_secs(cfg);
@@ -4101,7 +4608,7 @@ async fn cmd_contacts(
         let should_fetch = refresh
             || cached_contacts.is_empty()
             || (!cached && !daemon_warm && !is_cursor_fresh(&storage, &["cli:contacts"], ttl));
-        if should_fetch {
+        let contacts = if should_fetch {
             let (fetched, reached_end) = match graph.list_contacts_complete(limit).await {
                 Ok(c) => c,
                 Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
@@ -4115,10 +4622,11 @@ async fn cmd_contacts(
             storage.list_contacts(None, limit)?
         } else {
             cached_contacts
-        }
+        };
+        (contacts, directory_status_json(false, None))
     };
 
-    print_contacts_output(&contacts, json_out)
+    print_contacts_output(&contacts, directory, json_out)
 }
 
 // ---------------------------------------------------------------------------
@@ -4363,6 +4871,116 @@ async fn cmd_preview_mail(
 // ---------------------------------------------------------------------------
 // Shared `pub(crate)` helpers reused by `serve.rs` and `mcp.rs`
 // ---------------------------------------------------------------------------
+
+pub(crate) const FILTER_SCAN_MAX_PAGES: usize = 20;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CursorPos {
+    Cache { received_at: String, id: String },
+    Graph { skip: usize, url: String },
+    Offset(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PageCursor {
+    pub scope: String,
+    pub pos: CursorPos,
+}
+
+/// 범위 부분을 U+001F로 이은 문자열의 FNV-1a 32비트 해시, 16진 8자.
+pub(crate) fn cursor_scope(parts: &[&str]) -> String {
+    let mut h: u32 = 0x811c9dc5;
+    for b in parts.join("\u{1f}").bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    format!("{h:08x}")
+}
+
+pub(crate) fn mail_cursor_scope(
+    folder_id: &str,
+    unread_only: bool,
+    flagged_only: bool,
+    focused_only: bool,
+) -> String {
+    let flags = format!(
+        "{}{}{}",
+        u8::from(unread_only),
+        u8::from(flagged_only),
+        u8::from(focused_only)
+    );
+    cursor_scope(&["mail", folder_id, &flags])
+}
+
+impl PageCursor {
+    pub(crate) fn parse(raw: &str) -> Result<Self> {
+        let raw = raw.trim();
+        let bad = |why: &str| anyhow::anyhow!("invalid cursor: {why}");
+        let (kind, rest) = raw.split_once(':').ok_or_else(|| bad("malformed"))?;
+        if !matches!(kind, "c" | "g" | "o") {
+            return Err(bad("unknown prefix"));
+        }
+        let (scope, body) = rest.split_once(':').ok_or_else(|| bad("malformed"))?;
+        if scope.len() != 8 || !scope.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(bad("malformed"));
+        }
+        let pos = match kind {
+            "c" => {
+                let (ts, id) = body.split_once('|').ok_or_else(|| bad("malformed"))?;
+                if ts.is_empty() || id.is_empty() {
+                    return Err(bad("malformed"));
+                }
+                CursorPos::Cache {
+                    received_at: ts.into(),
+                    id: id.into(),
+                }
+            }
+            "g" => {
+                let (skip, url) = body.split_once('|').ok_or_else(|| bad("malformed"))?;
+                let skip = skip.parse().map_err(|_| bad("malformed"))?;
+                if url.is_empty() {
+                    return Err(bad("malformed"));
+                }
+                CursorPos::Graph {
+                    skip,
+                    url: url.into(),
+                }
+            }
+            _ => CursorPos::Offset(body.parse().map_err(|_| bad("malformed"))?),
+        };
+        Ok(Self {
+            scope: scope.into(),
+            pos,
+        })
+    }
+
+    /// 현재 호출의 scope와 다르면 거부한다. I/O 전에 호출한다.
+    pub(crate) fn require_scope(&self, expected: &str) -> Result<()> {
+        if self.scope.eq_ignore_ascii_case(expected) {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "invalid cursor: issued for a different command, folder, query or filter"
+            ))
+        }
+    }
+}
+
+pub(crate) fn offset_page<T: Clone>(
+    all: &[T],
+    offset: usize,
+    limit: usize,
+    scope: &str,
+) -> (Vec<T>, bool, Option<String>) {
+    let start = offset.min(all.len());
+    let end = start.saturating_add(limit).min(all.len());
+    let has_more = end < all.len();
+    (
+        all[start..end].to_vec(),
+        has_more,
+        has_more.then(|| format!("o:{scope}:{end}")),
+    )
+}
 
 pub(crate) fn clamp_limit(limit: usize) -> usize {
     limit.clamp(1, 1_000)
@@ -5598,5 +6216,123 @@ mod tests {
             cli.command.unwrap(),
             Command::Search { query, .. } if query == "-"
         ));
+    }
+
+    #[test]
+    fn page_cursor_parses_each_prefix_and_rejects_garbage() {
+        let c = PageCursor::parse("c:4f5129f1:2026-11-20T09:00:00Z|msg-1").unwrap();
+        assert_eq!(c.scope, "4f5129f1");
+        assert_eq!(
+            c.pos,
+            CursorPos::Cache {
+                received_at: "2026-11-20T09:00:00Z".into(),
+                id: "msg-1".into(),
+            }
+        );
+
+        let c_pipe = PageCursor::parse("c:4f5129f1:2026-11-20T09:00:00Z|a|b|c").unwrap();
+        assert_eq!(
+            c_pipe.pos,
+            CursorPos::Cache {
+                received_at: "2026-11-20T09:00:00Z".into(),
+                id: "a|b|c".into(),
+            }
+        );
+
+        let g_url = "http://127.0.0.1:53443/v1.0/me/messages?$skiptoken=a:b|c";
+        let g = PageCursor::parse(&format!("g:99e80d3c:12|{g_url}")).unwrap();
+        assert_eq!(g.scope, "99e80d3c");
+        assert_eq!(
+            g.pos,
+            CursorPos::Graph {
+                skip: 12,
+                url: g_url.into(),
+            }
+        );
+
+        let o = PageCursor::parse("o:f74800ea:50").unwrap();
+        assert_eq!(o.scope, "f74800ea");
+        assert_eq!(o.pos, CursorPos::Offset(50));
+
+        for (bad, expected_msg) in [
+            ("", "invalid cursor: malformed"),
+            ("c:a", "invalid cursor: malformed"),
+            ("c:2026-11-20T09:00:00Z|m", "invalid cursor: malformed"),
+            ("c:4f5129f:2026-11-20T09:00:00Z|m", "invalid cursor: malformed"),
+            ("c:4f5129fz:2026-11-20T09:00:00Z|m", "invalid cursor: malformed"),
+            ("c:4f5129f1:|m", "invalid cursor: malformed"),
+            ("c:4f5129f1:2026-11-20T09:00:00Z|", "invalid cursor: malformed"),
+            ("g:99e80d3c:x|u", "invalid cursor: malformed"),
+            ("g:99e80d3c:0|", "invalid cursor: malformed"),
+            ("o:f74800ea:-1", "invalid cursor: malformed"),
+            ("z:f74800ea:1", "invalid cursor: unknown prefix"),
+        ] {
+            let err = PageCursor::parse(bad)
+                .expect_err(&format!("expected failure for {bad:?}"))
+                .to_string();
+            assert_eq!(err, expected_msg, "input {bad:?}");
+        }
+    }
+
+    #[test]
+    fn cursor_scope_is_deterministic_and_separates_parts() {
+        assert_eq!(cursor_scope(&["mail", "folder-inbox", "000"]), "4f5129f1");
+        assert_eq!(cursor_scope(&["mail", "folder-inbox", "100"]), "d0b9c3c6");
+        assert_eq!(cursor_scope(&["folders"]), "f74800ea");
+        assert_eq!(cursor_scope(&["task-lists"]), "14525d78");
+        assert_eq!(cursor_scope(&["search", "", "Architecture"]), "99e80d3c");
+        assert_eq!(cursor_scope(&["search", "", "Budget"]), "714ee75a");
+        assert_eq!(cursor_scope(&["search", "", "a"]), "1d3b4932");
+        assert_ne!(
+            cursor_scope(&["mail", "ab", "c"]),
+            cursor_scope(&["mail", "a", "bc"])
+        );
+        assert_ne!(
+            mail_cursor_scope("folder-inbox", false, false, false),
+            mail_cursor_scope("folder-inbox", true, false, false)
+        );
+        assert_ne!(
+            mail_cursor_scope("folder-inbox", false, false, false),
+            mail_cursor_scope("folder-inbox", false, true, false)
+        );
+        assert_ne!(
+            mail_cursor_scope("folder-inbox", false, false, false),
+            mail_cursor_scope("folder-inbox", false, false, true)
+        );
+    }
+
+    #[test]
+    fn require_scope_rejects_mismatch() {
+        let c = PageCursor::parse("o:F74800EA:50").unwrap();
+        c.require_scope("f74800ea").unwrap();
+        let err = c.require_scope("14525d78").unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "invalid cursor: issued for a different command, folder, query or filter"
+        );
+    }
+
+    #[test]
+    fn offset_page_boundaries() {
+        let items: Vec<i32> = (0..5).collect();
+        let (p0, more0, cur0) = offset_page(&items, 0, 2, "f74800ea");
+        assert_eq!(p0, vec![0, 1]);
+        assert!(more0);
+        assert_eq!(cur0.as_deref(), Some("o:f74800ea:2"));
+
+        let (p1, more1, cur1) = offset_page(&items, 2, 3, "f74800ea");
+        assert_eq!(p1, vec![2, 3, 4]);
+        assert!(!more1);
+        assert_eq!(cur1, None);
+
+        let (p_end, more_end, cur_end) = offset_page(&items, 5, 2, "f74800ea");
+        assert!(p_end.is_empty());
+        assert!(!more_end);
+        assert_eq!(cur_end, None);
+
+        let (p_over, more_over, cur_over) = offset_page(&items, 99, 2, "f74800ea");
+        assert!(p_over.is_empty());
+        assert!(!more_over);
+        assert_eq!(cur_over, None);
     }
 }

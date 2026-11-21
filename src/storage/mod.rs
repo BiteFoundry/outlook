@@ -211,6 +211,27 @@ impl Storage {
         outlook::list_mail_messages(&conn, folder_id, unread_only, flagged_only, focused_only, limit)
     }
 
+    pub fn list_mail_messages_before(
+        &self,
+        folder_id: Option<&str>,
+        unread_only: bool,
+        flagged_only: bool,
+        focused_only: bool,
+        limit: usize,
+        before: Option<(&str, &str)>,
+    ) -> Result<Vec<MailMessage>> {
+        let conn = self.read_conn()?;
+        outlook::list_mail_messages_before(
+            &conn,
+            folder_id,
+            unread_only,
+            flagged_only,
+            focused_only,
+            limit,
+            before,
+        )
+    }
+
     pub fn list_mail_summaries(
         &self,
         folder_id: Option<&str>,
@@ -236,6 +257,27 @@ impl Storage {
             flagged_only,
             focused_only,
             limit,
+        )
+    }
+
+    pub fn list_mail_summaries_before(
+        &self,
+        folder_id: Option<&str>,
+        unread_only: bool,
+        flagged_only: bool,
+        focused_only: bool,
+        limit: usize,
+        before: Option<(&str, &str)>,
+    ) -> Result<Vec<MailMessage>> {
+        let conn = self.read_conn()?;
+        outlook::list_mail_summaries_before(
+            &conn,
+            folder_id,
+            unread_only,
+            flagged_only,
+            focused_only,
+            limit,
+            before,
         )
     }
 

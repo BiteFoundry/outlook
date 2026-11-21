@@ -74,8 +74,9 @@ For a company registration, use `outlook login --client-id YOUR_CLIENT_ID --tena
 
 ```bash
 # Mail: inspect inbox, read, reply, and send Markdown with attachments
-outlook mail --folder inbox --unread --limit 20 --json --compact
-outlook read AAMkAGI2... --json --compact
+outlook mail --folder inbox --unread --limit 20 --json
+outlook read AAMkAGI2... --json
+outlook read AAMkAGI2... --json --full
 outlook read AAMkAGI2... --mark-read
 outlook send --to elena.park@acme.dev --subject "v2.4 Release" \
   --body "**All canary checks passed.** See attached benchmarks." \
@@ -90,7 +91,7 @@ outlook add-task "Promote canary to 100%" --due 2026-11-20 --importance high
 outlook daemon start
 ```
 
-Use `--compact` with `--json` to list message headers or read headers and the complete plain-text body. Use `read --json` for HTML and attachment details.
+JSON output for `mail`, `read`, and `event` is compact by default. Pass `--full` with `--json` for full cached fields, HTML bodies, and attachment metadata (`content_bytes_b64` is never embedded in CLI/MCP JSON; fetch attachment bytes with `outlook download`, or `outlook download --offline` for cached bytes). `--compact` remains a compatibility alias and conflicts with `--full`. Paginated JSON listings (`mail`, `search --remote`, `folders`, `task-lists`) include `returned`, `has_more`, and `next_cursor`; continue with `--cursor <CURSOR>`. Cursors are bound to the originating command, folder, query, and filter, while `--limit` and `--full` may change between pages. In `mail --json`, `folder` is the canonical folder ID string, and the first online listing of an uncached folder syncs the full folder delta once.
 
 Use `outlook mark` for read and flag changes, and `outlook move` to change folders. MCP `update_message` supports both. In the TUI, `Ctrl+S` saves the current composition. Reopening and saving reuses the draft ID. Reply, reply-all, and forward drafts retain their source message relationship and quoted HTML.
 

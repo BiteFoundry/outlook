@@ -158,6 +158,10 @@ impl GraphClient {
         )
     }
 
+    pub(crate) fn owns_url(&self, url: &str) -> bool {
+        graph_base_owns_url(&self.config.graph_base_url, url)
+    }
+
     pub async fn get_me(&self) -> Result<UserProfile> {
         let user: GraphUser = self
             .get_json("/me?$select=id,displayName,mail,userPrincipalName,jobTitle,department")
@@ -755,6 +759,24 @@ impl GraphClient {
             return Ok(resp);
         }
     }
+}
+
+pub(crate) fn graph_base_owns_url(graph_base_url: &str, url: &str) -> bool {
+    if url.starts_with("/me/") {
+        return !url.split(['/', '?']).any(|seg| seg == "..");
+    }
+    let (Ok(base), Ok(target)) = (
+        reqwest::Url::parse(graph_base_url.trim_end_matches('/')),
+        reqwest::Url::parse(url),
+    ) else {
+        return false;
+    };
+    target.scheme() == base.scheme()
+        && target.host_str() == base.host_str()
+        && target.port_or_known_default() == base.port_or_known_default()
+        && target
+            .path()
+            .starts_with(&format!("{}/me/", base.path().trim_end_matches('/')))
 }
 
 pub(crate) fn parse_retry_after_secs(

@@ -31,7 +31,6 @@ use crate::models::{
 const MAIL_SMALL_ATTACHMENT_LIMIT: u64 = 3 * 1024 * 1024; // 3 MiB
 const MAIL_UPLOAD_CHUNK_SIZE: usize = 3_276_800; // 3.2 MiB
 const MAX_FOLDER_DEPTH: usize = 6;
-const SEARCH_MAX_PAGES: usize = 2;
 const WELL_KNOWN_FOLDER_NAMES: [&str; 6] = [
     "inbox",
     "sentitems",
@@ -632,6 +631,37 @@ pub struct MailDeltaPage {
     pub delta_link: Option<String>,
 }
 
+pub(crate) struct FilteredMailPage {
+    pub matched: Vec<MailMessage>,
+    pub fetched: Vec<MailMessage>,
+    pub has_more: Option<bool>,
+    pub next_cursor: Option<String>,
+}
+
+pub(crate) struct RemoteSearchPage {
+    pub messages: Vec<MailMessage>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
+pub(crate) fn mail_list_first_page_url(folder_id: &str, top: usize, header_only: bool) -> String {
+    let page_top = top.clamp(1, 100);
+    let select_fields = if header_only {
+        MAIL_HEADER_SELECT_FIELDS
+    } else {
+        MAIL_FULL_SELECT_FIELDS
+    };
+    let base_path = match normalize_folder_target(folder_id) {
+        None => "/me/messages".to_string(),
+        Some(folder) => {
+            format!("/me/mailFolders/{}/messages", urlencoding::encode(&folder))
+        }
+    };
+    format!(
+        "{base_path}?$top={page_top}&$orderby=receivedDateTime desc&$select={select_fields}"
+    )
+}
+
 pub(crate) fn initial_mail_delta_url(folder_id: &str) -> String {
     let base_path = match normalize_folder_target(folder_id) {
         None => "/me/messages/delta".to_string(),
@@ -913,12 +943,45 @@ impl GraphClient {
         limit: usize,
         header_only: bool,
     ) -> Result<(Vec<MailMessage>, Vec<MailMessage>)> {
+        let page = self
+            .list_mail_messages_filtered_paged(
+                folder_id,
+                unread_only,
+                flagged_only,
+                focused_only,
+                limit,
+                header_only,
+                "",
+                None,
+                None,
+            )
+            .await?;
+        Ok((page.matched, page.fetched))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn list_mail_messages_filtered_paged(
+        &self,
+        folder_id: &str,
+        unread_only: bool,
+        flagged_only: bool,
+        focused_only: bool,
+        limit: usize,
+        header_only: bool,
+        scope: &str,
+        start: Option<(usize, String)>,
+        max_pages: Option<usize>,
+    ) -> Result<FilteredMailPage> {
         if limit == 0 {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(FilteredMailPage {
+                matched: Vec::new(),
+                fetched: Vec::new(),
+                has_more: Some(false),
+                next_cursor: None,
+            });
         }
         let mut matched = Vec::with_capacity(limit);
         let mut fetched = Vec::new();
-        let mut next_link: Option<String> = None;
         let mut seen_urls = HashSet::new();
         let normalized_folder = normalize_folder_target(folder_id);
         let page_size = if unread_only || flagged_only || focused_only {
@@ -926,45 +989,97 @@ impl GraphClient {
         } else {
             limit.min(100)
         };
+        let (mut skip, mut url) = match start {
+            Some((s, u)) => (s, u),
+            None => (0, mail_list_first_page_url(folder_id, page_size, header_only)),
+        };
+        seen_urls.insert(canonical_pagination_key(&url).to_string());
+        let mut pages = 0usize;
 
         loop {
+            let page_url = url;
             let (page_msgs, next) = self
-                .list_mail_messages_page(folder_id, page_size, next_link.as_deref(), header_only)
+                .list_mail_messages_page(folder_id, page_size, Some(&page_url), header_only)
                 .await?;
-            if page_msgs.is_empty() {
-                break;
-            }
+            pages += 1;
+
+            let mut normalized_items = Vec::with_capacity(page_msgs.len());
             for mut msg in page_msgs {
                 if msg.folder_id.is_none() {
                     if let Some(ref fid) = normalized_folder {
                         msg.folder_id = Some(fid.clone());
                     }
                 }
-                let matches = (!unread_only || !msg.is_read)
-                    && (!flagged_only || msg.flagged)
-                    && (!focused_only || msg.is_focused());
-                if matches && matched.len() < limit {
-                    matched.push(msg.clone());
+                normalized_items.push(msg);
+            }
+            fetched.extend(normalized_items.iter().cloned());
+
+            if skip < normalized_items.len() {
+                for (i, msg) in normalized_items[skip..].iter().enumerate() {
+                    let matches = (!unread_only || !msg.is_read)
+                        && (!flagged_only || msg.flagged)
+                        && (!focused_only || msg.is_focused());
+                    if matches {
+                        if matched.len() < limit {
+                            matched.push(msg.clone());
+                        } else {
+                            return Ok(FilteredMailPage {
+                                matched,
+                                fetched,
+                                has_more: Some(true),
+                                next_cursor: Some(format!("g:{scope}:{}|{page_url}", skip + i)),
+                            });
+                        }
+                    }
                 }
-                fetched.push(msg);
             }
-            if matched.len() >= limit {
-                break;
-            }
-            let Some(next_url) = next
+
+            let next_trimmed = next
                 .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-            else {
-                break;
+                .filter(|s| !s.is_empty());
+
+            if matched.len() == limit {
+                return match next_trimmed {
+                    Some(next_url) => Ok(FilteredMailPage {
+                        matched,
+                        fetched,
+                        has_more: None,
+                        next_cursor: Some(format!("g:{scope}:0|{next_url}")),
+                    }),
+                    None => Ok(FilteredMailPage {
+                        matched,
+                        fetched,
+                        has_more: Some(false),
+                        next_cursor: None,
+                    }),
+                };
+            }
+
+            let Some(next_url) = next_trimmed else {
+                return Ok(FilteredMailPage {
+                    matched,
+                    fetched,
+                    has_more: Some(false),
+                    next_cursor: None,
+                });
             };
+
+            if max_pages == Some(pages) {
+                return Ok(FilteredMailPage {
+                    matched,
+                    fetched,
+                    has_more: None,
+                    next_cursor: Some(format!("g:{scope}:0|{next_url}")),
+                });
+            }
+
             let key = canonical_pagination_key(&next_url).to_string();
             if !seen_urls.insert(key) {
                 bail!("Cyclic or repeated @odata.nextLink detected during mail list: {next_url}");
             }
-            next_link = Some(next_url);
+            url = next_url;
+            skip = 0;
         }
-
-        Ok((matched, fetched))
     }
 
     /// Fetches a single page of mail messages with `@odata.nextLink` pagination support.
@@ -982,23 +1097,7 @@ impl GraphClient {
 
         let url = match trimmed_next {
             Some(link) => link.to_string(),
-            None => {
-                let page_top = top.clamp(1, 100);
-                let select_fields = if header_only {
-                    MAIL_HEADER_SELECT_FIELDS
-                } else {
-                    MAIL_FULL_SELECT_FIELDS
-                };
-                let base_path = match normalize_folder_target(folder_id) {
-                    None => "/me/messages".to_string(),
-                    Some(folder) => {
-                        format!("/me/mailFolders/{}/messages", urlencoding::encode(&folder))
-                    }
-                };
-                format!(
-                    "{base_path}?$top={page_top}&$orderby=receivedDateTime desc&$select={select_fields}"
-                )
-            }
+            None => mail_list_first_page_url(folder_id, top, header_only),
         };
 
         let page: GraphListPage<GraphMailMessage> = self.get_json(&url).await?;
@@ -1766,49 +1865,104 @@ impl GraphClient {
         folder_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MailMessage>> {
+        Ok(self
+            .search_mail_remote_paged(query, folder_id, limit, "", None)
+            .await?
+            .messages)
+    }
+
+    pub(crate) async fn search_mail_remote_paged(
+        &self,
+        query: &str,
+        folder_id: Option<&str>,
+        limit: usize,
+        scope: &str,
+        start: Option<(usize, String)>,
+    ) -> Result<RemoteSearchPage> {
         let q = query.trim();
         if limit == 0 || q.is_empty() {
-            return Ok(Vec::new());
+            return Ok(RemoteSearchPage {
+                messages: Vec::new(),
+                has_more: false,
+                next_cursor: None,
+            });
         }
-        let escaped = q.replace('\\', "\\\\").replace('"', "\\\"");
-        let search_val = format!("\"{escaped}\"");
-        let top = limit.min(50);
         let normalized_folder = folder_id.and_then(normalize_folder_target);
-        let base_path = match normalized_folder.as_deref() {
-            Some(fid) => format!("/me/mailFolders/{}/messages", urlencoding::encode(fid)),
-            None => "/me/messages".to_string(),
+        let (mut skip, mut url) = match start {
+            Some((s, u)) => (s, u),
+            None => {
+                let escaped = q.replace('\\', "\\\\").replace('"', "\\\"");
+                let search_val = format!("\"{escaped}\"");
+                let top = limit.min(50);
+                let base_path = match normalized_folder.as_deref() {
+                    Some(fid) => format!("/me/mailFolders/{}/messages", urlencoding::encode(fid)),
+                    None => "/me/messages".to_string(),
+                };
+                (
+                    0,
+                    format!(
+                        "{base_path}?$search={}&$top={top}&$select={MAIL_HEADER_SELECT_FIELDS}",
+                        urlencoding::encode(&search_val)
+                    ),
+                )
+            }
         };
-        let mut next_url = Some(format!(
-            "{base_path}?$search={}&$top={top}&$select={MAIL_HEADER_SELECT_FIELDS}",
-            urlencoding::encode(&search_val)
-        ));
         let mut messages = Vec::new();
         let headers = [("ConsistencyLevel", "eventual")];
-        let mut pages = 0usize;
+        let mut seen_urls = HashSet::new();
+        seen_urls.insert(canonical_pagination_key(&url).to_string());
 
-        while let Some(url) = next_url {
-            if pages >= SEARCH_MAX_PAGES {
-                break;
-            }
-            pages += 1;
+        loop {
+            let page_url = url;
             let page: GraphListPage<GraphMailMessage> =
-                self.get_json_with_headers(&url, &headers).await?;
-            for raw in page.value {
-                let mut msg = raw.into_mail_message(false);
-                if msg.folder_id.is_none() {
-                    if let Some(ref fid) = normalized_folder {
-                        msg.folder_id = Some(fid.clone());
+                self.get_json_with_headers(&page_url, &headers).await?;
+            let next = page
+                .next_link
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            if skip < page.value.len() {
+                for (i, raw) in page.value.into_iter().skip(skip).enumerate() {
+                    if messages.len() == limit {
+                        return Ok(RemoteSearchPage {
+                            messages,
+                            has_more: true,
+                            next_cursor: Some(format!("g:{scope}:{}|{page_url}", skip + i)),
+                        });
                     }
-                }
-                messages.push(msg);
-                if messages.len() >= limit {
-                    return Ok(messages);
+                    let mut msg = raw.into_mail_message(false);
+                    if msg.folder_id.is_none() {
+                        if let Some(ref fid) = normalized_folder {
+                            msg.folder_id = Some(fid.clone());
+                        }
+                    }
+                    messages.push(msg);
                 }
             }
-            next_url = page.next_link;
-        }
 
-        Ok(messages)
+            let Some(next_url) = next else {
+                return Ok(RemoteSearchPage {
+                    messages,
+                    has_more: false,
+                    next_cursor: None,
+                });
+            };
+
+            if messages.len() == limit {
+                return Ok(RemoteSearchPage {
+                    messages,
+                    has_more: true,
+                    next_cursor: Some(format!("g:{scope}:0|{next_url}")),
+                });
+            }
+
+            let key = canonical_pagination_key(&next_url).to_string();
+            if !seen_urls.insert(key) {
+                bail!("Cyclic or repeated @odata.nextLink detected during mail search: {next_url}");
+            }
+            url = next_url;
+            skip = 0;
+        }
     }
 
     /// Searches remote mailbox via `/me/messages?$search="..."` with `ConsistencyLevel: eventual`.
@@ -3006,8 +3160,8 @@ pub(crate) mod tests {
         assert_eq!(state_ref.delta_pages.load(Ordering::SeqCst), 3);
 
         let search_hits = client.search_mail_remote("budget", 100).await.unwrap();
-        assert_eq!(state_ref.search_pages.load(Ordering::SeqCst), SEARCH_MAX_PAGES);
-        assert_eq!(search_hits.len(), SEARCH_MAX_PAGES);
+        assert_eq!(state_ref.search_pages.load(Ordering::SeqCst), 100);
+        assert_eq!(search_hits.len(), 100);
     }
 
     #[tokio::test]

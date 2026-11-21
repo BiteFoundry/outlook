@@ -311,28 +311,57 @@ async fn call_tool(
         "list_mail_folders" => {
             let offline = args.optional_bool("offline")?.unwrap_or(false);
             let refresh = args.optional_bool("refresh")?.unwrap_or(false);
-            let ttl = cli::cli_cache_ttl_secs(config);
-            let (cached, fresh) = with_storage(storage, move |s| {
-                let folders = s.list_mail_folders()?;
-                let is_fresh = cli::is_cursor_fresh(s, &["cli:mail_folders"], ttl);
-                Ok((folders, is_fresh))
-            })
-            .await
-            .map_err(format_error)?;
-            let folders = if !offline && (refresh || cached.is_empty() || !fresh) {
-                let fetched = map_graph_result(graph, graph.list_mail_folders().await).await?;
-                let fetched_clone = fetched.clone();
-                with_storage(storage, move |s| {
-                    s.replace_mail_folders(&fetched_clone)?;
-                    cli::record_cli_sync_cursor(s, "cli:mail_folders");
-                    s.list_mail_folders()
+            let limit = args
+                .optional_usize("limit")?
+                .map(|v| bounds("limit", v, 1, 200))
+                .transpose()?
+                .unwrap_or(50);
+            let cursor = args.optional_str("cursor")?;
+            if cursor.is_some() && refresh {
+                return Err("cursor cannot be combined with refresh".to_string());
+            }
+            let scope = cli::cursor_scope(&["folders"]);
+            let (folders, offset) = if let Some(raw_cursor) = cursor {
+                let parsed = cli::PageCursor::parse(&raw_cursor).map_err(format_error)?;
+                let cli::CursorPos::Offset(offset) = parsed.pos else {
+                    return Err("invalid cursor: not valid for this command".to_string());
+                };
+                parsed.require_scope(&scope).map_err(format_error)?;
+                let cached = with_storage(storage, |s| s.list_mail_folders())
+                    .await
+                    .map_err(format_error)?;
+                (cached, offset)
+            } else {
+                let ttl = cli::cli_cache_ttl_secs(config);
+                let (cached, fresh) = with_storage(storage, move |s| {
+                    let folders = s.list_mail_folders()?;
+                    let is_fresh = cli::is_cursor_fresh(s, &["cli:mail_folders"], ttl);
+                    Ok((folders, is_fresh))
                 })
                 .await
-                .map_err(format_error)?
-            } else {
-                cached
+                .map_err(format_error)?;
+                let folders = if !offline && (refresh || cached.is_empty() || !fresh) {
+                    let fetched = map_graph_result(graph, graph.list_mail_folders().await).await?;
+                    let fetched_clone = fetched.clone();
+                    with_storage(storage, move |s| {
+                        s.replace_mail_folders(&fetched_clone)?;
+                        cli::record_cli_sync_cursor(s, "cli:mail_folders");
+                        s.list_mail_folders()
+                    })
+                    .await
+                    .map_err(format_error)?
+                } else {
+                    cached
+                };
+                (folders, 0)
             };
-            Ok(json!({ "folders": folders }))
+            let (page, has_more, next_cursor) = cli::offset_page(&folders, offset, limit, &scope);
+            Ok(json!({
+                "folders": page,
+                "returned": page.len(),
+                "has_more": has_more,
+                "next_cursor": next_cursor,
+            }))
         }
 
         "list_messages" => {
@@ -349,27 +378,139 @@ async fn call_tool(
             let flagged = args.optional_bool("flagged")?.unwrap_or(false);
             let focused = args.optional_bool("focused")?.unwrap_or(false);
             let offline = args.optional_bool("offline")?.unwrap_or(false);
-            let compact = args.optional_bool("compact")?.unwrap_or(false);
+            let compact = args.optional_bool("compact")?.unwrap_or(true);
+            let cursor = args.optional_str("cursor")?;
+
+            if let Some(raw_cursor) = cursor {
+                let parsed = cli::PageCursor::parse(&raw_cursor).map_err(format_error)?;
+                if matches!(parsed.pos, cli::CursorPos::Offset(_)) {
+                    return Err("invalid cursor: not valid for this command".to_string());
+                }
+                let q = folder.clone();
+                let resolved = with_storage(storage, move |s| {
+                    resolver::resolve_mail_folder_cached(s, &q)
+                })
+                .await
+                .map_err(format_error)?;
+                let scope = cli::mail_cursor_scope(&resolved.id, unread, flagged, focused);
+                parsed.require_scope(&scope).map_err(format_error)?;
+
+                let page = match parsed.pos {
+                    cli::CursorPos::Cache { received_at, id } => {
+                        let fid = resolved.id.clone();
+                        let scope_clone = scope.clone();
+                        with_storage(storage, move |s| {
+                            cli::load_cached_mail_list(
+                                s,
+                                &fid,
+                                unread,
+                                flagged,
+                                focused,
+                                limit,
+                                !compact,
+                                Some((&received_at, &id)),
+                                &scope_clone,
+                            )
+                        })
+                        .await
+                        .map_err(format_error)?
+                    }
+                    cli::CursorPos::Graph { skip, url } => {
+                        if offline {
+                            return Err(
+                                "invalid cursor: this cursor needs online access".to_string()
+                            );
+                        }
+                        if !graph.owns_url(&url) {
+                            return Err(
+                                "invalid cursor: url is not a Graph URL for this account"
+                                    .to_string(),
+                            );
+                        }
+                        let filtered = map_graph_result(
+                            graph,
+                            graph
+                                .list_mail_messages_filtered_paged(
+                                    &resolved.id,
+                                    unread,
+                                    flagged,
+                                    focused,
+                                    limit,
+                                    true,
+                                    &scope,
+                                    Some((skip, url)),
+                                    Some(cli::FILTER_SCAN_MAX_PAGES),
+                                )
+                                .await,
+                        )
+                        .await?;
+                        let matched = filtered.matched;
+                        let fetched = filtered.fetched;
+                        let messages = with_storage(storage, move |s| {
+                            s.upsert_mail_messages(&fetched)?;
+                            if !compact {
+                                Ok(matched
+                                    .into_iter()
+                                    .map(|m| s.get_mail_message(&m.id).ok().flatten().unwrap_or(m))
+                                    .collect())
+                            } else {
+                                Ok(matched)
+                            }
+                        })
+                        .await
+                        .map_err(format_error)?;
+                        cli::MailListPage {
+                            messages,
+                            has_more: filtered.has_more,
+                            next_cursor: filtered.next_cursor,
+                        }
+                    }
+                    cli::CursorPos::Offset(_) => unreachable!(),
+                };
+
+                return Ok(json!({
+                    "folder": resolved,
+                    "messages": cli::mail_list_json(&page.messages, compact),
+                    "returned": page.messages.len(),
+                    "has_more": page.has_more,
+                    "next_cursor": page.next_cursor,
+                }));
+            }
 
             let mut resolved = resolve_mail_folder_mcp(storage, graph, &folder, offline).await?;
             let has_filter = unread || flagged || focused;
 
-            let messages = if offline {
+            let page = if offline {
                 let fid = resolved.id.clone();
+                let scope = cli::mail_cursor_scope(&fid, unread, flagged, focused);
                 with_storage(storage, move |s| {
-                    cli::load_cached_mail_list(s, &fid, unread, flagged, focused, limit, !compact)
+                    cli::load_cached_mail_list(
+                        s,
+                        &fid,
+                        unread,
+                        flagged,
+                        focused,
+                        limit,
+                        !compact,
+                        None,
+                        &scope,
+                    )
                 })
                 .await
                 .map_err(format_error)?
             } else if has_filter {
-                let (matched, fetched) = match graph
-                    .list_mail_messages_filtered(
+                let scope = cli::mail_cursor_scope(&resolved.id, unread, flagged, focused);
+                let filtered = match graph
+                    .list_mail_messages_filtered_paged(
                         &resolved.id,
                         unread,
                         flagged,
                         focused,
                         limit,
                         true,
+                        &scope,
+                        None,
+                        Some(cli::FILTER_SCAN_MAX_PAGES),
                     )
                     .await
                 {
@@ -389,27 +530,44 @@ async fn call_tool(
                         {
                             Some(new_folder) => {
                                 resolved = new_folder;
+                                let new_scope = cli::mail_cursor_scope(
+                                    &resolved.id,
+                                    unread,
+                                    flagged,
+                                    focused,
+                                );
                                 map_graph_result(
                                     graph,
                                     graph
-                                        .list_mail_messages_filtered(
+                                        .list_mail_messages_filtered_paged(
                                             &resolved.id,
                                             unread,
                                             flagged,
                                             focused,
                                             limit,
                                             true,
+                                            &new_scope,
+                                            None,
+                                            Some(cli::FILTER_SCAN_MAX_PAGES),
                                         )
                                         .await,
                                 )
                                 .await?
                             }
-                            None => return Err(map_graph_result(graph, Err::<(), _>(err)).await.unwrap_err()),
+                            None => {
+                                return Err(map_graph_result(graph, Err::<(), _>(err))
+                                    .await
+                                    .unwrap_err());
+                            }
                         }
                     }
-                    Err(err) => return Err(map_graph_result(graph, Err::<(), _>(err)).await.unwrap_err()),
+                    Err(err) => {
+                        return Err(map_graph_result(graph, Err::<(), _>(err)).await.unwrap_err());
+                    }
                 };
-                with_storage(storage, move |s| {
+                let matched = filtered.matched;
+                let fetched = filtered.fetched;
+                let messages = with_storage(storage, move |s| {
                     s.upsert_mail_messages(&fetched)?;
                     if !compact {
                         Ok(matched
@@ -421,7 +579,12 @@ async fn call_tool(
                     }
                 })
                 .await
-                .map_err(format_error)?
+                .map_err(format_error)?;
+                cli::MailListPage {
+                    messages,
+                    has_more: filtered.has_more,
+                    next_cursor: filtered.next_cursor,
+                }
             } else {
                 let outcome = match crate::sync::sync_mail_folder_delta(
                     &resolved.id,
@@ -461,15 +624,32 @@ async fn call_tool(
                                 )
                                 .await?
                             }
-                            None => return Err(map_graph_result(graph, Err::<(), _>(err)).await.unwrap_err()),
+                            None => {
+                                return Err(map_graph_result(graph, Err::<(), _>(err))
+                                    .await
+                                    .unwrap_err());
+                            }
                         }
                     }
-                    Err(err) => return Err(map_graph_result(graph, Err::<(), _>(err)).await.unwrap_err()),
+                    Err(err) => {
+                        return Err(map_graph_result(graph, Err::<(), _>(err)).await.unwrap_err());
+                    }
                 };
                 let fid = outcome.folder_id;
+                let scope = cli::mail_cursor_scope(&fid, false, false, false);
                 with_storage(storage, move |s| {
                     cli::record_cli_sync_cursor(s, &format!("cli:mail:{fid}"));
-                    cli::load_cached_mail_list(s, &fid, false, false, false, limit, !compact)
+                    cli::load_cached_mail_list(
+                        s,
+                        &fid,
+                        false,
+                        false,
+                        false,
+                        limit,
+                        !compact,
+                        None,
+                        &scope,
+                    )
                 })
                 .await
                 .map_err(format_error)?
@@ -477,7 +657,10 @@ async fn call_tool(
 
             Ok(json!({
                 "folder": resolved,
-                "messages": cli::mail_list_json(&messages, compact),
+                "messages": cli::mail_list_json(&page.messages, compact),
+                "returned": page.messages.len(),
+                "has_more": page.has_more,
+                "next_cursor": page.next_cursor,
             }))
         }
 
@@ -485,7 +668,7 @@ async fn call_tool(
             let message_id = args.required_str("message_id")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
             let mark_read = args.optional_bool("mark_read")?.unwrap_or(false);
-            let compact = args.optional_bool("compact")?.unwrap_or(false);
+            let compact = args.optional_bool("compact")?.unwrap_or(true);
 
             let mut msg = if offline {
                 let id_owned = message_id.clone();
@@ -511,7 +694,7 @@ async fn call_tool(
                 let _ = with_storage(storage, move |s| s.set_mail_read_local(&mid, true)).await;
             }
 
-            Ok(cli::mail_read_json(&msg, compact))
+            Ok(cli::mail_read_json(&msg, compact, cli::Surface::Mcp))
         }
 
         "send_mail" => {
@@ -729,7 +912,7 @@ async fn call_tool(
                     .unwrap_or(message_id.as_str()),
                 "is_read": is_read,
                 "flagged": flagged,
-                "moved": moved_message,
+                "moved": moved_message.as_ref().map(cli::mail_message_public_json),
             }))
         }
 
@@ -810,6 +993,67 @@ async fn call_tool(
                 .map(cli::clamp_limit)
                 .unwrap_or(25);
             let offline = args.optional_bool("offline")?.unwrap_or(false);
+            let cursor = args.optional_str("cursor")?;
+
+            if let Some(raw_cursor) = cursor {
+                let parsed = cli::PageCursor::parse(&raw_cursor).map_err(format_error)?;
+                if !matches!(parsed.pos, cli::CursorPos::Graph { .. }) {
+                    return Err("invalid cursor: not valid for this command".to_string());
+                }
+                let folder_id = match folder.as_deref() {
+                    Some(f) => {
+                        let q = f.to_string();
+                        Some(
+                            with_storage(storage, move |s| {
+                                resolver::resolve_mail_folder_cached(s, &q)
+                            })
+                            .await
+                            .map_err(format_error)?
+                            .id,
+                        )
+                    }
+                    None => None,
+                };
+                let scope = cli::cursor_scope(&[
+                    "search",
+                    folder_id.as_deref().unwrap_or(""),
+                    query.trim(),
+                ]);
+                parsed.require_scope(&scope).map_err(format_error)?;
+                let cli::CursorPos::Graph { skip, url } = parsed.pos else {
+                    unreachable!();
+                };
+                if offline {
+                    return Err("invalid cursor: this cursor needs online access".to_string());
+                }
+                if !graph.owns_url(&url) {
+                    return Err(
+                        "invalid cursor: url is not a Graph URL for this account".to_string()
+                    );
+                }
+                let page = map_graph_result(
+                    graph,
+                    graph
+                        .search_mail_remote_paged(
+                            &query,
+                            folder_id.as_deref(),
+                            limit,
+                            &scope,
+                            Some((skip, url)),
+                        )
+                        .await,
+                )
+                .await?;
+                let msgs_clone = page.messages.clone();
+                let _ = with_storage(storage, move |s| s.upsert_mail_messages(&msgs_clone)).await;
+                return Ok(json!({
+                    "query": query,
+                    "messages": page.messages,
+                    "returned": page.messages.len(),
+                    "has_more": page.has_more,
+                    "next_cursor": page.next_cursor,
+                }));
+            }
 
             let folder_id = match folder.as_deref() {
                 Some(f) => Some(resolve_mail_folder_mcp(storage, graph, f, offline).await?.id),
@@ -826,16 +1070,27 @@ async fn call_tool(
                 .map_err(format_error)?;
                 Ok(json!({ "query": query, "hits": hits }))
             } else {
-                let messages = map_graph_result(
+                let scope = cli::cursor_scope(&[
+                    "search",
+                    folder_id.as_deref().unwrap_or(""),
+                    query.trim(),
+                ]);
+                let page = map_graph_result(
                     graph,
                     graph
-                        .search_mail_remote_in_folder(&query, folder_id.as_deref(), limit)
+                        .search_mail_remote_paged(&query, folder_id.as_deref(), limit, &scope, None)
                         .await,
                 )
                 .await?;
-                let msgs_clone = messages.clone();
+                let msgs_clone = page.messages.clone();
                 let _ = with_storage(storage, move |s| s.upsert_mail_messages(&msgs_clone)).await;
-                Ok(json!({ "query": query, "messages": messages }))
+                Ok(json!({
+                    "query": query,
+                    "messages": page.messages,
+                    "returned": page.messages.len(),
+                    "has_more": page.has_more,
+                    "next_cursor": page.next_cursor,
+                }))
             }
         }
 
@@ -859,14 +1114,23 @@ async fn call_tool(
                 cli::default_calendar_window(from.as_deref(), to.as_deref(), days)
                     .map_err(format_error)?;
 
-            let events = if offline {
+            let (events, has_more) = if offline {
                 let s_filter = start_iso.clone();
                 let e_filter = end_iso.clone();
-                with_storage(storage, move |s| {
-                    s.list_calendar_events(Some(&s_filter), Some(&e_filter), limit)
+                let mut rows = with_storage(storage, move |s| {
+                    s.list_calendar_events(
+                        Some(&s_filter),
+                        Some(&e_filter),
+                        limit.saturating_add(1),
+                    )
                 })
                 .await
-                .map_err(format_error)?
+                .map_err(format_error)?;
+                let has_more = rows.len() > limit;
+                if has_more {
+                    rows.truncate(limit);
+                }
+                (rows, has_more)
             } else {
                 let (fetched, reached_end) = map_graph_result(
                     graph,
@@ -887,13 +1151,15 @@ async fn call_tool(
                     }
                 })
                 .await;
-                fetched
+                (fetched, !reached_end)
             };
 
             Ok(json!({
                 "start": start_iso,
                 "end": end_iso,
                 "events": events,
+                "returned": events.len(),
+                "has_more": has_more,
             }))
         }
 
@@ -980,28 +1246,57 @@ async fn call_tool(
         "list_todo_lists" => {
             let offline = args.optional_bool("offline")?.unwrap_or(false);
             let refresh = args.optional_bool("refresh")?.unwrap_or(false);
-            let ttl = cli::cli_cache_ttl_secs(config);
-            let (cached, fresh) = with_storage(storage, move |s| {
-                let lists = s.list_todo_lists()?;
-                let is_fresh = cli::is_cursor_fresh(s, &["cli:todo_lists"], ttl);
-                Ok((lists, is_fresh))
-            })
-            .await
-            .map_err(format_error)?;
-            let lists = if !offline && (refresh || cached.is_empty() || !fresh) {
-                let fetched = map_graph_result(graph, graph.list_todo_lists().await).await?;
-                let fetched_clone = fetched.clone();
-                with_storage(storage, move |s| {
-                    s.replace_todo_lists(&fetched_clone)?;
-                    cli::record_cli_sync_cursor(s, "cli:todo_lists");
-                    s.list_todo_lists()
+            let limit = args
+                .optional_usize("limit")?
+                .map(|v| bounds("limit", v, 1, 200))
+                .transpose()?
+                .unwrap_or(50);
+            let cursor = args.optional_str("cursor")?;
+            if cursor.is_some() && refresh {
+                return Err("cursor cannot be combined with refresh".to_string());
+            }
+            let scope = cli::cursor_scope(&["task-lists"]);
+            let (lists, offset) = if let Some(raw_cursor) = cursor {
+                let parsed = cli::PageCursor::parse(&raw_cursor).map_err(format_error)?;
+                let cli::CursorPos::Offset(offset) = parsed.pos else {
+                    return Err("invalid cursor: not valid for this command".to_string());
+                };
+                parsed.require_scope(&scope).map_err(format_error)?;
+                let cached = with_storage(storage, |s| s.list_todo_lists())
+                    .await
+                    .map_err(format_error)?;
+                (cached, offset)
+            } else {
+                let ttl = cli::cli_cache_ttl_secs(config);
+                let (cached, fresh) = with_storage(storage, move |s| {
+                    let lists = s.list_todo_lists()?;
+                    let is_fresh = cli::is_cursor_fresh(s, &["cli:todo_lists"], ttl);
+                    Ok((lists, is_fresh))
                 })
                 .await
-                .map_err(format_error)?
-            } else {
-                cached
+                .map_err(format_error)?;
+                let lists = if !offline && (refresh || cached.is_empty() || !fresh) {
+                    let fetched = map_graph_result(graph, graph.list_todo_lists().await).await?;
+                    let fetched_clone = fetched.clone();
+                    with_storage(storage, move |s| {
+                        s.replace_todo_lists(&fetched_clone)?;
+                        cli::record_cli_sync_cursor(s, "cli:todo_lists");
+                        s.list_todo_lists()
+                    })
+                    .await
+                    .map_err(format_error)?
+                } else {
+                    cached
+                };
+                (lists, 0)
             };
-            Ok(json!({ "lists": lists }))
+            let (page, has_more, next_cursor) = cli::offset_page(&lists, offset, limit, &scope);
+            Ok(json!({
+                "lists": page,
+                "returned": page.len(),
+                "has_more": has_more,
+                "next_cursor": next_cursor,
+            }))
         }
 
         "list_tasks" => {
@@ -1019,13 +1314,15 @@ async fn call_tool(
                 resolve_todo_list_mcp(storage, graph, list_query.as_deref(), offline).await?;
             let list_id = resolved.id.clone();
 
-            let mut tasks = if offline {
+            let (mut tasks, has_more) = if offline {
                 let lid = list_id.clone();
-                with_storage(storage, move |s| {
+                let rows = with_storage(storage, move |s| {
                     s.list_todo_tasks(Some(&lid), include_completed)
                 })
                 .await
-                .map_err(format_error)?
+                .map_err(format_error)?;
+                let has_more = rows.len() > limit;
+                (rows, has_more)
             } else {
                 let (fetched, reached_end) = map_graph_result(
                     graph,
@@ -1044,7 +1341,8 @@ async fn call_tool(
                     }
                 })
                 .await;
-                fetched
+                let has_more = !reached_end || fetched.len() > limit;
+                (fetched, has_more)
             };
             tasks.truncate(limit);
 
@@ -1052,6 +1350,8 @@ async fn call_tool(
                 "list": resolved,
                 "list_id": list_id,
                 "tasks": tasks,
+                "returned": tasks.len(),
+                "has_more": has_more,
             }))
         }
 
@@ -1130,20 +1430,22 @@ async fn call_tool(
                 .unwrap_or(25);
             let offline = args.optional_bool("offline")?.unwrap_or(false);
 
-            let contacts = if offline {
+            let (contacts, directory) = if offline {
                 let q_clone = query.clone();
-                with_storage(storage, move |s| s.list_contacts(q_clone.as_deref(), limit))
+                let rows = with_storage(storage, move |s| s.list_contacts(q_clone.as_deref(), limit))
                     .await
-                    .map_err(format_error)?
+                    .map_err(format_error)?;
+                (rows, cli::directory_status_json(false, None))
             } else if let Some(ref q) = query {
-                let fetched = map_graph_result(
+                let outcome = map_graph_result(
                     graph,
-                    graph.search_contacts_and_directory(q, limit).await,
+                    graph.search_contacts_and_directory_detailed(q, limit).await,
                 )
                 .await?;
-                let fetched_clone = fetched.clone();
+                let fetched_clone = outcome.contacts.clone();
                 let _ = with_storage(storage, move |s| s.upsert_contacts(&fetched_clone)).await;
-                fetched
+                let dir = cli::directory_status_json(true, outcome.directory_error.as_ref());
+                (outcome.contacts, dir)
             } else {
                 let (fetched, reached_end) =
                     map_graph_result(graph, graph.list_contacts_complete(limit).await).await?;
@@ -1156,10 +1458,13 @@ async fn call_tool(
                     }
                 })
                 .await;
-                fetched
+                (fetched, cli::directory_status_json(false, None))
             };
 
-            Ok(json!({ "contacts": contacts }))
+            Ok(json!({
+                "contacts": contacts,
+                "directory": directory,
+            }))
         }
 
         other => Err(format!("unknown tool: {other}")),
@@ -1239,7 +1544,7 @@ fn initialize_result(request: &Value) -> Value {
             "name": SERVER_NAME,
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": "Microsoft Outlook MCP server (Mail, Calendar, To Do, Contacts). Pass `offline: true` on read/search tools to query the local SQLite cache without network calls. `delete_message` and `delete_event` require `confirm: true`.",
+        "instructions": "Microsoft Outlook MCP server (Mail, Calendar, To Do, Contacts). Pass `offline: true` on read/search tools to query the local SQLite cache without network calls. `delete_message` and `delete_event` require `confirm: true`. Reads are compact by default; pass compact: false for full fields. Follow next_cursor to continue a listing.",
     })
 }
 
@@ -1301,6 +1606,8 @@ pub fn tool_catalog() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+                    "cursor": { "type": "string", "description": "Opaque next_cursor from a previous response" },
                     "refresh": { "type": "boolean" },
                     "offline": { "type": "boolean" }
                 }
@@ -1314,23 +1621,24 @@ pub fn tool_catalog() -> Vec<Value> {
                 "properties": {
                     "folder": { "type": "string", "description": "Folder name, alias, or ID (default 'inbox')" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+                    "cursor": { "type": "string", "description": "Opaque next_cursor from a previous response" },
                     "unread": { "type": "boolean" },
                     "flagged": { "type": "boolean" },
                     "focused": { "type": "boolean" },
-                    "compact": { "type": "boolean", "description": "Return list fields without bodies or attachments" },
+                    "compact": { "type": "boolean", "description": "Default true. Set false for every cached field (no attachment bytes)" },
                     "offline": { "type": "boolean" }
                 }
             }
         }),
         json!({
             "name": "get_message",
-            "description": "Read an email by ID. Use compact for headers and complete plain text.",
+            "description": "Read an email by ID. Compact by default; set compact:false for HTML and attachment metadata.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "message_id": { "type": "string" },
                     "mark_read": { "type": "boolean" },
-                    "compact": { "type": "boolean", "description": "Return headers and plain text without HTML or attachments" },
+                    "compact": { "type": "boolean", "description": "Default true. Set false for HTML and attachment metadata (no attachment bytes)" },
                     "offline": { "type": "boolean" }
                 },
                 "required": ["message_id"]
@@ -1433,6 +1741,7 @@ pub fn tool_catalog() -> Vec<Value> {
                     "query": { "type": "string" },
                     "folder": { "type": "string" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+                    "cursor": { "type": "string", "description": "Opaque next_cursor from a previous remote search response" },
                     "offline": { "type": "boolean" }
                 },
                 "required": ["query"]
@@ -1502,6 +1811,8 @@ pub fn tool_catalog() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+                    "cursor": { "type": "string", "description": "Opaque next_cursor from a previous response" },
                     "refresh": { "type": "boolean" },
                     "offline": { "type": "boolean" }
                 }
@@ -1613,7 +1924,14 @@ pub fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
     match name {
         "whoami" => Ok(()),
         "list_mail_folders" => {
-            args.optional_bool("refresh")?;
+            if let Some(limit) = args.optional_usize("limit")? {
+                bounds("limit", limit, 1, 200)?;
+            }
+            let cursor = args.optional_str("cursor")?;
+            let refresh = args.optional_bool("refresh")?.unwrap_or(false);
+            if cursor.is_some() && refresh {
+                return Err("cursor cannot be combined with refresh".to_string());
+            }
             args.optional_bool("offline")?;
             Ok(())
         }
@@ -1622,6 +1940,7 @@ pub fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             if let Some(limit) = args.optional_usize("limit")? {
                 bounds("limit", limit, 1, 200)?;
             }
+            args.optional_str("cursor")?;
             args.optional_bool("unread")?;
             args.optional_bool("flagged")?;
             args.optional_bool("focused")?;
@@ -1762,6 +2081,7 @@ pub fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             if let Some(limit) = args.optional_usize("limit")? {
                 bounds("limit", limit, 1, 200)?;
             }
+            args.optional_str("cursor")?;
             args.optional_bool("offline")?;
             Ok(())
         }
@@ -1810,7 +2130,14 @@ pub fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             Ok(())
         }
         "list_todo_lists" => {
-            args.optional_bool("refresh")?;
+            if let Some(limit) = args.optional_usize("limit")? {
+                bounds("limit", limit, 1, 200)?;
+            }
+            let cursor = args.optional_str("cursor")?;
+            let refresh = args.optional_bool("refresh")?.unwrap_or(false);
+            if cursor.is_some() && refresh {
+                return Err("cursor cannot be combined with refresh".to_string());
+            }
             args.optional_bool("offline")?;
             Ok(())
         }

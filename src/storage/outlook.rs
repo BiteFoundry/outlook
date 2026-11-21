@@ -628,6 +628,7 @@ fn upsert_mail_messages_in_tx(tx: &Transaction<'_>, messages: &[MailMessage]) ->
     Ok(changed_count)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn query_mail_rows(
     conn: &Connection,
     select_cols: &str,
@@ -637,6 +638,7 @@ fn query_mail_rows(
     flagged_only: bool,
     focused_only: bool,
     limit: usize,
+    before: Option<(&str, &str)>,
 ) -> Result<Vec<MailMessage>> {
     if limit == 0 {
         return Ok(Vec::new());
@@ -657,6 +659,9 @@ fn query_mail_rows(
     }
 
     if let Some(folder) = filter {
+        if before.is_some() {
+            extra_clauses.push_str(" AND (m.received_at < ?3 OR (m.received_at = ?3 AND m.id < ?4))");
+        }
         let sql = format!(
             "
             SELECT {select_cols}
@@ -668,9 +673,16 @@ fn query_mail_rows(
             "
         );
         let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(params![folder, limit as i64], mapper)?;
+        let rows = if let Some((ts, id)) = before {
+            stmt.query_map(params![folder, limit as i64, ts, id], mapper)?
+        } else {
+            stmt.query_map(params![folder, limit as i64], mapper)?
+        };
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     } else {
+        if before.is_some() {
+            extra_clauses.push_str(" AND (m.received_at < ?2 OR (m.received_at = ?2 AND m.id < ?3))");
+        }
         let sql = format!(
             "
             SELECT {select_cols}
@@ -682,7 +694,11 @@ fn query_mail_rows(
             "
         );
         let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(params![limit as i64], mapper)?;
+        let rows = if let Some((ts, id)) = before {
+            stmt.query_map(params![limit as i64, ts, id], mapper)?
+        } else {
+            stmt.query_map(params![limit as i64], mapper)?
+        };
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 }
@@ -695,6 +711,27 @@ pub fn list_mail_messages(
     focused_only: bool,
     limit: usize,
 ) -> Result<Vec<MailMessage>> {
+    list_mail_messages_before(
+        conn,
+        folder_id,
+        unread_only,
+        flagged_only,
+        focused_only,
+        limit,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn list_mail_messages_before(
+    conn: &Connection,
+    folder_id: Option<&str>,
+    unread_only: bool,
+    flagged_only: bool,
+    focused_only: bool,
+    limit: usize,
+    before: Option<(&str, &str)>,
+) -> Result<Vec<MailMessage>> {
     query_mail_rows(
         conn,
         MAIL_SELECT_COLS,
@@ -704,6 +741,7 @@ pub fn list_mail_messages(
         flagged_only,
         focused_only,
         limit,
+        before,
     )
 }
 
@@ -717,6 +755,27 @@ pub fn list_mail_summaries_filtered(
     focused_only: bool,
     limit: usize,
 ) -> Result<Vec<MailMessage>> {
+    list_mail_summaries_before(
+        conn,
+        folder_id_or_wellknown,
+        unread_only,
+        flagged_only,
+        focused_only,
+        limit,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn list_mail_summaries_before(
+    conn: &Connection,
+    folder_id_or_wellknown: Option<&str>,
+    unread_only: bool,
+    flagged_only: bool,
+    focused_only: bool,
+    limit: usize,
+    before: Option<(&str, &str)>,
+) -> Result<Vec<MailMessage>> {
     query_mail_rows(
         conn,
         MAIL_SUMMARY_SELECT_COLS,
@@ -726,6 +785,7 @@ pub fn list_mail_summaries_filtered(
         flagged_only,
         focused_only,
         limit,
+        before,
     )
 }
 

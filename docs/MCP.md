@@ -92,25 +92,25 @@ Mail `folder` arguments accept a canonical folder ID, display name/prefix, or we
 | # | Tool | Domain | Arguments | Returns |
 | --- | --- | --- | --- | --- |
 | 1 | `whoami` | Auth | *(none)* | `{ "authenticated": bool, "user_id": ..., "email": ..., "auth_mode": ..., "auth_source": ..., "scopes": [...] }` |
-| 2 | `list_mail_folders` | Mail | `refresh?` (bool), `offline?` (bool) | `{ "folders": [...] }` |
-| 3 | `list_messages` | Mail | `folder?` (default `'inbox'`), `limit?` (1..200), `unread?`, `flagged?`, `focused?`, `offline?`, `compact?` | `{ "folder": {...}, "messages": [...] }` |
-| 4 | `get_message` | Mail | `message_id` (req), `mark_read?`, `offline?`, `compact?` | `{ "message": {...} }` |
+| 2 | `list_mail_folders` | Mail | `limit?` (1..200, default 50), `cursor?`, `refresh?` (bool), `offline?` (bool) | `{ "folders": [...], "returned": n, "has_more": bool, "next_cursor": string\|null }` |
+| 3 | `list_messages` | Mail | `folder?` (default `'inbox'`), `limit?` (1..200), `cursor?`, `unread?`, `flagged?`, `focused?`, `offline?`, `compact?` (default `true`) | `{ "folder": {...}, "messages": [...], "returned": n, "has_more": bool\|null, "next_cursor": string\|null }` |
+| 4 | `get_message` | Mail | `message_id` (req), `mark_read?`, `offline?`, `compact?` (default `true`) | `{ "message": {...} }` (compact includes `omitted`, `hint`) |
 | 5 | `send_mail` | Mail | `to` (`string[]`, req), `subject` (req), `body` (Markdown, req), `cc?`, `bcc?`, `importance?` (`low\|normal\|high`), `attachments?`, `save_to_sent_items?` | `{ "ok": true, "to": [...], "subject": "..." }` |
 | 6 | `reply_mail` | Mail | `message_id` (req), `body` (req), `reply_all?` | `{ "ok": true, "message_id": "...", "reply_all": bool }` |
 | 7 | `forward_mail` | Mail | `message_id` (req), `to` (`string[]`, req), `comment?` | `{ "ok": true, "message_id": "...", "to": [...] }` |
 | 8 | `update_message` | Mail | `message_id` (req), `is_read?`, `flagged?`, `destination_folder?` | `{ "ok": true, "message_id": "...", "is_read": ..., "flagged": ..., "moved": ... }` |
 | 9 | `delete_message` | Mail | `message_id` (req), `confirm` (must be literal `true`) | `{ "ok": true, "message_id": "..." }` |
-| 10 | `download_attachment` | Mail | `message_id` (req), `attachment_index?` (>=0), `attachment?` (ID/name/index), `output_dir?` | `{ "ok": true, "attachment": {...}, "file": {...} }` |
-| 11 | `search_mail` | Mail | `query` (req), `folder?`, `limit?` (1..200), `offline?` | `{ "query": "...", "hits": [...] }` (offline) or `{ "query": "...", "messages": [...] }` (online) |
-| 12 | `list_events` | Calendar | `from?` (`ISO-8601\|YYYY-MM-DD`), `to?`, `days?` (1..365), `limit?` (1..200), `offline?` | `{ "start": "...", "end": "...", "events": [...] }` |
+| 10 | `download_attachment` | Mail | `message_id` (req), `attachment_index?` (>=0), `attachment?` (ID/name/index), `output_dir?`, `offline?` | `{ "ok": true, "message_id": "...", "attachment_id": "...", "path": "...", "file_name": "...", "mime_type": "...", "size_bytes": n, "is_image": bool }` |
+| 11 | `search_mail` | Mail | `query` (req), `folder?`, `limit?` (1..200), `cursor?`, `offline?` | `{ "query": "...", "hits": [...] }` (offline) or `{ "query": "...", "messages": [...], "returned": n, "has_more": bool, "next_cursor": string\|null }` (online, no 100-item cap) |
+| 12 | `list_events` | Calendar | `from?` (`ISO-8601\|YYYY-MM-DD`), `to?`, `days?` (1..365), `limit?` (1..200), `offline?` | `{ "start": "...", "end": "...", "events": [...], "returned": n, "has_more": bool }` |
 | 13 | `create_event` | Calendar | `subject` (req), `start` (req), `end` (req), `time_zone?`, `is_all_day?`, `location?`, `body?`, `attendees?`, `is_online_meeting?` | `{ "ok": true, "event": {...} }` |
 | 14 | `respond_event` | Calendar | `event_id` (req), `response` (`accept\|tentative\|decline`, req), `comment?` | `{ "ok": true, "event_id": "...", "response": "..." }` |
 | 15 | `delete_event` | Calendar | `event_id` (req), `confirm` (must be literal `true`) | `{ "ok": true, "event_id": "..." }` |
-| 16 | `list_todo_lists` | To Do | `refresh?`, `offline?` | `{ "lists": [...] }` |
-| 17 | `list_tasks` | To Do | `list?`, `include_completed?`, `limit?` (1..200), `offline?` | `{ "list": {...}, "list_id": "...", "tasks": [...] }` |
+| 16 | `list_todo_lists` | To Do | `limit?` (1..200, default 50), `cursor?`, `refresh?`, `offline?` | `{ "lists": [...], "returned": n, "has_more": bool, "next_cursor": string\|null }` |
+| 17 | `list_tasks` | To Do | `list?`, `include_completed?`, `limit?` (1..200), `offline?` | `{ "list": {...}, "list_id": "...", "tasks": [...], "returned": n, "has_more": bool }` |
 | 18 | `create_task` | To Do | `title` (req), `list?`, `notes?`, `due?` (`YYYY-MM-DD\|ISO-8601`), `importance?` (`low\|normal\|high`) | `{ "ok": true, "task": {...} }` |
 | 19 | `complete_task` | To Do | `task_id` (req), `list?`, `completed?` (default `true`) | `{ "ok": true, "task": {...} }` |
-| 20 | `search_contacts` | Contacts | `query?`, `limit?` (1..200), `offline?` | `{ "contacts": [...] }` |
+| 20 | `search_contacts` | Contacts | `query?`, `limit?` (1..200), `offline?` | `{ "contacts": [...], "directory": { "status": "ok\|forbidden\|error\|not_queried", "error": string\|null } }` |
 | 21 | `update_draft` | Mail | `message_id` (req), `subject?`, `body?` (Markdown), `body_html?` (HTML) | `{ "ok": true, "message_id": "..." }` |
 | 22 | `update_event` | Calendar | `event_id` (req), `subject?`, `start?`, `end?` | `{ "ok": true, "event": {...} }` |
 | 23 | `update_task` | To Do | `task_id` (req), `list?` (default `'tasks'`), `title?`, `due?` | `{ "ok": true, "task": {...} }` |
@@ -125,7 +125,7 @@ Mail `folder` arguments accept a canonical folder ID, display name/prefix, or we
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"agent","version":"1.0"}}}
 {"jsonrpc":"2.0","method":"notifications/initialized"}
 {"jsonrpc":"2.0","id":2,"method":"tools/list"}
-{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_messages","arguments":{"folder":"inbox","unread":true,"limit":20,"compact":true}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_messages","arguments":{"folder":"inbox","unread":true,"limit":20}}}
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"send_mail","arguments":{"to":["alice@contoso.com"],"subject":"Release v0.1.0","body":"Build **passed**!"}}}
 {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"create_event","arguments":{"subject":"Design Sync","start":"2026-11-20T09:00:00Z","end":"2026-11-20T10:00:00Z","is_online_meeting":true}}}
 {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"delete_message","arguments":{"message_id":"AAMkAGI2...","confirm":true}}}
@@ -135,7 +135,8 @@ Mail `folder` arguments accept a canonical folder ID, display name/prefix, or we
 
 - `send_mail` `attachments` paths and `download_attachment` `output_dir` paths are resolved on the host running `outlook mcp`, not on a remote MCP client.
 - Pass `"offline": true` on read/search tools (`list_mail_folders`, `list_messages`, `get_message`, `search_mail`, `list_events`, `list_todo_lists`, `list_tasks`, `search_contacts`) to query the local SQLite cache (`cache.db`) without network calls.
-- With `"compact": true`, `list_messages` returns the message ID, subject, sender, received time, and read, draft, flag, and attachment indicators. `get_message` returns addresses, timestamps, status, and the complete `body_plain` when loaded. For HTML and attachments, call `get_message` with the default output.
+- `list_messages` and `get_message` default to `"compact": true`. Pass `"compact": false` to return full cached fields, HTML bodies, and attachment metadata (`content_bytes_b64` is never included; use `download_attachment` to retrieve attachment bytes). Compact `get_message` responses include `omitted` (`attachments` is the known count, `0` when the message has no attachments, or `null` when attachment metadata has not been fetched yet; `fields` lists omitted scalar fields) and a follow-up `hint`.
+- `next_cursor` is an opaque pagination token valid only for the same tool, `folder`, `query`, and filter combination (`limit` and `compact` may change between pages). Reusing a cursor with a different tool, folder, query, or filter fails before any network call with `invalid cursor: issued for a different command, folder, query or filter`.
 - `update_message` accepts read and flag changes or a destination folder. An unsupported argument such as `subject` fails validation before any write. Use `update_draft` for a draft's subject or body.
 
 ## Partial edits
