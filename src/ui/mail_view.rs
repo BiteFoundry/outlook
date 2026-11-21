@@ -161,10 +161,56 @@ impl LineSliceCache {
         }
         self.entries.push((sig, val));
     }
+
+    fn retain_latest(&mut self) {
+        self.entries.drain(..self.entries.len().saturating_sub(1));
+    }
 }
 
 thread_local! {
     static MAIL_READER_CACHE: RefCell<LineSliceCache> = RefCell::new(LineSliceCache::new(6));
+}
+
+pub(crate) fn retain_latest_reader_layout() {
+    MAIL_READER_CACHE.with(|cache| cache.borrow_mut().retain_latest());
+}
+
+pub(crate) struct ReaderMailContent {
+    fingerprint: (u64, u64, usize),
+    blocks: Arc<[RichBlock]>,
+    has_attachments: bool,
+    has_images: bool,
+    has_quoted: bool,
+}
+
+impl ReaderMailContent {
+    fn refresh(slot: &mut Option<Self>, mail: Option<&MailMessage>) {
+        let Some(mail) = mail else {
+            *slot = None;
+            return;
+        };
+        let fingerprint =
+            parser::html_in::compute_parse_fingerprint(&mail.body_html, &mail.attachments);
+        if slot
+            .as_ref()
+            .is_some_and(|content| content.fingerprint == fingerprint)
+        {
+            return;
+        }
+        let blocks = parser::parse_message_blocks_arc(&mail.body_html, &mail.attachments);
+        let attachments = parser::effective_mail_attachments_from_blocks(mail, &blocks);
+        *slot = Some(Self {
+            fingerprint,
+            has_attachments: !attachments.is_empty(),
+            has_images: attachments.iter().any(|att| {
+                img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name))
+            }),
+            has_quoted: blocks
+                .iter()
+                .any(|block| matches!(block, RichBlock::QuotedHistory { .. })),
+            blocks,
+        });
+    }
 }
 
 pub fn render_scrolled_lines(
@@ -600,6 +646,7 @@ pub fn draw_reader(
     }
 
     app.ensure_displayed_mail_details_local(ui);
+    ReaderMailContent::refresh(&mut ui.mail_reader_content, app.active_mail());
 
     draw_reader_toolbar(frame, area, app, ui, hitmap);
 
@@ -701,7 +748,12 @@ pub fn draw_reader(
             } else {
                 None
             };
-            let built: Arc<[RenderedLine]> = Arc::from(build_reader_lines_with_opts(
+            let selected_blocks = app.active_mail_id.as_deref().zip(
+                ui.mail_reader_content
+                    .as_ref()
+                    .map(|content| content.blocks.as_ref()),
+            );
+            let built: Arc<[RenderedLine]> = Arc::from(build_reader_lines_with_selected(
                 &thread_msgs,
                 &app.expanded_thread_ids,
                 &app.expanded_quoted_ids,
@@ -710,6 +762,7 @@ pub fn draw_reader(
                 thumbs,
                 (thumb_cols, thumb_rows),
                 ui.show_link_urls,
+                selected_blocks,
             ));
             MAIL_READER_CACHE.with(|c| c.borrow_mut().insert(sig, Arc::clone(&built)));
             built
@@ -749,19 +802,11 @@ fn draw_reader_toolbar(
     );
 
     let mail_opt = app.active_mail();
-    let eff_attachments = mail_opt.map(parser::effective_mail_attachments);
+    let content = ui.mail_reader_content.as_ref();
     let has_attachments = mail_opt.is_some_and(|m| m.has_attachments)
-        || eff_attachments.as_ref().is_some_and(|a| !a.is_empty());
-    let has_img = eff_attachments.as_ref().is_some_and(|atts| {
-        atts.iter()
-            .any(|a| img_preview::is_image_mime_or_name(&a.content_type, Some(&a.name)))
-    });
-    let has_quoted = mail_opt.is_some_and(|m| {
-        !m.body_html.trim().is_empty()
-            && parser::parse_message_blocks_arc(&m.body_html, &m.attachments)
-                .iter()
-                .any(|b| matches!(b, RichBlock::QuotedHistory { .. }))
-    });
+        || content.is_some_and(|parsed| parsed.has_attachments);
+    let has_img = content.is_some_and(|parsed| parsed.has_images);
+    let has_quoted = content.is_some_and(|parsed| parsed.has_quoted);
     let mut buttons: Vec<(&str, &str, ButtonId)> = vec![
         ("[r Reply]", "[r]", ButtonId::MailReply),
         ("[R All]", "[R]", ButtonId::MailReplyAll),
@@ -880,6 +925,31 @@ pub fn build_reader_lines_with_opts(
     thumb_dims: (u16, u16),
     show_link_urls: bool,
 ) -> Vec<RenderedLine> {
+    build_reader_lines_with_selected(
+        thread_msgs,
+        expanded_threads,
+        expanded_quoted,
+        theme,
+        width,
+        image_cache,
+        thumb_dims,
+        show_link_urls,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_reader_lines_with_selected(
+    thread_msgs: &[MailMessage],
+    expanded_threads: &std::collections::HashSet<String>,
+    expanded_quoted: &std::collections::HashSet<String>,
+    theme: &Theme,
+    width: usize,
+    image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
+    thumb_dims: (u16, u16),
+    show_link_urls: bool,
+    selected_blocks: Option<(&str, &[RichBlock])>,
+) -> Vec<RenderedLine> {
     let mut out = Vec::new();
     let total = thread_msgs.len();
     let latest = &thread_msgs[total - 1];
@@ -987,7 +1057,14 @@ pub fn build_reader_lines_with_opts(
         }
 
         // Attachment chips bar
-        let eff_attachments = parser::effective_mail_attachments(msg);
+        let cached_blocks = selected_blocks
+            .filter(|(id, _)| *id == msg.id)
+            .map(|(_, blocks)| blocks);
+        let eff_attachments = if let Some(blocks) = cached_blocks {
+            parser::effective_mail_attachments_from_blocks(msg, blocks)
+        } else {
+            parser::effective_mail_attachments(msg)
+        };
         if !eff_attachments.is_empty() {
             let mut spans = vec![Span::raw("  ")];
             let mut inline_targets = Vec::new();
@@ -1065,12 +1142,18 @@ pub fn build_reader_lines_with_opts(
                 theme.muted_style().add_modifier(Modifier::ITALIC),
             ))));
         } else if !msg.body_html.trim().is_empty() {
-            let blocks = parser::parse_message_blocks_arc(&msg.body_html, &msg.attachments);
+            let parsed;
+            let blocks = if let Some(blocks) = cached_blocks {
+                blocks
+            } else {
+                parsed = parser::parse_message_blocks_arc(&msg.body_html, &msg.attachments);
+                &parsed
+            };
             let quote_expanded = expanded_quoted.contains(&msg.id);
             let mut body_lines = Vec::new();
             render_email_blocks(
                 &mut body_lines,
-                &blocks,
+                blocks,
                 msg,
                 t_pos,
                 eff_attachments.as_ref(),
@@ -2214,10 +2297,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reader_and_list_render_summaries_with_lazy_loaded_expanded_thread() {
-        use ratatui::{backend::TestBackend, Terminal};
-
+    fn make_reader_test_app() -> (AppState, UiState) {
         let cfg = crate::config::AppConfig::default();
         let auth = crate::auth::AuthManager::new(cfg.clone()).unwrap();
         let graph = crate::graph::GraphClient::new(cfg.clone(), auth.clone()).unwrap();
@@ -2226,8 +2306,33 @@ mod tests {
         let (cmd_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let sync_ctrl = crate::sync::SyncController::from_channels(focus_tx, cmd_tx);
         let (ui_tx, _) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
-        let mut ui = UiState::from_config(&cfg);
+        let app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let ui = UiState::from_config(&cfg);
+        (app, ui)
+    }
+
+    fn render_reader_text(app: &mut AppState, ui: &mut UiState) -> (String, HitMap) {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        let mut hitmap = HitMap::default();
+        terminal
+            .draw(|f| draw_reader(f, f.area(), app, ui, &mut hitmap))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        (text, hitmap)
+    }
+
+    #[test]
+    fn reader_and_list_render_summaries_with_lazy_loaded_expanded_thread() {
+        let (mut app, mut ui) = make_reader_test_app();
         ui.group_threads = true;
 
         app.storage
@@ -2258,33 +2363,99 @@ mod tests {
         app.select_mail_folder(&mut ui, "f-inbox".into());
         assert!(app.mail_messages.iter().all(|m| m.body_html.is_empty()));
 
-        let render_reader_text = |app: &mut AppState, ui: &mut UiState| -> String {
-            let backend = TestBackend::new(100, 24);
-            let mut terminal = Terminal::new(backend).unwrap();
-            let mut hitmap = HitMap::default();
-            terminal
-                .draw(|f| draw_reader(f, f.area(), app, ui, &mut hitmap))
-                .unwrap();
-            let buf = terminal.backend().buffer();
-            let mut s = String::new();
-            for y in 0..buf.area.height {
-                for x in 0..buf.area.width {
-                    s.push_str(buf[(x, y)].symbol());
-                }
-                s.push('\n');
-            }
-            s
-        };
-
-        let collapsed = render_reader_text(&mut app, &mut ui);
+        let (collapsed, _) = render_reader_text(&mut app, &mut ui);
         assert!(collapsed.contains("NEWER_LAZY_BODY_TOKEN"));
         assert!(collapsed.contains("Older collapsed preview"));
         assert!(!collapsed.contains("OLDER_LAZY_BODY_TOKEN"));
 
         // Expanding older thread item lazily loads and renders its body
         app.expanded_thread_ids.insert("m-old".into());
-        let expanded = render_reader_text(&mut app, &mut ui);
+        let (expanded, _) = render_reader_text(&mut app, &mut ui);
         assert!(expanded.contains("NEWER_LAZY_BODY_TOKEN"));
         assert!(expanded.contains("OLDER_LAZY_BODY_TOKEN"));
+    }
+
+    #[test]
+    fn leaving_mail_keeps_the_layout_reused_on_return_at_the_same_scroll_offset() {
+        use crate::ui::{action::{dispatch, Action}, nav_pane::{TAB_CALENDAR, TAB_MAIL}};
+
+        let (mut app, mut ui) = make_reader_test_app();
+        for i in 0..6 {
+            let id = format!("mail-{i}");
+            let body: String = (0..1200).map(|j| format!("<p>Mail {i}, line {j}</p>")).collect();
+            app.mail_messages.push(sample_mail(&id, &id, &body));
+            app.select_mail_row(&mut ui, i);
+            render_reader_text(&mut app, &mut ui);
+        }
+        ui.mail_read_scroll.offset = 33;
+        let (before, _) = render_reader_text(&mut app, &mut ui);
+        let latest = MAIL_READER_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            assert_eq!(cache.entries.len(), 6);
+            Arc::clone(&cache.entries.last().unwrap().1)
+        });
+        dispatch(Action::SelectNavTab(TAB_CALENDAR), &mut app, &mut ui);
+        MAIL_READER_CACHE.with(|cache| assert_eq!(cache.borrow().entries.len(), 1));
+
+        dispatch(Action::SelectNavTab(TAB_MAIL), &mut app, &mut ui);
+        let (after, _) = render_reader_text(&mut app, &mut ui);
+        assert_eq!(ui.mail_read_scroll.offset, 33);
+        assert_eq!(before, after);
+        MAIL_READER_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            assert_eq!(cache.entries.len(), 1);
+            assert!(Arc::ptr_eq(&cache.entries[0].1, &latest));
+        });
+    }
+
+    #[test]
+    fn warm_oversized_mail_skips_dom_parsing_and_tracks_same_id_quote_edits() {
+        use crate::models::CoreEvent;
+        use crate::parser::html_in::DOM_PARSE_COUNT;
+        use crate::ui::action::{dispatch, Action};
+
+        let pad = |html: String| {
+            let padding = "x".repeat(259 * 1024 - 7 - html.len());
+            format!("{html}<!--{padding}-->")
+        };
+        let body = "<p>Mail body</p>".repeat(60);
+        let mut mail = sample_mail("m-quote", "m-quote", &pad(body.clone()));
+        mail.meeting_request = None;
+        let (mut app, mut ui) = make_reader_test_app();
+        ui.inline_images = false;
+        app.mail_messages.push(mail.clone());
+        app.select_mail_row(&mut ui, 0);
+        let quote = HitTarget::Button(ButtonId::ExpandQuoted);
+        let before = DOM_PARSE_COUNT.with(|count| count.get());
+        let (_, hitmap) = render_reader_text(&mut app, &mut ui);
+        assert!(hitmap.region_of(quote).is_none());
+        let warm = DOM_PARSE_COUNT.with(|count| count.get());
+        assert_eq!(warm - before, 1);
+        for offset in 1..=12 {
+            ui.mail_read_scroll.offset = offset;
+            render_reader_text(&mut app, &mut ui);
+        }
+        assert_eq!(DOM_PARSE_COUNT.with(|count| count.get()), warm);
+
+        ui.mail_read_scroll.top();
+        let quoted = r#"<div id="divRplyFwdMsg"><p>OLDER_QUOTED_TEXT</p></div>"#;
+        let added = pad(format!("<p>Edited body</p>{quoted}"));
+        mail.body_html = added;
+        app.handle_core_event(&mut ui, CoreEvent::MailMessageHydrated(Box::new(mail.clone())));
+        let (folded, hitmap) = render_reader_text(&mut app, &mut ui);
+        assert!(hitmap.region_of(quote).is_some());
+        assert!(!folded.contains("OLDER_QUOTED_TEXT"));
+        dispatch(Action::ToggleQuotedHistory, &mut app, &mut ui);
+        let (opened, _) = render_reader_text(&mut app, &mut ui);
+        assert!(opened.contains("OLDER_QUOTED_TEXT"));
+        assert_eq!(DOM_PARSE_COUNT.with(|count| count.get()), warm + 1);
+
+        mail.body_html = pad("<p>Edited again</p>".into());
+        app.handle_core_event(&mut ui, CoreEvent::MailMessageHydrated(Box::new(mail)));
+        let (removed, hitmap) = render_reader_text(&mut app, &mut ui);
+        assert!(hitmap.region_of(quote).is_none());
+        assert!(removed.contains("Edited again"));
+        assert!(!removed.contains("OLDER_QUOTED_TEXT"));
+        assert_eq!(DOM_PARSE_COUNT.with(|count| count.get()), warm + 2);
     }
 }

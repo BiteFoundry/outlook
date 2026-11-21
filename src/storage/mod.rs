@@ -239,6 +239,16 @@ impl Storage {
         )
     }
 
+    pub(crate) fn list_mail_summaries_through(
+        &self,
+        folder_id: &str,
+        received_at: &str,
+        id: &str,
+    ) -> Result<Vec<MailMessage>> {
+        let conn = self.read_conn()?;
+        outlook::list_mail_summaries_through(&conn, folder_id, received_at, id)
+    }
+
     pub fn get_mail_message(&self, id: &str) -> Result<Option<MailMessage>> {
         let conn = self.read_conn()?;
         outlook::get_mail_message(&conn, id)

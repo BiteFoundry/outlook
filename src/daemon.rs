@@ -239,6 +239,7 @@ impl DaemonSharedState {
                 guard.last_sync_at = Some(chrono::Utc::now().to_rfc3339());
                 guard.last_error = None;
             }
+            CoreEvent::MailHistoryPageFinished { .. } => {}
             CoreEvent::SyncError(err) => {
                 guard.last_error = Some(err.clone());
             }

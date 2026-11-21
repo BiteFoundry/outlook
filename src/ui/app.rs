@@ -24,7 +24,7 @@ use crate::models::{
 };
 use crate::parser;
 use crate::storage::Storage;
-use crate::sync::{ActiveView, FocusTarget, SyncCommand, SyncController};
+use crate::sync::{ActiveView, FocusTarget, SyncCommand, SyncController, MAIL_HISTORY_PAGE_SIZE};
 
 use super::hitmap::{HitMap, HitTarget};
 use super::keymap::Keymap;
@@ -225,6 +225,8 @@ pub enum UiMsg {
 
 pub const MAX_RAW_IMAGE_CACHE_ENTRIES: usize = 8;
 pub const MAX_RAW_IMAGE_CACHE_BYTES: usize = 16 * 1024 * 1024;
+// Preserve the initial history jump when the cache already holds several pages.
+const INITIAL_MAIL_HISTORY_LIMIT: usize = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingPixelGraphic {
@@ -246,6 +248,7 @@ pub struct UiState {
     pub nav_area: Rect,
     pub mail_list_scroll: ScrollState,
     pub mail_read_scroll: ScrollState,
+    pub(crate) mail_reader_content: Option<super::mail_view::ReaderMailContent>,
     pub cal_list_scroll: ScrollState,
     pub cal_detail_scroll: ScrollState,
     pub todo_list_scroll: ScrollState,
@@ -297,6 +300,7 @@ impl UiState {
             nav_area: Rect::default(),
             mail_list_scroll: ScrollState::default(),
             mail_read_scroll: ScrollState::default(),
+            mail_reader_content: None,
             cal_list_scroll: ScrollState::default(),
             cal_detail_scroll: ScrollState::default(),
             todo_list_scroll: ScrollState::default(),
@@ -413,6 +417,7 @@ pub struct AppState {
     pub loading_mail: bool,
     pub loading_older_mail: bool,
     pub mail_oldest_reached: bool,
+    mail_history_boundary: Option<(String, String)>,
     pub syncing: bool,
     pub sync_summary: String,
     pub daemon_attached: bool,
@@ -483,6 +488,7 @@ impl AppState {
             loading_mail: false,
             loading_older_mail: false,
             mail_oldest_reached: false,
+            mail_history_boundary: None,
             syncing: false,
             sync_summary: "Synced".to_string(),
             daemon_attached: false,
@@ -881,6 +887,18 @@ impl AppState {
         self.sync_displayed_mail_details(group_threads, true);
     }
 
+    fn replace_mail_list(&mut self, ui: &mut UiState, messages: Vec<MailMessage>) {
+        self.mail_messages = messages;
+        self.clear_mail_detail_cache();
+        self.preserve_pinned_mail_in_list();
+        if self.active_mail().is_none() {
+            self.select_first_visible_mail(ui);
+        } else {
+            self.hydrate_active_mail_if_needed(ui.group_threads);
+        }
+        self.sync_mail_list_selection_to_active(ui);
+    }
+
     pub(crate) fn sync_mail_list_selection_to_active(&self, ui: &mut UiState) {
         let Some(ref active_id) = self.active_mail_id else {
             return;
@@ -1097,6 +1115,7 @@ impl AppState {
         self.clear_mail_detail_cache();
         self.mail_oldest_reached = false;
         self.loading_older_mail = false;
+        self.mail_history_boundary = None;
         ui.mail_list_scroll = ScrollState::default();
         ui.mail_read_scroll = ScrollState::default();
 
@@ -2811,41 +2830,62 @@ impl AppState {
                 ui.poll_retrying = false;
                 if self.folder_matches_active(&folder_id) {
                     self.loading_mail = false;
-                    self.loading_older_mail = false;
-                    let limit = self.mail_messages.len().max(messages.len()).max(150);
-                    let (filter_folder, unread_only, flagged_only) =
-                        if self.active_folder_id == VIRTUAL_UNREAD_FOLDER {
-                            (None, true, false)
-                        } else if self.active_folder_id == VIRTUAL_FLAGGED_FOLDER {
-                            (None, false, true)
-                        } else {
-                            (Some(self.active_folder_id.as_str()), false, false)
-                        };
-                    if let Ok(loaded) = self.storage.list_mail_summaries_filtered(
-                        filter_folder,
-                        unread_only,
-                        flagged_only,
-                        false,
-                        limit,
-                    ) {
-                        self.mail_messages = loaded;
-                    } else if !messages.is_empty()
-                        && self.active_folder_id != VIRTUAL_UNREAD_FOLDER
-                        && self.active_folder_id != VIRTUAL_FLAGGED_FOLDER
-                    {
-                        self.mail_messages = messages;
-                    }
-                    self.clear_mail_detail_cache();
-                    self.preserve_pinned_mail_in_list();
-                    if self.active_mail().is_none() {
-                        self.select_first_visible_mail(ui);
+                    self.mail_oldest_reached = false;
+                    if let Some((received_at, id)) = &self.mail_history_boundary {
+                        if let Ok(loaded) = self.storage.list_mail_summaries_through(
+                            &self.active_folder_id,
+                            received_at,
+                            id,
+                        ) {
+                            self.replace_mail_list(ui, loaded);
+                        }
                     } else {
-                        self.hydrate_active_mail_if_needed(ui.group_threads);
+                        let limit = self.mail_messages.len().max(messages.len()).max(150);
+                        let (filter_folder, unread_only, flagged_only) =
+                            if self.active_folder_id == VIRTUAL_UNREAD_FOLDER {
+                                (None, true, false)
+                            } else if self.active_folder_id == VIRTUAL_FLAGGED_FOLDER {
+                                (None, false, true)
+                            } else {
+                                (Some(self.active_folder_id.as_str()), false, false)
+                            };
+                        if let Ok(loaded) = self.storage.list_mail_summaries_filtered(
+                            filter_folder,
+                            unread_only,
+                            flagged_only,
+                            false,
+                            limit,
+                        ) {
+                            self.replace_mail_list(ui, loaded);
+                        } else if !messages.is_empty() && filter_folder.is_some() {
+                            self.replace_mail_list(ui, messages);
+                        }
                     }
-                    self.sync_mail_list_selection_to_active(ui);
                 }
                 if let Some(candidate) = notify_candidate {
                     self.maybe_notify(ui, &candidate);
+                }
+            }
+            CoreEvent::MailHistoryPageFinished { folder_id, has_more } => {
+                if !self.loading_older_mail || !self.folder_matches_active(&folder_id) {
+                    return;
+                }
+                self.loading_older_mail = false;
+                let Some(has_more) = has_more else { return };
+                let limit = self
+                    .mail_messages
+                    .len()
+                    .saturating_add(MAIL_HISTORY_PAGE_SIZE)
+                    .max(INITIAL_MAIL_HISTORY_LIMIT);
+                if let Ok(loaded) = self
+                    .storage
+                    .list_mail_summaries(Some(&self.active_folder_id), limit)
+                {
+                    self.mail_oldest_reached = !has_more && loaded.len() < limit;
+                    self.mail_history_boundary = loaded
+                        .last()
+                        .map(|mail| (mail.received_at.clone(), mail.id.clone()));
+                    self.replace_mail_list(ui, loaded);
                 }
             }
             CoreEvent::MailMessageHydrated(hydrated) => {
@@ -2959,7 +2999,7 @@ impl AppState {
                         }
                     }
                 }
-                if !mail_messages.is_empty() {
+                if !mail_messages.is_empty() && self.mail_history_boundary.is_none() {
                     self.mail_messages = mail_messages;
                     self.clear_mail_detail_cache();
                 } else if self.mail_messages.is_empty()
@@ -3404,6 +3444,59 @@ mod tests {
         let app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
         let ui = UiState::from_config(&cfg);
         (app, ui)
+    }
+
+    #[tokio::test]
+    async fn older_pages_extend_folder_and_survive_new_mail_at_the_head() {
+        let (mut app, mut ui) = make_test_app();
+        let mail = |idx: usize| {
+            let id = format!("m{idx:03}");
+            // Equal timestamps exercise SQLite's ID tie-breaker at the history boundary.
+            make_mail(&id, &id, "2026-11-19T08:00:00Z", true, false)
+        };
+        app.storage.upsert_mail_messages(&(101..600).map(mail).collect::<Vec<_>>()).unwrap();
+        app.select_mail_folder(&mut ui, "inbox".into());
+        assert_eq!(app.mail_messages.len(), 150);
+
+        for (rows, expected_selected, has_more) in [
+            (51..101, "m450", true),
+            (1..51, "m100", false),
+        ] {
+            let last_row = app.mail_messages.len() - 1;
+            app.select_mail_row(&mut ui, last_row);
+            assert_eq!(app.active_mail_id.as_deref(), Some(expected_selected));
+            assert!(app.loading_older_mail);
+            app.handle_core_event(&mut ui, CoreEvent::MailMessagesUpdated {
+                folder_id: "inbox".into(), messages: vec![], notify_candidate: None,
+            });
+            assert!(app.loading_older_mail);
+
+            app.storage.upsert_mail_messages(&rows.map(mail).collect::<Vec<_>>()).unwrap();
+            app.handle_core_event(&mut ui, CoreEvent::MailHistoryPageFinished {
+                folder_id: "inbox".into(), has_more: Some(has_more),
+            });
+            assert!(!app.loading_older_mail);
+            assert_eq!(ui.mail_list_scroll.selected_idx, Some(last_row));
+            assert_eq!(app.active_mail_id.as_deref(), Some(expected_selected));
+        }
+
+        // A new arrival must keep the prior oldest visible mail, including when selected.
+        app.select_mail_row(&mut ui, 549);
+        assert_eq!(app.active_mail_id.as_deref(), Some("m050"));
+        app.storage.upsert_mail_messages(&[mail(600)]).unwrap();
+        app.handle_core_event(&mut ui, CoreEvent::MailMessagesUpdated {
+            folder_id: "inbox".into(), messages: vec![], notify_candidate: None,
+        });
+        assert_eq!(app.mail_messages.len(), 551);
+        assert_eq!(app.active_mail_id.as_deref(), Some("m050"));
+        assert_eq!(ui.mail_list_scroll.selected_idx, Some(550));
+
+        // An exhausted Graph cursor still allows paging through the remaining local rows.
+        app.handle_core_event(&mut ui, CoreEvent::MailHistoryPageFinished {
+            folder_id: "inbox".into(), has_more: Some(false),
+        });
+        assert_eq!(app.mail_messages.len(), 600);
+        assert!(app.mail_oldest_reached);
     }
 
     #[tokio::test]

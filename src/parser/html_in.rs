@@ -56,6 +56,11 @@ impl HtmlParseCache {
 
 static HTML_PARSE_CACHE: OnceLock<Mutex<HtmlParseCache>> = OnceLock::new();
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static DOM_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 struct Fnv1a64(u64);
 
 impl Fnv1a64 {
@@ -105,7 +110,7 @@ fn hash_opt_str_field(h1: &mut DefaultHasher, h2: &mut Fnv1a64, opt: Option<&str
     }
 }
 
-fn compute_parse_fingerprint(html: &str, attachments: &[MailAttachment]) -> HtmlCacheKey {
+pub(crate) fn compute_parse_fingerprint(html: &str, attachments: &[MailAttachment]) -> HtmlCacheKey {
     let mut h1 = DefaultHasher::new();
     let mut h2 = Fnv1a64::new();
 
@@ -227,6 +232,8 @@ fn parse_message_blocks_uncached(
         if !html.contains('<') && !html.contains('&') {
             ctx.parse_plain_text_lines(html);
         } else {
+            #[cfg(test)]
+            DOM_PARSE_COUNT.with(|count| count.set(count.get() + 1));
             let fragment = Html::parse_fragment(html);
             ctx.walk_children(fragment.root_element(), &TextStyleFlags::default());
             ctx.flush_paragraph();

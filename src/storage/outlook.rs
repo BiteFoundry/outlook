@@ -742,6 +742,24 @@ pub fn list_mail_summaries(
     list_mail_summaries_filtered(conn, folder_id_or_wellknown, false, false, false, limit)
 }
 
+/// Reload a folder through the last exposed row, including newer arrivals above it.
+pub(super) fn list_mail_summaries_through(
+    conn: &Connection,
+    folder_id: &str,
+    received_at: &str,
+    id: &str,
+) -> Result<Vec<MailMessage>> {
+    let sql = format!(
+        "SELECT {MAIL_SUMMARY_SELECT_COLS}
+         FROM mail_messages m
+         WHERE {FOLDER_FILTER_PREDICATE} AND (m.received_at, m.id) >= (?2, ?3)
+         ORDER BY m.received_at DESC, m.id DESC"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map(params![folder_id, received_at, id], map_mail_summary_row)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+}
+
 pub fn get_mail_message(conn: &Connection, message_id: &str) -> Result<Option<MailMessage>> {
     let sql = format!(
         "

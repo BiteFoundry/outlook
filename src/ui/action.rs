@@ -13,6 +13,7 @@ use crate::sync::SyncCommand;
 use super::app::{AppState, CalendarRangeFilter, Focus, NarrowPane, UiMsg, UiState};
 use super::composer;
 use super::hitmap::{ButtonId, HitTarget};
+use super::mail_view::retain_latest_reader_layout;
 use super::nav_pane::{NavRow, TAB_CALENDAR, TAB_COUNT, TAB_MAIL, TAB_TASKS};
 use super::overlays::context_menu::{ContextMenu, ContextTarget};
 use super::overlays::html_preview::{self, HtmlPreviewOverlay};
@@ -308,6 +309,9 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         // Tabs & navigation
         Action::SelectNavTab(tab) => {
             ui.show_nav_rail = true;
+            if ui.active_nav_tab == TAB_MAIL && tab != TAB_MAIL {
+                retain_latest_reader_layout();
+            }
             ui.active_nav_tab = tab.min(TAB_COUNT - 1);
             ui.medium_reader_fullscreen = false;
             ui.nav_selected = 1;
@@ -675,6 +679,9 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             }
         }
         Action::JumpToCalendarEvent(event_id) => {
+            if ui.active_nav_tab == TAB_MAIL {
+                retain_latest_reader_layout();
+            }
             ui.active_nav_tab = TAB_CALENDAR;
             ui.cal_range = CalendarRangeFilter::AllUpcoming;
             app.active_event_id = Some(event_id.clone());

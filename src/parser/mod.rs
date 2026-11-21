@@ -26,8 +26,15 @@ pub fn effective_mail_attachments(msg: &MailMessage) -> Cow<'_, [MailAttachment]
     }
 
     let blocks = parse_message_blocks_arc(&msg.body_html, &msg.attachments);
+    effective_mail_attachments_from_blocks(msg, &blocks)
+}
+
+pub(crate) fn effective_mail_attachments_from_blocks<'a>(
+    msg: &'a MailMessage,
+    blocks: &[RichBlock],
+) -> Cow<'a, [MailAttachment]> {
     let mut extra: Vec<MailAttachment> = Vec::new();
-    collect_inline_image_attachments(&blocks, &msg.attachments, &mut extra);
+    collect_inline_image_attachments(blocks, &msg.attachments, &mut extra);
 
     if extra.is_empty() {
         Cow::Borrowed(&msg.attachments)

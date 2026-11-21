@@ -395,6 +395,11 @@ pub enum CoreEvent {
         messages: Vec<MailMessage>,
         notify_candidate: Option<NotificationCandidate>,
     },
+    MailHistoryPageFinished {
+        folder_id: String,
+        /// Graph cursor availability, or `None` if the request failed.
+        has_more: Option<bool>,
+    },
     MailMessageHydrated(Box<MailMessage>),
     CalendarEventsUpdated(Vec<CalendarEvent>),
     ContactsUpdated(Vec<ContactItem>),

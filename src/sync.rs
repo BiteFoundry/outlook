@@ -36,6 +36,7 @@ const DEDUP_COALESCE_WINDOW: Duration = Duration::from_millis(400);
 const AUTH_EXPIRY_PAUSE_SECS: u64 = 30;
 const MAX_ERROR_BACKOFF_MS: u64 = 300_000;
 const HISTORY_EOF_MARKER: &str = "__eof__";
+pub(crate) const MAIL_HISTORY_PAGE_SIZE: usize = 50;
 const INBOX_PREFETCH_UNREAD_LIMIT: usize = 5;
 
 pub(crate) struct SyncSharedState {
@@ -651,9 +652,14 @@ pub fn spawn_sync_engine(
                         Some(SyncCommand::LoadOlderMail { folder_id, explicit }) => {
                             fast_shared.record_activity(Instant::now());
                             fast_shared.clear_auth_pause();
-                            if !restricted_folders.contains(&folder_id) {
-                                match load_older_mail_page(&folder_id, explicit, &fast_graph, &fast_storage, &fast_event_tx).await {
-                                    Ok(()) => emit_recovered_if_needed(&mut active_err_backoff, &fast_event_tx),
+                            let has_more = if restricted_folders.contains(&folder_id) {
+                                None
+                            } else {
+                                match load_older_mail_page(&folder_id, explicit, &fast_graph, &fast_storage).await {
+                                    Ok(has_more) => {
+                                        emit_recovered_if_needed(&mut active_err_backoff, &fast_event_tx);
+                                        Some(has_more)
+                                    }
                                     Err(err) => {
                                         handle_quiet_mail_error(
                                             &err,
@@ -663,9 +669,11 @@ pub fn spawn_sync_engine(
                                             &mut active_err_backoff,
                                             &fast_event_tx,
                                         );
+                                        None
                                     }
                                 }
-                            }
+                            };
+                            let _ = fast_event_tx.send(CoreEvent::MailHistoryPageFinished { folder_id, has_more });
                         }
                         Some(SyncCommand::NotifyUserActivity) => {
                             fast_shared.record_activity(Instant::now());
@@ -1263,15 +1271,14 @@ async fn load_older_mail_page(
     explicit: bool,
     graph: &GraphClient,
     storage: &Storage,
-    event_tx: &mpsc::UnboundedSender<CoreEvent>,
-) -> Result<()> {
+) -> Result<bool> {
     let scope_key = format!("mail_history:{folder_id}");
     let scope_clone = scope_key.clone();
     let cursor = run_storage(storage, move |st| st.get_sync_cursor(&scope_clone)).await?;
     let existing_next = cursor.and_then(|c| c.history_next_link);
 
     if existing_next.as_deref() == Some(HISTORY_EOF_MARKER) && !explicit {
-        return Ok(());
+        return Ok(false);
     }
 
     let mut next_arg: Option<String> = existing_next
@@ -1279,18 +1286,17 @@ async fn load_older_mail_page(
         .filter(|s| *s != HISTORY_EOF_MARKER)
         .map(str::to_string);
 
-    let mut total_changed = 0usize;
     let mut final_next_link: Option<String> = None;
 
     for _ in 0..5 {
         let (messages, next_link) = match graph
-            .list_mail_messages_page(folder_id, 50, next_arg.as_deref(), true)
+            .list_mail_messages_page(folder_id, MAIL_HISTORY_PAGE_SIZE, next_arg.as_deref(), true)
             .await
         {
             Ok(res) => res,
             Err(err) if next_arg.is_some() && is_expired_delta_error(&err) => {
                 graph
-                    .list_mail_messages_page(folder_id, 50, None, true)
+                    .list_mail_messages_page(folder_id, MAIL_HISTORY_PAGE_SIZE, None, true)
                     .await?
             }
             Err(err) => return Err(err),
@@ -1298,7 +1304,6 @@ async fn load_older_mail_page(
 
         let msgs_for_db = messages;
         let changed = run_storage(storage, move |st| st.upsert_mail_messages(&msgs_for_db)).await?;
-        total_changed += changed;
         final_next_link = next_link.clone();
         if changed > 0 || next_link.is_none() {
             break;
@@ -1306,26 +1311,19 @@ async fn load_older_mail_page(
         next_arg = next_link;
     }
 
-    let fid_owned = folder_id.to_string();
-    let stored_list = run_storage(storage, move |st| {
+    let has_more = final_next_link.is_some();
+    run_storage(storage, move |st| {
         st.upsert_sync_cursor(&SyncCursor {
             scope_key,
             delta_link: None,
             history_next_link: final_next_link.or_else(|| Some(HISTORY_EOF_MARKER.to_string())),
             last_synced_at: chrono::Utc::now().to_rfc3339(),
         })?;
-        st.list_mail_summaries_filtered(Some(&fid_owned), false, false, false, 500)
+        Ok(())
     })
     .await?;
 
-    if total_changed > 0 || explicit {
-        let _ = event_tx.send(CoreEvent::MailMessagesUpdated {
-            folder_id: folder_id.to_string(),
-            messages: stored_list,
-            notify_candidate: None,
-        });
-    }
-    Ok(())
+    Ok(has_more)
 }
 
 #[derive(Debug, Clone)]

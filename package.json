@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/outlook",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Microsoft Outlook terminal client & AI agent toolkit — Mail, Calendar, Tasks & Contacts (CLI, TUI, HTTP API, MCP)",
   "repository": {
     "type": "git",
@@ -36,11 +36,11 @@
     "build:npm": "node scripts/build-npm.mjs"
   },
   "optionalDependencies": {
-    "@bitefoundry/outlook-win32-x64": "0.1.4",
-    "@bitefoundry/outlook-win32-arm64": "0.1.4",
-    "@bitefoundry/outlook-darwin-x64": "0.1.4",
-    "@bitefoundry/outlook-darwin-arm64": "0.1.4",
-    "@bitefoundry/outlook-linux-x64": "0.1.4",
-    "@bitefoundry/outlook-linux-arm64": "0.1.4"
+    "@bitefoundry/outlook-win32-x64": "0.1.5",
+    "@bitefoundry/outlook-win32-arm64": "0.1.5",
+    "@bitefoundry/outlook-darwin-x64": "0.1.5",
+    "@bitefoundry/outlook-darwin-arm64": "0.1.5",
+    "@bitefoundry/outlook-linux-x64": "0.1.5",
+    "@bitefoundry/outlook-linux-arm64": "0.1.5"
   }
 }
