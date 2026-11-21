@@ -41,6 +41,8 @@ outlook login
 outlook
 ```
 
+For a company registration, use `outlook login --client-id YOUR_CLIENT_ID --tenant-id YOUR_TENANT_ID`. Without an override, Outlook uses the Microsoft Graph Command Line Tools client for its own interactive login. [Register a desktop app](https://github.com/BiteFoundry/teams/blob/master/docs/ENTERPRISE.md) · [Outlook delegated permissions](docs/NPM.md#required-microsoft-graph-delegated-scopes)
+
 > **Shared M365 Session & Token Brokers:** When `share_m365_auth = true` (default), `outlook` seamlessly reuses or upgrades an existing `@bitefoundry/teams` session without a second browser login. Also supports `--device-code`, `OUTLOOK_ACCESS_TOKEN`, `OUTLOOK_TOKEN_FILE`, `OUTLOOK_TOKEN_REFRESH_CMD` (`az account get-access-token`), and custom Entra ID apps. Run `outlook whoami` or `outlook doctor --online` for JWT scope diagnostics, and `outlook update` for one-click SHA-256 verified self-updates.
 
 ---
@@ -148,10 +150,10 @@ Full tool schemas & client setups: **[docs/MCP.md](docs/MCP.md)** · **[docs/NPM
 | --- | --- | --- | --- |
 | [`@bitefoundry/teams`](https://github.com/BiteFoundry/teams) | `teams` | Microsoft Teams (Chats, Channels, Threads, Presence) | TUI · CLI · HTTP · MCP |
 | **`@bitefoundry/outlook`** *(this repo)* | `outlook` | Microsoft Outlook (Mail, Calendar, To Do, Contacts) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/onenote`](https://github.com/BiteFoundry/onenote) | `onenote`, `note` | Microsoft OneNote (Notebooks, Sections, Pages) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/sharepoint`](https://github.com/BiteFoundry/sharepoint) | `sharepoint`, `sp`, `onedrive`, `od` | SharePoint & OneDrive (Sites, Drives, Lists, Files) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/atlassian`](https://github.com/BiteFoundry/atlassian) | `atlassian`, `jira`, `confluence`, `conf` | Jira & Confluence (Issues, Boards, Sprints, Wiki) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/notion`](https://github.com/BiteFoundry/notion) | `notion`, `nt` | Notion (Pages, Databases, Blocks, Comments) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/onenote`](https://github.com/BiteFoundry/onenote) | `onenote` | Microsoft OneNote (Notebooks, Sections, Pages) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/sharepoint`](https://github.com/BiteFoundry/sharepoint) | `sharepoint`, `bitefoundry-onedrive` | SharePoint & OneDrive (Sites, Drives, Lists, Files) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/atlassian`](https://github.com/BiteFoundry/atlassian) | `atlassian`, `confluence`, `conf` | Jira & Confluence (Issues, Boards, Sprints, Wiki) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/notion`](https://github.com/BiteFoundry/notion) | `notion` | Notion (Pages, Databases, Blocks, Comments) | TUI · CLI · HTTP · MCP |
 
 ---
 
