@@ -1777,7 +1777,21 @@ async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
     let search_remote_text = search_remote_call["result"]["content"][0]["text"]
         .as_str()
         .unwrap();
-    assert!(search_remote_text.contains("Remote KQL hit"));
+    assert!(search_remote_text.contains("Q4 Metrics & Architecture"));
+    assert!(!search_remote_text.contains("body_html"));
+
+    let search_remote_full_call = mcp::handle_rpc_line(
+        &cfg,
+        &graph,
+        &storage,
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"search_mail","arguments":{"query":"Architecture","offline":false,"compact":false}}}"#,
+    )
+    .await
+    .unwrap();
+    let search_remote_full_text = search_remote_full_call["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(search_remote_full_text.contains("Remote KQL hit"));
 
     // 4. Self-updater check against a newer release and mandatory SHA256SUMS.txt verification.
     fn next_version() -> String {
@@ -2112,10 +2126,10 @@ async fn regression_outlook_outlook_02_preserves_cached_attachments_after_move()
                         calls.fetch_add(1, Ordering::SeqCst);
                         match id.as_str() {
                             // Standard Graph /move response: includes body, hasAttachments=true, omits attachments
-                            "m-att-1" => Json(json!({
-                                "id": "m-att-1-moved",
+                            "m-att-1" | "m-att-full" | "m-att-mcp" => Json(json!({
+                                "id": format!("{id}-moved"),
                                 "parentFolderId": "folder-archive",
-                                "subject": "Attachment test m-att-1",
+                                "subject": format!("Attachment test {id}"),
                                 "from": { "emailAddress": { "name": "Bob", "address": "bob@contoso.com" } },
                                 "receivedDateTime": "2026-11-20T10:00:00Z",
                                 "isRead": false,
@@ -2202,9 +2216,11 @@ async fn regression_outlook_outlook_02_preserves_cached_attachments_after_move()
 
     let dir = tempfile::tempdir().unwrap();
 
-    // Seed all 5 messages into cache via online read ($expand=attachments)
+    // Seed all messages into cache via online read ($expand=attachments)
     for id in [
         "m-att-1",
+        "m-att-full",
+        "m-att-mcp",
         "m-explicit-empty",
         "m-no-att",
         "m-server-list",
@@ -2225,6 +2241,83 @@ async fn regression_outlook_outlook_02_preserves_cached_attachments_after_move()
         "move m-att-1 failed: {}",
         String::from_utf8_lossy(&mv.stderr)
     );
+    let mv_stdout = String::from_utf8_lossy(&mv.stdout);
+    assert!(
+        !mv_stdout.contains("content_bytes_b64"),
+        "move --json must not leak content_bytes_b64: {mv_stdout}"
+    );
+    assert!(
+        !mv_stdout.contains("body_html"),
+        "move --json default must not include body_html: {mv_stdout}"
+    );
+    let mv_val: Value = serde_json::from_slice(&mv.stdout).unwrap();
+    assert_eq!(mv_val["ok"], true);
+    assert_eq!(mv_val["message_id"], "m-att-1-moved");
+    assert_eq!(mv_val["previous_message_id"], "m-att-1");
+    assert_eq!(mv_val["destination_folder"]["id"], "folder-archive");
+    assert!(
+        mv_val.get("message").is_none(),
+        "move --json default must omit message object: {mv_val}"
+    );
+
+    // 1-full. Archive --json --full returns public message with content_cached and without content_bytes_b64
+    let mv_full = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["archive", "m-att-full", "--json", "--full"],
+    );
+    assert!(
+        mv_full.status.success(),
+        "archive --full failed: {}",
+        String::from_utf8_lossy(&mv_full.stderr)
+    );
+    let mv_full_stdout = String::from_utf8_lossy(&mv_full.stdout);
+    assert!(
+        !mv_full_stdout.contains("content_bytes_b64"),
+        "archive --json --full must not leak content_bytes_b64"
+    );
+    let mv_full_val: Value = serde_json::from_slice(&mv_full.stdout).unwrap();
+    assert_eq!(mv_full_val["message_id"], "m-att-full-moved");
+    assert_eq!(mv_full_val["previous_message_id"], "m-att-full");
+    let full_atts = mv_full_val["message"]["attachments"].as_array().unwrap();
+    assert_eq!(full_atts.len(), 2);
+    assert_eq!(full_atts[0]["content_cached"], false);
+    assert_eq!(full_atts[1]["content_cached"], true);
+    assert!(full_atts[1].get("content_bytes_b64").is_none());
+
+    // 1-mcp. MCP update_message(destination_folder) returns compact moved {id, folder_id}
+    let cfg = test_config_for_server(&base_url);
+    let tok = StoredTokens {
+        access_token: token.clone(),
+        refresh_token: None,
+        expires_at: chrono::Utc::now().timestamp() + 3600,
+        client_id: cfg.client_id.clone(),
+        tenant_id: cfg.tenant_id.clone(),
+        user_id: Some("regression-user".into()),
+        user_display_name: Some("Alice Outlook".into()),
+        user_email: Some("alice@contoso.com".into()),
+        auth_mode: "access_token".into(),
+    };
+    let auth = AuthManager::from_tokens(cfg.clone(), tok);
+    let graph = GraphClient::new(cfg.clone(), auth).unwrap();
+    let db_path = dir.path().join("regression-user").join("cache.db");
+    let storage = Storage::open(&db_path).unwrap();
+    let (mcp_err, mcp_val) = call_mcp_tool_json(
+        &cfg,
+        &graph,
+        &storage,
+        "update_message",
+        json!({ "message_id": "m-att-mcp", "destination_folder": "archive" }),
+    )
+    .await;
+    assert!(!mcp_err, "MCP update_message move failed: {mcp_val}");
+    assert_eq!(mcp_val["message_id"], "m-att-mcp-moved");
+    assert_eq!(
+        mcp_val["moved"],
+        json!({ "id": "m-att-mcp-moved", "folder_id": "folder-archive" })
+    );
+    drop(storage);
 
     let calls_before_offline = graph_calls.load(Ordering::SeqCst);
     // 1a. read --cached on new ID MUST expose report.pdf & chart.png with IDs
@@ -2375,7 +2468,7 @@ async fn regression_outlook_outlook_02_preserves_cached_attachments_after_move()
     assert_eq!(srv_atts[0]["id"], "att-server-new");
     assert_eq!(srv_atts[0]["name"], "server_new.txt");
 
-    // 5. Control 4: move failure preserves existing ID and attachments
+    // 5. Control 4: move failure preserves existing ID and attachments, and emits structured JSON error under --json
     let mv_fail = run_outlook_cli(
         &dir,
         &base_url,
@@ -2383,6 +2476,36 @@ async fn regression_outlook_outlook_02_preserves_cached_attachments_after_move()
         &["move", "m-fail-move", "archive", "--json"],
     );
     assert!(!mv_fail.status.success());
+    let mv_fail_json: Value = serde_json::from_slice(&mv_fail.stdout).expect("move --json failure must emit JSON on stdout");
+    assert_eq!(mv_fail_json["ok"], false);
+    assert!(mv_fail_json["error"]["code"].is_string());
+    assert!(mv_fail_json["error"]["message"].is_string());
+    assert!(
+        !mv_fail.stderr.is_empty(),
+        "move --json failure must still emit message on stderr"
+    );
+
+    // 5a. Control: same failure without --json leaves stdout empty and writes Error: to stderr
+    let mv_fail_text = run_outlook_cli(&dir, &base_url, &token, &["move", "m-fail-move", "archive"]);
+    assert!(!mv_fail_text.status.success());
+    assert!(
+        mv_fail_text.stdout.is_empty(),
+        "non-json failure must leave stdout empty"
+    );
+    assert!(
+        String::from_utf8_lossy(&mv_fail_text.stderr).contains("Error:"),
+        "non-json failure must print Error: on stderr"
+    );
+
+    // 5b. W2: delete --json without --yes emits confirmation_required with 0 Graph calls
+    let calls_before_del = graph_calls.load(Ordering::SeqCst);
+    let del_no_yes = run_outlook_cli(&dir, &base_url, &token, &["delete", "m-fail-move", "--json"]);
+    assert!(!del_no_yes.status.success());
+    let del_json: Value = serde_json::from_slice(&del_no_yes.stdout).expect("delete --json failure must emit JSON on stdout");
+    assert_eq!(del_json["ok"], false);
+    assert_eq!(del_json["error"]["code"], "confirmation_required");
+    assert_eq!(graph_calls.load(Ordering::SeqCst), calls_before_del);
+
     let read_fail = run_outlook_cli(
         &dir,
         &base_url,
@@ -2764,7 +2887,8 @@ async fn regression_outlook_outlook_04_applies_computed_window_offline_and_cache
             "end": { "dateTime": ev_span_end, "timeZone": "UTC" },
             "isAllDay": false,
             "responseStatus": { "response": "accepted" },
-            "isCancelled": false
+            "isCancelled": false,
+            "body": { "contentType": "html", "content": "<p>Spanning agenda</p>" }
         }),
         json!({
             "id": "ev-inside",
@@ -3023,7 +3147,7 @@ async fn regression_outlook_outlook_04_applies_computed_window_offline_and_cache
         "offline/cached calendar queries must make 0 Graph calls"
     );
 
-    // 6. Online CLI with same window matches offline/cached/MCP/HTTP IDs
+    // 6. Online CLI with same window matches offline/cached/MCP/HTTP IDs, compact omits body_html, --full restores it
     let out_online = run_outlook_cli(
         &dir,
         &base_url,
@@ -3035,6 +3159,49 @@ async fn regression_outlook_outlook_04_applies_computed_window_offline_and_cache
     assert_eq!(extract_ids(&val_online), expected);
     assert_eq!(val_online["start"], val_days_offline["start"]);
     assert_eq!(val_online["end"], val_days_offline["end"]);
+    assert!(
+        val_online["events"][0].get("body_html").is_none(),
+        "calendar --json must omit body_html by default"
+    );
+    assert!(
+        val_online["events"][0].get("body_plain").is_some(),
+        "calendar --json must retain body_plain"
+    );
+
+    let out_online_full = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["calendar", "--days", "1", "--json", "--full"],
+    );
+    assert!(out_online_full.status.success());
+    let val_online_full: Value = serde_json::from_slice(&out_online_full.stdout).unwrap();
+    assert!(
+        val_online_full["events"][0].get("body_html").is_some(),
+        "calendar --json --full must include body_html"
+    );
+
+    // MCP list_events compact default vs compact:false
+    let (mcp_c_err, mcp_compact) = call_mcp_tool_json(
+        &cfg,
+        &graph,
+        &storage,
+        "list_events",
+        json!({ "days": 1, "offline": true }),
+    )
+    .await;
+    assert!(!mcp_c_err);
+    assert!(mcp_compact["events"][0].get("body_html").is_none());
+    let (mcp_f_err, mcp_full) = call_mcp_tool_json(
+        &cfg,
+        &graph,
+        &storage,
+        "list_events",
+        json!({ "days": 1, "offline": true, "compact": false }),
+    )
+    .await;
+    assert!(!mcp_f_err);
+    assert!(mcp_full["events"][0].get("body_html").is_some());
 
     api_server.abort();
     server.abort();
@@ -3624,13 +3791,28 @@ async fn regression_outlook_outlook_10_recovers_recreated_folder_id_on_404() {
                     log.write()
                         .unwrap()
                         .push(format!("POST /v1.0/me/messages/{id}/move->{dest}"));
-                    (
-                        StatusCode::NOT_FOUND,
+                    if dest == "f-sprint-new" {
                         Json(json!({
-                            "error": { "code": "ErrorItemNotFound", "message": "folder gone" }
-                        })),
-                    )
+                            "id": format!("{id}-moved"),
+                            "parentFolderId": "f-sprint-new",
+                            "subject": "Moved Sprint Mail",
+                            "from": { "emailAddress": { "name": "Bob", "address": "bob@contoso.com" } },
+                            "receivedDateTime": "2026-11-21T10:00:00Z",
+                            "isRead": false,
+                            "isDraft": false,
+                            "hasAttachments": false,
+                            "bodyPreview": "Moved item"
+                        }))
                         .into_response()
+                    } else {
+                        (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({
+                                "error": { "code": "ErrorItemNotFound", "message": "folder gone" }
+                            })),
+                        )
+                            .into_response()
+                    }
                 }
             }),
         );
@@ -3795,7 +3977,7 @@ async fn regression_outlook_outlook_10_recovers_recreated_folder_id_on_404() {
     assert!(out_off.status.success());
     assert!(req_log.read().unwrap().is_empty());
 
-    // 7. Control: mail move does NOT apply folder refresh retry
+    // 7. W5 #5-c: mail move recovers recreated folder ID on 404 when destination is given by name
     reset_stale_folders();
     req_log.write().unwrap().clear();
     let out_mv = run_outlook_cli(
@@ -3804,7 +3986,33 @@ async fn regression_outlook_outlook_10_recovers_recreated_folder_id_on_404() {
         &token,
         &["move", "m-any", "Sprint", "--json"],
     );
-    assert!(!out_mv.status.success());
+    assert!(
+        out_mv.status.success(),
+        "move m-any Sprint must recover recreated folder on 404: {}",
+        String::from_utf8_lossy(&out_mv.stderr)
+    );
+    let mv_val: Value = serde_json::from_slice(&out_mv.stdout).unwrap();
+    assert_eq!(mv_val["destination_folder"]["id"], "f-sprint-new");
+    assert_eq!(mv_val["message_id"], "m-any-moved");
+    assert_eq!(
+        *req_log.read().unwrap(),
+        vec![
+            "POST /v1.0/me/messages/m-any/move->f-sprint-old",
+            "GET /v1.0/me/mailFolders",
+            "POST /v1.0/me/messages/m-any/move->f-sprint-new",
+        ]
+    );
+
+    // 7b. Control: move with explicit folder ID does NOT refresh mailFolders or retry on 404
+    reset_stale_folders();
+    req_log.write().unwrap().clear();
+    let out_mv_id = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["move", "m-any", "f-sprint-old", "--json"],
+    );
+    assert!(!out_mv_id.status.success());
     assert_eq!(
         *req_log.read().unwrap(),
         vec!["POST /v1.0/me/messages/m-any/move->f-sprint-old"]
@@ -5389,6 +5597,27 @@ async fn plan_outlook_08_remote_search_control_small() {
     assert_eq!(val["returned"], 30);
     assert_eq!(val["has_more"], true);
     assert_eq!(req_count.load(Ordering::SeqCst), 1);
+    assert!(
+        val["remote"][0].get("body_html").is_none(),
+        "search --remote --json must be compact by default"
+    );
+
+    let out_full = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &["search", "q", "--remote", "--limit", "30", "--json", "--full"],
+    );
+    assert!(
+        out_full.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out_full.stderr)
+    );
+    let val_full: Value = serde_json::from_slice(&out_full.stdout).unwrap();
+    assert!(
+        val_full["remote"][0].get("body_html").is_some(),
+        "search --remote --json --full must include full message fields"
+    );
 
     server.abort();
 }
@@ -5434,7 +5663,14 @@ async fn plan_outlook_08_cursor_rejects_foreign_url() {
             &["search", "q", "--remote", "--json", "--cursor", &cur],
         );
         assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
+        let err_json: Value =
+            serde_json::from_slice(&out.stdout).expect("expected structured JSON error on stdout");
+        assert_eq!(err_json["ok"], false);
+        assert_eq!(err_json["error"]["code"], "error");
+        assert!(err_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid cursor: url is not a Graph URL for this account"));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             stderr.contains("invalid cursor: url is not a Graph URL for this account"),
@@ -5641,7 +5877,10 @@ async fn plan_outlook_cursor_rejects_changed_folder_or_filter() {
     for args in cli_bad_cases {
         let out = run_outlook_cli(&dir, &base_url, &token, &args);
         assert_eq!(out.status.code(), Some(1), "expected exit 1 for {args:?}");
-        assert!(out.stdout.is_empty(), "expected empty stdout for {args:?}");
+        let err_json: Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("expected JSON error stdout for {args:?}: {e}"));
+        assert_eq!(err_json["ok"], false);
+        assert_eq!(err_json["error"]["message"], expected_err);
         assert_eq!(
             String::from_utf8_lossy(&out.stderr).trim(),
             expected_cli_stderr,
@@ -5856,7 +6095,10 @@ async fn plan_outlook_cursor_rejects_changed_query_or_operation() {
     for args in bad_cli {
         let out = run_outlook_cli(&dir, &base_url, &token, &args);
         assert_eq!(out.status.code(), Some(1), "expected exit 1 for {args:?}");
-        assert!(out.stdout.is_empty());
+        let err_json: Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("expected JSON error stdout for {args:?}: {e}"));
+        assert_eq!(err_json["ok"], false);
+        assert_eq!(err_json["error"]["message"], expected_err);
         assert_eq!(
             String::from_utf8_lossy(&out.stderr).trim(),
             expected_cli_stderr,

@@ -2079,6 +2079,11 @@ pub fn explain_graph_permission_error(err_msg: &str, access_token: Option<&str>)
         if let Some(msg) = targeted.or_else(|| diag.warnings.into_iter().next()) {
             return Some(format!("{INSUFFICIENT_PERMISSIONS_PREFIX} {msg}"));
         }
+        if !diag.scopes.is_empty() || !diag.roles.is_empty() {
+            return Some(format!(
+                "{INSUFFICIENT_PERMISSIONS_PREFIX} the token carries the required Outlook scopes; access to this resource is restricted (item or mailbox permissions, or tenant policy)."
+            ));
+        }
     }
     Some(format!(
         "{INSUFFICIENT_PERMISSIONS_PREFIX} current token lacks required Outlook scopes (`Mail.ReadWrite`, `Mail.Send`, `Calendars.ReadWrite`, `Contacts.Read`, `Tasks.ReadWrite`) or access to this resource is restricted."
@@ -3234,6 +3239,28 @@ mod tests {
             ),
             None
         );
+
+        let full_scope_jwt = make_test_jwt_with_encoder(
+            &serde_json::json!({
+                "scp": "User.Read Mail.ReadWrite Mail.Send Calendars.ReadWrite Contacts.ReadWrite Tasks.ReadWrite"
+            }),
+            false,
+        );
+        let explained_acl = explain_graph_permission_error(
+            "Graph API error (GET https://graph.microsoft.com/v1.0/me/messages/msg-403-deny): 403 Forbidden [ErrorAccessDenied]",
+            Some(&full_scope_jwt),
+        )
+        .expect("403 with full scopes must be explained");
+        assert!(explained_acl.starts_with(INSUFFICIENT_PERMISSIONS_PREFIX));
+        assert!(!explained_acl.to_ascii_lowercase().contains("lacks"));
+        assert!(explained_acl.contains("restricted"));
+
+        let explained_opaque = explain_graph_permission_error(
+            "Graph API error (GET https://graph.microsoft.com/v1.0/me/messages/msg-403-deny): 403 Forbidden [ErrorAccessDenied]",
+            Some("opaque-non-jwt-token"),
+        )
+        .expect("403 with opaque token must keep fallback explanation");
+        assert!(explained_opaque.contains("current token lacks required Outlook scopes"));
     }
 
     #[tokio::test]

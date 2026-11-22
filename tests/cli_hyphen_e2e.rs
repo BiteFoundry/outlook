@@ -25,7 +25,8 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
-const RICH_DRAFT_HTML: &str = r#"<p>Review <a href="https://example.com/spec">the specification</a>.</p><p><img src="cid:diagram01@contoso" alt="Architecture Diagram"></p>"#;
+const QUOTED_THREAD_HTML: &str = r#"<div id="appendonsend"></div><hr><div id="divRplyFwdMsg"><p>Quoted thread from Bob</p></div>"#;
+const RICH_DRAFT_HTML: &str = r#"<p>Review <a href="https://example.com/spec">the specification</a>.</p><p><img src="cid:diagram01@contoso" alt="Architecture Diagram"></p><div id="appendonsend"></div><hr><div id="divRplyFwdMsg"><p>Quoted thread from Bob</p></div>"#;
 
 #[derive(Clone)]
 struct DraftFixture {
@@ -543,6 +544,11 @@ async fn built_cli_handles_hyphen_inputs_draft_preservation_and_flag_guards() {
         "edit-draft subject failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let subj_resp: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        subj_resp.get("quote_preserved").is_none(),
+        "subject-only edit must not include quote_preserved: {subj_resp}"
+    );
     {
         let patches = state.draft_patches.read().unwrap();
         assert_eq!(patches.len(), 1);
@@ -576,7 +582,7 @@ async fn built_cli_handles_hyphen_inputs_draft_preservation_and_flag_guards() {
         }));
     }
 
-    // 4. Draft Markdown body edit sends <ul><li>first</li><li>second</li></ul>, and `--body=--dry-run` works via `=`
+    // 4. Draft Markdown body edit preserves quoted thread, `--body=--dry-run` works via `=`, and `--body-html` replaces verbatim
     let out = run_outlook(
         &dir,
         &base_url,
@@ -585,6 +591,9 @@ async fn built_cli_handles_hyphen_inputs_draft_preservation_and_flag_guards() {
         None,
     );
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let body_resp: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(body_resp["quote_preserved"], true);
+
     let out = run_outlook(
         &dir,
         &base_url,
@@ -593,16 +602,54 @@ async fn built_cli_handles_hyphen_inputs_draft_preservation_and_flag_guards() {
         None,
     );
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let body_eq_resp: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(body_eq_resp["quote_preserved"], true);
+
+    let out = run_outlook(
+        &dir,
+        &base_url,
+        &token,
+        &[
+            "edit-draft",
+            "draft-rich",
+            "--body-html",
+            "<p>Explicit HTML</p>",
+            "--json",
+        ],
+        None,
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let html_resp: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(html_resp["quote_preserved"], false);
     {
         let patches = state.draft_patches.read().unwrap();
-        assert_eq!(patches.len(), 3);
+        assert_eq!(patches.len(), 4);
         assert_eq!(
             patches[1].1,
-            json!({ "body": { "contentType": "HTML", "content": "<ul><li>first</li><li>second</li></ul>" } })
+            json!({
+                "body": {
+                    "contentType": "HTML",
+                    "content": format!("<ul><li>first</li><li>second</li></ul>{QUOTED_THREAD_HTML}")
+                }
+            })
         );
         assert_eq!(
             patches[2].1,
-            json!({ "body": { "contentType": "HTML", "content": "<p>--dry-run</p>" } })
+            json!({
+                "body": {
+                    "contentType": "HTML",
+                    "content": format!("<p>--dry-run</p>{QUOTED_THREAD_HTML}")
+                }
+            })
+        );
+        assert_eq!(
+            patches[3].1,
+            json!({
+                "body": {
+                    "contentType": "HTML",
+                    "content": "<p>Explicit HTML</p>"
+                }
+            })
         );
     }
 
@@ -710,6 +757,41 @@ async fn built_cli_handles_hyphen_inputs_draft_preservation_and_flag_guards() {
             "<ul><li>first</li><li>second</li></ul>"
         );
         assert_eq!(forwards[1].1["comment"], "");
+    }
+
+    // 7b. W4 recipient validation: empty angle brackets rejected locally with 0 Graph calls; non-@ token passed through
+    let bad_fwd = run_outlook(
+        &dir,
+        &base_url,
+        &token,
+        &["forward", "msg-1", "--to", "Alex Kim <>", "--json"],
+        None,
+    );
+    assert!(!bad_fwd.status.success());
+    let bad_fwd_json: Value = serde_json::from_slice(&bad_fwd.stdout).unwrap();
+    assert_eq!(bad_fwd_json["ok"], false);
+    assert_eq!(bad_fwd_json["error"]["code"], "invalid_recipient");
+    assert_eq!(state.forwards.read().unwrap().len(), 2);
+
+    let alias_fwd = run_outlook(
+        &dir,
+        &base_url,
+        &token,
+        &["forward", "msg-1", "--to", "carol", "--json"],
+        None,
+    );
+    assert!(
+        alias_fwd.status.success(),
+        "{}",
+        String::from_utf8_lossy(&alias_fwd.stderr)
+    );
+    {
+        let forwards = state.forwards.read().unwrap();
+        assert_eq!(forwards.len(), 3);
+        assert_eq!(
+            forwards[2].1["toRecipients"][0]["emailAddress"]["address"],
+            "carol"
+        );
     }
 
     // 8. `create-event --body` renders Markdown list

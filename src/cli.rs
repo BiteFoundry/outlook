@@ -267,12 +267,18 @@ pub enum Command {
         dest_folder: String,
         #[arg(long)]
         json: bool,
+        /// With --json, include the full moved message (no attachment bytes)
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Archive a mail message (shortcut for `outlook move <MESSAGE_ID> archive`)
     Archive {
         message_id: String,
         #[arg(long)]
         json: bool,
+        /// With --json, include the full moved message (no attachment bytes)
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Delete a mail message
     #[command(visible_alias = "rm")]
@@ -296,6 +302,9 @@ pub enum Command {
         limit: usize,
         #[arg(long)]
         json: bool,
+        /// With --json, return full message fields in remote results (no attachment bytes)
+        #[arg(long, requires = "json")]
+        full: bool,
         /// With --remote --json, continue from a previous response's next_cursor
         #[arg(long, requires_all = ["remote", "json"], value_name = "CURSOR")]
         cursor: Option<String>,
@@ -365,6 +374,9 @@ pub enum Command {
         cached: bool,
         #[arg(long)]
         json: bool,
+        /// With --json, include body_html on each event
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Read full details and attendees of a calendar event
     Event {
@@ -914,11 +926,176 @@ where
     None
 }
 
+impl Command {
+    pub(crate) fn json_requested(&self) -> bool {
+        match self {
+            Command::Login { json, .. }
+            | Command::Logout { json }
+            | Command::Whoami { json }
+            | Command::Doctor { json, .. }
+            | Command::Folders { json, .. }
+            | Command::Mail { json, .. }
+            | Command::Read { json, .. }
+            | Command::Send { json, .. }
+            | Command::Reply { json, .. }
+            | Command::Forward { json, .. }
+            | Command::EditDraft { json, .. }
+            | Command::Mark { json, .. }
+            | Command::Move { json, .. }
+            | Command::Archive { json, .. }
+            | Command::Delete { json, .. }
+            | Command::Search { json, .. }
+            | Command::Download { json, .. }
+            | Command::Calendar { json, .. }
+            | Command::Event { json, .. }
+            | Command::CreateEvent { json, .. }
+            | Command::UpdateEvent { json, .. }
+            | Command::Rsvp { json, .. }
+            | Command::DeleteEvent { json, .. }
+            | Command::Tasks { json, .. }
+            | Command::TaskLists { json, .. }
+            | Command::AddTask { json, .. }
+            | Command::Done { json, .. }
+            | Command::UpdateTask { json, .. }
+            | Command::DeleteTask { json, .. }
+            | Command::Contacts { json, .. }
+            | Command::Sync { json, .. }
+            | Command::Update { json, .. } => *json,
+            Command::Daemon { command } => match command {
+                DaemonCommand::Start { json }
+                | DaemonCommand::Stop { json }
+                | DaemonCommand::Status { json }
+                | DaemonCommand::Restart { json } => *json,
+                DaemonCommand::Run => false,
+            },
+            Command::Preview { .. }
+            | Command::PreviewFile { .. }
+            | Command::Tui
+            | Command::Serve { .. }
+            | Command::Mcp => false,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ErrorInfo {
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
+    pub(crate) details: Option<serde_json::Value>,
+}
+
+impl std::fmt::Display for ErrorInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ErrorInfo {}
+
+pub(crate) fn error_with_info(
+    code: &'static str,
+    message: impl Into<String>,
+    details: Option<serde_json::Value>,
+) -> anyhow::Error {
+    anyhow::Error::new(ErrorInfo {
+        code,
+        message: message.into(),
+        details,
+    })
+}
+
+fn find_error_info(err: &anyhow::Error) -> Option<&ErrorInfo> {
+    err.chain().find_map(|cause| cause.downcast_ref::<ErrorInfo>())
+}
+
+pub(crate) fn error_code(err: &anyhow::Error) -> &'static str {
+    if let Some(info) = find_error_info(err) {
+        return info.code;
+    }
+    let msg = format!("{err:#}");
+    if msg.starts_with("Ambiguous ") {
+        return "ambiguous";
+    }
+    let lower = msg.to_ascii_lowercase();
+    if resolver::is_graph_not_found_error(err)
+        || (!lower.contains("401 ")
+            && !lower.contains("403 ")
+            && !lower.contains("unauthorized")
+            && !lower.contains("forbidden")
+            && lower.contains(" not found:"))
+    {
+        return "not_found";
+    }
+    if is_forbidden_error(err) {
+        return "forbidden";
+    }
+    let graph_detail = msg
+        .strip_prefix(crate::graph::GRAPH_API_ERROR_PREFIX)
+        .and_then(|rest| rest.split_once("): ").map(|(_, d)| d))
+        .unwrap_or(&msg);
+    if msg.starts_with("Sign-in required")
+        || graph_detail.starts_with("401 ")
+        || graph_detail.to_ascii_lowercase().contains("401 unauthorized")
+    {
+        return "auth_required";
+    }
+    if msg.starts_with("Token expired ") {
+        return "token_expired";
+    }
+    if msg == DELETE_JSON_REQUIRES_YES {
+        return "confirmation_required";
+    }
+    "error"
+}
+
+pub(crate) fn json_error_payload(err: &anyhow::Error) -> serde_json::Value {
+    let mut error_obj = json!({
+        "code": error_code(err),
+        "message": format!("{err:#}"),
+    });
+    if let Some(details) = find_error_info(err).and_then(|info| info.details.as_ref()) {
+        error_obj["details"] = details.clone();
+    }
+    json!({
+        "ok": false,
+        "error": error_obj,
+    })
+}
+
+pub(crate) fn check_recipient_addresses(addrs: &[String]) -> Result<()> {
+    for raw in addrs {
+        let trimmed = raw.trim();
+        if let Some((_name_part, rest)) = trimmed.rsplit_once('<') {
+            if let Some(addr) = rest.strip_suffix('>') {
+                if addr.trim().is_empty() {
+                    return Err(error_with_info(
+                        "invalid_recipient",
+                        format!(
+                            "Recipient '{trimmed}' has an empty address. Use user@example.com or \"Name <user@example.com>\"."
+                        ),
+                        None,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn run_from_env() -> Result<()> {
     let persona = Persona::detect();
     let cli = parse_cli_from(std::env::args_os()).unwrap_or_else(|err| err.exit());
+    let json_out = cli.command.as_ref().is_some_and(Command::json_requested);
     let mut cfg = AppConfig::load();
-    Box::pin(dispatch_command(&mut cfg, persona, cli.command)).await
+    let res = Box::pin(dispatch_command(&mut cfg, persona, cli.command)).await;
+    if let Err(ref err) = res {
+        if json_out {
+            if let Ok(serialized) = serde_json::to_string_pretty(&json_error_payload(err)) {
+                println!("{serialized}");
+            }
+        }
+    }
+    res
 }
 
 async fn dispatch_command(
@@ -1129,10 +1306,13 @@ async fn dispatch_command(
             message_id,
             dest_folder,
             json,
-        }) => Box::pin(cmd_mail_move(cfg, &message_id, &dest_folder, json)).await,
-        Some(Command::Archive { message_id, json }) => {
-            Box::pin(cmd_mail_move(cfg, &message_id, "archive", json)).await
-        }
+            full,
+        }) => Box::pin(cmd_mail_move(cfg, &message_id, &dest_folder, json, full)).await,
+        Some(Command::Archive {
+            message_id,
+            json,
+            full,
+        }) => Box::pin(cmd_mail_move(cfg, &message_id, "archive", json, full)).await,
         Some(Command::Delete {
             message_id,
             yes,
@@ -1144,6 +1324,7 @@ async fn dispatch_command(
             remote,
             limit,
             json,
+            full,
             cursor,
         }) => {
             Box::pin(cmd_mail_search(
@@ -1153,6 +1334,7 @@ async fn dispatch_command(
                 remote,
                 limit,
                 json,
+                !full,
                 cursor.as_deref(),
             ))
             .await
@@ -1207,6 +1389,7 @@ async fn dispatch_command(
             offline,
             cached,
             json,
+            full,
         }) => {
             Box::pin(cmd_calendar_list(
                 cfg,
@@ -1217,6 +1400,7 @@ async fn dispatch_command(
                 offline,
                 cached,
                 json,
+                !full,
             ))
             .await
         }
@@ -1973,32 +2157,32 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
             ),
         };
         if json_out {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "persona": persona,
-                    "user_id": tokens.user_id,
-                    "display_name": tokens.user_display_name,
-                    "email": tokens.user_email,
-                    "client_id": tokens.client_id,
-                    "tenant_id": tokens.tenant_id,
-                    "auth_mode": tokens.auth_mode,
-                    "auth_source": auth_source,
-                    "expires_at": tokens.expires_at,
-                    "expires_at_human": format_unix_ts(tokens.expires_at),
-                    "expired": true,
-                    "expiring_soon": true,
-                    "status": "expired",
-                    "scopes": scope_diag.scopes,
-                    "roles": scope_diag.roles,
-                    "scope_warnings": scope_diag.warnings,
-                    "error": err_detail,
-                }))?
-            );
-            bail!(
-                "Token expired (exp: {}) — refresh the token and retry.",
-                format_unix_ts(tokens.expires_at)
-            );
+            let details = json!({
+                "persona": persona,
+                "user_id": tokens.user_id,
+                "display_name": tokens.user_display_name,
+                "email": tokens.user_email,
+                "client_id": tokens.client_id,
+                "tenant_id": tokens.tenant_id,
+                "auth_mode": tokens.auth_mode,
+                "auth_source": auth_source,
+                "expires_at": tokens.expires_at,
+                "expires_at_human": format_unix_ts(tokens.expires_at),
+                "expired": true,
+                "expiring_soon": true,
+                "status": "expired",
+                "scopes": scope_diag.scopes,
+                "roles": scope_diag.roles,
+                "scope_warnings": scope_diag.warnings,
+            });
+            return Err(error_with_info(
+                "token_expired",
+                format!(
+                    "Token expired (exp: {}) — refresh the token and retry.",
+                    format_unix_ts(tokens.expires_at)
+                ),
+                Some(details),
+            ));
         }
         bail!("{err_detail}");
     }
@@ -3261,6 +3445,9 @@ async fn cmd_mail_send(
     importance: &str,
     json_out: bool,
 ) -> Result<()> {
+    check_recipient_addresses(&to)?;
+    check_recipient_addresses(&cc)?;
+    check_recipient_addresses(&bcc)?;
     let markdown_body = match body_opt {
         Some(b) => b,
         None => {
@@ -3394,6 +3581,7 @@ async fn cmd_mail_forward(
     if to.is_empty() {
         bail!("At least one recipient (--to) must be specified.");
     }
+    check_recipient_addresses(&to)?;
     let (_auth, graph, _storage) = open_runtime(cfg, true).await?;
     let comment_html = if comment_md.trim().is_empty() {
         String::new()
@@ -3434,18 +3622,24 @@ async fn cmd_edit_draft(
     json_out: bool,
 ) -> Result<()> {
     let html = draft_edit_html(body, body_html);
+    let preserve_quote = body.is_some();
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    if let Err(err) = graph.edit_mail_draft(id, subject, html.as_deref()).await {
-        return Err(wrap_graph_permission_error(&graph, err).await);
-    }
+    let quote_preserved = match graph
+        .edit_mail_draft(id, subject, html.as_deref(), preserve_quote)
+        .await
+    {
+        Ok(preserved) => preserved,
+        Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+    };
     if let Ok(updated) = graph.get_mail_message(id).await {
         let _ = storage.upsert_mail_messages(&[updated]);
     }
     if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({ "ok": true, "message_id": id }))?
-        );
+        let mut payload = json!({ "ok": true, "message_id": id });
+        if html.is_some() {
+            payload["quote_preserved"] = json!(quote_preserved);
+        }
+        println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!("Updated draft {id}.");
     }
@@ -3504,25 +3698,59 @@ async fn cmd_mail_move(
     mail_id: &str,
     dest_folder: &str,
     json_out: bool,
+    full: bool,
 ) -> Result<()> {
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let folder = resolver::resolve_mail_folder(&graph, &storage, dest_folder, false).await?;
+    let mut folder = resolver::resolve_mail_folder(&graph, &storage, dest_folder, false).await?;
     let (moved, attachments_expanded) =
         match graph.move_mail_message_with_meta(mail_id, &folder.id).await {
             Ok(m) => m,
+            Err(err) if resolver::is_graph_not_found_error(&err) => {
+                match resolver::refresh_mail_folder_after_not_found(
+                    &graph,
+                    &storage,
+                    dest_folder,
+                    &folder.id,
+                )
+                .await
+                {
+                    Ok(Some(new_folder)) => {
+                        folder = new_folder;
+                        match graph.move_mail_message_with_meta(mail_id, &folder.id).await {
+                            Ok(m) => m,
+                            Err(retry_err) => {
+                                return Err(wrap_graph_permission_error(&graph, retry_err).await);
+                            }
+                        }
+                    }
+                    Ok(None) => return Err(wrap_graph_permission_error(&graph, err).await),
+                    Err(refresh_err) => {
+                        return Err(wrap_graph_permission_error(&graph, refresh_err).await);
+                    }
+                }
+            }
             Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
         };
     let moved = storage.replace_moved_mail_local_ex(mail_id, &moved, attachments_expanded)?;
 
     if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
+        let payload = if full {
+            json!({
                 "ok": true,
                 "destination_folder": folder,
-                "message": moved,
-            }))?
-        );
+                "message_id": moved.id,
+                "previous_message_id": mail_id,
+                "message": mail_message_public_json(&moved),
+            })
+        } else {
+            json!({
+                "ok": true,
+                "destination_folder": folder,
+                "message_id": moved.id,
+                "previous_message_id": mail_id,
+            })
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!(
             "Moved message {} -> {} ({})",
@@ -3611,6 +3839,7 @@ async fn cmd_mail_download(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_mail_search(
     cfg: &AppConfig,
     query: &str,
@@ -3618,6 +3847,7 @@ async fn cmd_mail_search(
     remote: bool,
     limit: usize,
     json_out: bool,
+    compact: bool,
     cursor: Option<&str>,
 ) -> Result<()> {
     if query.trim().is_empty() {
@@ -3700,11 +3930,12 @@ async fn cmd_mail_search(
     };
 
     if json_out {
+        let remote_json = mail_list_json(&remote_messages, compact);
         let payload = if let Some((has_more, next_cursor)) = remote_paging {
             json!({
                 "query": query,
                 "hits": hits,
-                "remote": remote_messages,
+                "remote": remote_json,
                 "returned": remote_messages.len(),
                 "has_more": has_more,
                 "next_cursor": next_cursor,
@@ -3713,7 +3944,7 @@ async fn cmd_mail_search(
             json!({
                 "query": query,
                 "hits": hits,
-                "remote": remote_messages,
+                "remote": remote_json,
             })
         };
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -3743,20 +3974,35 @@ async fn cmd_mail_search(
 // Calendar commands
 // ---------------------------------------------------------------------------
 
+pub(crate) fn event_json(ev: &CalendarEvent, compact: bool) -> serde_json::Value {
+    let mut val = json!(ev);
+    if compact {
+        if let Some(obj) = val.as_object_mut() {
+            obj.remove("body_html");
+        }
+    }
+    val
+}
+
 fn print_cal_events_output(
     start_iso: &str,
     end_iso: &str,
     events: &[CalendarEvent],
     has_more: bool,
     json_out: bool,
+    compact: bool,
 ) -> Result<()> {
     if json_out {
+        let events_json: Vec<serde_json::Value> = events
+            .iter()
+            .map(|ev| event_json(ev, compact))
+            .collect();
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "start": start_iso,
                 "end": end_iso,
-                "events": events,
+                "events": events_json,
                 "returned": events.len(),
                 "has_more": has_more,
             }))?
@@ -3791,6 +4037,7 @@ async fn cmd_calendar_list(
     offline: bool,
     cached: bool,
     json_out: bool,
+    compact: bool,
 ) -> Result<()> {
     let limit = clamp_limit(limit);
     let (start_iso, end_iso) = default_calendar_window(from, to, days)?;
@@ -3803,7 +4050,7 @@ async fn cmd_calendar_list(
         if has_more {
             events.truncate(limit);
         }
-        return print_cal_events_output(&start_iso, &end_iso, &events, has_more, json_out);
+        return print_cal_events_output(&start_iso, &end_iso, &events, has_more, json_out, compact);
     }
 
     let ttl = cli_cache_ttl_secs(cfg);
@@ -3829,6 +4076,7 @@ async fn cmd_calendar_list(
                         &events,
                         has_more,
                         json_out,
+                        compact,
                     );
                 }
             }
@@ -3850,25 +4098,29 @@ async fn cmd_calendar_list(
     }
     record_cli_sync_cursor(&storage, "cli:cal");
 
-    print_cal_events_output(&start_iso, &end_iso, &events, !reached_end, json_out)
+    print_cal_events_output(
+        &start_iso,
+        &end_iso,
+        &events,
+        !reached_end,
+        json_out,
+        compact,
+    )
 }
 
 fn print_event_show_output(ev: &CalendarEvent, json_out: bool, compact: bool) -> Result<()> {
     if json_out {
-        let payload = if compact {
-            let mut val = json!(ev);
+        let mut val = event_json(ev, compact);
+        if compact {
             if let Some(obj) = val.as_object_mut() {
-                obj.remove("body_html");
                 obj.insert("omitted".into(), json!({ "fields": ["body_html"] }));
                 obj.insert(
                     "hint".into(),
                     json!(format!("outlook event {} --json --full", ev.id)),
                 );
             }
-            json!({ "event": val })
-        } else {
-            json!({ "event": ev })
-        };
+        }
+        let payload = json!({ "event": val });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!("Subject: {}", ev.subject);
@@ -3952,6 +4204,7 @@ async fn cmd_event_create(
     if subject.trim().is_empty() {
         bail!("Event subject is empty.");
     }
+    check_recipient_addresses(&attendees)?;
     let start_iso = normalize_datetime_iso(start)?;
     let end_iso = normalize_datetime_iso(end)?;
     let body_html = body
@@ -4998,17 +5251,25 @@ pub(crate) fn is_forbidden_error(err: &anyhow::Error) -> bool {
         || lower.contains("insufficient permissions")
 }
 
+pub(crate) fn format_graph_error(err: anyhow::Error, access_token: Option<&str>) -> anyhow::Error {
+    let raw = format!("{err:#}");
+    if let Some(explained) = explain_graph_permission_error(&raw, access_token) {
+        anyhow::anyhow!("{explained}\nRaw error: {raw}")
+    } else if raw.contains("ErrorInvalidRecipients") {
+        anyhow::anyhow!(
+            "{raw}\nHint: recipients must be SMTP addresses (user@example.com or \"Name <user@example.com>\"). Find an address with `outlook contacts --query <name>` (MCP: search_contacts)."
+        )
+    } else {
+        err
+    }
+}
+
 pub(crate) async fn wrap_graph_permission_error(
     graph: &GraphClient,
     err: anyhow::Error,
 ) -> anyhow::Error {
-    let raw = format!("{err:#}");
     let token = graph.auth().current_tokens().await.map(|t| t.access_token);
-    if let Some(explained) = explain_graph_permission_error(&raw, token.as_deref()) {
-        anyhow::anyhow!("{explained}\nRaw error: {raw}")
-    } else {
-        err
-    }
+    format_graph_error(err, token.as_deref())
 }
 
 pub(crate) fn delete_gate(yes: bool, json: bool, answer: Option<&str>) -> Result<()> {
@@ -5414,7 +5675,8 @@ mod tests {
             cli.command.unwrap(),
             Command::Archive {
                 message_id,
-                json: true
+                json: true,
+                full: false,
             } if message_id == "msg-99"
         ));
 
@@ -6334,5 +6596,117 @@ mod tests {
         assert!(p_over.is_empty());
         assert!(!more_over);
         assert_eq!(cur_over, None);
+    }
+
+    #[test]
+    fn error_code_classifies_documented_failures() {
+        assert_eq!(
+            error_code(&anyhow::anyhow!("Ambiguous mail folder 'Reports' matches 2 folders")),
+            "ambiguous"
+        );
+        assert_eq!(
+            error_code(&anyhow::anyhow!(
+                "Graph API error (GET https://graph.microsoft.com/v1.0/me/messages/x): 404 Not Found [ErrorItemNotFound]"
+            )),
+            "not_found"
+        );
+        assert_eq!(
+            error_code(&anyhow::anyhow!("Mail message not found: Weekly Sync")),
+            "not_found"
+        );
+        assert_eq!(
+            error_code(&anyhow::anyhow!(
+                "Insufficient Graph permissions (403): access restricted"
+            )),
+            "forbidden"
+        );
+        assert_eq!(
+            error_code(&anyhow::anyhow!("Sign-in required. Run `outlook login`.")),
+            "auth_required"
+        );
+        assert_eq!(
+            error_code(&anyhow::anyhow!(
+                "Graph API error (GET https://graph.microsoft.com/v1.0/me/messages): 401 Unauthorized [InvalidAuthenticationToken]"
+            )),
+            "auth_required"
+        );
+        assert_eq!(
+            error_code(&error_with_info(
+                "token_expired",
+                "Token expired (exp: 2026-01-01T00:00:00Z) — refresh the token and retry.",
+                Some(json!({ "expired": true })),
+            )),
+            "token_expired"
+        );
+        assert_eq!(
+            error_code(&anyhow::anyhow!("{DELETE_JSON_REQUIRES_YES}")),
+            "confirmation_required"
+        );
+        assert_eq!(
+            error_code(&error_with_info(
+                "invalid_recipient",
+                "Recipient 'Alex Kim <>' has an empty address.",
+                None,
+            )),
+            "invalid_recipient"
+        );
+        assert_eq!(
+            error_code(&anyhow::anyhow!("Message 'm1' is not an Outlook draft.")),
+            "error"
+        );
+
+        let payload = json_error_payload(&error_with_info(
+            "token_expired",
+            "Token expired",
+            Some(json!({ "auth_mode": "env_token" })),
+        ));
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["error"]["code"], "token_expired");
+        assert_eq!(payload["error"]["details"]["auth_mode"], "env_token");
+
+        let plain_payload = json_error_payload(&anyhow::anyhow!("boom"));
+        assert_eq!(plain_payload["ok"], false);
+        assert_eq!(plain_payload["error"]["code"], "error");
+        assert!(plain_payload["error"].get("details").is_none());
+    }
+
+    #[test]
+    fn check_recipient_addresses_rejects_only_empty_angle_brackets() {
+        for ok_case in [
+            vec![],
+            vec!["a@b.com".to_string()],
+            vec!["\"Bob\" <bob@x.com>".to_string()],
+            vec!["carol".to_string()],
+            vec!["Carol Organizer".to_string()],
+            vec!["dir-carol".to_string()],
+            vec!["".to_string(), "   ".to_string()],
+        ] {
+            assert!(
+                check_recipient_addresses(&ok_case).is_ok(),
+                "expected {ok_case:?} to be accepted"
+            );
+        }
+
+        for bad_case in ["Alex Kim <>", "<>", "Alex Kim <   >"] {
+            let err = check_recipient_addresses(&[bad_case.to_string()])
+                .expect_err(&format!("expected {bad_case:?} to fail"));
+            assert_eq!(error_code(&err), "invalid_recipient");
+            assert!(err.to_string().contains("has an empty address"));
+        }
+    }
+
+    #[test]
+    fn format_graph_error_appends_hint_only_for_invalid_recipients() {
+        let raw = "Graph API error (POST https://graph.microsoft.com/v1.0/me/sendMail): 400 Bad Request [ErrorInvalidRecipients] One or more recipients are invalid.";
+        let formatted = format_graph_error(anyhow::anyhow!("{raw}"), None);
+        let text = format!("{formatted:#}");
+        assert!(text.starts_with(raw));
+        assert!(text.contains("\nHint: recipients must be SMTP addresses"));
+        assert_eq!(error_code(&formatted), error_code(&anyhow::anyhow!("{raw}")));
+
+        let raw_404 = "Graph API error (GET https://graph.microsoft.com/v1.0/me/messages/missing): 404 Not Found [ErrorItemNotFound]";
+        let formatted_404 = format_graph_error(anyhow::anyhow!("{raw_404}"), None);
+        assert_eq!(format!("{formatted_404:#}"), raw_404);
+        assert_eq!(error_code(&formatted_404), "not_found");
     }
 }

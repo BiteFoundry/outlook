@@ -1520,26 +1520,46 @@ impl GraphClient {
         id: &str,
         subject: Option<&str>,
         body_html: Option<&str>,
-    ) -> Result<()> {
+        preserve_quote: bool,
+    ) -> Result<bool> {
+        if subject.is_none() && body_html.is_none() {
+            bail!("Provide a draft subject or body to update.");
+        }
+        let path = format!("/me/messages/{}", urlencoding::encode(id.trim()));
+        let select = if preserve_quote && body_html.is_some() {
+            "$select=isDraft,body"
+        } else {
+            "$select=isDraft"
+        };
+        let original: GraphMailMessage = self.get_json(&format!("{path}?{select}")).await?;
+        if original.is_draft != Some(true) {
+            bail!("Message '{id}' is not an Outlook draft.");
+        }
         let mut fields = serde_json::Map::new();
         if let Some(subject) = subject {
             fields.insert("subject".into(), serde_json::json!(subject));
         }
+        let mut quote_preserved = false;
         if let Some(html) = body_html {
+            let final_html = if preserve_quote {
+                let existing = original
+                    .body
+                    .as_ref()
+                    .and_then(|b| b.content.as_deref())
+                    .unwrap_or("");
+                let (spliced, preserved) = splice_draft_body_preserving_quote(existing, html);
+                quote_preserved = preserved;
+                spliced
+            } else {
+                html.to_string()
+            };
             fields.insert(
                 "body".into(),
-                serde_json::json!({ "contentType": "HTML", "content": html }),
+                serde_json::json!({ "contentType": "HTML", "content": final_html }),
             );
         }
-        if fields.is_empty() {
-            bail!("Provide a draft subject or body to update.");
-        }
-        let path = format!("/me/messages/{}", urlencoding::encode(id.trim()));
-        let original: GraphMailMessage = self.get_json(&format!("{path}?$select=isDraft")).await?;
-        if original.is_draft != Some(true) {
-            bail!("Message '{id}' is not an Outlook draft.");
-        }
-        self.patch_json(&path, &fields).await
+        self.patch_json(&path, &fields).await?;
+        Ok(quote_preserved)
     }
 
     async fn upload_draft_file_attachment(
@@ -2040,6 +2060,51 @@ fn prepend_to_thread_html(content: &str, quote: &str) -> String {
         format!("{}{content}{}", &quote[..body], &quote[body..])
     } else {
         format!("{content}{quote}")
+    }
+}
+
+fn find_quote_boundary(html: &str) -> Option<usize> {
+    let lower = html.to_ascii_lowercase();
+    let needles = [
+        "id=\"appendonsend\"",
+        "id=\"divrplyfwdmsg\"",
+        "id='appendonsend'",
+        "id='divrplyfwdmsg'",
+    ];
+    let mut best: Option<usize> = None;
+    for needle in needles {
+        for (attr_pos, _) in lower.match_indices(needle) {
+            if let Some(tag_start) = html[..attr_pos].rfind('<') {
+                if !html[tag_start..attr_pos].contains('>') {
+                    best = Some(best.map_or(tag_start, |prev| prev.min(tag_start)));
+                    break;
+                }
+            }
+        }
+    }
+    best
+}
+
+fn splice_draft_body_preserving_quote(existing_html: &str, new_html: &str) -> (String, bool) {
+    let Some(boundary) = find_quote_boundary(existing_html) else {
+        return (new_html.to_string(), false);
+    };
+    let head = &existing_html[..boundary];
+    let tail = &existing_html[boundary..];
+    let head_lower = head.to_ascii_lowercase();
+    if let Some(body_end) = head_lower.match_indices("<body").find_map(|(index, tag)| {
+        let after = index + tag.len();
+        let suffix = &head_lower[after..];
+        if suffix.starts_with('>') || suffix.starts_with(char::is_whitespace) {
+            suffix.find('>').map(|end| after + end + 1)
+        } else {
+            None
+        }
+    }) {
+        let shell = format!("{}{tail}", &head[..body_end]);
+        (prepend_to_thread_html(new_html, &shell), true)
+    } else {
+        (format!("{new_html}{tail}"), true)
     }
 }
 
@@ -3229,5 +3294,36 @@ pub(crate) mod tests {
                 .is_some_and(|l| l.contains("$deltatoken=big-done")),
             "expected terminal deltaLink, got {delta_link:?}"
         );
+    }
+
+    #[test]
+    fn splice_draft_body_preserving_quote_handles_audit_body_html_shell_and_plain() {
+        let quoted = "<div id=\"appendonsend\"></div><hr><div id=\"divRplyFwdMsg\"><p>Quoted thread from Bob</p></div>";
+        let existing_a = format!("<p>Initial draft paragraph.</p>{quoted}");
+        let (out_a, preserved_a) = splice_draft_body_preserving_quote(
+            &existing_a,
+            "<ul><li>First item</li><li>Second item</li></ul>",
+        );
+        assert!(preserved_a);
+        assert_eq!(
+            out_a,
+            format!("<ul><li>First item</li><li>Second item</li></ul>{quoted}")
+        );
+
+        let existing_b = format!(
+            "<html><body dir=\"ltr\"><p>Old reply</p><div id=\"divRplyFwdMsg\"><p>Original</p></div></body></html>"
+        );
+        let (out_b, preserved_b) =
+            splice_draft_body_preserving_quote(&existing_b, "<p>Updated reply</p>");
+        assert!(preserved_b);
+        assert_eq!(
+            out_b,
+            "<html><body dir=\"ltr\"><p>Updated reply</p><div id=\"divRplyFwdMsg\"><p>Original</p></div></body></html>"
+        );
+
+        let (out_c, preserved_c) =
+            splice_draft_body_preserving_quote("<p>Plain standalone draft</p>", "<p>Replacement</p>");
+        assert!(!preserved_c);
+        assert_eq!(out_c, "<p>Replacement</p>");
     }
 }

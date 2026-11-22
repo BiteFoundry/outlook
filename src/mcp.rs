@@ -791,15 +791,22 @@ async fn call_tool(
             let body = args.optional_text("body")?;
             let body_html = args.optional_text("body_html")?;
             let html = cli::draft_edit_html(body, body_html);
-            map_graph_result(
+            let preserve_quote = body.is_some();
+            let quote_preserved = map_graph_result(
                 graph,
-                graph.edit_mail_draft(&id, subject, html.as_deref()).await,
+                graph
+                    .edit_mail_draft(&id, subject, html.as_deref(), preserve_quote)
+                    .await,
             )
             .await?;
             if let Ok(updated) = graph.get_mail_message(&id).await {
                 let _ = with_storage(storage, move |s| s.upsert_mail_messages(&[updated])).await;
             }
-            Ok(json!({ "ok": true, "message_id": id }))
+            let mut payload = json!({ "ok": true, "message_id": id });
+            if html.is_some() {
+                payload["quote_preserved"] = json!(quote_preserved);
+            }
+            Ok(payload)
         }
 
         "update_event" => {
@@ -853,6 +860,7 @@ async fn call_tool(
             let message_id = args.required_str("message_id")?;
             let is_read = args.optional_bool("is_read")?;
             let flagged = args.optional_bool("flagged")?;
+            let compact = args.optional_bool("compact")?.unwrap_or(true);
             let dest_folder = args
                 .optional_str("destination_folder")?
                 .or(args.optional_str("destination_folder_id")?)
@@ -883,15 +891,47 @@ async fn call_tool(
             })
             .await;
 
-            let moved_message = if let Some(dest) = dest_folder.as_deref() {
-                let folder = resolve_mail_folder_mcp(storage, graph, dest, false).await?;
-                let (moved, attachments_expanded) = map_graph_result(
-                    graph,
-                    graph
-                        .move_mail_message_with_meta(&message_id, &folder.id)
-                        .await,
-                )
-                .await?;
+            let moved_result = if let Some(dest) = dest_folder.as_deref() {
+                let mut folder = resolve_mail_folder_mcp(storage, graph, dest, false).await?;
+                let (moved, attachments_expanded) = match graph
+                    .move_mail_message_with_meta(&message_id, &folder.id)
+                    .await
+                {
+                    Ok(m) => m,
+                    Err(err) if resolver::is_graph_not_found_error(&err) => {
+                        match map_graph_result(
+                            graph,
+                            resolver::refresh_mail_folder_after_not_found(
+                                graph,
+                                storage,
+                                dest,
+                                &folder.id,
+                            )
+                            .await,
+                        )
+                        .await?
+                        {
+                            Some(new_folder) => {
+                                folder = new_folder;
+                                map_graph_result(
+                                    graph,
+                                    graph
+                                        .move_mail_message_with_meta(&message_id, &folder.id)
+                                        .await,
+                                )
+                                .await?
+                            }
+                            None => {
+                                return Err(map_graph_result(graph, Err::<(), _>(err))
+                                    .await
+                                    .unwrap_err());
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        return Err(map_graph_result(graph, Err::<(), _>(err)).await.unwrap_err());
+                    }
+                };
                 let moved_clone = moved.clone();
                 let old_id_clone = message_id.clone();
                 let persisted = with_storage(storage, move |s| {
@@ -899,20 +939,31 @@ async fn call_tool(
                 })
                 .await
                 .unwrap_or(moved);
-                Some(persisted)
+                Some((persisted, folder.id))
             } else {
                 None
             };
 
+            let moved_json = moved_result.as_ref().map(|(m, folder_id)| {
+                if compact {
+                    json!({
+                        "id": m.id,
+                        "folder_id": m.folder_id.as_deref().unwrap_or(folder_id.as_str()),
+                    })
+                } else {
+                    cli::mail_message_public_json(m)
+                }
+            });
+
             Ok(json!({
                 "ok": true,
-                "message_id": moved_message
+                "message_id": moved_result
                     .as_ref()
-                    .map(|m| m.id.as_str())
+                    .map(|(m, _)| m.id.as_str())
                     .unwrap_or(message_id.as_str()),
                 "is_read": is_read,
                 "flagged": flagged,
-                "moved": moved_message.as_ref().map(cli::mail_message_public_json),
+                "moved": moved_json,
             }))
         }
 
@@ -993,6 +1044,7 @@ async fn call_tool(
                 .map(cli::clamp_limit)
                 .unwrap_or(25);
             let offline = args.optional_bool("offline")?.unwrap_or(false);
+            let compact = args.optional_bool("compact")?.unwrap_or(true);
             let cursor = args.optional_str("cursor")?;
 
             if let Some(raw_cursor) = cursor {
@@ -1048,7 +1100,7 @@ async fn call_tool(
                 let _ = with_storage(storage, move |s| s.upsert_mail_messages(&msgs_clone)).await;
                 return Ok(json!({
                     "query": query,
-                    "messages": page.messages,
+                    "messages": cli::mail_list_json(&page.messages, compact),
                     "returned": page.messages.len(),
                     "has_more": page.has_more,
                     "next_cursor": page.next_cursor,
@@ -1086,7 +1138,7 @@ async fn call_tool(
                 let _ = with_storage(storage, move |s| s.upsert_mail_messages(&msgs_clone)).await;
                 Ok(json!({
                     "query": query,
-                    "messages": page.messages,
+                    "messages": cli::mail_list_json(&page.messages, compact),
                     "returned": page.messages.len(),
                     "has_more": page.has_more,
                     "next_cursor": page.next_cursor,
@@ -1109,6 +1161,7 @@ async fn call_tool(
                 .map(cli::clamp_limit)
                 .unwrap_or(50);
             let offline = args.optional_bool("offline")?.unwrap_or(false);
+            let compact = args.optional_bool("compact")?.unwrap_or(true);
 
             let (start_iso, end_iso) =
                 cli::default_calendar_window(from.as_deref(), to.as_deref(), days)
@@ -1154,10 +1207,14 @@ async fn call_tool(
                 (fetched, !reached_end)
             };
 
+            let events_json: Vec<Value> = events
+                .iter()
+                .map(|ev| cli::event_json(ev, compact))
+                .collect();
             Ok(json!({
                 "start": start_iso,
                 "end": end_iso,
-                "events": events,
+                "events": events_json,
                 "returned": events.len(),
                 "has_more": has_more,
             }))
@@ -1618,6 +1675,7 @@ pub fn tool_catalog() -> Vec<Value> {
             "description": "List emails in a mail folder (accepts folder ID, display name/prefix, or well-known alias such as 'inbox', 'sent', 'drafts', 'archive', 'trash', 'junk').",
             "inputSchema": {
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
                     "folder": { "type": "string", "description": "Folder name, alias, or ID (default 'inbox')" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
@@ -1635,6 +1693,7 @@ pub fn tool_catalog() -> Vec<Value> {
             "description": "Read an email by ID. Compact by default; set compact:false for HTML and attachment metadata.",
             "inputSchema": {
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
                     "message_id": { "type": "string" },
                     "mark_read": { "type": "boolean" },
@@ -1700,7 +1759,8 @@ pub fn tool_catalog() -> Vec<Value> {
                     "flagged": { "type": "boolean" },
                     "destination_folder": { "type": "string", "description": "Target folder name, alias (e.g. 'archive'), or ID" },
                     "destination_folder_id": { "type": "string", "description": "Alias for destination_folder" },
-                    "move_to_folder": { "type": "string", "description": "Alias for destination_folder" }
+                    "move_to_folder": { "type": "string", "description": "Alias for destination_folder" },
+                    "compact": { "type": "boolean", "description": "Default true. Set false to include full moved message fields (no attachment bytes)" }
                 },
                 "required": ["message_id"]
             }
@@ -1737,11 +1797,13 @@ pub fn tool_catalog() -> Vec<Value> {
             "description": "Search emails in local SQLite FTS5 (`offline: true`) or remotely via Microsoft Graph KQL `$search`.",
             "inputSchema": {
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
                     "query": { "type": "string" },
                     "folder": { "type": "string" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
                     "cursor": { "type": "string", "description": "Opaque next_cursor from a previous remote search response" },
+                    "compact": { "type": "boolean", "description": "Default true. Set false for full message fields in online results (no attachment bytes)" },
                     "offline": { "type": "boolean" }
                 },
                 "required": ["query"]
@@ -1752,11 +1814,15 @@ pub fn tool_catalog() -> Vec<Value> {
             "description": "List calendar events within a date/time window (defaults to next 7 days).",
             "inputSchema": {
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
                     "from": { "type": "string", "description": "Start ISO-8601 or YYYY-MM-DD" },
+                    "start": { "type": "string", "description": "Alias for from" },
                     "to": { "type": "string", "description": "End ISO-8601 or YYYY-MM-DD" },
+                    "end": { "type": "string", "description": "Alias for to" },
                     "days": { "type": "integer", "minimum": 1, "maximum": 365 },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+                    "compact": { "type": "boolean", "description": "Default true. Set false to include body_html on each event" },
                     "offline": { "type": "boolean" }
                 }
             }
@@ -1936,6 +2002,13 @@ pub fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             Ok(())
         }
         "list_messages" => {
+            args.only(
+                name,
+                &[
+                    "folder", "limit", "cursor", "unread", "flagged", "focused", "compact",
+                    "offline",
+                ],
+            )?;
             args.optional_str("folder")?;
             if let Some(limit) = args.optional_usize("limit")? {
                 bounds("limit", limit, 1, 200)?;
@@ -1949,6 +2022,7 @@ pub fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             Ok(())
         }
         "get_message" => {
+            args.only(name, &["message_id", "mark_read", "compact", "offline"])?;
             args.required_str("message_id")?;
             args.optional_bool("mark_read")?;
             args.optional_bool("offline")?;
@@ -1956,11 +2030,16 @@ pub fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             Ok(())
         }
         "send_mail" => {
-            args.required_str_array("to")?;
+            let to = args.required_str_array("to")?;
+            cli::check_recipient_addresses(&to).map_err(format_error)?;
             args.required_str("subject")?;
             args.required_text("body")?;
-            args.optional_str_array("cc")?;
-            args.optional_str_array("bcc")?;
+            if let Some(cc) = args.optional_str_array("cc")? {
+                cli::check_recipient_addresses(&cc).map_err(format_error)?;
+            }
+            if let Some(bcc) = args.optional_str_array("bcc")? {
+                cli::check_recipient_addresses(&bcc).map_err(format_error)?;
+            }
             if let Some(imp) = args.optional_str("importance")? {
                 cli::normalize_mail_importance(&imp).map_err(format_error)?;
             }
@@ -1976,7 +2055,8 @@ pub fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
         }
         "forward_mail" => {
             args.required_str("message_id")?;
-            args.required_str_array("to")?;
+            let to = args.required_str_array("to")?;
+            cli::check_recipient_addresses(&to).map_err(format_error)?;
             args.optional_str("comment")?;
             Ok(())
         }
@@ -2032,24 +2112,22 @@ pub fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             Ok(())
         }
         "update_message" => {
-            const SUPPORTED: &[&str] = &[
-                "message_id",
-                "is_read",
-                "flagged",
-                "destination_folder",
-                "destination_folder_id",
-                "move_to_folder",
-            ];
-            if let Some(field) = args
-                .object()?
-                .keys()
-                .find(|key| !SUPPORTED.contains(&key.as_str()))
-            {
-                return Err(format!("unsupported argument for update_message: {field}"));
-            }
+            args.only(
+                name,
+                &[
+                    "message_id",
+                    "is_read",
+                    "flagged",
+                    "destination_folder",
+                    "destination_folder_id",
+                    "move_to_folder",
+                    "compact",
+                ],
+            )?;
             args.required_str("message_id")?;
             let is_read = args.optional_bool("is_read")?;
             let flagged = args.optional_bool("flagged")?;
+            args.optional_bool("compact")?;
             let dest = args
                 .optional_str("destination_folder")?
                 .or(args.optional_str("destination_folder_id")?)
@@ -2076,16 +2154,27 @@ pub fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             Ok(())
         }
         "search_mail" => {
+            args.only(
+                name,
+                &["query", "folder", "limit", "cursor", "compact", "offline"],
+            )?;
             args.required_str("query")?;
             args.optional_str("folder")?;
             if let Some(limit) = args.optional_usize("limit")? {
                 bounds("limit", limit, 1, 200)?;
             }
             args.optional_str("cursor")?;
+            args.optional_bool("compact")?;
             args.optional_bool("offline")?;
             Ok(())
         }
         "list_events" => {
+            args.only(
+                name,
+                &[
+                    "from", "start", "to", "end", "days", "limit", "compact", "offline",
+                ],
+            )?;
             if let Some(f) = args.optional_str("from")?.or(args.optional_str("start")?) {
                 cli::normalize_datetime_iso(&f).map_err(format_error)?;
             }
@@ -2100,6 +2189,7 @@ pub fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             if let Some(limit) = args.optional_usize("limit")? {
                 bounds("limit", limit, 1, 200)?;
             }
+            args.optional_bool("compact")?;
             args.optional_bool("offline")?;
             Ok(())
         }
@@ -2113,7 +2203,9 @@ pub fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             args.optional_bool("is_all_day")?;
             args.optional_str("location")?;
             args.optional_str("body")?;
-            args.optional_str_array("attendees")?;
+            if let Some(attendees) = args.optional_str_array("attendees")? {
+                cli::check_recipient_addresses(&attendees).map_err(format_error)?;
+            }
             args.optional_bool("is_online_meeting")?;
             Ok(())
         }
@@ -2920,5 +3012,89 @@ mod tests {
         assert_eq!(pdf_payload["size_bytes"], pdf_bytes.len() as u64);
         assert_eq!(pdf_payload["is_image"], false);
         assert!(PathBuf::from(pdf_payload["path"].as_str().unwrap()).is_absolute());
+    }
+
+    #[test]
+    fn compact_read_tools_reject_unknown_args_and_accept_documented_args() {
+        let err = validate_tool_args("list_messages", &json!({ "folder": "inbox", "full": true }))
+            .expect_err("list_messages must reject unknown `full` argument");
+        assert_eq!(err, "unsupported argument for list_messages: full");
+
+        assert!(validate_tool_args(
+            "list_messages",
+            &json!({
+                "folder": "inbox",
+                "limit": 20,
+                "cursor": "o:abc12345:10",
+                "unread": true,
+                "flagged": false,
+                "focused": true,
+                "compact": false,
+                "offline": true
+            })
+        )
+        .is_ok());
+
+        assert_eq!(
+            validate_tool_args(
+                "get_message",
+                &json!({ "message_id": "m1", "full": true })
+            )
+            .unwrap_err(),
+            "unsupported argument for get_message: full"
+        );
+        assert!(validate_tool_args(
+            "get_message",
+            &json!({
+                "message_id": "m1",
+                "mark_read": true,
+                "compact": false,
+                "offline": false
+            })
+        )
+        .is_ok());
+
+        assert_eq!(
+            validate_tool_args("search_mail", &json!({ "query": "Q4", "full": true })).unwrap_err(),
+            "unsupported argument for search_mail: full"
+        );
+        assert!(validate_tool_args(
+            "search_mail",
+            &json!({
+                "query": "Q4",
+                "folder": "inbox",
+                "limit": 25,
+                "cursor": "g:12345678:0|https://graph.microsoft.com/v1.0/me/messages",
+                "compact": false,
+                "offline": false
+            })
+        )
+        .is_ok());
+
+        assert_eq!(
+            validate_tool_args("list_events", &json!({ "full": true })).unwrap_err(),
+            "unsupported argument for list_events: full"
+        );
+        assert!(validate_tool_args(
+            "list_events",
+            &json!({
+                "from": "2026-11-20",
+                "to": "2026-11-27",
+                "days": 7,
+                "limit": 50,
+                "compact": false,
+                "offline": true
+            })
+        )
+        .is_ok());
+        assert!(validate_tool_args(
+            "list_events",
+            &json!({
+                "start": "2026-11-20",
+                "end": "2026-11-27",
+                "compact": true
+            })
+        )
+        .is_ok());
     }
 }

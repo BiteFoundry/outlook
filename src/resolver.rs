@@ -5,8 +5,10 @@
 //! To Do task lists, cached mail messages, and cached calendar events.
 
 use anyhow::{bail, Result};
+use serde_json::json;
 
 use crate::{
+    cli,
     graph::GraphClient,
     models::{CalendarEvent, MailFolder, MailMessage, TodoList},
     storage::Storage,
@@ -110,10 +112,14 @@ pub fn resolve_mail_folder_from_slice(
     if exact_name.len() == 1 {
         return Ok(exact_name[0].clone());
     } else if exact_name.len() > 1 {
-        bail!(
-            "Ambiguous mail folder '{q}' matches multiple folders exactly:\n{}",
-            format_folder_candidates(&exact_name)
-        );
+        return Err(cli::error_with_info(
+            "ambiguous",
+            format!(
+                "Ambiguous mail folder '{q}' matches multiple folders exactly:\n{}",
+                format_folder_candidates(&exact_name, folders)
+            ),
+            Some(json!({ "candidates": folder_candidates_json(&exact_name, folders) })),
+        ));
     }
 
     let prefix_matches: Vec<&MailFolder> = folders
@@ -123,10 +129,14 @@ pub fn resolve_mail_folder_from_slice(
     if prefix_matches.len() == 1 {
         return Ok(prefix_matches[0].clone());
     } else if prefix_matches.len() > 1 {
-        bail!(
-            "Ambiguous mail folder prefix '{q}' matches multiple folders:\n{}",
-            format_folder_candidates(&prefix_matches)
-        );
+        return Err(cli::error_with_info(
+            "ambiguous",
+            format!(
+                "Ambiguous mail folder prefix '{q}' matches multiple folders:\n{}",
+                format_folder_candidates(&prefix_matches, folders)
+            ),
+            Some(json!({ "candidates": folder_candidates_json(&prefix_matches, folders) })),
+        ));
     }
 
     let sub_matches: Vec<&MailFolder> = folders
@@ -135,10 +145,14 @@ pub fn resolve_mail_folder_from_slice(
         .collect();
     match sub_matches.len() {
         1 => Ok(sub_matches[0].clone()),
-        n if n > 1 => bail!(
-            "Ambiguous mail folder '{q}' matches {n} folders:\n{}",
-            format_folder_candidates(&sub_matches)
-        ),
+        n if n > 1 => Err(cli::error_with_info(
+            "ambiguous",
+            format!(
+                "Ambiguous mail folder '{q}' matches {n} folders:\n{}",
+                format_folder_candidates(&sub_matches, folders)
+            ),
+            Some(json!({ "candidates": folder_candidates_json(&sub_matches, folders) })),
+        )),
         _ => bail!("Mail folder not found: {q}"),
     }
 }
@@ -403,7 +417,14 @@ pub fn resolve_mail_message_from_slice(
     if id_prefixes.len() == 1 {
         return Ok(id_prefixes[0].clone());
     } else if id_prefixes.len() > 1 {
-        bail!("Ambiguous message ID prefix '{q}' matches {} messages.", id_prefixes.len());
+        return Err(cli::error_with_info(
+            "ambiguous",
+            format!(
+                "Ambiguous message ID prefix '{q}' matches {} messages.",
+                id_prefixes.len()
+            ),
+            Some(json!({ "candidates": message_candidates_json(&id_prefixes) })),
+        ));
     }
 
     let q_lower = q.to_lowercase();
@@ -413,6 +434,15 @@ pub fn resolve_mail_message_from_slice(
         .collect();
     if subj_exact.len() == 1 {
         return Ok(subj_exact[0].clone());
+    } else if subj_exact.len() > 1 {
+        return Err(cli::error_with_info(
+            "ambiguous",
+            format!(
+                "Ambiguous message subject '{q}' matches {} messages.",
+                subj_exact.len()
+            ),
+            Some(json!({ "candidates": message_candidates_json(&subj_exact) })),
+        ));
     }
 
     bail!("Mail message not found: {q}")
@@ -434,7 +464,14 @@ pub fn resolve_calendar_event_from_slice(
     if id_prefixes.len() == 1 {
         return Ok(id_prefixes[0].clone());
     } else if id_prefixes.len() > 1 {
-        bail!("Ambiguous event ID prefix '{q}' matches {} events.", id_prefixes.len());
+        return Err(cli::error_with_info(
+            "ambiguous",
+            format!(
+                "Ambiguous event ID prefix '{q}' matches {} events.",
+                id_prefixes.len()
+            ),
+            Some(json!({ "candidates": event_candidates_json(&id_prefixes) })),
+        ));
     }
 
     let q_lower = q.to_lowercase();
@@ -445,7 +482,14 @@ pub fn resolve_calendar_event_from_slice(
     if subj_exact.len() == 1 {
         return Ok(subj_exact[0].clone());
     } else if subj_exact.len() > 1 {
-        bail!("Ambiguous event subject '{q}' matches {} events.", subj_exact.len());
+        return Err(cli::error_with_info(
+            "ambiguous",
+            format!(
+                "Ambiguous event subject '{q}' matches {} events.",
+                subj_exact.len()
+            ),
+            Some(json!({ "candidates": event_candidates_json(&subj_exact) })),
+        ));
     }
 
     let subj_prefix: Vec<&CalendarEvent> = events
@@ -454,20 +498,97 @@ pub fn resolve_calendar_event_from_slice(
         .collect();
     if subj_prefix.len() == 1 {
         return Ok(subj_prefix[0].clone());
+    } else if subj_prefix.len() > 1 {
+        return Err(cli::error_with_info(
+            "ambiguous",
+            format!(
+                "Ambiguous event subject prefix '{q}' matches {} events.",
+                subj_prefix.len()
+            ),
+            Some(json!({ "candidates": event_candidates_json(&subj_prefix) })),
+        ));
     }
 
     bail!("Calendar event not found: {q}")
 }
 
-fn format_folder_candidates(candidates: &[&MailFolder]) -> String {
-    const MAX_LIST: usize = 8;
+const MAX_CANDIDATE_LIST: usize = 8;
+
+fn folder_display_path(all_folders: &[MailFolder], folder: &MailFolder) -> String {
+    let mut parts = vec![folder.display_name.as_str()];
+    let mut visited = vec![folder.id.as_str()];
+    let mut cur_parent = folder.parent_folder_id.as_deref();
+    while let Some(pid) = cur_parent {
+        if visited.contains(&pid) {
+            break;
+        }
+        let Some(parent) = all_folders.iter().find(|f| f.id == pid) else {
+            break;
+        };
+        visited.push(parent.id.as_str());
+        parts.push(parent.display_name.as_str());
+        cur_parent = parent.parent_folder_id.as_deref();
+    }
+    parts.reverse();
+    parts.join("/")
+}
+
+fn folder_candidates_json(
+    candidates: &[&MailFolder],
+    all_folders: &[MailFolder],
+) -> Vec<serde_json::Value> {
+    candidates
+        .iter()
+        .take(MAX_CANDIDATE_LIST)
+        .map(|f| {
+            json!({
+                "id": f.id,
+                "display_name": f.display_name,
+                "path": folder_display_path(all_folders, f),
+            })
+        })
+        .collect()
+}
+
+fn message_candidates_json(candidates: &[&MailMessage]) -> Vec<serde_json::Value> {
+    candidates
+        .iter()
+        .take(MAX_CANDIDATE_LIST)
+        .map(|m| {
+            json!({
+                "id": m.id,
+                "subject": m.subject,
+                "received_at": m.received_at,
+            })
+        })
+        .collect()
+}
+
+fn event_candidates_json(candidates: &[&CalendarEvent]) -> Vec<serde_json::Value> {
+    candidates
+        .iter()
+        .take(MAX_CANDIDATE_LIST)
+        .map(|e| {
+            json!({
+                "id": e.id,
+                "subject": e.subject,
+                "start_iso": e.start_iso,
+            })
+        })
+        .collect()
+}
+
+fn format_folder_candidates(candidates: &[&MailFolder], all_folders: &[MailFolder]) -> String {
     let mut lines: Vec<String> = candidates
         .iter()
-        .take(MAX_LIST)
-        .map(|f| format!("  - {} ({})", f.display_name, f.id))
+        .take(MAX_CANDIDATE_LIST)
+        .map(|f| format!("  - {} ({})", folder_display_path(all_folders, f), f.id))
         .collect();
-    if candidates.len() > MAX_LIST {
-        lines.push(format!("  ... and {} more", candidates.len() - MAX_LIST));
+    if candidates.len() > MAX_CANDIDATE_LIST {
+        lines.push(format!(
+            "  ... and {} more",
+            candidates.len() - MAX_CANDIDATE_LIST
+        ));
     }
     lines.join("\n")
 }
@@ -747,5 +868,118 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[test]
+    fn duplicate_message_subject_event_prefix_and_folder_paths_report_ambiguous() {
+        let make_msg = |id: &str, subject: &str| MailMessage {
+            id: id.to_string(),
+            internet_message_id: None,
+            conversation_id: None,
+            folder_id: Some("inbox".to_string()),
+            subject: subject.to_string(),
+            from: None,
+            to_recipients: Vec::new(),
+            cc_recipients: Vec::new(),
+            bcc_recipients: Vec::new(),
+            reply_to: Vec::new(),
+            received_at: "2026-11-20T09:00:00Z".to_string(),
+            sent_at: None,
+            last_modified_at: None,
+            is_read: true,
+            is_draft: false,
+            flagged: false,
+            importance: "normal".to_string(),
+            inference_classification: None,
+            has_attachments: false,
+            body_loaded: false,
+            preview: String::new(),
+            body_html: String::new(),
+            body_plain: String::new(),
+            attachments: Vec::new(),
+            meeting_request: None,
+            web_link: None,
+        };
+        let msgs = vec![
+            make_msg("msg-dup-1", "Weekly Sync Notes"),
+            make_msg("msg-dup-2", "Weekly Sync Notes"),
+            make_msg("msg-uniq", "Unique Subject"),
+        ];
+        let dup_err = resolve_mail_message_from_slice(&msgs, "Weekly Sync Notes")
+            .expect_err("duplicate subject must fail as ambiguous");
+        assert!(dup_err.to_string().starts_with("Ambiguous"));
+        assert_eq!(cli::error_code(&dup_err), "ambiguous");
+        let dup_json = cli::json_error_payload(&dup_err);
+        assert_eq!(
+            dup_json["error"]["details"]["candidates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            resolve_mail_message_from_slice(&msgs, "Unique Subject")
+                .unwrap()
+                .id,
+            "msg-uniq"
+        );
+
+        let make_ev = |id: &str, subject: &str| CalendarEvent {
+            id: id.to_string(),
+            subject: subject.to_string(),
+            start_iso: "2026-11-20T09:00:00Z".to_string(),
+            end_iso: "2026-11-20T10:00:00Z".to_string(),
+            time_zone: "UTC".to_string(),
+            is_all_day: false,
+            location: None,
+            organizer_name: None,
+            organizer_email: None,
+            attendees: Vec::new(),
+            response_status: "accepted".to_string(),
+            is_online_meeting: false,
+            online_meeting_url: None,
+            body_html: String::new(),
+            body_plain: String::new(),
+            is_cancelled: false,
+            web_link: None,
+        };
+        let events = vec![
+            make_ev("ev-1", "Design Review Alpha"),
+            make_ev("ev-2", "Design Review Beta"),
+        ];
+        let ev_err = resolve_calendar_event_from_slice(&events, "Design Review")
+            .expect_err("duplicate event subject prefix must fail as ambiguous");
+        assert!(ev_err.to_string().starts_with("Ambiguous"));
+        assert_eq!(cli::error_code(&ev_err), "ambiguous");
+
+        let mut inbox_reports = folder("folder-dup-1", "Reports", None);
+        inbox_reports.parent_folder_id = Some("f-inbox".to_string());
+        let mut archive_reports = folder("folder-dup-2", "Reports", None);
+        archive_reports.parent_folder_id = Some("f-archive".to_string());
+        let folders = vec![
+            folder("f-inbox", "Inbox", Some("inbox")),
+            folder("f-archive", "Archive", Some("archive")),
+            inbox_reports,
+            archive_reports,
+        ];
+        let fld_err = resolve_mail_folder_from_slice(&folders, "Reports")
+            .expect_err("duplicate folder display name must fail as ambiguous");
+        let fld_msg = fld_err.to_string();
+        assert!(fld_msg.contains("Inbox/Reports (folder-dup-1)"), "{fld_msg}");
+        assert!(
+            fld_msg.contains("Archive/Reports (folder-dup-2)"),
+            "{fld_msg}"
+        );
+        let fld_json = cli::json_error_payload(&fld_err);
+        let cands = fld_json["error"]["details"]["candidates"].as_array().unwrap();
+        assert_eq!(cands[0]["path"], "Inbox/Reports");
+        assert_eq!(cands[1]["path"], "Archive/Reports");
+
+        assert_eq!(
+            resolve_mail_folder_from_slice(&folders, "folder-dup-1")
+                .unwrap()
+                .id,
+            "folder-dup-1"
+        );
     }
 }

@@ -140,7 +140,7 @@ curl "http://127.0.0.1:3939/v1/mail/messages?folder=inbox&limit=20&unread=true"
 
 #### `GET /v1/mail/messages/{id}?offline=false`
 
-Fetches full headers, HTML/plain body, and attachment metadata for a single message (and caches it in SQLite).
+Fetches full headers, HTML/plain body, and attachment metadata for a single message (and caches it in SQLite). Messages fetched with expanded attachments include `attachments[].content_bytes_b64`.
 
 ```bash
 curl "http://127.0.0.1:3939/v1/mail/messages/AAMkAGI2..."
@@ -202,7 +202,7 @@ curl -X PATCH http://127.0.0.1:3939/v1/mail/messages/AAMkAGI2... \
   "message_id": "AAMkAGI2...",
   "is_read": true,
   "flagged": false,
-  "moved": { "id": "AAMkAGI2..." }
+  "moved": { "id": "AAMkAGI2...", "folder_id": "AAMkAGI2..." }
 }
 ```
 

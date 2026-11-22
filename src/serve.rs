@@ -85,10 +85,11 @@ impl IntoResponse for ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(err: anyhow::Error) -> Self {
-        let status = if cli::is_forbidden_error(&err) {
-            StatusCode::FORBIDDEN
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
+        let status = match cli::error_code(&err) {
+            "not_found" => StatusCode::NOT_FOUND,
+            "auth_required" | "token_expired" => StatusCode::UNAUTHORIZED,
+            "forbidden" => StatusCode::FORBIDDEN,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self::new(status, format!("{err:#}"))
     }
@@ -458,12 +459,12 @@ async fn map_graph_error(graph: &GraphClient, err: anyhow::Error) -> ApiError {
 fn map_resolve_error(err: anyhow::Error) -> ApiError {
     let msg = format!("{err:#}");
     let lower = msg.to_ascii_lowercase();
-    if lower.contains("empty") {
+    if lower.contains("empty") || lower.contains("ambiguous") {
         ApiError::bad_request(msg)
-    } else if lower.contains("not found") || lower.contains("ambiguous") {
+    } else if lower.contains("not found") {
         ApiError::not_found(msg)
     } else {
-        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, msg)
+        ApiError::from(err)
     }
 }
 
@@ -958,7 +959,7 @@ async fn patch_mail_message(
     })
     .await;
 
-    let moved_message = if let Some(dest) = dest_query {
+    let moved_result = if let Some(dest) = dest_query {
         let folder = resolve_mail_folder_for_api(&state, dest, false).await?;
         let (moved, attachments_expanded) =
             match state.graph.move_mail_message_with_meta(&id, &folder.id).await {
@@ -972,17 +973,20 @@ async fn patch_mail_message(
         })
         .await
         .unwrap_or(moved);
-        Some(persisted)
+        Some((persisted, folder.id))
     } else {
         None
     };
 
     Ok(Json(json!({
         "ok": true,
-        "message_id": moved_message.as_ref().map(|m| m.id.as_str()).unwrap_or(&id),
+        "message_id": moved_result.as_ref().map(|(m, _)| m.id.as_str()).unwrap_or(&id),
         "is_read": body.is_read,
         "flagged": body.flagged,
-        "moved": moved_message,
+        "moved": moved_result.as_ref().map(|(m, folder_id)| json!({
+            "id": m.id,
+            "folder_id": m.folder_id.as_deref().unwrap_or(folder_id.as_str()),
+        })),
     })))
 }
 
@@ -1967,5 +1971,31 @@ mod tests {
 
         assert!(is_loopback_origin("http://[::1]:5173"));
         assert!(!is_loopback_origin("https://localhost.evil.com"));
+    }
+
+    #[test]
+    fn api_error_maps_graph_404_401_and_resolver_ambiguity() {
+        let not_found = ApiError::from(anyhow::anyhow!(
+            "Graph API error (GET http://127.0.0.1/v1.0/me/messages/msg-missing-999): 404 Not Found [ErrorItemNotFound]"
+        ));
+        assert_eq!(not_found.status, StatusCode::NOT_FOUND);
+
+        let unauth = ApiError::from(anyhow::anyhow!(
+            "Graph API error (GET http://127.0.0.1/v1.0/me/messages): 401 Unauthorized [InvalidAuthenticationToken]"
+        ));
+        assert_eq!(unauth.status, StatusCode::UNAUTHORIZED);
+
+        let forbidden = ApiError::from(anyhow::anyhow!(
+            "Insufficient Graph permissions (403): restricted"
+        ));
+        assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
+
+        let ambiguous = map_resolve_error(anyhow::anyhow!(
+            "Ambiguous mail folder 'Reports' matches multiple folders"
+        ));
+        assert_eq!(ambiguous.status, StatusCode::BAD_REQUEST);
+
+        let missing_folder = map_resolve_error(anyhow::anyhow!("Mail folder not found: Ghost"));
+        assert_eq!(missing_folder.status, StatusCode::NOT_FOUND);
     }
 }
