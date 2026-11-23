@@ -783,7 +783,7 @@ fn parse_env_bool(input: &str) -> Option<bool> {
     }
 }
 
-fn expand_tilde(input: &str) -> PathBuf {
+pub(crate) fn expand_tilde(input: &str) -> PathBuf {
     if input == "~" {
         return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
     }

@@ -212,6 +212,37 @@ token_refresh_mins = 5
 | `OUTLOOK_IMAGE_PROTOCOL` | Terminal image protocol override (`auto`, `kitty`, `iterm2`, `sixel`, `halfblock`) |
 | `OUTLOOK_GITHUB_REPO` | Override GitHub `owner/repo` used by `outlook update` (default `BiteFoundry/outlook`) |
 | `OUTLOOK_GITHUB_TOKEN` | GitHub token for private release checks in `outlook update` |
+| `OUTLOOK_EXTRA_CA_PEM` | PEM file with extra root CAs to trust (also read: `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`) |
+
+### Corporate TLS proxies and private root CAs
+
+`outlook` trusts the Mozilla roots bundled into the binary plus the OS trust store (Windows certificate store, macOS keychain, the Linux system bundle). A CA installed in the OS store therefore works without configuration.
+
+To trust a root CA that is not in the OS store, export it (and any intermediates you want to pin) as PEM and point one of these variables at the file:
+
+| Variable | Notes |
+| --- | --- |
+| `OUTLOOK_EXTRA_CA_PEM` | Read by `outlook` only |
+| `SSL_CERT_FILE` | Shared with OpenSSL tools. While it is set, the OS store is not read: this file replaces it |
+| `NODE_EXTRA_CA_CERTS` | Shared with Node.js, so an existing Node setup carries over |
+
+All of them are additive and can be combined; a path named twice is read once. A file may hold several `-----BEGIN CERTIFICATE-----` blocks. A missing or invalid file prints a warning to stderr and is skipped, so it never breaks `--json` or MCP output. Certificate verification cannot be turned off.
+
+```powershell
+# Windows PowerShell
+$env:OUTLOOK_EXTRA_CA_PEM = "C:\certs\corp-root.pem"
+outlook doctor
+```
+
+```bash
+# macOS / Linux
+export OUTLOOK_EXTRA_CA_PEM="$HOME/certs/corp-root.pem"
+outlook doctor
+```
+
+`outlook doctor` prints `tls_roots` and one `tls_extra_ca` line per file (`--json`: `tls.roots`, `tls.extra_ca[]` with `source`, `path`, `loaded`, `certs`, `error`). A request that fails with an untrusted certificate (`UnknownIssuer`) ends with a hint pointing to these variables.
+
+For MCP clients, put the variable in the server's `env` block, e.g. `"env": { "OUTLOOK_EXTRA_CA_PEM": "C:\\certs\\corp-root.pem" }`.
 
 ## Troubleshooting
 

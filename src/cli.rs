@@ -2330,6 +2330,19 @@ fn missing_configured_scopes(configured: &[String], token_scopes: &[String]) -> 
         .collect()
 }
 
+/// Which built-in trust roots clients use, for `doctor`.
+fn tls_roots_label(native_roots: bool) -> &'static str {
+    let env_redirect = ["SSL_CERT_FILE", "SSL_CERT_DIR"]
+        .iter()
+        .any(|var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty()));
+    match (native_roots, env_redirect) {
+        (false, _) => "webpki (SSL_CERT_FILE unusable, OS store off)",
+        // rustls-native-certs reads these instead of the OS store.
+        (true, true) => "webpki+SSL_CERT_FILE/SSL_CERT_DIR",
+        (true, false) => "webpki+os",
+    }
+}
+
 async fn cmd_doctor(
     cfg: &AppConfig,
     persona: Persona,
@@ -2388,6 +2401,8 @@ async fn cmd_doctor(
         .await
         .unwrap_or_default();
     let graphics_caps = img_preview::detect_graphics_caps(cfg.image_protocol);
+    let extra_cas = crate::http::extra_cas();
+    let tls_roots = tls_roots_label(extra_cas.native_roots());
 
     let mut probe_results: Option<serde_json::Value> = None;
     if online {
@@ -2490,6 +2505,10 @@ async fn cmd_doctor(
                 "image_protocol": graphics_caps.protocol.as_str(),
                 "image_protocol_preference": cfg.image_protocol.as_str(),
                 "cell_px": [graphics_caps.cell_px.0, graphics_caps.cell_px.1],
+                "tls": {
+                    "roots": tls_roots,
+                    "extra_ca": extra_cas.reports(),
+                },
                 "online_check": probe_results,
             }))?
         );
@@ -2516,6 +2535,27 @@ async fn cmd_doctor(
             "cache_counts: folders={cached_folders}, messages={cached_messages}, events={cached_events}, contacts={cached_contacts}, todo_lists={cached_todo_lists}"
         );
         println!("download_dir: {}", dl_dir.display());
+        println!("tls_roots: {tls_roots}");
+        if extra_cas.reports().is_empty() {
+            println!("tls_extra_ca: (none; set OUTLOOK_EXTRA_CA_PEM to add a root CA)");
+        }
+        for report in extra_cas.reports() {
+            match &report.error {
+                None => println!(
+                    "tls_extra_ca: {}={} (loaded, {} certs)",
+                    report.source,
+                    report.path.display(),
+                    report.certs
+                ),
+                Some(error) => println!(
+                    "tls_extra_ca: {}={} (loaded={}, {} certs): {error}",
+                    report.source,
+                    report.path.display(),
+                    report.loaded,
+                    report.certs
+                ),
+            }
+        }
         println!("github_repo: {}", cfg.github_repo);
         println!(
             "configured_scopes ({}): {}",

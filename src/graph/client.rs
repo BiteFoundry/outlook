@@ -695,8 +695,10 @@ impl GraphClient {
                         continue;
                     }
                     let uncertain = mail_action && !err.is_connect();
-                    let error = anyhow::Error::new(err)
-                        .context(format!("Graph HTTP request failed ({method} {url})"));
+                    let error = crate::http::with_tls_hint(
+                        anyhow::Error::new(err)
+                            .context(format!("Graph HTTP request failed ({method} {url})")),
+                    );
                     return Err(if uncertain {
                         error.context(MailActionUnconfirmed)
                     } else {

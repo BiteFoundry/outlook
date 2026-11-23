@@ -32,7 +32,7 @@ notify-rust = "4"
 open = "5"
 rand = "0.8"
 ratatui = "0.28"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "http2", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "stream", "http2", "gzip"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 scraper = "0.20"
@@ -56,6 +56,9 @@ keyring = { version = "3", features = ["apple-native"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["async-secret-service", "async-io", "crypto-rust"] }
+
+[dev-dependencies]
+rcgen = "0.13"
 
 [profile.release]
 lto = "fat"

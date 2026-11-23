@@ -31,7 +31,7 @@ pub struct GraphClient {
 
 impl GraphClient {
     pub fn new(config: AppConfig, auth: AuthManager) -> Result<Self> {
-        let http = reqwest::Client::builder()
+        let http = crate::http::client_builder()
             .user_agent(concat!("outlook-cli/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))

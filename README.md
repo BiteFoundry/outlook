@@ -53,6 +53,8 @@ For a company registration, use `outlook login --client-id YOUR_CLIENT_ID --tena
 
 > **Shared M365 Session & Token Brokers:** When `share_m365_auth = true` (default), `outlook` seamlessly reuses or upgrades an existing `@bitefoundry/teams` session without a second browser login. Also supports `--device-code`, `OUTLOOK_ACCESS_TOKEN`, `OUTLOOK_TOKEN_FILE`, `OUTLOOK_TOKEN_REFRESH_CMD` (`az account get-access-token`), and custom Entra ID apps. Run `outlook whoami` or `outlook doctor --online` for JWT scope diagnostics.
 
+> **Corporate TLS proxies:** `outlook` trusts the bundled Mozilla roots and the OS trust store. If your network re-signs HTTPS with a private root CA, export it as PEM and set `OUTLOOK_EXTRA_CA_PEM` (`SSL_CERT_FILE` and `NODE_EXTRA_CA_CERTS` also work). `outlook doctor` shows which CA files were loaded. [Details](docs/NPM.md#corporate-tls-proxies-and-private-root-cas)
+
 Update a global npm install with `npm install -g @bitefoundry/outlook@latest`. For a standalone binary from [GitHub Releases](https://github.com/BiteFoundry/outlook/releases), use `outlook update`.
 
 ---
