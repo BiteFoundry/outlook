@@ -927,6 +927,96 @@ mod tests {
         );
     }
 
+    fn calendar_event_at(id: &str, start: chrono::DateTime<chrono::Utc>) -> CalendarEvent {
+        let fmt = |t: chrono::DateTime<chrono::Utc>| {
+            t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
+        CalendarEvent {
+            id: id.to_string(),
+            subject: id.to_string(),
+            start_iso: fmt(start),
+            end_iso: fmt(start + chrono::Duration::hours(1)),
+            time_zone: "UTC".to_string(),
+            is_all_day: false,
+            location: None,
+            organizer_name: None,
+            organizer_email: None,
+            attendees: Vec::new(),
+            response_status: "none".to_string(),
+            is_online_meeting: false,
+            online_meeting_url: None,
+            body_html: String::new(),
+            body_plain: String::new(),
+            is_cancelled: false,
+            web_link: None,
+        }
+    }
+
+    #[test]
+    fn calendar_rows_cached_without_offset_are_normalized_on_read() {
+        let storage = Storage::open_in_memory().unwrap();
+        {
+            let conn = storage.conn().lock().unwrap();
+            for (id, start, end, zone, all_day) in [
+                ("legacy", "2026-11-23T05:00:00.0000000", "2026-11-23T06:00:00.0000000", "UTC", 0),
+                ("all-day", "2026-11-23T00:00:00.0000000", "2026-11-24T00:00:00.0000000", "UTC", 1),
+                ("zoned", "2026-11-23T09:00:00.0000000", "2026-11-23T10:00:00.0000000", "Asia/Seoul", 0),
+            ] {
+                conn.execute(
+                    "INSERT INTO calendar_events (
+                        id, subject, start_iso, end_iso, time_zone, is_all_day,
+                        attendees_json, response_status, body_html, body_plain
+                    ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, '[]', 'none', '', '')",
+                    rusqlite::params![id, start, end, zone, all_day],
+                )
+                .unwrap();
+            }
+        }
+
+        let legacy = storage.get_calendar_event("legacy").unwrap().unwrap();
+        assert_eq!(legacy.start_iso, "2026-11-23T05:00:00Z");
+        assert_eq!(legacy.end_iso, "2026-11-23T06:00:00Z");
+        let all_day = storage.get_calendar_event("all-day").unwrap().unwrap();
+        assert_eq!(all_day.start_iso, "2026-11-23T00:00:00.0000000");
+        let zoned = storage.get_calendar_event("zoned").unwrap().unwrap();
+        assert_eq!(zoned.start_iso, "2026-11-23T09:00:00.0000000");
+
+        let listed = storage.list_calendar_events(None, None, 10).unwrap();
+        let legacy_listed = listed.iter().find(|e| e.id == "legacy").unwrap();
+        assert_eq!(legacy_listed.start_iso, "2026-11-23T05:00:00Z");
+    }
+
+    #[test]
+    fn calendar_cache_window_start_keeps_upcoming_events_ahead_of_old_history() {
+        let storage = Storage::open_in_memory().unwrap();
+        let now = chrono::Utc::now();
+        let mut events: Vec<CalendarEvent> = (0..250)
+            .map(|i| {
+                calendar_event_at(
+                    &format!("old-{i:03}"),
+                    now - chrono::Duration::days(60 + i),
+                )
+            })
+            .collect();
+        for day in 1..=3 {
+            events.push(calendar_event_at(
+                &format!("upcoming-{day}"),
+                now + chrono::Duration::days(day),
+            ));
+        }
+        storage.upsert_calendar_events(&events).unwrap();
+
+        // Without a lower bound the 200-row cap is filled by history and hides everything upcoming.
+        let unbounded = storage.list_calendar_events(None, None, 200).unwrap();
+        assert_eq!(unbounded.len(), 200);
+        assert!(unbounded.iter().all(|e| e.id.starts_with("old-")));
+
+        let start = crate::sync::calendar_cache_window_start();
+        let windowed = storage.list_calendar_events(Some(&start), None, 200).unwrap();
+        let ids: Vec<&str> = windowed.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["upcoming-1", "upcoming-2", "upcoming-3"]);
+    }
+
     #[test]
     fn test_list_mail_summaries_filtered_projection_order_and_first_recipient() {
         let storage = Storage::open_in_memory().unwrap();

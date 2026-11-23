@@ -612,7 +612,9 @@ async fn calendar_view_handler(
             {
                 "id": "evt-existing-1",
                 "subject": "Weekly Sync",
-                "start": { "dateTime": "2026-11-19T10:00:00Z", "timeZone": "UTC" },
+                // Real Graph wire format under `Prefer: outlook.timezone="UTC"`: no offset, 7 fractional digits.
+                // The end keeps the `Z` form so both inputs stay covered.
+                "start": { "dateTime": "2026-11-19T10:00:00.0000000", "timeZone": "UTC" },
                 "end": { "dateTime": "2026-11-19T10:30:00Z", "timeZone": "UTC" },
                 "isAllDay": false,
                 "location": { "displayName": "Teams" },
@@ -635,6 +637,46 @@ async fn calendar_view_handler(
     .into_response()
 }
 
+/// Graph rejects all-day events whose start/end are not midnight in the event's time zone.
+fn graph_all_day_rejection(payload: &Value) -> Option<Response> {
+    if payload["isAllDay"].as_bool() != Some(true) {
+        return None;
+    }
+    let is_midnight = |endpoint: &Value| {
+        endpoint["dateTime"]
+            .as_str()
+            .map(|value| value.trim_end_matches('0').trim_end_matches('.'))
+            .is_some_and(|value| value.ends_with("T00:00:00") || value.ends_with("T00:00:"))
+    };
+    if is_midnight(&payload["start"]) && is_midnight(&payload["end"]) {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "code": "ErrorInvalidRequest",
+                    "message": "The Event.Start property for an all-day event needs to be set to midnight."
+                }
+            })),
+        )
+            .into_response(),
+    )
+}
+
+/// Graph answers in the event's zone without an offset and with 7 fractional digits.
+fn graph_wire_time(endpoint: &Value) -> Value {
+    let raw = endpoint["dateTime"].as_str().unwrap_or_default();
+    let naive = raw.trim_end_matches('Z');
+    let date_time = if naive.contains('.') {
+        naive.to_string()
+    } else {
+        format!("{naive}.0000000")
+    };
+    json!({ "dateTime": date_time, "timeZone": endpoint["timeZone"] })
+}
+
 async fn create_event_handler(
     State(st): State<Arc<MockGraphState>>,
     headers: HeaderMap,
@@ -644,13 +686,16 @@ async fn create_event_handler(
     if let Err(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
+    if let Some(rejection) = graph_all_day_rejection(&payload) {
+        return rejection;
+    }
     st.created_events.write().unwrap().push(payload.clone());
     Json(json!({
         "id": "evt-created-1",
         "subject": payload["subject"],
-        "start": payload["start"],
-        "end": payload["end"],
-        "isAllDay": false,
+        "start": graph_wire_time(&payload["start"]),
+        "end": graph_wire_time(&payload["end"]),
+        "isAllDay": payload["isAllDay"].as_bool().unwrap_or(false),
         "location": payload["location"],
         "organizer": { "emailAddress": { "name": "Alice Outlook", "address": "alice@contoso.com" } },
         "attendees": [],
@@ -1667,6 +1712,8 @@ async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
         .await
         .unwrap();
     assert_eq!(events_json["events"].as_array().unwrap().len(), 1);
+    assert_eq!(events_json["events"][0]["start_iso"], "2026-11-19T10:00:00Z");
+    assert_eq!(events_json["events"][0]["end_iso"], "2026-11-19T10:30:00Z");
 
     let tasks_json: Value = http
         .get(format!("{api_base}/v1/todo/tasks?offline=true"))
@@ -7017,6 +7064,225 @@ async fn plan_outlook_04_event_compact_default() {
     assert_eq!(ev_f.len(), 17);
     assert!(ev_f.get("omitted").is_none());
     assert!(ev_f.get("hint").is_none());
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn out_01_02_all_day_create_and_utc_normalized_calendar_times() {
+    let token = make_regression_jwt();
+    let created: Arc<RwLock<Vec<Value>>> = Arc::new(RwLock::new(Vec::new()));
+    let created_for_route = created.clone();
+    let router = Router::new()
+        .route(
+            "/v1.0/me/calendarView",
+            get(|| async {
+                Json(json!({
+                    "value": [
+                        {
+                            "id": "ev-wire",
+                            "subject": "Wire Format",
+                            "start": { "dateTime": "2026-11-19T10:00:00.0000000", "timeZone": "UTC" },
+                            "end": { "dateTime": "2026-11-19T10:30:00.0000000", "timeZone": "UTC" },
+                            "isAllDay": false
+                        },
+                        {
+                            "id": "ev-z",
+                            "subject": "Already RFC3339",
+                            "start": { "dateTime": "2026-11-19T11:00:00Z", "timeZone": "UTC" },
+                            "end": { "dateTime": "2026-11-19T11:30:00Z", "timeZone": "UTC" },
+                            "isAllDay": false
+                        },
+                        {
+                            "id": "ev-all-day",
+                            "subject": "Holiday",
+                            "start": { "dateTime": "2026-11-20T00:00:00.0000000", "timeZone": "UTC" },
+                            "end": { "dateTime": "2026-11-21T00:00:00.0000000", "timeZone": "UTC" },
+                            "isAllDay": true
+                        }
+                    ]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/events",
+            post(move |Json(payload): Json<Value>| {
+                let created = created_for_route.clone();
+                async move {
+                    if let Some(rejection) = graph_all_day_rejection(&payload) {
+                        return rejection;
+                    }
+                    let id = {
+                        let mut list = created.write().unwrap();
+                        list.push(payload.clone());
+                        format!("evt-new-{}", list.len())
+                    };
+                    Json(json!({
+                        "id": id,
+                        "subject": payload["subject"],
+                        "start": graph_wire_time(&payload["start"]),
+                        "end": graph_wire_time(&payload["end"]),
+                        "isAllDay": payload["isAllDay"].as_bool().unwrap_or(false),
+                        "responseStatus": { "response": "organizer" }
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+
+    // OUT-02: offset-less Graph UTC values are reported as RFC3339 UTC; all-day values stay floating.
+    let listed = run_outlook_cli(&dir, &base_url, &token, &["calendar", "--days", "1", "--json"]);
+    assert!(listed.status.success(), "{}", String::from_utf8_lossy(&listed.stderr));
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let by_id = |id: &str| {
+        listed["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|ev| ev["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("missing {id} in {listed}"))
+    };
+    assert_eq!(by_id("ev-wire")["start_iso"], "2026-11-19T10:00:00Z");
+    assert_eq!(by_id("ev-wire")["end_iso"], "2026-11-19T10:30:00Z");
+    assert_eq!(by_id("ev-z")["start_iso"], "2026-11-19T11:00:00Z");
+    assert_eq!(by_id("ev-all-day")["start_iso"], "2026-11-20T00:00:00.0000000");
+
+    // OUT-01: an all-day create sends midnight boundaries (Graph answers 400 otherwise).
+    let all_day = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &[
+            "create-event", "--subject", "PTO", "--start", "2026-11-23", "--end", "2026-11-24",
+            "--all-day", "--json",
+        ],
+    );
+    assert!(all_day.status.success(), "{}", String::from_utf8_lossy(&all_day.stderr));
+    let all_day: Value = serde_json::from_slice(&all_day.stdout).unwrap();
+    assert_eq!(all_day["ok"], true);
+    assert_eq!(all_day["event"]["is_all_day"], true);
+    assert_eq!(all_day["event"]["start_iso"], "2026-11-23T00:00:00.0000000");
+    {
+        let sent = created.read().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["isAllDay"], true);
+        assert_eq!(sent[0]["start"]["dateTime"], "2026-11-23T00:00:00");
+        assert_eq!(sent[0]["end"]["dateTime"], "2026-11-24T00:00:00");
+        assert_eq!(sent[0]["start"]["timeZone"], sent[0]["end"]["timeZone"]);
+        assert!(!sent[0]["start"]["timeZone"].as_str().unwrap().is_empty());
+    }
+
+    // Invalid all-day input is rejected locally: non-zero exit, actionable message, no Graph call.
+    for (start, end, needle) in [
+        ("2026-11-23 09:00", "2026-11-24", "YYYY-MM-DD"),
+        ("2026-11-23", "2026-11-23", "2026-11-24"),
+    ] {
+        let rejected = run_outlook_cli(
+            &dir,
+            &base_url,
+            &token,
+            &["create-event", "--subject", "PTO", "--start", start, "--end", end, "--all-day"],
+        );
+        assert!(!rejected.status.success());
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(stderr.contains(needle), "{stderr}");
+    }
+    assert_eq!(created.read().unwrap().len(), 1);
+
+    // Wall clock + --time-zone is sent unconverted in that zone; RFC3339 + --time-zone stays a UTC instant.
+    let zoned = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &[
+            "create-event", "--subject", "Standup", "--start", "2026-11-23 09:00", "--end",
+            "2026-11-23 09:30", "--time-zone", "Asia/Seoul", "--json",
+        ],
+    );
+    assert!(zoned.status.success(), "{}", String::from_utf8_lossy(&zoned.stderr));
+    let instant = run_outlook_cli(
+        &dir,
+        &base_url,
+        &token,
+        &[
+            "create-event", "--subject", "Instant", "--start", "2026-11-23T09:00:00+09:00",
+            "--end", "2026-11-23T09:30:00+09:00", "--time-zone", "Asia/Seoul", "--json",
+        ],
+    );
+    assert!(instant.status.success(), "{}", String::from_utf8_lossy(&instant.stderr));
+    let instant: Value = serde_json::from_slice(&instant.stdout).unwrap();
+    assert_eq!(instant["event"]["start_iso"], "2026-11-23T00:00:00Z");
+    {
+        let sent = created.read().unwrap();
+        assert_eq!(
+            sent[1]["start"],
+            json!({ "dateTime": "2026-11-23T09:00:00", "timeZone": "Asia/Seoul" })
+        );
+        assert_eq!(
+            sent[1]["end"],
+            json!({ "dateTime": "2026-11-23T09:30:00", "timeZone": "Asia/Seoul" })
+        );
+        assert_eq!(
+            sent[2]["start"],
+            json!({ "dateTime": "2026-11-23T00:00:00Z", "timeZone": "UTC" })
+        );
+    }
+
+    // MCP create_event follows the same contract.
+    let cfg = test_config_for_server(&base_url);
+    let auth = AuthManager::from_tokens(
+        cfg.clone(),
+        StoredTokens {
+            access_token: token.clone(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: cfg.client_id.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            user_id: Some("regression-user".into()),
+            user_display_name: Some("Alice Outlook".into()),
+            user_email: Some("alice@contoso.com".into()),
+            auth_mode: "access_token".into(),
+        },
+    );
+    let graph = GraphClient::new(cfg.clone(), auth).unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let (mcp_err, mcp_created) = call_mcp_tool_json(
+        &cfg,
+        &graph,
+        &storage,
+        "create_event",
+        json!({
+            "subject": "Offsite", "start": "2026-12-01", "end": "2026-12-03",
+            "is_all_day": true, "time_zone": "Asia/Seoul"
+        }),
+    )
+    .await;
+    assert!(!mcp_err, "{mcp_created}");
+    assert_eq!(mcp_created["event"]["is_all_day"], true);
+    assert_eq!(
+        created.read().unwrap()[3]["start"],
+        json!({ "dateTime": "2026-12-01T00:00:00", "timeZone": "Asia/Seoul" })
+    );
+    let (mcp_bad_err, mcp_bad) = call_mcp_tool_json(
+        &cfg,
+        &graph,
+        &storage,
+        "create_event",
+        json!({ "subject": "Bad", "start": "2026-12-01T09:00:00Z", "end": "2026-12-02", "is_all_day": true }),
+    )
+    .await;
+    assert!(mcp_bad_err);
+    assert!(mcp_bad.to_string().contains("YYYY-MM-DD"), "{mcp_bad}");
+    assert_eq!(created.read().unwrap().len(), 4);
 
     server.abort();
 }

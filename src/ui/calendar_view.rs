@@ -84,7 +84,7 @@ pub fn draw_list(
     let mut last_day: Option<NaiveDate> = None;
 
     for (idx, ev) in events.iter().enumerate() {
-        let day = event_local_date(&ev.start_iso);
+        let day = event_local_date(ev);
         if day != last_day {
             if !lines.is_empty() {
                 lines.push(RenderedLine::plain(Line::raw("")));
@@ -363,14 +363,15 @@ pub fn build_event_detail_lines(
     ])));
 
     let when = if ev.is_all_day {
-        format!("  When:      {} (All Day · {})", format_date_only(&ev.start_iso), ev.time_zone)
+        format!("  When:      {} (All Day · {})", format_date_only(ev), ev.time_zone)
     } else {
+        // Hours are shown in the machine's zone, so label them with its offset, not the event's storage zone.
         format!(
             "  When:      {} {} – {} ({})",
-            format_date_only(&ev.start_iso),
+            format_date_only(ev),
             format_hhmm(&ev.start_iso),
             format_hhmm(&ev.end_iso),
-            ev.time_zone
+            Local::now().format("%:z")
         )
     };
     out.push(RenderedLine::plain(Line::from(Span::styled(
@@ -508,9 +509,14 @@ fn rsvp_badge(status: &str, theme: &crate::ui::theme::Theme) -> (&'static str, C
     }
 }
 
-pub fn event_local_date(iso: &str) -> Option<NaiveDate> {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(iso) {
-        return Some(dt.with_timezone(&Local).date_naive());
+/// Calendar date an event starts on. All-day events are floating dates: only the date part is read,
+/// with no time-zone conversion, so they stay on the same day in every UTC offset.
+pub fn event_local_date(ev: &CalendarEvent) -> Option<NaiveDate> {
+    let iso = ev.start_iso.as_str();
+    if !ev.is_all_day {
+        if let Ok(dt) = DateTime::parse_from_rfc3339(iso) {
+            return Some(dt.with_timezone(&Local).date_naive());
+        }
     }
     NaiveDate::parse_from_str(iso.get(..10)?, "%Y-%m-%d").ok()
 }
@@ -536,12 +542,81 @@ fn format_hhmm(iso: &str) -> String {
     iso.get(11..16).unwrap_or("--:--").to_string()
 }
 
-fn format_date_only(iso: &str) -> String {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(iso) {
-        return dt
-            .with_timezone(&Local)
-            .format("%a, %b %d %Y")
-            .to_string();
+fn format_date_only(ev: &CalendarEvent) -> String {
+    match event_local_date(ev) {
+        Some(date) => date.format("%a, %b %d %Y").to_string(),
+        None => ev.start_iso.get(..10).unwrap_or(&ev.start_iso).to_string(),
     }
-    iso.get(..10).unwrap_or(iso).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn event(id: &str, start: &str, end: &str, zone: &str, all_day: bool) -> CalendarEvent {
+        CalendarEvent {
+            id: id.into(),
+            subject: id.into(),
+            start_iso: crate::graph::calendar::normalize_graph_event_time(start, zone, all_day),
+            end_iso: crate::graph::calendar::normalize_graph_event_time(end, zone, all_day),
+            time_zone: zone.into(),
+            is_all_day: all_day,
+            location: None,
+            organizer_name: None,
+            organizer_email: None,
+            attendees: Vec::new(),
+            response_status: "none".into(),
+            is_online_meeting: false,
+            online_meeting_url: None,
+            body_html: String::new(),
+            body_plain: String::new(),
+            is_cancelled: false,
+            web_link: None,
+        }
+    }
+
+    #[test]
+    fn conflicts_are_detected_for_offsetless_graph_utc_times() {
+        let events = [
+            event("a", "2026-11-23T05:00:00.0000000", "2026-11-23T06:00:00.0000000", "UTC", false),
+            event("b", "2026-11-23T05:30:00.0000000", "2026-11-23T06:30:00.0000000", "UTC", false),
+            event("c", "2026-11-23T07:00:00.0000000", "2026-11-23T08:00:00.0000000", "UTC", false),
+            event("d", "2026-11-23T00:00:00.0000000", "2026-11-24T00:00:00.0000000", "UTC", true),
+        ];
+        assert_eq!(detect_conflicts(&events), vec![true, true, false, false]);
+    }
+
+    #[test]
+    fn timed_events_render_in_the_machine_zone() {
+        let instant = Utc.with_ymd_and_hms(2026, 11, 23, 5, 0, 0).unwrap();
+        assert_eq!(
+            format_hhmm("2026-11-23T05:00:00Z"),
+            instant.with_timezone(&Local).format("%H:%M").to_string()
+        );
+
+        let late = event("late", "2026-11-23T23:30:00.0000000", "2026-11-24T00:30:00.0000000", "UTC", false);
+        let expected = Utc
+            .with_ymd_and_hms(2026, 11, 23, 23, 30, 0)
+            .unwrap()
+            .with_timezone(&Local)
+            .date_naive();
+        assert_eq!(event_local_date(&late), Some(expected));
+        assert_eq!(format_date_only(&late), expected.format("%a, %b %d %Y").to_string());
+    }
+
+    #[test]
+    fn all_day_events_keep_their_floating_date_in_every_offset() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 23).unwrap();
+        let floating = event("x", "2026-11-23T00:00:00.0000000", "2026-11-24T00:00:00.0000000", "UTC", true);
+        assert_eq!(event_local_date(&floating), Some(day));
+        assert_eq!(format_date_only(&floating), "Mon, Nov 23 2026");
+
+        let mut with_z = floating.clone();
+        with_z.start_iso = "2026-11-23T00:00:00Z".into();
+        assert_eq!(event_local_date(&with_z), Some(day));
+        let mut negative_offset = floating;
+        negative_offset.start_iso = "2026-11-23T00:00:00-08:00".into();
+        assert_eq!(event_local_date(&negative_offset), Some(day));
+    }
 }

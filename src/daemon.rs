@@ -1217,7 +1217,11 @@ async fn run_initial_bootstrap(
             let st_rest = storage.clone();
             if let Ok(Ok((events, contacts, lists, def_tasks))) =
                 tokio::task::spawn_blocking(move || {
-                    let events = st_rest.list_calendar_events(None, None, 200)?;
+                    let events = st_rest.list_calendar_events(
+                        Some(&crate::sync::calendar_cache_window_start()),
+                        None,
+                        200,
+                    )?;
                     let contacts = st_rest.list_contacts(None, 200)?;
                     let lists = st_rest.list_todo_lists()?;
                     let def_id = lists
@@ -1502,7 +1506,11 @@ async fn handle_client_connection(
                                     tokio::task::spawn_blocking(move || {
                                         Ok::<_, anyhow::Error>((
                                             st.list_mail_folders()?,
-                                            st.list_calendar_events(None, None, 200)?,
+                                            st.list_calendar_events(
+                                                Some(&crate::sync::calendar_cache_window_start()),
+                                                None,
+                                                200,
+                                            )?,
                                         ))
                                     })
                                     .await

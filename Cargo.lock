@@ -2171,6 +2171,7 @@ dependencies = [
  "dirs",
  "futures",
  "hex",
+ "iana-time-zone",
  "image",
  "keyring",
  "notify-rust",

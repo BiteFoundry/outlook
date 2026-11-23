@@ -276,6 +276,15 @@ curl "http://127.0.0.1:3939/v1/calendar/events?days=14"
 
 Creates a new calendar event. `start_iso` / `end_iso` accept aliases `start` / `end`; `markdown` accepts alias `body`; `is_online_meeting` accepts alias `online`.
 
+| Input | `time_zone` | Result |
+|---|---|---|
+| RFC3339 (`2026-11-20T14:00:00Z`, `...+09:00`) | any | Exact instant, stored in UTC. |
+| Wall clock (`2026-11-20 14:00`) | omitted | Read in the server machine's time zone. |
+| Wall clock (`2026-11-20 14:00`) | `Asia/Seoul` | Read in that zone (IANA or Windows name). |
+| `is_all_day: true` | optional | `start_iso` and `end_iso` must be `YYYY-MM-DD`; the end date is exclusive. |
+
+Invalid all-day input (a time of day, or an end date that is not after the start date) returns `400` without calling Microsoft Graph.
+
 ```bash
 curl -X POST http://127.0.0.1:3939/v1/calendar/events \
   -H "Content-Type: application/json" \

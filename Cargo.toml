@@ -26,6 +26,7 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 dirs = "5"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 hex = "0.4"
+iana-time-zone = "0.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 notify-rust = "4"
 open = "5"

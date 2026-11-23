@@ -578,7 +578,11 @@ impl AppState {
                 self.active_mail_id = None;
             }
         }
-        if let Ok(events) = self.storage.list_calendar_events(None, None, 200) {
+        let calendar_start = crate::sync::calendar_cache_window_start();
+        if let Ok(events) = self
+            .storage
+            .list_calendar_events(Some(&calendar_start), None, 200)
+        {
             self.calendar_events = events;
             if let Some(first) = self.calendar_events.first() {
                 self.active_event_id = Some(first.id.clone());
@@ -1010,7 +1014,7 @@ impl AppState {
             .calendar_events
             .iter()
             .filter(|ev| {
-                let Some(d) = super::calendar_view::event_local_date(&ev.start_iso) else {
+                let Some(d) = super::calendar_view::event_local_date(ev) else {
                     return matches!(ui.cal_range, CalendarRangeFilter::AllUpcoming);
                 };
                 match ui.cal_range {
@@ -1081,7 +1085,11 @@ impl AppState {
                     .list_mail_summaries_filtered(Some(&inbox_id), false, false, false, 150)
                     .unwrap_or_default();
                 let events = read_st
-                    .list_calendar_events(None, None, 200)
+                    .list_calendar_events(
+                        Some(&crate::sync::calendar_cache_window_start()),
+                        None,
+                        200,
+                    )
                     .unwrap_or_default();
                 let contacts = read_st.list_contacts(None, 200).unwrap_or_default();
                 let lists = read_st.list_todo_lists().unwrap_or_default();
@@ -3973,6 +3981,52 @@ mod tests {
         let app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
         let ui = UiState::from_config(&cfg);
         (app, ui)
+    }
+
+    fn make_event_at(id: &str, start: chrono::DateTime<chrono::Utc>) -> CalendarEvent {
+        let fmt = |t: chrono::DateTime<chrono::Utc>| {
+            t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
+        CalendarEvent {
+            id: id.into(),
+            subject: id.into(),
+            start_iso: fmt(start),
+            end_iso: fmt(start + chrono::Duration::hours(1)),
+            time_zone: "UTC".into(),
+            is_all_day: false,
+            location: None,
+            organizer_name: None,
+            organizer_email: None,
+            attendees: vec![],
+            response_status: "none".into(),
+            is_online_meeting: false,
+            online_meeting_url: None,
+            body_html: String::new(),
+            body_plain: String::new(),
+            is_cancelled: false,
+            web_link: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_calendar_load_is_not_starved_by_old_history() {
+        let (mut app, _ui) = make_test_app();
+        let now = chrono::Utc::now();
+        let mut events: Vec<CalendarEvent> = (0..250)
+            .map(|i| make_event_at(&format!("old-{i:03}"), now - chrono::Duration::days(60 + i)))
+            .collect();
+        for day in 1..=3 {
+            events.push(make_event_at(
+                &format!("upcoming-{day}"),
+                now + chrono::Duration::days(day),
+            ));
+        }
+        app.storage.upsert_calendar_events(&events).unwrap();
+
+        app.load_cached_initial();
+        let ids: Vec<&str> = app.calendar_events.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["upcoming-1", "upcoming-2", "upcoming-3"]);
+        assert_eq!(app.active_event_id.as_deref(), Some("upcoming-1"));
     }
 
     #[tokio::test]

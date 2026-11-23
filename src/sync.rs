@@ -443,6 +443,11 @@ pub(crate) fn default_calendar_window() -> (String, String) {
     (start, end)
 }
 
+/// Lower bound for calendar views read from the cache: the same "now - 7 days" the sync engine fetches from.
+pub(crate) fn calendar_cache_window_start() -> String {
+    default_calendar_window().0
+}
+
 fn pick_default_todo_list(lists: &[TodoList]) -> Option<&TodoList> {
     lists
         .iter()

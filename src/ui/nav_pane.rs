@@ -696,7 +696,7 @@ fn draw_mini_calendar(
         .calendar_events
         .iter()
         .filter(|e| !e.is_cancelled)
-        .filter_map(|e| parse_event_local_date(&e.start_iso))
+        .filter_map(super::calendar_view::event_local_date)
         .collect();
 
     let first_of_month = NaiveDate::from_ymd_opt(year, month, 1).unwrap_or(today);
@@ -767,13 +767,6 @@ fn draw_mini_calendar(
             Rect::new(area.x, y, area.width, 1),
         );
     }
-}
-
-fn parse_event_local_date(iso: &str) -> Option<NaiveDate> {
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(iso) {
-        return Some(dt.with_timezone(&Local).date_naive());
-    }
-    NaiveDate::parse_from_str(iso.get(..10)?, "%Y-%m-%d").ok()
 }
 
 fn month_name(m: u32) -> &'static str {

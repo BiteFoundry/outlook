@@ -399,8 +399,10 @@ pub enum Command {
     CreateEvent {
         #[arg(long, required = true)]
         subject: String,
+        /// Start: RFC3339 (exact instant), wall clock `YYYY-MM-DD HH:MM` (machine zone, or --time-zone), or `YYYY-MM-DD` with --all-day
         #[arg(long, required = true, value_name = "ISO")]
         start: String,
+        /// End, in the same form as --start. With --all-day the end date is exclusive
         #[arg(long, required = true, value_name = "ISO")]
         end: String,
         #[arg(long)]
@@ -411,8 +413,10 @@ pub enum Command {
         body: Option<String>,
         #[arg(long = "online", visible_alias = "teams-meeting")]
         online: bool,
+        /// All-day event: --start and --end must be `YYYY-MM-DD`; end is exclusive (next day for a one-day event)
         #[arg(long = "all-day")]
         all_day: bool,
+        /// IANA or Windows zone. Wall-clock times are read in this zone; RFC3339 times stay exact instants (UTC)
         #[arg(long)]
         time_zone: Option<String>,
         #[arg(long)]
@@ -4205,8 +4209,12 @@ async fn cmd_event_create(
         bail!("Event subject is empty.");
     }
     check_recipient_addresses(&attendees)?;
-    let start_iso = normalize_datetime_iso(start)?;
-    let end_iso = normalize_datetime_iso(end)?;
+    let (start_iso, end_iso, time_zone) = crate::graph::calendar::resolve_new_event_times(
+        start,
+        end,
+        is_all_day,
+        time_zone.as_deref(),
+    )?;
     let body_html = body
         .as_deref()
         .map(str::trim)

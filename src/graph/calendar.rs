@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat, Utc};
 use serde::Deserialize;
 
 use super::{
@@ -150,6 +150,30 @@ struct GraphCalendarEvent {
     web_link: Option<String>,
 }
 
+/// Normalises a Graph `dateTimeTimeZone.dateTime` value for a timed event into RFC3339 UTC.
+///
+/// Graph returns offset-less values (`2026-11-23T05:00:00.0000000`) when the request carries
+/// `Prefer: outlook.timezone="UTC"`. Every consumer parses RFC3339, so the offset is made explicit here.
+/// All-day values are floating dates and are never shifted; values in a non-UTC zone are left as they are.
+pub(crate) fn normalize_graph_event_time(raw: &str, time_zone: &str, is_all_day: bool) -> String {
+    if is_all_day || DateTime::parse_from_rfc3339(raw).is_ok() {
+        return raw.to_string();
+    }
+    let zone = time_zone.trim();
+    let is_utc = zone.is_empty()
+        || zone.eq_ignore_ascii_case("UTC")
+        || zone.eq_ignore_ascii_case("Etc/UTC");
+    if !is_utc {
+        return raw.to_string();
+    }
+    match NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f") {
+        Ok(naive) => naive
+            .and_utc()
+            .to_rfc3339_opts(SecondsFormat::AutoSi, true),
+        Err(_) => raw.to_string(),
+    }
+}
+
 pub(crate) enum CalendarEditTime {
     Date(NaiveDate),
     WallClock(NaiveDateTime),
@@ -165,7 +189,14 @@ impl CalendarEditTime {
         if let Ok(value) = raw.parse::<NaiveDate>() {
             return Ok(Self::Date(value));
         }
-        for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M"] {
+        for format in [
+            "%Y-%m-%dT%H:%M:%S%.f",
+            "%Y-%m-%dT%H:%M",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d_%H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d_%H:%M",
+        ] {
             if let Ok(value) = NaiveDateTime::parse_from_str(raw, format) {
                 return Ok(Self::WallClock(value));
             }
@@ -212,6 +243,85 @@ impl CalendarEditTime {
     }
 }
 
+/// IANA name of the machine's time zone, or `UTC` when it cannot be determined (stripped containers).
+fn system_time_zone() -> String {
+    iana_time_zone::get_timezone()
+        .ok()
+        .map(|zone| zone.trim().to_string())
+        .filter(|zone| !zone.is_empty())
+        .unwrap_or_else(|| "UTC".to_string())
+}
+
+fn is_utc_zone(zone: &str) -> bool {
+    zone.eq_ignore_ascii_case("UTC") || zone.eq_ignore_ascii_case("Etc/UTC")
+}
+
+/// Resolves `create-event` input into the `(start, end, timeZone)` triple sent to Graph.
+///
+/// - All-day: `YYYY-MM-DD` for both ends (end exclusive), sent as floating midnights in `time_zone`
+///   (or the system zone). Graph rejects all-day events whose boundaries are not midnight.
+/// - Timed without `time_zone`: unchanged from 0.3.0 (machine-local or RFC3339 input, sent as a UTC instant).
+/// - Timed with `time_zone`: wall-clock input is read in that zone and sent unconverted; RFC3339 input is an
+///   exact instant and is sent in UTC. A `Z`-suffixed value is never paired with a non-UTC zone.
+pub(crate) fn resolve_new_event_times(
+    start: &str,
+    end: &str,
+    is_all_day: bool,
+    time_zone: Option<&str>,
+) -> Result<(String, String, Option<String>)> {
+    let zone = time_zone.map(str::trim).filter(|zone| !zone.is_empty());
+
+    if is_all_day {
+        let parse_date = |raw: &str| {
+            raw.trim().parse::<NaiveDate>().ok().context(
+                "Use YYYY-MM-DD for --all-day events (end date is exclusive).",
+            )
+        };
+        let start_date = parse_date(start)?;
+        let end_date = parse_date(end)?;
+        if end_date <= start_date {
+            let next_day = start_date.succ_opt().unwrap_or(start_date);
+            bail!("All-day end date is exclusive; use {next_day} for a one-day event.");
+        }
+        let zone = zone.map(str::to_string).unwrap_or_else(system_time_zone);
+        return Ok((
+            format!("{start_date}T00:00:00"),
+            format!("{end_date}T00:00:00"),
+            Some(zone),
+        ));
+    }
+
+    let Some(zone) = zone else {
+        return Ok((
+            crate::cli::normalize_datetime_iso(start)?,
+            crate::cli::normalize_datetime_iso(end)?,
+            None,
+        ));
+    };
+
+    let wall_clock = |time: &CalendarEditTime| match time {
+        CalendarEditTime::WallClock(value) => Some(*value),
+        CalendarEditTime::Date(date) => date.and_hms_opt(0, 0, 0),
+        CalendarEditTime::Instant(_) => None,
+    };
+    let start_time = CalendarEditTime::parse(start)?;
+    let end_time = CalendarEditTime::parse(end)?;
+    match (wall_clock(&start_time), wall_clock(&end_time)) {
+        (Some(start_wall), Some(end_wall)) => {
+            let format = |value: NaiveDateTime| value.format("%Y-%m-%dT%H:%M:%S%.f").to_string();
+            Ok((format(start_wall), format(end_wall), Some(zone.to_string())))
+        }
+        (None, None) => Ok((
+            crate::cli::normalize_datetime_iso(start)?,
+            crate::cli::normalize_datetime_iso(end)?,
+            Some("UTC".to_string()),
+        )),
+        _ => bail!(
+            "With --time-zone, give --start and --end in the same form: both wall-clock (YYYY-MM-DD HH:MM, read in {zone}) or both RFC3339."
+        ),
+    }
+}
+
 impl From<GraphCalendarEvent> for CalendarEvent {
     fn from(raw: GraphCalendarEvent) -> Self {
         let preview = raw.body_preview.unwrap_or_default();
@@ -233,16 +343,20 @@ impl From<GraphCalendarEvent> for CalendarEvent {
         let is_online_meeting =
             raw.is_online_meeting.unwrap_or(false) || online_meeting_url.is_some();
 
-        let start_iso = raw
-            .start
-            .as_ref()
-            .and_then(|s| s.date_time.clone())
-            .unwrap_or_default();
-        let end_iso = raw
-            .end
-            .as_ref()
-            .and_then(|s| s.date_time.clone())
-            .unwrap_or_default();
+        let is_all_day = raw.is_all_day.unwrap_or(false);
+        let endpoint_iso = |endpoint: Option<&GraphDateTimeTimeZone>| {
+            let Some(endpoint) = endpoint else {
+                return String::new();
+            };
+            let value = endpoint.date_time.as_deref().unwrap_or_default();
+            normalize_graph_event_time(
+                value,
+                endpoint.time_zone.as_deref().unwrap_or_default(),
+                is_all_day,
+            )
+        };
+        let start_iso = endpoint_iso(raw.start.as_ref());
+        let end_iso = endpoint_iso(raw.end.as_ref());
         let time_zone = raw
             .start
             .as_ref()
@@ -264,7 +378,7 @@ impl From<GraphCalendarEvent> for CalendarEvent {
             start_iso,
             end_iso,
             time_zone,
-            is_all_day: raw.is_all_day.unwrap_or(false),
+            is_all_day,
             location: raw
                 .location
                 .and_then(|l| l.display_name)
@@ -299,6 +413,13 @@ fn build_event_payload(event: &OutgoingEvent) -> serde_json::Value {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("UTC");
+    debug_assert!(
+        is_utc_zone(tz)
+            || [&event.start_iso, &event.end_iso]
+                .iter()
+                .all(|value| DateTime::parse_from_rfc3339(value).is_err()),
+        "an offset-suffixed dateTime must only be paired with the UTC time zone"
+    );
 
     let mut payload = serde_json::json!({
         "subject": event.subject,
@@ -592,6 +713,171 @@ mod tests {
     };
 
     #[test]
+    fn normalize_graph_event_time_makes_utc_explicit_only_for_timed_utc_values() {
+        for (raw, zone, all_day, expected) in [
+            ("2026-11-23T05:00:00.0000000", "UTC", false, "2026-11-23T05:00:00Z"),
+            ("2026-11-23T05:00:00", "utc", false, "2026-11-23T05:00:00Z"),
+            ("2026-11-23T05:00:00.0000000", "Etc/UTC", false, "2026-11-23T05:00:00Z"),
+            ("2026-11-23T05:00:00.5000000", "", false, "2026-11-23T05:00:00.500Z"),
+            ("2026-11-19T10:00:00Z", "UTC", false, "2026-11-19T10:00:00Z"),
+            ("2026-11-19T19:00:00+09:00", "UTC", false, "2026-11-19T19:00:00+09:00"),
+            (
+                "2026-11-23T09:00:00.0000000",
+                "Pacific Standard Time",
+                false,
+                "2026-11-23T09:00:00.0000000",
+            ),
+            ("2026-11-23T00:00:00.0000000", "UTC", true, "2026-11-23T00:00:00.0000000"),
+            ("", "UTC", false, ""),
+            ("not a time", "UTC", false, "not a time"),
+        ] {
+            assert_eq!(
+                normalize_graph_event_time(raw, zone, all_day),
+                expected,
+                "raw={raw:?} zone={zone:?} all_day={all_day}"
+            );
+        }
+    }
+
+    #[test]
+    fn graph_event_conversion_normalizes_offsetless_utc_wire_format() {
+        let timed: GraphCalendarEvent = serde_json::from_value(serde_json::json!({
+            "id": "timed",
+            "start": { "dateTime": "2026-11-23T05:00:00.0000000", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-11-23T06:00:00.0000000", "timeZone": "UTC" },
+            "isAllDay": false
+        }))
+        .unwrap();
+        let timed = CalendarEvent::from(timed);
+        assert_eq!(timed.start_iso, "2026-11-23T05:00:00Z");
+        assert_eq!(timed.end_iso, "2026-11-23T06:00:00Z");
+        assert_eq!(timed.time_zone, "UTC");
+
+        let all_day: GraphCalendarEvent = serde_json::from_value(serde_json::json!({
+            "id": "all-day",
+            "start": { "dateTime": "2026-11-23T00:00:00.0000000", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-11-24T00:00:00.0000000", "timeZone": "UTC" },
+            "isAllDay": true
+        }))
+        .unwrap();
+        let all_day = CalendarEvent::from(all_day);
+        assert!(all_day.is_all_day);
+        assert_eq!(all_day.start_iso, "2026-11-23T00:00:00.0000000");
+        assert_eq!(all_day.end_iso, "2026-11-24T00:00:00.0000000");
+
+        let zoned: GraphCalendarEvent = serde_json::from_value(serde_json::json!({
+            "id": "zoned",
+            "start": { "dateTime": "2026-11-23T09:00:00.0000000", "timeZone": "Asia/Seoul" },
+            "end": { "dateTime": "2026-11-23T10:00:00.0000000", "timeZone": "Asia/Seoul" }
+        }))
+        .unwrap();
+        assert_eq!(CalendarEvent::from(zoned).start_iso, "2026-11-23T09:00:00.0000000");
+    }
+
+    #[test]
+    fn new_event_times_follow_the_create_contract() {
+        let s = |v: &str| v.to_string();
+
+        // All-day: floating midnights in the requested zone.
+        assert_eq!(
+            resolve_new_event_times("2026-11-23", "2026-11-24", true, Some("Asia/Seoul")).unwrap(),
+            (s("2026-11-23T00:00:00"), s("2026-11-24T00:00:00"), Some(s("Asia/Seoul")))
+        );
+        // All-day without a zone: still floating midnights, in a non-empty default zone.
+        let (start, end, zone) =
+            resolve_new_event_times("2026-11-23", "2026-11-25", true, None).unwrap();
+        assert_eq!((start.as_str(), end.as_str()), ("2026-11-23T00:00:00", "2026-11-25T00:00:00"));
+        assert!(zone.is_some_and(|zone| !zone.trim().is_empty()));
+        let (_, _, blank_zone) =
+            resolve_new_event_times("2026-11-23", "2026-11-24", true, Some("  ")).unwrap();
+        assert!(blank_zone.is_some_and(|zone| !zone.trim().is_empty()));
+
+        // All-day validation happens before any network call.
+        let same_day = resolve_new_event_times("2026-11-23", "2026-11-23", true, None).unwrap_err();
+        assert!(same_day.to_string().contains("2026-11-24"), "{same_day}");
+        assert!(resolve_new_event_times("2026-11-24", "2026-11-23", true, None).is_err());
+        for (start, end) in [
+            ("2026-11-23 09:00", "2026-11-24"),
+            ("2026-11-23", "2026-11-24T00:00:00Z"),
+            ("2026-11-23T00:00:00+09:00", "2026-11-24T00:00:00+09:00"),
+        ] {
+            let err = resolve_new_event_times(start, end, true, Some("Asia/Seoul")).unwrap_err();
+            assert!(err.to_string().contains("YYYY-MM-DD"), "{err}");
+        }
+
+        // Timed wall clock + zone: sent unconverted, read in that zone.
+        for (start, end) in [
+            ("2026-11-23 09:00", "2026-11-23 10:00"),
+            ("2026-11-23T09:00", "2026-11-23T10:00:00"),
+            ("2026-11-23_09:00:00", "2026-11-23_10:00"),
+        ] {
+            assert_eq!(
+                resolve_new_event_times(start, end, false, Some("Asia/Seoul")).unwrap(),
+                (s("2026-11-23T09:00:00"), s("2026-11-23T10:00:00"), Some(s("Asia/Seoul")))
+            );
+        }
+
+        // Timed RFC3339 + zone: exact instant in UTC; the zone is not sent alongside a `Z` value.
+        assert_eq!(
+            resolve_new_event_times(
+                "2026-11-23T09:00:00+09:00",
+                "2026-11-23T10:00:00+09:00",
+                false,
+                Some("Asia/Seoul")
+            )
+            .unwrap(),
+            (s("2026-11-23T00:00:00Z"), s("2026-11-23T01:00:00Z"), Some(s("UTC")))
+        );
+        assert!(resolve_new_event_times(
+            "2026-11-23 09:00",
+            "2026-11-23T10:00:00+09:00",
+            false,
+            Some("Asia/Seoul")
+        )
+        .is_err());
+
+        // Timed without a zone: identical to the 0.3.0 path.
+        for (start, end) in [
+            ("2026-11-23T09:00:00+09:00", "2026-11-23T10:00:00Z"),
+            ("2026-11-23 09:00", "2026-11-23 10:00:30"),
+            ("2026-11-23", "2026-11-24"),
+        ] {
+            assert_eq!(
+                resolve_new_event_times(start, end, false, None).unwrap(),
+                (
+                    crate::cli::normalize_datetime_iso(start).unwrap(),
+                    crate::cli::normalize_datetime_iso(end).unwrap(),
+                    None
+                )
+            );
+        }
+        assert!(resolve_new_event_times("nonsense", "2026-11-24", false, None).is_err());
+    }
+
+    #[test]
+    fn all_day_payload_sends_midnight_boundaries_in_the_event_zone() {
+        let (start_iso, end_iso, time_zone) =
+            resolve_new_event_times("2026-11-23", "2026-11-24", true, Some("Asia/Seoul")).unwrap();
+        let payload = build_event_payload(&OutgoingEvent {
+            subject: "PTO".into(),
+            start_iso,
+            end_iso,
+            time_zone,
+            is_all_day: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "subject": "PTO",
+                "start": { "dateTime": "2026-11-23T00:00:00", "timeZone": "Asia/Seoul" },
+                "end": { "dateTime": "2026-11-24T00:00:00", "timeZone": "Asia/Seoul" },
+                "isAllDay": true
+            })
+        );
+    }
+
+    #[test]
     fn edit_times_keep_series_zone_and_encode_instants_and_dates() {
         let mut event: GraphCalendarEvent = serde_json::from_value(serde_json::json!({
             "type": "seriesMaster", "isAllDay": false,
@@ -725,6 +1011,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(events.len(), 3);
+        assert_eq!(events[0].start_iso, "2026-11-15T10:00:00Z");
+        assert_eq!(events[0].end_iso, "2026-11-15T11:00:00Z");
         assert_eq!(
             events[0].online_meeting_url.as_deref(),
             Some("https://teams.microsoft.com/l/meetup-join/19%3a111/0")

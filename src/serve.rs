@@ -1183,10 +1183,13 @@ async fn create_calendar_event(
     if body.subject.trim().is_empty() {
         return Err(ApiError::bad_request("subject must not be empty"));
     }
-    let start_iso = cli::normalize_datetime_iso(&body.start_iso)
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
-    let end_iso = cli::normalize_datetime_iso(&body.end_iso)
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    let (start_iso, end_iso, time_zone) = crate::graph::calendar::resolve_new_event_times(
+        &body.start_iso,
+        &body.end_iso,
+        body.is_all_day,
+        body.time_zone.as_deref(),
+    )
+    .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     let body_html = body
         .markdown
         .as_deref()
@@ -1198,7 +1201,7 @@ async fn create_calendar_event(
         subject: body.subject,
         start_iso,
         end_iso,
-        time_zone: body.time_zone,
+        time_zone,
         is_all_day: body.is_all_day,
         location: body.location,
         body_html,
@@ -1914,6 +1917,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // All-day events need YYYY-MM-DD boundaries and an exclusive end; both are rejected before Graph is called.
+        for (start, end, needle) in [
+            ("2026-11-23T09:00:00Z", "2026-11-24", "YYYY-MM-DD"),
+            ("2026-11-23", "2026-11-23", "2026-11-24"),
+        ] {
+            let res = client
+                .post(format!("{base}/v1/calendar/events"))
+                .json(&json!({ "subject": "PTO", "start": start, "end": end, "is_all_day": true }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            let body: Value = res.json().await.unwrap();
+            assert!(body.to_string().contains(needle), "{body}");
+        }
 
         let res = client
             .post(format!("{base}/v1/todo/tasks"))

@@ -670,13 +670,17 @@ components:
           type: string
         start_iso:
           type: string
+          description: RFC3339 instant, wall clock "YYYY-MM-DD HH:MM" (machine zone, or time_zone when given), or "YYYY-MM-DD" when is_all_day is true.
         end_iso:
           type: string
+          description: Same form as start_iso. For all-day events the end date is exclusive.
         time_zone:
           type: string
+          description: IANA or Windows time zone. Wall-clock values are read in this zone; RFC3339 values stay exact instants in UTC.
         is_all_day:
           type: boolean
           default: false
+          description: All-day event. start_iso and end_iso must be YYYY-MM-DD.
         location:
           type: string
         markdown:

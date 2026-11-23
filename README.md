@@ -116,7 +116,9 @@ outlook update-task TASK_ID --list tasks --due 2026-11-25 --json
 
 Each edit sends the specified fields. A draft subject change preserves the original body and its markup. Use `--body-html` to supply replacement HTML directly. Calendar edits leave the body, attendees, and recurrence out of the request. To Do edits leave the body and checklist out of the request. [Message updates](https://learn.microsoft.com/en-us/graph/api/message-update?view=graph-rest-1.0) · [Event updates](https://learn.microsoft.com/en-us/graph/api/event-update?view=graph-rest-1.0) · [To Do updates](https://learn.microsoft.com/en-us/graph/api/todotask-update?view=graph-rest-1.0)
 
-Calendar wall-clock times such as `2026-11-23T09:00` use the event's original Graph time zone. Use date-only values with all-day events and give the exclusive end date. RFC3339 values such as `2026-11-23T09:00:00+09:00` are sent in UTC for timed events. Non-UTC recurring events require wall-clock times. To Do dates use midnight UTC, and RFC3339 To Do timestamps are converted to UTC. [Event time and recurrence](https://learn.microsoft.com/en-us/graph/api/resources/event?view=graph-rest-1.0)
+For `create-event`, RFC3339 times are exact instants and wall-clock times such as `"2026-11-23 09:00"` are read in the machine's time zone, or in `--time-zone` when given. `--all-day` needs `YYYY-MM-DD` for both `--start` and `--end`, with an exclusive end date (`--start 2026-11-23 --end 2026-11-24` is one day).
+
+For `update-event`, calendar wall-clock times such as `2026-11-23T09:00` use the event's original Graph time zone. Use date-only values with all-day events and give the exclusive end date. RFC3339 values such as `2026-11-23T09:00:00+09:00` are sent in UTC for timed events. Non-UTC recurring events require wall-clock times. To Do dates use midnight UTC, and RFC3339 To Do timestamps are converted to UTC. [Event time and recurrence](https://learn.microsoft.com/en-us/graph/api/resources/event?view=graph-rest-1.0)
 
 ### Local HTTP REST API (`outlook serve`)
 

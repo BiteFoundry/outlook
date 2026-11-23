@@ -2177,13 +2177,23 @@ fn map_calendar_event_row(row: &Row<'_>) -> rusqlite::Result<CalendarEvent> {
     let is_cancelled_int: i32 = row.get(15)?;
     let attendees: Vec<EventAttendee> = serde_json::from_str(&attendees_json).unwrap_or_default();
 
+    // Rows cached by <= 0.3.0 hold Graph's offset-less UTC values; make the offset explicit on read.
+    let is_all_day = is_all_day_int != 0;
+    let time_zone: String = row.get(4)?;
+    let start_raw: String = row.get(2)?;
+    let end_raw: String = row.get(3)?;
+    let start_iso =
+        crate::graph::calendar::normalize_graph_event_time(&start_raw, &time_zone, is_all_day);
+    let end_iso =
+        crate::graph::calendar::normalize_graph_event_time(&end_raw, &time_zone, is_all_day);
+
     Ok(CalendarEvent {
         id: row.get(0)?,
         subject: row.get(1)?,
-        start_iso: row.get(2)?,
-        end_iso: row.get(3)?,
-        time_zone: row.get(4)?,
-        is_all_day: is_all_day_int != 0,
+        start_iso,
+        end_iso,
+        time_zone,
+        is_all_day,
         location: row.get(6)?,
         organizer_name: row.get(7)?,
         organizer_email: row.get(8)?,

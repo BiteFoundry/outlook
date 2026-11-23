@@ -1224,10 +1224,15 @@ async fn call_tool(
             let subject = args.required_str("subject")?;
             let start_raw = args.required_str("start")?;
             let end_raw = args.required_str("end")?;
-            let start_iso = cli::normalize_datetime_iso(&start_raw).map_err(format_error)?;
-            let end_iso = cli::normalize_datetime_iso(&end_raw).map_err(format_error)?;
             let time_zone = args.optional_str("time_zone")?;
             let is_all_day = args.optional_bool("is_all_day")?.unwrap_or(false);
+            let (start_iso, end_iso, time_zone) = crate::graph::calendar::resolve_new_event_times(
+                &start_raw,
+                &end_raw,
+                is_all_day,
+                time_zone.as_deref(),
+            )
+            .map_err(format_error)?;
             let location = args.optional_str("location")?;
             let body_html = args
                 .optional_str("body")?
@@ -1834,10 +1839,10 @@ pub fn tool_catalog() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "subject": { "type": "string" },
-                    "start": { "type": "string" },
-                    "end": { "type": "string" },
-                    "time_zone": { "type": "string" },
-                    "is_all_day": { "type": "boolean" },
+                    "start": { "type": "string", "description": "RFC3339 instant, wall clock 'YYYY-MM-DD HH:MM' (machine zone, or time_zone when given), or 'YYYY-MM-DD' when is_all_day." },
+                    "end": { "type": "string", "description": "Same form as start. For all-day events the end date is exclusive (next day for a one-day event)." },
+                    "time_zone": { "type": "string", "description": "IANA or Windows zone. Wall-clock start/end are read in this zone; RFC3339 values stay exact instants in UTC." },
+                    "is_all_day": { "type": "boolean", "description": "All-day event: start and end must be 'YYYY-MM-DD'." },
                     "location": { "type": "string" },
                     "body": { "type": "string" },
                     "attendees": { "type": "array", "items": { "type": "string" } },
