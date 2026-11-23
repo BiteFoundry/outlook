@@ -7286,3 +7286,32 @@ async fn out_01_02_all_day_create_and_utc_normalized_calendar_times() {
 
     server.abort();
 }
+
+#[test]
+fn out_03_doctor_reports_scopes_the_token_is_missing() {
+    // The regression JWT predates the directory scope: no User.ReadBasic.All, no Contacts.Read.
+    let token = make_regression_jwt();
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_outlook_cli(&dir, "http://127.0.0.1:9", &token, &["doctor", "--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let doctor: Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    let configured: Vec<&str> = doctor["configured_scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(configured, outlook_cli::auth::DEFAULT_SCOPES);
+    assert_eq!(
+        doctor["missing_scopes"],
+        json!(["User.ReadBasic.All", "Contacts.Read"])
+    );
+
+    let text = run_outlook_cli(&dir, "http://127.0.0.1:9", &token, &["doctor"]);
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        stdout.contains("Run 'outlook login' to grant: User.ReadBasic.All Contacts.Read"),
+        "{stdout}"
+    );
+}

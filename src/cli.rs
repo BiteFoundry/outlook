@@ -2290,6 +2290,29 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
     Ok(())
 }
 
+/// Configured scopes the current access token does not carry, so `doctor` can tell existing users to
+/// sign in again after the default list grows. Empty when the token exposes no `scp` claim.
+fn missing_configured_scopes(configured: &[String], token_scopes: &[String]) -> Vec<String> {
+    if token_scopes.is_empty() {
+        return Vec::new();
+    }
+    let granted = |wanted: &str| {
+        token_scopes.iter().any(|have| {
+            have.eq_ignore_ascii_case(wanted)
+                // A read/write grant covers the read-only scope of the same resource.
+                || (wanted.to_ascii_lowercase().ends_with(".read")
+                    && have.eq_ignore_ascii_case(&format!("{wanted}Write")))
+        })
+    };
+    configured
+        .iter()
+        .map(|scope| scope.trim())
+        .filter(|scope| !scope.is_empty() && !scope.eq_ignore_ascii_case("offline_access"))
+        .filter(|scope| !granted(scope))
+        .map(str::to_string)
+        .collect()
+}
+
 async fn cmd_doctor(
     cfg: &AppConfig,
     persona: Persona,
@@ -2310,6 +2333,7 @@ async fn cmd_doctor(
     let db = config::db_path(user_id);
     let dl_dir = cfg.resolved_download_dir();
     let configured_scopes = cfg.effective_scopes();
+    let missing_scopes = missing_configured_scopes(&configured_scopes, &token_diag.scopes);
     let token_file = cfg.resolved_token_file();
     let token_refresh_cmd_configured = !cfg.token_refresh_cmd.trim().is_empty();
     let auth_mode = tokens.as_ref().map(|t| t.auth_mode.clone());
@@ -2407,6 +2431,7 @@ async fn cmd_doctor(
                 "roles": token_diag.roles,
                 "scope_warnings": token_diag.warnings,
                 "configured_scopes": configured_scopes,
+                "missing_scopes": missing_scopes,
                 "config_path": cfg_path,
                 "config_exists": cfg_path.exists(),
                 "credentials_fallback_path": cred_path,
@@ -2498,6 +2523,17 @@ async fn cmd_doctor(
         }
         for warning in &token_diag.warnings {
             println!("scope_warning: {warning}");
+        }
+        if !missing_scopes.is_empty() {
+            println!(
+                "missing_scopes ({}): {}",
+                missing_scopes.len(),
+                missing_scopes.join(" ")
+            );
+            println!(
+                "hint: Run 'outlook login' to grant: {}",
+                missing_scopes.join(" ")
+            );
         }
         println!("client_id: {}", cfg.client_id);
         println!("tenant_id: {}", cfg.tenant_id);
@@ -5558,6 +5594,38 @@ fn truncate_single_line(input: &str, max_chars: usize) -> String {
     } else {
         let prefix: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
         format!("{prefix}…")
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::missing_configured_scopes;
+
+    fn list(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn missing_scopes_lists_configured_scopes_absent_from_the_token() {
+        let configured = list(&[
+            "offline_access",
+            "User.Read",
+            "User.ReadBasic.All",
+            "Mail.ReadWrite",
+            "Contacts.Read",
+        ]);
+        assert_eq!(
+            missing_configured_scopes(&configured, &list(&["user.read", "Mail.ReadWrite", "Contacts.Read"])),
+            ["User.ReadBasic.All"]
+        );
+        // A read/write grant covers the read-only scope; offline_access never appears in `scp`.
+        assert!(missing_configured_scopes(
+            &configured,
+            &list(&["User.Read", "User.ReadBasic.All", "Mail.ReadWrite", "Contacts.ReadWrite"])
+        )
+        .is_empty());
+        // Opaque tokens (no `scp`) cannot be judged.
+        assert!(missing_configured_scopes(&configured, &[]).is_empty());
     }
 }
 

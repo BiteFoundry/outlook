@@ -76,7 +76,7 @@ curl http://127.0.0.1:3939/v1/whoami -H "Authorization: Bearer secret123"
   "auth_source": "keyring",
   "expires_at": 1795023600,
   "expired": false,
-  "scopes": ["Mail.ReadWrite", "Mail.Send", "Calendars.ReadWrite", "Tasks.ReadWrite", "Contacts.Read"],
+  "scopes": ["User.Read", "User.ReadBasic.All", "Mail.ReadWrite", "Mail.Send", "Calendars.ReadWrite", "Contacts.Read", "Tasks.ReadWrite"],
   "roles": []
 }
 ```

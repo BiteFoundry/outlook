@@ -360,16 +360,10 @@ impl AppConfig {
         if !self.scopes.is_empty() {
             return self.scopes.clone();
         }
-        vec![
-            "offline_access".to_string(),
-            "User.Read".to_string(),
-            "User.ReadBasic.All".to_string(),
-            "Mail.ReadWrite".to_string(),
-            "Mail.Send".to_string(),
-            "Calendars.ReadWrite".to_string(),
-            "Contacts.ReadWrite".to_string(),
-            "Tasks.ReadWrite".to_string(),
-        ]
+        crate::auth::DEFAULT_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect()
     }
 
     pub fn resolved_download_dir(&self) -> PathBuf {
@@ -935,7 +929,9 @@ mod tests {
             assert!(scopes.iter().any(|s| s == "Mail.ReadWrite"));
             assert!(scopes.iter().any(|s| s == "Mail.Send"));
             assert!(scopes.iter().any(|s| s == "Calendars.ReadWrite"));
-            assert!(scopes.iter().any(|s| s == "Contacts.ReadWrite"));
+            assert!(scopes.iter().any(|s| s == "Contacts.Read"));
+            assert!(scopes.iter().any(|s| s == "User.ReadBasic.All"));
+            assert!(!scopes.iter().any(|s| s == "Contacts.ReadWrite"));
             assert!(scopes.iter().any(|s| s == "Tasks.ReadWrite"));
             assert!(!scopes.iter().any(|s| s.starts_with("Chat.")));
             assert!(!scopes.iter().any(|s| s.starts_with("Channel")));

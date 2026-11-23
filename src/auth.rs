@@ -27,15 +27,38 @@ use url::Url;
 use crate::config::{credential_fallback_path, legacy_teams_config_dir, write_atomic, AppConfig};
 
 /// Default Microsoft Graph delegated OAuth scopes for `outlook-cli`.
+///
+/// Single source of truth: login, token refresh, `doctor` and the docs all read this list
+/// (through `AppConfig::effective_scopes`).
 pub const DEFAULT_SCOPES: &[&str] = &[
+    "offline_access",
     "User.Read",
+    "User.ReadBasic.All",
     "Mail.ReadWrite",
     "Mail.Send",
     "Calendars.ReadWrite",
     "Contacts.Read",
     "Tasks.ReadWrite",
-    "offline_access",
 ];
+
+/// Organization directory search scope. It is the only default scope a tenant commonly refuses
+/// (restricted user consent), so token requests degrade without it instead of failing.
+pub const OPTIONAL_DIRECTORY_SCOPE: &str = "User.ReadBasic.All";
+
+/// Whether an OAuth error means a requested scope was not (or cannot be) consented.
+fn is_scope_consent_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "aadsts65001",
+        "aadsts65004",
+        "aadsts90094",
+        "aadsts70011",
+        "consent_required",
+        "invalid_scope",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
 
 const KEYRING_SERVICE: &str = "outlook-cli";
 const LEGACY_TEAMS_KEYRING_SERVICE: &str = "teams-cli";
@@ -232,11 +255,77 @@ impl AuthManager {
     }
 
     fn effective_scopes_string(&self) -> String {
+        self.config.effective_scopes().join(" ")
+    }
+
+    /// Default scope list without the optional directory scope; `None` when `scopes` is set in
+    /// `config.toml` (an explicit list is never rewritten).
+    fn scopes_string_without_directory(&self) -> Option<String> {
         if !self.config.scopes.is_empty() {
-            self.config.scopes.join(" ")
-        } else {
-            DEFAULT_SCOPES.join(" ")
+            return None;
         }
+        Some(
+            DEFAULT_SCOPES
+                .iter()
+                .copied()
+                .filter(|scope| !scope.eq_ignore_ascii_case(OPTIONAL_DIRECTORY_SCOPE))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    }
+
+    /// Exchanges a refresh token, keeping sessions alive when the tenant never granted
+    /// `User.ReadBasic.All`: a session whose access token lacks it is refreshed without it, and a
+    /// consent rejection of the full list is retried once without it.
+    async fn post_refresh_token_form(
+        &self,
+        token_url: &str,
+        client_id: &str,
+        refresh_token: &str,
+        current_access_token: &str,
+    ) -> Result<TokenResponse> {
+        let full = self.effective_scopes_string();
+        let reduced = self.scopes_string_without_directory();
+        let session_lacks_directory = parse_jwt_claims(current_access_token)
+            .filter(|claims| !claims.scopes.is_empty())
+            .is_some_and(|claims| {
+                !claims
+                    .scopes
+                    .iter()
+                    .any(|scope| scope.eq_ignore_ascii_case(OPTIONAL_DIRECTORY_SCOPE))
+            });
+        let first = match reduced.as_deref() {
+            Some(reduced) if session_lacks_directory => reduced,
+            _ => full.as_str(),
+        };
+        let send = |scope: String| async move {
+            let params = [
+                ("client_id", client_id),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+                ("scope", scope.as_str()),
+            ];
+            self.post_token_form(token_url, &params).await
+        };
+        match send(first.to_string()).await {
+            Ok(response) => Ok(response),
+            Err(err) => match reduced {
+                Some(reduced) if reduced != first && is_scope_consent_error(&format!("{err:#}")) => {
+                    send(reduced).await
+                }
+                _ => Err(err),
+            },
+        }
+    }
+
+    /// Adds the directory-scope workaround to an interactive login failure caused by consent policy.
+    fn with_consent_hint(&self, err: anyhow::Error) -> anyhow::Error {
+        if self.config.scopes.is_empty() && is_scope_consent_error(&format!("{err:#}")) {
+            return err.context(format!(
+                "Sign-in was refused for a requested permission. If your tenant restricts user consent for {OPTIONAL_DIRECTORY_SCOPE} (organization directory search), ask an administrator to approve it, or set `scopes = [...]` without it in config.toml and run 'outlook login' again."
+            ));
+        }
+        err
     }
 
     pub fn config(&self) -> &AppConfig {
@@ -371,6 +460,9 @@ impl AuthManager {
     }
 
     fn resolve_shared_teams_token_file_path(&self) -> Option<PathBuf> {
+        if !self.config.share_m365_auth {
+            return None;
+        }
         #[cfg(test)]
         if self.token_path_override.is_some()
             && self.legacy_teams_dir_override.is_none()
@@ -534,6 +626,19 @@ impl AuthManager {
         if self.has_refresh_cmd() {
             return self.run_external_refresh_cmd(None, true).await.ok();
         }
+        // A teams-cli session that is expired or lacks Outlook scopes is still usable when it carries a
+        // refresh token: exchange it silently instead of reporting "sign-in required".
+        if self.config.share_m365_auth {
+            if let Some(teams_tok) = self.load_legacy_teams_stored_tokens() {
+                let has_refresh_token = teams_tok
+                    .refresh_token
+                    .as_deref()
+                    .is_some_and(|token| !token.trim().is_empty());
+                if has_refresh_token {
+                    return self.upgrade_shared_teams_session(&teams_tok).await.ok();
+                }
+            }
+        }
         None
     }
 
@@ -695,16 +800,13 @@ impl AuthManager {
             .ok_or_else(|| anyhow!("Shared Microsoft 365 session has no refresh token. Run 'outlook login'."))?;
 
         let token_url = self.token_endpoint(&teams_tok.tenant_id);
-        let scope = self.effective_scopes_string();
-        let params = [
-            ("client_id", teams_tok.client_id.as_str()),
-            ("grant_type", "refresh_token"),
-            ("refresh_token", rt),
-            ("scope", scope.as_str()),
-        ];
-
         let token_resp = self
-            .post_token_form(&token_url, &params)
+            .post_refresh_token_form(
+                &token_url,
+                teams_tok.client_id.as_str(),
+                rt,
+                &teams_tok.access_token,
+            )
             .await
             .map_err(|err| {
                 anyhow!(
@@ -863,14 +965,18 @@ impl AuthManager {
 
         // 3. Device Code Flow
         if opts.device_code {
-            let stored = self.login_device_code(&client_id, &tenant_id).await?;
+            let stored = self
+                .login_device_code(&client_id, &tenant_id)
+                .await
+                .map_err(|err| self.with_consent_hint(err))?;
             return self.store_tokens(stored).await;
         }
 
         // 4. Interactive Browser Flow (Authorization Code + PKCE)
         let stored = self
             .login_pkce_loopback(&client_id, &tenant_id, opts.port)
-            .await?;
+            .await
+            .map_err(|err| self.with_consent_hint(err))?;
         self.store_tokens(stored).await
     }
 
@@ -1128,7 +1234,6 @@ impl AuthManager {
             .ok_or_else(|| anyhow!("No stored token found. Run 'outlook login' first."))?;
 
         let token_url = self.token_endpoint(&current.tenant_id);
-        let scope = self.effective_scopes_string();
 
         let token_resp = if let Some(rt) = current
             .refresh_token
@@ -1136,13 +1241,13 @@ impl AuthManager {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            let params = [
-                ("client_id", current.client_id.as_str()),
-                ("grant_type", "refresh_token"),
-                ("refresh_token", rt),
-                ("scope", scope.as_str()),
-            ];
-            self.post_token_form(&token_url, &params).await?
+            self.post_refresh_token_form(
+                &token_url,
+                current.client_id.as_str(),
+                rt,
+                &current.access_token,
+            )
+            .await?
         } else if current.auth_mode == "client_credentials" {
             let secret = env_client_secret().ok_or_else(|| {
                 anyhow!("OUTLOOK_CLIENT_SECRET environment variable is required to refresh client_credentials token.")
@@ -2624,15 +2729,56 @@ mod tests {
         assert_eq!(
             DEFAULT_SCOPES,
             &[
+                "offline_access",
                 "User.Read",
+                "User.ReadBasic.All",
                 "Mail.ReadWrite",
                 "Mail.Send",
                 "Calendars.ReadWrite",
                 "Contacts.Read",
                 "Tasks.ReadWrite",
-                "offline_access",
             ]
         );
+        // Contacts stay read-only: nothing in the CLI, MCP or HTTP surface writes contacts.
+        assert!(!DEFAULT_SCOPES.iter().any(|scope| *scope == "Contacts.ReadWrite"));
+    }
+
+    #[test]
+    fn login_doctor_and_config_share_one_scope_list() {
+        let cfg = AppConfig::default();
+        let expected: Vec<String> = DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(cfg.effective_scopes(), expected);
+        let mgr = AuthManager::empty_for_test(cfg.clone());
+        assert_eq!(mgr.effective_scopes_string(), DEFAULT_SCOPES.join(" "));
+        let reduced = mgr.scopes_string_without_directory().unwrap();
+        assert!(!reduced.contains("User.ReadBasic.All"));
+        assert!(reduced.contains("Mail.ReadWrite"));
+
+        // An explicit list in config.toml is used verbatim and never rewritten.
+        let mut custom = cfg;
+        custom.scopes = vec!["User.Read".into(), "Mail.Read".into()];
+        assert_eq!(custom.effective_scopes(), ["User.Read", "Mail.Read"]);
+        let mgr = AuthManager::empty_for_test(custom);
+        assert_eq!(mgr.effective_scopes_string(), "User.Read Mail.Read");
+        assert!(mgr.scopes_string_without_directory().is_none());
+    }
+
+    #[test]
+    fn consent_errors_are_recognised_without_matching_other_failures() {
+        for message in [
+            "OAuth token error (400 Bad Request - invalid_grant): AADSTS65001: The user or administrator has not consented",
+            "AADSTS90094: Admin consent is required",
+            "error=consent_required",
+            "OAuth token error (400 - invalid_scope): AADSTS70011",
+        ] {
+            assert!(is_scope_consent_error(message), "{message}");
+        }
+        for message in [
+            "OAuth token error (400 - invalid_grant): AADSTS700082: The refresh token has expired",
+            "Failed to send OAuth token request",
+        ] {
+            assert!(!is_scope_consent_error(message), "{message}");
+        }
     }
 
     #[test]
@@ -3470,6 +3616,248 @@ mod tests {
             .with_legacy_teams_dir(teams_dir);
         let err = mgr_fail.valid_access_token().await.unwrap_err().to_string();
         assert!(err.contains("outlook login"), "unexpected error: {err}");
+    }
+
+    /// Token endpoint mock for `/tid-shared/oauth2/v2.0/token`: counts hits, records the requested
+    /// scope lists, and optionally rejects any request that asks for the directory scope.
+    async fn spawn_scope_recording_token_endpoint(
+        issued_scp: &'static str,
+        reject_directory_scope: bool,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::{http::StatusCode, routing::post, Json, Router};
+
+        let requested: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let recorder = requested.clone();
+        let app = Router::new().route(
+            "/tid-shared/oauth2/v2.0/token",
+            post(move |body: String| {
+                let recorder = recorder.clone();
+                async move {
+                    let scope = url::form_urlencoded::parse(body.as_bytes())
+                        .find(|(key, _)| key == "scope")
+                        .map(|(_, value)| value.into_owned())
+                        .unwrap_or_default();
+                    recorder.lock().unwrap().push(scope.clone());
+                    if reject_directory_scope && scope.contains(OPTIONAL_DIRECTORY_SCOPE) {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "invalid_grant",
+                                "error_description": "AADSTS65001: The user or administrator has not consented to use the application."
+                            })),
+                        );
+                    }
+                    let now = chrono::Utc::now().timestamp();
+                    let jwt = make_test_jwt_with_encoder(
+                        &serde_json::json!({ "exp": now + 3600, "scp": issued_scp, "oid": "u-shared" }),
+                        false,
+                    );
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "access_token": jwt,
+                            "refresh_token": "rt-new",
+                            "expires_in": 3600
+                        })),
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), requested)
+    }
+
+    fn shared_session_tokens(scp: Option<&str>, expires_in: i64, refresh_token: Option<&str>) -> StoredTokens {
+        let now = chrono::Utc::now().timestamp();
+        StoredTokens {
+            access_token: match scp {
+                Some(scp) => make_test_jwt_with_encoder(
+                    &serde_json::json!({ "exp": now + expires_in, "scp": scp }),
+                    false,
+                ),
+                None => "opaque-access-token".into(),
+            },
+            refresh_token: refresh_token.map(str::to_string),
+            expires_at: now + expires_in,
+            client_id: "cid".into(),
+            tenant_id: "tid-shared".into(),
+            user_id: Some("u-shared".into()),
+            user_display_name: Some("Shared User".into()),
+            user_email: Some("shared@example.com".into()),
+            auth_mode: "pkce".into(),
+        }
+    }
+
+    const OUTLOOK_SCP: &str =
+        "User.Read Mail.ReadWrite Mail.Send Calendars.ReadWrite Contacts.Read Tasks.ReadWrite";
+
+    #[tokio::test]
+    async fn out_08_current_tokens_silently_upgrades_an_expired_teams_session() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::clear_auth_env();
+        let (auth_base, requested) = spawn_scope_recording_token_endpoint(OUTLOOK_SCP, false).await;
+
+        let dir = tempdir().unwrap();
+        let teams_dir = dir.path().join("teams-cli");
+        std::fs::create_dir_all(&teams_dir).unwrap();
+        let expired = shared_session_tokens(Some("User.Read Chat.Read"), -600, Some("rt-teams"));
+        save_tokens_to_path(&expired, &teams_dir.join("credentials.json")).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.auth_base_url = auth_base;
+        cfg.share_m365_auth = true;
+
+        // Flag off: the teams-cli session is never read and the token endpoint is never contacted.
+        let mut disabled = cfg.clone();
+        disabled.share_m365_auth = false;
+        let mgr_off = AuthManager::empty_for_test(disabled)
+            .with_token_path(dir.path().join("off").join("credentials.json"))
+            .with_legacy_teams_dir(teams_dir.clone());
+        assert!(mgr_off.current_tokens().await.is_none());
+        assert!(requested.lock().unwrap().is_empty());
+
+        // Flag on: an expired session with a refresh token is exchanged instead of "sign-in required".
+        let cred_path = dir.path().join("on").join("credentials.json");
+        let mgr_on = AuthManager::empty_for_test(cfg.clone())
+            .with_token_path(cred_path.clone())
+            .with_legacy_teams_dir(teams_dir.clone());
+        let upgraded = mgr_on.current_tokens().await.expect("silent upgrade");
+        assert_eq!(upgraded.auth_mode, "shared_teams_session");
+        assert!(token_has_outlook_scopes(&upgraded.access_token));
+        assert_eq!(requested.lock().unwrap().len(), 1);
+        assert!(load_tokens_from_path(&cred_path).unwrap().is_some());
+        // The upgraded session is cached: a second lookup makes no further request.
+        assert!(mgr_on.current_tokens().await.is_some());
+        assert_eq!(requested.lock().unwrap().len(), 1);
+
+        // Without a refresh token nothing can be upgraded (unchanged behaviour).
+        let no_refresh = shared_session_tokens(Some("User.Read Chat.Read"), -600, None);
+        save_tokens_to_path(&no_refresh, &teams_dir.join("credentials.json")).unwrap();
+        let mgr_none = AuthManager::empty_for_test(cfg)
+            .with_token_path(dir.path().join("none").join("credentials.json"))
+            .with_legacy_teams_dir(teams_dir);
+        assert!(mgr_none.current_tokens().await.is_none());
+        assert_eq!(requested.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn out_08_teams_token_file_env_is_ignored_when_sharing_is_disabled() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::clear_auth_env();
+
+        let dir = tempdir().unwrap();
+        let teams_dir = dir.path().join("teams-cli");
+        std::fs::create_dir_all(&teams_dir).unwrap();
+        let token_file = dir.path().join("teams-token.txt");
+        let shared_jwt = make_test_jwt_with_encoder(
+            &serde_json::json!({
+                "exp": chrono::Utc::now().timestamp() + 3600,
+                "scp": "User.Read Mail.ReadWrite"
+            }),
+            false,
+        );
+        std::fs::write(&token_file, &shared_jwt).unwrap();
+        let token_file_str = token_file.to_string_lossy().to_string();
+        let _teams_env = EnvVarGuard::set(&[("TEAMS_TOKEN_FILE", Some(token_file_str.as_str()))]);
+
+        let mut cfg = AppConfig::default();
+        cfg.auth_base_url = "http://127.0.0.1:9".into();
+        cfg.share_m365_auth = true;
+        let mgr_on = AuthManager::empty_for_test(cfg.clone())
+            .with_token_path(dir.path().join("on.json"))
+            .with_legacy_teams_dir(teams_dir.clone());
+        let shared = mgr_on.refresh_now().await.unwrap();
+        assert_eq!(shared.access_token, shared_jwt);
+        assert_eq!(shared.auth_mode, "shared_teams_token_file");
+
+        cfg.share_m365_auth = false;
+        let mgr_off = AuthManager::empty_for_test(cfg)
+            .with_token_path(dir.path().join("off.json"))
+            .with_legacy_teams_dir(teams_dir);
+        assert!(mgr_off.resolve_shared_teams_token_file_path().is_none());
+        assert!(mgr_off.current_tokens().await.is_none());
+        match mgr_off.refresh_now().await {
+            Ok(token) => assert_ne!(token.access_token, shared_jwt),
+            Err(err) => assert!(!err.to_string().contains("Shared Teams"), "{err}"),
+        }
+        assert!(mgr_off
+            .refresh_for_failed_token("rejected-token")
+            .await
+            .map(|token| token.access_token != shared_jwt)
+            .unwrap_or(true));
+    }
+
+    #[tokio::test]
+    async fn out_03_refresh_degrades_without_the_directory_scope_instead_of_failing() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::clear_auth_env();
+        let (auth_base, requested) = spawn_scope_recording_token_endpoint(OUTLOOK_SCP, true).await;
+        let dir = tempdir().unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.auth_base_url = auth_base;
+        cfg.client_id = "cid".into();
+        cfg.tenant_id = "tid-shared".into();
+
+        // A session signed in before 0.3.1 has no directory scope: refresh asks only for what it holds.
+        let legacy = shared_session_tokens(Some(OUTLOOK_SCP), -600, Some("rt-legacy"));
+        let mgr = AuthManager::from_tokens(cfg.clone(), legacy).with_token_path(dir.path().join("a.json"));
+        let refreshed = mgr.refresh_now().await.unwrap();
+        assert_eq!(refreshed.refresh_token.as_deref(), Some("rt-new"));
+        {
+            let seen = requested.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert!(!seen[0].contains(OPTIONAL_DIRECTORY_SCOPE));
+            assert!(seen[0].contains("Mail.ReadWrite") && seen[0].contains("offline_access"));
+        }
+
+        // An opaque token gives no hint: the full list is tried, and a consent rejection is retried without it.
+        requested.lock().unwrap().clear();
+        let opaque = shared_session_tokens(None, -600, Some("rt-opaque"));
+        let mgr = AuthManager::from_tokens(cfg.clone(), opaque).with_token_path(dir.path().join("b.json"));
+        mgr.refresh_now().await.unwrap();
+        {
+            let seen = requested.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            assert!(seen[0].contains(OPTIONAL_DIRECTORY_SCOPE));
+            assert!(!seen[1].contains(OPTIONAL_DIRECTORY_SCOPE));
+        }
+
+        // Scopes pinned in config.toml are sent verbatim and never retried with a different list.
+        requested.lock().unwrap().clear();
+        let mut pinned = cfg;
+        pinned.scopes = vec!["User.Read".into(), "User.ReadBasic.All".into(), "Mail.ReadWrite".into()];
+        let opaque = shared_session_tokens(None, -600, Some("rt-pinned"));
+        let mgr = AuthManager::from_tokens(pinned, opaque).with_token_path(dir.path().join("c.json"));
+        let err = mgr.refresh_now().await.unwrap_err().to_string();
+        assert!(err.contains("AADSTS65001"), "{err}");
+        assert_eq!(requested.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn out_03_refresh_keeps_the_directory_scope_once_it_was_granted() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::clear_auth_env();
+        let (auth_base, requested) = spawn_scope_recording_token_endpoint(OUTLOOK_SCP, false).await;
+        let dir = tempdir().unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.auth_base_url = auth_base;
+        cfg.client_id = "cid".into();
+        cfg.tenant_id = "tid-shared".into();
+
+        let granted = shared_session_tokens(
+            Some("User.Read User.ReadBasic.All Mail.ReadWrite"),
+            -600,
+            Some("rt-granted"),
+        );
+        let mgr = AuthManager::from_tokens(cfg, granted).with_token_path(dir.path().join("d.json"));
+        mgr.refresh_now().await.unwrap();
+        let seen = requested.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0], DEFAULT_SCOPES.join(" "));
     }
 
     #[test]

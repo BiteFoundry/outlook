@@ -159,7 +159,9 @@ When `share_m365_auth = true` (default; `OUTLOOK_SHARE_M365_AUTH=true`), `outloo
 
 Pure Outlook requests only Microsoft Outlook & Graph core scopes:
 
-`offline_access`, `User.Read`, `User.ReadBasic.All`, `Mail.ReadWrite`, `Mail.Send`, `Calendars.ReadWrite`, `Contacts.ReadWrite`, `Tasks.ReadWrite`
+`offline_access`, `User.Read`, `User.ReadBasic.All`, `Mail.ReadWrite`, `Mail.Send`, `Calendars.ReadWrite`, `Contacts.Read`, `Tasks.ReadWrite`
+
+Login, token refresh, and `outlook doctor` all use this one list (override it with `scopes = [...]` in `config.toml`). `User.ReadBasic.All` enables organization directory search in `outlook contacts`. Sessions created before v0.3.1 keep working without it; `outlook doctor` lists it under `missing_scopes` until you run `outlook login` again. If your tenant restricts user consent for that scope, either ask an administrator to approve it or set `scopes` without it; contact search then returns personal contacts only.
 
 Run `outlook whoami` or `outlook doctor` to inspect JWT `scp`/`roles` claims automatically.
 
