@@ -1672,20 +1672,20 @@ pub fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "list_mail_folders",
-            "description": "List Outlook mail folders with unread and total item counts.",
+            "description": "List Outlook mail folders with unread and total item counts. Graph cost: 1 request plus 1 batch per folder nesting level, skipped while the cache is younger than OUTLOOK_CLI_CACHE_SECS (default 0).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
                     "cursor": { "type": "string", "description": "Opaque next_cursor from a previous response" },
-                    "refresh": { "type": "boolean" },
-                    "offline": { "type": "boolean" }
+                    "refresh": { "type": "boolean", "description": "Force a full folder-tree fetch even when the cache is fresh. Use only when a folder is missing." },
+                    "offline": { "type": "boolean", "description": "Read the local cache only; no Graph request." }
                 }
             }
         }),
         json!({
             "name": "list_messages",
-            "description": "List emails in a mail folder (accepts folder ID, display name/prefix, or well-known alias such as 'inbox', 'sent', 'drafts', 'archive', 'trash', 'junk').",
+            "description": "List emails in a mail folder (accepts folder ID, display name/prefix, or well-known alias such as 'inbox', 'sent', 'drafts', 'archive', 'trash', 'junk'). Usually 1-2 Graph requests. The first call on a large folder syncs at most 40 pages (sync_complete: false until done); unread/flagged/focused filters scan at most 20 pages. offline: true reads the cache only.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -1697,13 +1697,13 @@ pub fn tool_catalog() -> Vec<Value> {
                     "flagged": { "type": "boolean" },
                     "focused": { "type": "boolean" },
                     "compact": { "type": "boolean", "description": "Default true. Set false for every cached field (no attachment bytes)" },
-                    "offline": { "type": "boolean" }
+                    "offline": { "type": "boolean", "description": "Read the local cache only; no Graph request." }
                 }
             }
         }),
         json!({
             "name": "get_message",
-            "description": "Read an email by ID. Compact by default; set compact:false for HTML and attachment metadata.",
+            "description": "Read an email by ID. Compact by default; set compact:false for HTML and attachment metadata. 1 Graph request unless offline (plus 1 when mark_read changes the state); compact:false can be large.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -1711,14 +1711,14 @@ pub fn tool_catalog() -> Vec<Value> {
                     "message_id": { "type": "string" },
                     "mark_read": { "type": "boolean" },
                     "compact": { "type": "boolean", "description": "Default true. Set false for HTML and attachment metadata (no attachment bytes)" },
-                    "offline": { "type": "boolean" }
+                    "offline": { "type": "boolean", "description": "Read the local cache only; no Graph request." }
                 },
                 "required": ["message_id"]
             }
         }),
         json!({
             "name": "send_mail",
-            "description": "Compose and send an email with Markdown body and optional file attachments.",
+            "description": "Compose and send an email with Markdown body and optional file attachments. Attachments over 3 MiB are uploaded in chunks before sending, which takes several requests.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1792,7 +1792,7 @@ pub fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "download_attachment",
-            "description": "Download an Outlook email attachment or inline screenshot to disk and return structured JSON { ok, path, file_name, mime_type, size_bytes, is_image } so multimodal AI agents can read media directly from disk.",
+            "description": "Download an Outlook email attachment or inline screenshot to disk and return structured JSON { ok, path, file_name, mime_type, size_bytes, is_image } so multimodal AI agents can read media directly from disk. Fetches the full attachment bytes with Graph requests unless offline reads them from the cache; time grows with file size.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1807,7 +1807,7 @@ pub fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "search_mail",
-            "description": "Search emails in local SQLite FTS5 (`offline: true`) or remotely via Microsoft Graph KQL `$search`.",
+            "description": "Search emails in local SQLite FTS5 (`offline: true`) or remotely via Microsoft Graph KQL `$search`. Remote search is 1 Graph request per page and is rate-limited by Exchange; prefer offline: true (local FTS, no request) for mail that is already synced.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -1817,14 +1817,14 @@ pub fn tool_catalog() -> Vec<Value> {
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
                     "cursor": { "type": "string", "description": "Opaque next_cursor from a previous remote search response" },
                     "compact": { "type": "boolean", "description": "Default true. Set false for full message fields in online results (no attachment bytes)" },
-                    "offline": { "type": "boolean" }
+                    "offline": { "type": "boolean", "description": "Read the local cache only; no Graph request." }
                 },
                 "required": ["query"]
             }
         }),
         json!({
             "name": "list_events",
-            "description": "List calendar events within a date/time window (defaults to next 7 days).",
+            "description": "List calendar events within a date/time window (defaults to next 7 days). 1 Graph request per 100 events in the window; offline: true reads the cache only.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -1836,7 +1836,7 @@ pub fn tool_catalog() -> Vec<Value> {
                     "days": { "type": "integer", "minimum": 1, "maximum": 365 },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
                     "compact": { "type": "boolean", "description": "Default true. Set false to include body_html on each event" },
-                    "offline": { "type": "boolean" }
+                    "offline": { "type": "boolean", "description": "Read the local cache only; no Graph request." }
                 }
             }
         }),
@@ -1886,27 +1886,27 @@ pub fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "list_todo_lists",
-            "description": "List Microsoft To Do task lists.",
+            "description": "List Microsoft To Do task lists. Graph cost: 1 request per page of lists, skipped while the cache is younger than OUTLOOK_CLI_CACHE_SECS (default 0).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
                     "cursor": { "type": "string", "description": "Opaque next_cursor from a previous response" },
-                    "refresh": { "type": "boolean" },
-                    "offline": { "type": "boolean" }
+                    "refresh": { "type": "boolean", "description": "Force a refetch even when the cache is fresh." },
+                    "offline": { "type": "boolean", "description": "Read the local cache only; no Graph request." }
                 }
             }
         }),
         json!({
             "name": "list_tasks",
-            "description": "List tasks in a Microsoft To Do list (accepts list name, 'tasks'/'defaultList', or ID).",
+            "description": "List tasks in a Microsoft To Do list (accepts list name, 'tasks'/'defaultList', or ID). 1 Graph request per 100 tasks unless offline.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "list": { "type": "string" },
                     "include_completed": { "type": "boolean" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
-                    "offline": { "type": "boolean" }
+                    "offline": { "type": "boolean", "description": "Read the local cache only; no Graph request." }
                 }
             }
         }),
@@ -1940,13 +1940,13 @@ pub fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "search_contacts",
-            "description": "List or search personal Outlook contacts and Entra organization directory.",
+            "description": "List or search personal Outlook contacts and Entra organization directory. A query reads personal contacts and the organization directory: 2-3 Graph requests.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
-                    "offline": { "type": "boolean" }
+                    "offline": { "type": "boolean", "description": "Read the local cache only; no Graph request." }
                 }
             }
         }),
@@ -2510,7 +2510,61 @@ mod tests {
         assert_eq!(err["error"]["code"], METHOD_NOT_FOUND);
     }
 
-    #[tokio::test]
+        #[test]
+    fn tool_catalog_states_graph_cost_for_cache_and_refresh_flags() {
+        let catalog = tool_catalog();
+        let mut flagged_tools = 0;
+        for tool in &catalog {
+            let name = tool["name"].as_str().unwrap();
+            for flag in ["refresh", "offline"] {
+                if let Some(prop) = tool["inputSchema"]["properties"].get(flag) {
+                    let description = prop["description"].as_str().unwrap_or_default();
+                    assert!(
+                        !description.trim().is_empty(),
+                        "{name}.{flag} needs a description of its Graph cost"
+                    );
+                    flagged_tools += 1;
+                }
+            }
+        }
+        assert!(flagged_tools >= 10, "only {flagged_tools} refresh/offline flags found");
+
+        for name in [
+            "list_messages",
+            "search_mail",
+            "list_mail_folders",
+            "download_attachment",
+        ] {
+            let tool = catalog
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name} missing from the catalog"));
+            let description = tool["description"].as_str().unwrap().to_lowercase();
+            assert!(
+                description.contains("request") || description.contains("cache"),
+                "{name} description must state its Graph cost: {description}"
+            );
+        }
+
+        // The page caps quoted to agents must match the code.
+        let list_messages = catalog
+            .iter()
+            .find(|tool| tool["name"] == "list_messages")
+            .unwrap()["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(list_messages.contains(&format!(
+            "at most {} pages (sync_complete",
+            crate::sync::INTERACTIVE_DELTA_MAX_PAGES
+        )));
+        assert!(list_messages.contains(&format!(
+            "scan at most {} pages",
+            cli::FILTER_SCAN_MAX_PAGES
+        )));
+    }
+
+#[tokio::test]
     async fn tools_list_exposes_outlook_tools() {
         let (cfg, graph, storage) = test_ctx();
         let resp = handle_rpc_line(

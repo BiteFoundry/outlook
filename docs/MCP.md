@@ -115,6 +115,22 @@ Mail `folder` arguments accept a canonical folder ID, display name/prefix, or we
 | 22 | `update_event` | Calendar | `event_id` (req), `subject?`, `start?`, `end?` | `{ "ok": true, "event": {...} }` |
 | 23 | `update_task` | To Do | `task_id` (req), `list?` (default `'tasks'`), `title?`, `due?` | `{ "ok": true, "task": {...} }` |
 
+### Graph request cost
+
+Tool descriptions state what a call costs, so an agent can prefer the cache:
+
+- Every `offline` flag: read the local cache only; no Graph request.
+- `list_mail_folders`: 1 request plus 1 batch per folder nesting level, skipped while the cache is younger than `OUTLOOK_CLI_CACHE_SECS` (default 0). `refresh`: force a full folder-tree fetch even when the cache is fresh; use only when a folder is missing.
+- `list_messages`: usually 1-2 requests. The first call on a large folder syncs at most 40 pages (`sync_complete: false` until done); `unread`/`flagged`/`focused` filters scan at most 20 pages.
+- `get_message`: 1 request unless `offline` (plus 1 when `mark_read` changes the state); `compact: false` can be large.
+- `send_mail`: attachments over 3 MiB are uploaded in chunks before sending, which takes several requests.
+- `download_attachment`: fetches the full attachment bytes unless `offline` reads them from the cache; time grows with file size.
+- `search_mail`: remote search is 1 request per page and is rate-limited by Exchange; prefer `offline: true` (local FTS, no request) for mail that is already synced.
+- `list_events`: 1 request per 100 events in the window.
+- `list_todo_lists`: 1 request per page of lists, skipped while the cache is younger than `OUTLOOK_CLI_CACHE_SECS`. `refresh`: force a refetch even when the cache is fresh.
+- `list_tasks`: 1 request per 100 tasks unless `offline`.
+- `search_contacts`: a query reads personal contacts and the organization directory: 2-3 requests.
+
 ### Destructive tool guard (`confirm: true`)
 
 `delete_message` and `delete_event` require `"confirm": true` as a literal JSON boolean. Omitting `confirm`, passing `false`, `"true"`, or `1` is rejected during argument validation before any Graph API call is made.
