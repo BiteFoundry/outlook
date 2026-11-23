@@ -1057,6 +1057,9 @@ pub async fn run_with_persona(
     let (proxy_nudge_tx, proxy_nudge_rx) = mpsc::unbounded_channel::<SyncCommand>();
     let sync_ctrl = SyncController::from_channels(proxy_focus_tx, proxy_nudge_tx);
 
+    // Drafts written before per-account draft files existed go to the first account that opens the TUI.
+    crate::config::adopt_legacy_drafts(graph.my_user_id());
+
     let mut ui = UiState::from_config(&config);
     if let Ok(sz) = terminal.size() {
         ui.term_width = sz.width;

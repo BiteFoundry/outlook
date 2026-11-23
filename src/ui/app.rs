@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::auth::{self, AuthManager};
 use crate::config::{
-    drafts_path, AppConfig, DensityMode, DraftStore, MailDraftEntry, MailDraftFields, ThemePreset,
+    drafts_path_for, AppConfig, DensityMode, DraftStore, MailDraftEntry, MailDraftFields, ThemePreset,
 };
 use crate::graph::client::MailActionUnconfirmed;
 use crate::graph::mail::{rewrite_inline_image_cids, DraftSaveChange};
@@ -499,7 +499,9 @@ impl AppState {
         ui_tx: mpsc::UnboundedSender<UiMsg>,
     ) -> Self {
         let download_dir = config.resolved_download_dir();
-        let draft_store_path = drafts_path();
+        // Drafts are per account. The one-time move of the legacy shared file happens in `tui::run`,
+        // not here, so constructing an `AppState` never renames files.
+        let draft_store_path = drafts_path_for(graph.my_user_id());
         let mut draft_store = DraftStore::load_from(&draft_store_path).unwrap_or_default();
         for entry in draft_store.mail.values_mut() {
             if entry.compose_id.is_empty() {

@@ -1840,11 +1840,16 @@ fn resolve_storage_db_path_fast(
     }
 
     if cred_path.is_file() {
-        if let Some(uid) = extract_user_id_from_token_file(cred_path) {
-            return Some(db_path_in_dir(data_dir, Some(&uid)));
-        }
+        // A credentials file means someone is signed in. When no user id can be read from it the
+        // `default` bucket is used: falling through to "the only cache on disk" could open a
+        // different account's mail.
+        let uid = extract_user_id_from_token_file(cred_path);
+        return Some(db_path_in_dir(data_dir, uid.as_deref()));
     }
 
+    // No token source on disk or in the environment: the session lives in the OS keyring or the user
+    // is signed out. A single local cache is then the only candidate, and using it avoids opening
+    // the keyring for a read.
     if let Some(single_db) = find_single_existing_db(data_dir) {
         return Some(single_db);
     }
@@ -2329,7 +2334,7 @@ async fn cmd_doctor(
 
     let cfg_path = config::config_file_path();
     let cred_path = config::credential_fallback_path();
-    let drafts = config::drafts_path();
+    let drafts = config::drafts_path_for(user_id);
     let db = config::db_path(user_id);
     let dl_dir = cfg.resolved_download_dir();
     let configured_scopes = cfg.effective_scopes();
@@ -2493,7 +2498,7 @@ async fn cmd_doctor(
             cred_path.display(),
             cred_path.exists()
         );
-        println!("drafts.json: {}", drafts.display());
+        println!("drafts: {}", drafts.display());
         println!("cache.db: {} (exists={})", db.display(), db.exists());
         println!(
             "cache_counts: folders={cached_folders}, messages={cached_messages}, events={cached_events}, contacts={cached_contacts}, todo_lists={cached_todo_lists}"
@@ -6694,6 +6699,37 @@ mod tests {
         assert!(p_over.is_empty());
         assert!(!more_over);
         assert_eq!(cur_over, None);
+    }
+
+    #[test]
+    fn fast_storage_path_never_borrows_another_accounts_cache_while_signed_in() {
+        let data = tempfile::tempdir().unwrap();
+        let conf = tempfile::tempdir().unwrap();
+        let cfg = AppConfig::default();
+        let other_db = data.path().join("someone-else").join("cache.db");
+        std::fs::create_dir_all(other_db.parent().unwrap()).unwrap();
+        std::fs::write(&other_db, b"").unwrap();
+        let cred_path = conf.path().join("credentials.json");
+
+        // Nothing on disk says who is signed in: the single local cache is used (unchanged).
+        assert_eq!(
+            resolve_storage_db_path_fast(&cfg, None, data.path(), &cred_path),
+            Some(other_db.clone())
+        );
+
+        // A credentials file without a readable user id: the `default` bucket, not the other account.
+        std::fs::write(&cred_path, br#"{"access_token":"not-a-jwt"}"#).unwrap();
+        assert_eq!(
+            resolve_storage_db_path_fast(&cfg, None, data.path(), &cred_path),
+            Some(data.path().join("default").join("cache.db"))
+        );
+
+        // A credentials file that names its user: that user's bucket.
+        std::fs::write(&cred_path, br#"{"user_id":"user-b"}"#).unwrap();
+        assert_eq!(
+            resolve_storage_db_path_fast(&cfg, None, data.path(), &cred_path),
+            Some(data.path().join("user-b").join("cache.db"))
+        );
     }
 
     #[test]

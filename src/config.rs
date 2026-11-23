@@ -425,15 +425,18 @@ pub fn credential_fallback_path() -> PathBuf {
     config_dir().join("credentials.json")
 }
 
+/// The pre-0.3.1 draft file, shared by every account on the OS profile. Kept only so
+/// [`adopt_legacy_drafts`] can move it; live drafts are per user (see [`drafts_path_for`]).
 pub fn drafts_path() -> PathBuf {
     config_dir().join("drafts.json")
 }
 
-pub fn db_path(user_id: Option<&str>) -> PathBuf {
-    let bucket = user_id
+/// File-system-safe name of a user's bucket: the id with every character outside `[A-Za-z0-9_-]`
+/// replaced by `_`, or `default` when the id is unknown.
+pub(crate) fn user_bucket(user_id: Option<&str>) -> String {
+    user_id
         .filter(|id| !id.trim().is_empty())
-        .unwrap_or("default");
-    let sanitized: String = bucket
+        .unwrap_or("default")
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -442,8 +445,37 @@ pub fn db_path(user_id: Option<&str>) -> PathBuf {
                 '_'
             }
         })
-        .collect();
-    data_dir().join(sanitized).join("cache.db")
+        .collect()
+}
+
+/// Per-user draft file: `<config dir>/drafts/<bucket>.json`.
+pub fn drafts_path_for(user_id: Option<&str>) -> PathBuf {
+    config_dir()
+        .join("drafts")
+        .join(format!("{}.json", user_bucket(user_id)))
+}
+
+/// Moves the legacy shared `drafts.json` to `user_id`'s draft file when that user has none yet,
+/// and returns the per-user path. The file is moved, not copied, so exactly one account adopts it;
+/// if it cannot be moved it stays where it is and the user starts with an empty store.
+pub fn adopt_legacy_drafts(user_id: Option<&str>) -> PathBuf {
+    let per_user = drafts_path_for(user_id);
+    let legacy = drafts_path();
+    if per_user.exists() || !legacy.is_file() || ensure_parent(&per_user).is_err() {
+        return per_user;
+    }
+    if fs::rename(&legacy, &per_user).is_err() && fs::copy(&legacy, &per_user).is_ok() {
+        // Rename can fail across volumes; after a successful copy the legacy file must go, or a
+        // second account would adopt the same drafts.
+        if fs::remove_file(&legacy).is_err() {
+            let _ = fs::remove_file(&per_user);
+        }
+    }
+    per_user
+}
+
+pub fn db_path(user_id: Option<&str>) -> PathBuf {
+    data_dir().join(user_bucket(user_id)).join("cache.db")
 }
 
 pub fn default_download_dir() -> PathBuf {
@@ -620,7 +652,7 @@ impl MailDraftEntry {
     }
 }
 
-/// Persistent draft store backed by `drafts.json` (`0600` permissions on Unix).
+/// Persistent draft store backed by a per-user `drafts/<bucket>.json` (`0600` permissions on Unix).
 /// Supports structured `MailDraftEntry` records alongside simple string entries.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -1018,6 +1050,52 @@ mod tests {
             })
             .collect();
         assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn test_drafts_are_per_user_and_legacy_file_is_adopted_once() {
+        let _lock = TEST_ENV_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("OUTLOOK_CONFIG_DIR", Some(&dir_str)),
+            ("OUTLOOK_DATA_DIR", Some(&dir_str)),
+        ]);
+
+        // One file per account, named with the same bucket as the account's cache directory.
+        assert_ne!(drafts_path_for(Some("a")), drafts_path_for(Some("b")));
+        assert_eq!(drafts_path_for(Some("a")), dir.path().join("drafts").join("a.json"));
+        assert_eq!(drafts_path_for(None), dir.path().join("drafts").join("default.json"));
+        let odd_id = "user@contoso.com/../x";
+        assert_eq!(user_bucket(Some(odd_id)), "user_contoso_com____x");
+        assert_eq!(
+            drafts_path_for(Some(odd_id)).file_stem(),
+            db_path(Some(odd_id)).parent().and_then(|p| p.file_name())
+        );
+        assert_eq!(user_bucket(Some("  ")), "default");
+
+        // No legacy file: adoption only names the per-user path and creates nothing.
+        assert_eq!(adopt_legacy_drafts(Some("a")), drafts_path_for(Some("a")));
+        assert!(!drafts_path_for(Some("a")).exists());
+
+        // The legacy shared file goes to the first account that asks, and only to that one.
+        let mut legacy = DraftStore::default();
+        legacy.set_text("quick", "written before the upgrade");
+        legacy.save_to(&drafts_path()).unwrap();
+        let path_a = adopt_legacy_drafts(Some("a"));
+        assert!(!drafts_path().exists(), "the legacy file is moved, not copied");
+        assert_eq!(DraftStore::load_from(&path_a).unwrap(), legacy);
+        let path_b = adopt_legacy_drafts(Some("b"));
+        assert!(!path_b.exists());
+        assert_eq!(DraftStore::load_from(&path_b).unwrap(), DraftStore::default());
+
+        // An account that already has drafts keeps them; a legacy file that shows up later is left alone.
+        let mut stray = DraftStore::default();
+        stray.set_text("quick", "stray legacy file");
+        stray.save_to(&drafts_path()).unwrap();
+        assert_eq!(adopt_legacy_drafts(Some("a")), path_a);
+        assert_eq!(DraftStore::load_from(&path_a).unwrap(), legacy);
+        assert!(drafts_path().exists());
     }
 
     #[test]
