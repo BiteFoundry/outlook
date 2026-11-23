@@ -701,6 +701,18 @@ impl GraphClient {
     /// resolves missing localized well-known folder mappings via a single best-effort `$batch`,
     /// and recursively fetches child folders (`childFolderCount > 0`) up to depth 6.
     pub async fn list_mail_folders(&self) -> Result<Vec<MailFolder>> {
+        let (folders, _complete) = self.list_mail_folders_complete().await?;
+        Ok(folders)
+    }
+
+    /// Like [`Self::list_mail_folders`], and also reports whether the whole tree was read.
+    ///
+    /// `complete == false` means a child-folder request failed (throttling, server error, an unreadable
+    /// body, a failed next page) or the depth cap was hit, so the result may lack folders that still
+    /// exist. Callers must then merge the result into the cache instead of replacing the cache with it.
+    /// A `404` for a child listing is a legitimate absence (the parent was deleted mid-listing).
+    pub async fn list_mail_folders_complete(&self) -> Result<(Vec<MailFolder>, bool)> {
+        let mut complete = true;
         let mut next_url =
             Some("/me/mailFolders?$top=100&includeHiddenFolders=false".to_string());
         let mut folders = Vec::new();
@@ -811,8 +823,15 @@ impl GraphClient {
                             ordered.insert(idx, resp);
                         }
                     }
+                    if (0..frontier.len()).any(|idx| !ordered.contains_key(&idx)) {
+                        // Graph answered the batch without a sub-response for some parent.
+                        complete = false;
+                    }
                     for (idx, resp) in ordered {
                         if !(200..300).contains(&resp.status) {
+                            if resp.status != 404 {
+                                complete = false;
+                            }
                             continue;
                         }
                         let Some(parent_id) = frontier.get(idx) else {
@@ -821,16 +840,21 @@ impl GraphClient {
                         let Ok(page) =
                             serde_json::from_value::<GraphListPage<GraphMailFolder>>(resp.body)
                         else {
+                            complete = false;
                             continue;
                         };
-                        self.collect_child_folder_page(
-                            page,
-                            parent_id,
-                            &mut seen_ids,
-                            &mut folders,
-                            &mut next_frontier,
-                        )
-                        .await;
+                        if !self
+                            .collect_child_folder_page(
+                                page,
+                                parent_id,
+                                &mut seen_ids,
+                                &mut folders,
+                                &mut next_frontier,
+                            )
+                            .await
+                        {
+                            complete = false;
+                        }
                     }
                 }
                 Err(err) if is_batch_fallback_status(&err) => {
@@ -841,24 +865,39 @@ impl GraphClient {
                         );
                         if let Ok(page) = self.get_json::<GraphListPage<GraphMailFolder>>(&url).await
                         {
-                            self.collect_child_folder_page(
-                                page,
-                                parent_id,
-                                &mut seen_ids,
-                                &mut folders,
-                                &mut next_frontier,
-                            )
-                            .await;
+                            if !self
+                                .collect_child_folder_page(
+                                    page,
+                                    parent_id,
+                                    &mut seen_ids,
+                                    &mut folders,
+                                    &mut next_frontier,
+                                )
+                                .await
+                            {
+                                complete = false;
+                            }
+                        } else {
+                            complete = false;
                         }
                     }
                 }
-                Err(_) => break,
+                Err(_) => {
+                    complete = false;
+                    next_frontier.clear();
+                    frontier.clear();
+                    break;
+                }
             }
 
             frontier = next_frontier;
         }
+        if frontier.iter().any(|id| !expanded_ids.contains(id)) {
+            // Depth cap reached with folders still waiting to be expanded.
+            complete = false;
+        }
 
-        Ok(folders)
+        Ok((folders, complete))
     }
 
     async fn collect_child_folder_page(
@@ -868,7 +907,7 @@ impl GraphClient {
         seen_ids: &mut HashSet<String>,
         folders: &mut Vec<MailFolder>,
         next_frontier: &mut Vec<String>,
-    ) {
+    ) -> bool {
         let mut page = initial_page;
         loop {
             for raw in page.value {
@@ -881,11 +920,11 @@ impl GraphClient {
                 }
             }
             let Some(next_url) = page.next_link else {
-                break;
+                return true;
             };
             match self.get_json::<GraphListPage<GraphMailFolder>>(&next_url).await {
                 Ok(next_page) => page = next_page,
-                Err(_) => break,
+                Err(_) => return false,
             }
         }
     }
@@ -3202,7 +3241,8 @@ pub(crate) mod tests {
         });
 
         let client = test_graph_client(&format!("http://{addr}/v1.0"));
-        let folders = client.list_mail_folders().await.unwrap();
+        let (folders, complete) = client.list_mail_folders_complete().await.unwrap();
+        assert!(complete, "every child listing answered 200, so the tree is complete");
 
         let by_id: HashMap<String, MailFolder> =
             folders.into_iter().map(|f| (f.id.clone(), f)).collect();
@@ -3227,6 +3267,127 @@ pub(crate) mod tests {
         let search_hits = client.search_mail_remote("budget", 100).await.unwrap();
         assert_eq!(state_ref.search_pages.load(Ordering::SeqCst), 100);
         assert_eq!(search_hits.len(), 100);
+    }
+
+    /// Serves a three-parent folder tree where `f-a`'s child listing misbehaves per `mode`:
+    /// `throttled` (429 sub-response), `gone` (404 sub-response) or `nextfail` (second page fails).
+    async fn folder_tree_listing_with_fault(mode: &'static str) -> (Vec<MailFolder>, bool) {
+        let base_url = Arc::new(Mutex::new(String::new()));
+        let base_for_batch = Arc::clone(&base_url);
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/mailFolders",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [
+                            { "id": "f-inbox", "displayName": "Inbox", "childFolderCount": 1, "unreadItemCount": 0, "totalItemCount": 1 },
+                            { "id": "f-a", "displayName": "Alpha", "childFolderCount": 2, "unreadItemCount": 0, "totalItemCount": 1 },
+                            { "id": "f-b", "displayName": "Beta", "childFolderCount": 1, "unreadItemCount": 0, "totalItemCount": 1 }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/f-a/childFolders",
+                get(|| async {
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": { "code": "BadRequest", "message": "page lost" } })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/$batch",
+                post(move |Json(payload): Json<serde_json::Value>| {
+                    let base = base_for_batch.lock().unwrap().clone();
+                    async move {
+                        let reqs = payload["requests"].as_array().cloned().unwrap_or_default();
+                        let child = |id: &str, parent: &str| {
+                            serde_json::json!({ "id": id, "displayName": id, "parentFolderId": parent, "childFolderCount": 0, "unreadItemCount": 0, "totalItemCount": 0 })
+                        };
+                        let responses: Vec<serde_json::Value> = reqs
+                            .into_iter()
+                            .map(|r| {
+                                let req_id = r["id"].as_str().unwrap_or_default().to_string();
+                                let url = r["url"].as_str().unwrap_or_default().to_string();
+                                if url.starts_with("/me/mailFolders/f-inbox/childFolders") {
+                                    serde_json::json!({ "id": req_id, "status": 200, "body": { "value": [child("f-in-1", "f-inbox")] } })
+                                } else if url.starts_with("/me/mailFolders/f-b/childFolders") {
+                                    serde_json::json!({ "id": req_id, "status": 200, "body": { "value": [child("f-b-1", "f-b")] } })
+                                } else if url.starts_with("/me/mailFolders/f-a/childFolders") {
+                                    match mode {
+                                        "throttled" => serde_json::json!({
+                                            "id": req_id,
+                                            "status": 429,
+                                            "headers": { "Retry-After": "5" },
+                                            "body": { "error": { "code": "TooManyRequests", "message": "throttled" } }
+                                        }),
+                                        "gone" => serde_json::json!({
+                                            "id": req_id,
+                                            "status": 404,
+                                            "body": { "error": { "code": "ErrorItemNotFound", "message": "gone" } }
+                                        }),
+                                        _ => serde_json::json!({
+                                            "id": req_id,
+                                            "status": 200,
+                                            "body": {
+                                                "value": [child("f-a-1", "f-a")],
+                                                "@odata.nextLink": format!("{base}/v1.0/me/mailFolders/f-a/childFolders?page=2")
+                                            }
+                                        }),
+                                    }
+                                } else {
+                                    serde_json::json!({ "id": req_id, "status": 404, "body": {} })
+                                }
+                            })
+                            .collect();
+                        Json(serde_json::json!({ "responses": responses }))
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        *base_url.lock().unwrap() = format!("http://{addr}");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = test_graph_client(&format!("http://{addr}/v1.0"));
+        client.list_mail_folders_complete().await.unwrap()
+    }
+
+    fn folder_ids(folders: &[MailFolder]) -> Vec<&str> {
+        let mut ids: Vec<&str> = folders.iter().map(|f| f.id.as_str()).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[tokio::test]
+    async fn test_list_mail_folders_complete_flags_throttled_child_listing_as_partial() {
+        let (folders, complete) = folder_tree_listing_with_fault("throttled").await;
+        assert!(!complete, "a 429 child sub-response must mark the tree partial");
+        // The siblings that did answer are still returned so they can be merged into the cache.
+        assert_eq!(folder_ids(&folders), ["f-a", "f-b", "f-b-1", "f-in-1", "f-inbox"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_mail_folders_complete_treats_deleted_parent_as_complete() {
+        // 404 means the parent vanished between the two calls: there is nothing left to list under it.
+        let (folders, complete) = folder_tree_listing_with_fault("gone").await;
+        assert!(complete);
+        assert_eq!(folder_ids(&folders), ["f-a", "f-b", "f-b-1", "f-in-1", "f-inbox"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_mail_folders_complete_flags_failed_child_next_page_as_partial() {
+        let (folders, complete) = folder_tree_listing_with_fault("nextfail").await;
+        assert!(!complete, "a failed @odata.nextLink page must mark the tree partial");
+        assert_eq!(
+            folder_ids(&folders),
+            ["f-a", "f-a-1", "f-b", "f-b-1", "f-in-1", "f-inbox"]
+        );
     }
 
     #[tokio::test]

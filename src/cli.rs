@@ -2754,12 +2754,15 @@ async fn cmd_folders(
         || cached_folders.is_empty()
         || (!cached && !daemon_warm && !is_cursor_fresh(&storage, &["cli:mail_folders"], ttl));
     let folders = if should_fetch {
-        let fetched = match graph.list_mail_folders().await {
+        let (fetched, complete) = match graph.list_mail_folders_complete().await {
             Ok(items) => items,
             Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
         };
-        storage.replace_mail_folders(&fetched)?;
-        record_cli_sync_cursor(&storage, "cli:mail_folders");
+        storage.store_mail_folder_listing(&fetched, complete)?;
+        if complete {
+            // A partial listing leaves the cursor stale so the next call retries.
+            record_cli_sync_cursor(&storage, "cli:mail_folders");
+        }
         storage.list_mail_folders()?
     } else {
         cached_folders
@@ -2772,6 +2775,17 @@ pub(crate) struct MailListPage {
     pub messages: Vec<MailMessage>,
     pub has_more: Option<bool>,
     pub next_cursor: Option<String>,
+    /// `false` when this listing ran a first folder sync that stopped at the interactive page budget.
+    pub sync_complete: bool,
+}
+
+/// Adds `"sync_complete": false` to a mail list response whose folder is still being bootstrapped
+/// (see `sync::sync_mail_folder_for_listing`). The key is absent in every other case.
+pub(crate) fn with_sync_complete_marker(mut out: serde_json::Value, sync_complete: bool) -> serde_json::Value {
+    if !sync_complete {
+        out["sync_complete"] = json!(false);
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2821,6 +2835,7 @@ pub(crate) fn load_cached_mail_list(
         messages,
         has_more: Some(has_more),
         next_cursor,
+        sync_complete: true,
     })
 }
 
@@ -2939,13 +2954,16 @@ fn print_mail_list_output(
     if json_out {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
-                "folder": folder_id,
-                "messages": mail_list_json(&page.messages, compact),
-                "returned": page.messages.len(),
-                "has_more": page.has_more,
-                "next_cursor": page.next_cursor,
-            }))?
+            serde_json::to_string_pretty(&with_sync_complete_marker(
+                json!({
+                    "folder": folder_id,
+                    "messages": mail_list_json(&page.messages, compact),
+                    "returned": page.messages.len(),
+                    "has_more": page.has_more,
+                    "next_cursor": page.next_cursor,
+                }),
+                page.sync_complete,
+            ))?
         );
     } else if page.messages.is_empty() {
         println!("No messages found in '{folder}'.");
@@ -3055,6 +3073,7 @@ async fn cmd_mail_list(
                     messages,
                     has_more: filtered.has_more,
                     next_cursor: filtered.next_cursor,
+                    sync_complete: true,
                 };
                 return print_mail_list_output(folder, &resolved.id, page, json_out, compact);
             }
@@ -3221,14 +3240,14 @@ async fn cmd_mail_list(
                 messages,
                 has_more: filtered.has_more,
                 next_cursor: filtered.next_cursor,
+                sync_complete: true,
             }
         } else {
-            let sync_res = match crate::sync::sync_mail_folder_delta(
+            let sync_res = match crate::sync::sync_mail_folder_for_listing(
                 &resolved.id,
                 &graph,
                 &storage,
-                None,
-                false,
+                limit,
             )
             .await
             {
@@ -3244,12 +3263,11 @@ async fn cmd_mail_list(
                     {
                         Ok(Some(new_folder)) => {
                             resolved = new_folder;
-                            match crate::sync::sync_mail_folder_delta(
+                            match crate::sync::sync_mail_folder_for_listing(
                                 &resolved.id,
                                 &graph,
                                 &storage,
-                                None,
-                                false,
+                                limit,
                             )
                             .await
                             {
@@ -3269,7 +3287,7 @@ async fn cmd_mail_list(
             };
             record_cli_sync_cursor(&storage, &format!("cli:mail:{}", sync_res.folder_id));
             let scope = mail_cursor_scope(&sync_res.folder_id, false, false, false);
-            load_cached_mail_list(
+            let mut page = load_cached_mail_list(
                 &storage,
                 &sync_res.folder_id,
                 false,
@@ -3279,7 +3297,9 @@ async fn cmd_mail_list(
                 full,
                 None,
                 &scope,
-            )?
+            )?;
+            page.sync_complete = sync_res.complete;
+            page
         }
     } else {
         let scope = mail_cursor_scope(&resolved.id, unread_only, flagged_only, focused_only);
@@ -4936,7 +4956,7 @@ async fn cmd_sync(cfg: &AppConfig, days: i64, limit: usize, json_out: bool) -> R
     let (start_iso, end_iso) = default_calendar_window(None, None, days)?;
 
     let (folders_res, cal_res, lists_res, contacts_res) = tokio::join!(
-        graph.list_mail_folders(),
+        graph.list_mail_folders_complete(),
         graph.list_calendar_view_complete(&start_iso, &end_iso, limit),
         graph.list_todo_lists(),
         graph.list_contacts_complete(limit),
@@ -4951,10 +4971,12 @@ async fn cmd_sync(cfg: &AppConfig, days: i64, limit: usize, json_out: bool) -> R
     let mut contact_count = 0usize;
 
     match folders_res {
-        Ok(folders) => {
+        Ok((folders, complete)) => {
             folder_count = folders.len();
-            storage.replace_mail_folders(&folders)?;
-            record_cli_sync_cursor(&storage, "cli:mail_folders");
+            storage.store_mail_folder_listing(&folders, complete)?;
+            if complete {
+                record_cli_sync_cursor(&storage, "cli:mail_folders");
+            }
         }
         Err(err) => errors.push(format!(
             "mail_folders: {:#}",

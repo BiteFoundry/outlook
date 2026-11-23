@@ -466,7 +466,7 @@ pub async fn bootstrap_outlook(graph: &GraphClient, storage: &Storage) -> Result
     let (start_iso, end_iso) = default_calendar_window();
     let (me_res, folders_res, events_res, contacts_res, lists_res) = tokio::join!(
         graph.get_me(),
-        graph.list_mail_folders(),
+        graph.list_mail_folders_complete(),
         graph.list_calendar_view_complete(&start_iso, &end_iso, 100),
         graph.list_contacts_complete(100),
         graph.list_todo_lists(),
@@ -474,8 +474,8 @@ pub async fn bootstrap_outlook(graph: &GraphClient, storage: &Storage) -> Result
 
     let _ = me_res;
 
-    if let Ok(folders) = folders_res {
-        run_storage(storage, move |st| st.replace_mail_folders(&folders)).await?;
+    if let Ok((folders, complete)) = folders_res {
+        run_storage(storage, move |st| st.store_mail_folder_listing(&folders, complete)).await?;
     }
 
     let (inbox_res, sent_res) = tokio::join!(
@@ -1336,6 +1336,33 @@ pub struct MailFolderSyncOutcome {
     pub folder_id: String,
     pub changed_rows: usize,
     pub deleted_rows: usize,
+    /// `false` when a first (full) delta bootstrap stopped at the caller's page budget before
+    /// reaching the terminal `@odata.deltaLink`. Always `true` for unbounded callers.
+    pub complete: bool,
+    /// The run continued an earlier budget-limited bootstrap instead of starting a new round.
+    pub(crate) resumed: bool,
+}
+
+/// Page budget for a first (full) delta bootstrap started by a one-shot listing (CLI, MCP, HTTP).
+/// At the default page size of 50 this covers folders of about 2,000 messages in a single call.
+pub(crate) const INTERACTIVE_DELTA_MAX_PAGES: usize = 40;
+
+/// Cursor scope holding the `@odata.nextLink` at which a budget-limited bootstrap stopped.
+fn mail_delta_resume_scope(real_folder_id: &str) -> String {
+    format!("mail_delta_resume:{real_folder_id}")
+}
+
+async fn store_mail_delta_resume_link(storage: &Storage, scope: &str, link: Option<String>) {
+    let scope_key = scope.to_string();
+    let _ = run_storage(storage, move |st| {
+        st.upsert_sync_cursor(&SyncCursor {
+            scope_key,
+            delta_link: link,
+            history_next_link: None,
+            last_synced_at: chrono::Utc::now().to_rfc3339(),
+        })
+    })
+    .await;
 }
 
 async fn resolve_canonical_folder_id(
@@ -1359,9 +1386,12 @@ async fn resolve_canonical_folder_id(
         );
     }
 
-    if let Ok(folders) = graph.list_mail_folders().await {
+    if let Ok((folders, complete)) = graph.list_mail_folders_complete().await {
         let folders_for_db = folders.clone();
-        let _ = run_storage(storage, move |st| st.replace_mail_folders(&folders_for_db)).await;
+        let _ = run_storage(storage, move |st| {
+            st.store_mail_folder_listing(&folders_for_db, complete)
+        })
+        .await;
         if let Ok(found) = crate::resolver::resolve_mail_folder_from_slice(&folders, trimmed) {
             return (
                 found.id,
@@ -1458,13 +1488,102 @@ pub(crate) async fn sync_mail_folder_delta_with_page_size(
     is_periodic: bool,
     page_size: usize,
 ) -> Result<MailFolderSyncOutcome> {
+    sync_mail_folder_delta_impl(folder_id, graph, storage, event_tx, is_periodic, page_size, None)
+        .await
+}
+
+/// Folder sync for a one-shot listing (CLI, MCP, HTTP) that must answer in bounded time.
+///
+/// An incremental sync (a delta link exists) runs to the end as usual. A first sync stops after
+/// [`INTERACTIVE_DELTA_MAX_PAGES`] delta pages, keeps what it fetched, and remembers where it stopped;
+/// the next listing of the same folder continues from there, so a large folder is bootstrapped over a
+/// few calls instead of stalling the first one. While the bootstrap is unfinished (`complete == false`)
+/// the newest `limit` messages are fetched with a plain listing, because delta pages arrive in no
+/// guaranteed order and the cached rows alone may not hold the head of the folder.
+pub(crate) async fn sync_mail_folder_for_listing(
+    folder_id: &str,
+    graph: &GraphClient,
+    storage: &Storage,
+    limit: usize,
+) -> Result<MailFolderSyncOutcome> {
+    sync_mail_folder_for_listing_with_budget(
+        folder_id,
+        graph,
+        storage,
+        limit,
+        50,
+        INTERACTIVE_DELTA_MAX_PAGES,
+    )
+    .await
+}
+
+pub(crate) async fn sync_mail_folder_for_listing_with_budget(
+    folder_id: &str,
+    graph: &GraphClient,
+    storage: &Storage,
+    limit: usize,
+    page_size: usize,
+    max_pages: usize,
+) -> Result<MailFolderSyncOutcome> {
+    let mut outcome = sync_mail_folder_delta_impl(
+        folder_id,
+        graph,
+        storage,
+        None,
+        false,
+        page_size,
+        Some(max_pages),
+    )
+    .await?;
+
+    if outcome.complete && outcome.resumed {
+        // The resumed round describes the folder as of the call that started it. The delta link is
+        // saved now, so one incremental request picks up everything that changed since.
+        if let Ok(follow_up) = sync_mail_folder_delta_impl(
+            &outcome.folder_id,
+            graph,
+            storage,
+            None,
+            false,
+            page_size,
+            Some(max_pages),
+        )
+        .await
+        {
+            outcome.changed_rows += follow_up.changed_rows;
+            outcome.deleted_rows += follow_up.deleted_rows;
+        }
+    }
+
+    if !outcome.complete {
+        let mut newest = graph
+            .list_mail_messages(&outcome.folder_id, limit.max(1), true)
+            .await?;
+        normalize_incoming_folder_ids(&mut newest, &outcome.folder_id);
+        outcome.changed_rows +=
+            run_storage(storage, move |st| st.upsert_mail_messages(&newest)).await?;
+    }
+    Ok(outcome)
+}
+
+async fn sync_mail_folder_delta_impl(
+    folder_id: &str,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: Option<&mpsc::UnboundedSender<CoreEvent>>,
+    is_periodic: bool,
+    page_size: usize,
+    max_pages: Option<usize>,
+) -> Result<MailFolderSyncOutcome> {
     let (real_folder_id, folder_alias) =
         resolve_canonical_folder_id(folder_id, graph, storage).await;
     let scope_key = format!("mail_delta:{real_folder_id}");
+    let resume_scope = mail_delta_resume_scope(&real_folder_id);
+    let resume_scope_for_read = resume_scope.clone();
     let scope_for_read = scope_key.clone();
     let fid_for_read = real_folder_id.clone();
     let alias_for_read = folder_alias.clone();
-    let (prev_cursor, existing_count) = run_storage(storage, move |st| {
+    let (prev_cursor, existing_count, saved_resume_link) = run_storage(storage, move |st| {
         let mut cursor = st.get_sync_cursor(&scope_for_read)?;
         if cursor
             .as_ref()
@@ -1490,7 +1609,12 @@ pub(crate) async fn sync_mail_folder_delta_with_page_size(
             }
         }
         let summaries = st.list_mail_summaries(Some(&fid_for_read), 1)?;
-        Ok((cursor, summaries.len()))
+        let resume_link = st
+            .get_sync_cursor(&resume_scope_for_read)?
+            .and_then(|c| c.delta_link)
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty());
+        Ok((cursor, summaries.len(), resume_link))
     })
     .await?;
 
@@ -1516,17 +1640,28 @@ pub(crate) async fn sync_mail_folder_delta_with_page_size(
         .await;
     }
 
-    let mut next_link: Option<String> = existing_delta_link.clone();
+    // Only budget-limited callers continue an unfinished bootstrap. Unbounded callers (the sync
+    // engine) restart the round so they can reconcile the whole folder against what they saw.
+    let mut resumed = is_full_bootstrap && max_pages.is_some() && saved_resume_link.is_some();
+    let mut next_link: Option<String> = if resumed {
+        saved_resume_link.clone()
+    } else {
+        existing_delta_link.clone()
+    };
     let mut seen_urls = HashSet::new();
     seen_urls.insert(crate::graph::mail::canonical_delta_url_key(
         &real_folder_id,
         next_link.as_deref(),
     ));
-    let mut reconcile_seen: Option<HashSet<String>> = if is_full_bootstrap {
+    // A resumed run has not seen the round's earlier pages, so it cannot tell which cached rows
+    // the server no longer has: it skips the reconcile instead of deleting rows it never compared.
+    let mut reconcile_seen: Option<HashSet<String>> = if is_full_bootstrap && !resumed {
         Some(HashSet::new())
     } else {
         None
     };
+    let mut pages_fetched = 0usize;
+    let mut budget_exhausted = false;
     let mut tried_expired_reset = false;
     let mut total_changed = 0usize;
     let mut total_deleted = 0usize;
@@ -1539,10 +1674,12 @@ pub(crate) async fn sync_mail_folder_delta_with_page_size(
             .await
         {
             Ok(p) => p,
+            // A saved resume link that fails on its first request is dropped and the round restarts,
+            // whatever the error: keeping it would fail the same way on every later call.
             Err(err)
                 if next_link.is_some()
                     && !tried_expired_reset
-                    && is_expired_delta_error(&err) =>
+                    && (is_expired_delta_error(&err) || (resumed && pages_fetched == 0)) =>
             {
                 // Persist cleared expired cursor immediately so an interrupted re-bootstrap
                 // retries a full delta instead of replaying the dead token.
@@ -1558,6 +1695,10 @@ pub(crate) async fn sync_mail_folder_delta_with_page_size(
                     })
                 })
                 .await;
+                if saved_resume_link.is_some() {
+                    store_mail_delta_resume_link(storage, &resume_scope, None).await;
+                }
+                resumed = false;
                 is_full_bootstrap = true;
                 reconcile_seen = Some(HashSet::new());
                 next_link = None;
@@ -1570,6 +1711,7 @@ pub(crate) async fn sync_mail_folder_delta_with_page_size(
             }
             Err(err) => return Err(err),
         };
+        pages_fetched += 1;
 
         normalize_incoming_folder_ids(&mut page.upserted, &real_folder_id);
         if let Some(ref mut seen) = reconcile_seen {
@@ -1613,6 +1755,13 @@ pub(crate) async fn sync_mail_folder_delta_with_page_size(
             total_deleted += deleted;
             if notify_candidate.is_none() {
                 notify_candidate = page_notify;
+            }
+            if is_full_bootstrap && max_pages.is_some_and(|max| pages_fetched >= max) {
+                // Budget spent on a first sync: the pages above are already persisted, no delta link
+                // is saved (the round is unfinished) and the next bounded call continues from here.
+                store_mail_delta_resume_link(storage, &resume_scope, Some(next)).await;
+                budget_exhausted = true;
+                break;
             }
             next_link = Some(next);
             continue;
@@ -1668,6 +1817,10 @@ pub(crate) async fn sync_mail_folder_delta_with_page_size(
         if notify_candidate.is_none() {
             notify_candidate = page_notify;
         }
+        if saved_resume_link.is_some() {
+            // The round ended (or the server ended it without a delta link): the resume point is spent.
+            store_mail_delta_resume_link(storage, &resume_scope, None).await;
+        }
         break;
     }
 
@@ -1690,6 +1843,8 @@ pub(crate) async fn sync_mail_folder_delta_with_page_size(
         folder_id: real_folder_id,
         changed_rows: total_changed,
         deleted_rows: total_deleted,
+        complete: !budget_exhausted,
+        resumed,
     })
 }
 
@@ -1762,7 +1917,13 @@ async fn poll_mail_folders_quiet(
     event_tx: &mpsc::UnboundedSender<CoreEvent>,
     last_folders: &mut Option<Vec<MailFolder>>,
 ) -> Result<()> {
-    let folders = graph.list_mail_folders().await?;
+    let (folders, complete) = graph.list_mail_folders_complete().await?;
+    if !complete {
+        // A partial tree is merged into the cache but never becomes the baseline: nothing is deleted,
+        // the UI keeps its current list, and the next poll retries the full listing.
+        run_storage(storage, move |st| st.upsert_mail_folders(&folders)).await?;
+        return Ok(());
+    }
     let changed = last_folders.as_ref() != Some(&folders);
     if changed {
         let to_store = folders.clone();
@@ -3494,6 +3655,303 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(delta_hits.load(Ordering::SeqCst), 1);
+    }
+
+    fn test_folder(id: &str, name: &str, parent: Option<&str>, children: i32) -> MailFolder {
+        MailFolder {
+            id: id.into(),
+            display_name: name.into(),
+            well_known_name: None,
+            parent_folder_id: parent.map(str::to_string),
+            child_folder_count: children,
+            unread_item_count: 0,
+            total_item_count: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partial_folder_listing_never_deletes_cached_folders() {
+        use axum::{
+            routing::{get, post},
+            Json, Router,
+        };
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        // mode: 0 = the Projects child listing is throttled; 1 = clean listing, Alpha really removed
+        let mode = Arc::new(AtomicU8::new(0));
+        let mode_batch = Arc::clone(&mode);
+        let app = Router::new()
+            .route(
+                "/v1.0/me/mailFolders",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [
+                            { "id": "f-inbox", "displayName": "Inbox", "childFolderCount": 1, "unreadItemCount": 0, "totalItemCount": 1 }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/$batch",
+                post(move |Json(payload): Json<serde_json::Value>| {
+                    let mode = Arc::clone(&mode_batch);
+                    async move {
+                        let cur = mode.load(Ordering::SeqCst);
+                        let responses: Vec<serde_json::Value> = payload["requests"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|r| {
+                                let id = r["id"].as_str().unwrap_or_default().to_string();
+                                let url = r["url"].as_str().unwrap_or_default().to_string();
+                                if url.starts_with("/me/mailFolders/f-inbox/childFolders") {
+                                    let grandchildren = if cur == 0 { 1 } else { 0 };
+                                    serde_json::json!({ "id": id, "status": 200, "body": { "value": [
+                                        { "id": "f-proj", "displayName": "Projects", "parentFolderId": "f-inbox", "childFolderCount": grandchildren, "unreadItemCount": 0, "totalItemCount": 0 }
+                                    ] } })
+                                } else if url.starts_with("/me/mailFolders/f-proj/childFolders") {
+                                    serde_json::json!({ "id": id, "status": 429, "body": { "error": { "code": "TooManyRequests", "message": "throttled" } } })
+                                } else {
+                                    serde_json::json!({ "id": id, "status": 404, "body": {} })
+                                }
+                            })
+                            .collect();
+                        Json(serde_json::json!({ "responses": responses }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = mock_client(format!("http://{addr}/v1.0"));
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .replace_mail_folders(&[
+                test_folder("f-inbox", "Inbox", None, 1),
+                test_folder("f-proj", "Projects", Some("f-inbox"), 1),
+                test_folder("f-alpha", "Alpha", Some("f-proj"), 0),
+            ])
+            .unwrap();
+        let cached_ids = |st: &Storage| {
+            let mut ids: Vec<String> =
+                st.list_mail_folders().unwrap().into_iter().map(|f| f.id).collect();
+            ids.sort();
+            ids
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut last_folders = None;
+
+        // Throttled child listing: the tree is partial, so Alpha (which Graph never listed) survives.
+        poll_mail_folders_quiet(&client, &storage, &tx, &mut last_folders)
+            .await
+            .unwrap();
+        assert_eq!(cached_ids(&storage), ["f-alpha", "f-inbox", "f-proj"]);
+        assert!(last_folders.is_none(), "a partial tree must not become the poll baseline");
+        assert!(rx.try_recv().is_err(), "a partial tree must not be pushed to the UI");
+
+        // The resolver's live refresh takes the same path.
+        let err = crate::resolver::resolve_mail_folder(&client, &storage, "No Such Folder", false).await;
+        assert!(err.is_err());
+        assert_eq!(cached_ids(&storage), ["f-alpha", "f-inbox", "f-proj"]);
+
+        // Clean listing in which Alpha is really gone: now the cache drops it.
+        mode.store(1, Ordering::SeqCst);
+        poll_mail_folders_quiet(&client, &storage, &tx, &mut last_folders)
+            .await
+            .unwrap();
+        assert_eq!(cached_ids(&storage), ["f-inbox", "f-proj"]);
+        assert!(matches!(rx.try_recv(), Ok(CoreEvent::MailFoldersUpdated(_))));
+    }
+
+    #[tokio::test]
+    async fn test_bounded_first_sync_stops_at_budget_resumes_and_never_cuts_incremental() {
+        use axum::{
+            extract::{Path, Query},
+            http::StatusCode,
+            response::IntoResponse,
+            routing::get,
+            Json, Router,
+        };
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const TOTAL_PAGES: usize = 45;
+        const BUDGET: usize = 40;
+        let delta_hits = Arc::new(AtomicUsize::new(0));
+        let list_hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}/v1.0");
+
+        let hits_r = Arc::clone(&delta_hits);
+        let base_r = base_url.clone();
+        let list_r = Arc::clone(&list_hits);
+        let app = Router::new()
+            .route(
+                "/v1.0/me/mailFolders/{folder}/messages/delta",
+                get(move |Path(folder): Path<String>, Query(params): Query<HashMap<String, String>>| {
+                    let hits = Arc::clone(&hits_r);
+                    let base = base_r.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let link = |query: &str| format!("{base}/me/mailFolders/{folder}/messages/delta?{query}");
+                        if params.contains_key("broken") {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({ "error": { "code": "InternalServerError", "message": "stale link" } })),
+                            )
+                                .into_response();
+                        }
+                        // `chain` pages model a long *incremental* round reached from a saved delta link.
+                        let (key, page): (&str, usize) = match params.get("chain") {
+                            Some(v) => ("chain", v.parse().unwrap_or(1)),
+                            None if params.contains_key("$deltatoken") => {
+                                return Json(serde_json::json!({ "value": [], "@odata.deltaLink": link("$deltatoken=d2") }))
+                                    .into_response();
+                            }
+                            None => ("page", params.get("page").and_then(|v| v.parse().ok()).unwrap_or(1)),
+                        };
+                        let item = serde_json::json!({
+                            "id": format!("{folder}-m-{page:04}"),
+                            "parentFolderId": folder,
+                            "subject": format!("Mail {page}"),
+                            "receivedDateTime": "2026-11-20T05:00:00Z",
+                            "isRead": true
+                        });
+                        if page < TOTAL_PAGES {
+                            Json(serde_json::json!({ "value": [item], "@odata.nextLink": link(&format!("{key}={}", page + 1)) }))
+                                .into_response()
+                        } else {
+                            Json(serde_json::json!({ "value": [item], "@odata.deltaLink": link("$deltatoken=d1") }))
+                                .into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/{folder}/messages",
+                get(move |Path(folder): Path<String>| {
+                    let hits = Arc::clone(&list_r);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({ "value": [{
+                            "id": format!("{folder}-newest"),
+                            "parentFolderId": folder,
+                            "subject": "Newest mail",
+                            "receivedDateTime": "2026-11-23T05:00:00Z",
+                            "isRead": false
+                        }] }))
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = mock_client(base_url.clone());
+        let new_storage = |folder: &str| {
+            let storage = Storage::open_in_memory().unwrap();
+            storage.upsert_mail_folders(&[test_folder(folder, "Big", None, 0)]).unwrap();
+            storage
+        };
+        let delta_link_of = |st: &Storage, scope: &str| {
+            st.get_sync_cursor(scope).unwrap().and_then(|c| c.delta_link)
+        };
+        let take = |counter: &AtomicUsize| counter.swap(0, Ordering::SeqCst);
+
+        // 1. A bounded first sync stops after BUDGET delta pages, saves no delta link, remembers where
+        //    it stopped, and fetches the newest messages with one plain listing.
+        let storage = new_storage("fld-big");
+        let first = sync_mail_folder_for_listing_with_budget("fld-big", &client, &storage, 10, 1, BUDGET)
+            .await
+            .unwrap();
+        assert!(!first.complete);
+        assert_eq!(take(&delta_hits), BUDGET);
+        assert_eq!(take(&list_hits), 1);
+        assert!(delta_link_of(&storage, "mail_delta:fld-big").is_none());
+        assert!(delta_link_of(&storage, "mail_delta_resume:fld-big")
+            .is_some_and(|l| l.contains("page=41")));
+        assert!(storage.get_mail_message("fld-big-m-0040").unwrap().is_some());
+        assert!(storage.get_mail_message("fld-big-m-0041").unwrap().is_none());
+        assert!(storage.get_mail_message("fld-big-newest").unwrap().is_some());
+
+        // 2. The next bounded call continues at page 41, reaches the delta link, then makes one
+        //    incremental request for whatever changed while the bootstrap was spread over two calls.
+        let second = sync_mail_folder_for_listing_with_budget("fld-big", &client, &storage, 10, 1, BUDGET)
+            .await
+            .unwrap();
+        assert!(second.complete);
+        assert_eq!(take(&delta_hits), TOTAL_PAGES - BUDGET + 1);
+        assert_eq!(take(&list_hits), 0);
+        assert!(storage.get_mail_message("fld-big-m-0045").unwrap().is_some());
+        assert!(delta_link_of(&storage, "mail_delta:fld-big").is_some_and(|l| l.contains("$deltatoken=d2")));
+        assert!(delta_link_of(&storage, "mail_delta_resume:fld-big").is_none());
+
+        // 3. From then on a listing is a single incremental request.
+        let third = sync_mail_folder_for_listing_with_budget("fld-big", &client, &storage, 10, 1, BUDGET)
+            .await
+            .unwrap();
+        assert!(third.complete);
+        assert_eq!(take(&delta_hits), 1);
+
+        // 4. The unbounded sync (sync engine) ignores a saved resume point: it runs the whole round,
+        //    saves the delta link and clears the resume point.
+        let storage = new_storage("fld-engine");
+        let cut = sync_mail_folder_for_listing_with_budget("fld-engine", &client, &storage, 10, 1, BUDGET)
+            .await
+            .unwrap();
+        assert!(!cut.complete);
+        take(&delta_hits);
+        let full = sync_mail_folder_delta_with_page_size("fld-engine", &client, &storage, None, false, 1)
+            .await
+            .unwrap();
+        assert!(full.complete);
+        assert_eq!(take(&delta_hits), TOTAL_PAGES);
+        assert!(delta_link_of(&storage, "mail_delta:fld-engine").is_some_and(|l| l.contains("$deltatoken=d1")));
+        assert!(delta_link_of(&storage, "mail_delta_resume:fld-engine").is_none());
+
+        // 5. A bounded call with an existing delta link is never cut, however long the round is.
+        let storage = new_storage("fld-inc");
+        storage
+            .upsert_sync_cursor(&SyncCursor {
+                scope_key: "mail_delta:fld-inc".into(),
+                delta_link: Some(format!("{base_url}/me/mailFolders/fld-inc/messages/delta?chain=1")),
+                history_next_link: None,
+                last_synced_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        take(&list_hits);
+        let incremental = sync_mail_folder_for_listing_with_budget("fld-inc", &client, &storage, 10, 1, BUDGET)
+            .await
+            .unwrap();
+        assert!(incremental.complete);
+        assert_eq!(take(&delta_hits), TOTAL_PAGES);
+        assert_eq!(take(&list_hits), 0);
+        assert!(delta_link_of(&storage, "mail_delta:fld-inc").is_some_and(|l| l.contains("$deltatoken=d1")));
+
+        // 6. A resume link the server no longer accepts is dropped and the round restarts.
+        let storage = new_storage("fld-stale");
+        storage
+            .upsert_sync_cursor(&SyncCursor {
+                scope_key: "mail_delta_resume:fld-stale".into(),
+                delta_link: Some(format!("{base_url}/me/mailFolders/fld-stale/messages/delta?broken=1")),
+                history_next_link: None,
+                last_synced_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        let restarted = sync_mail_folder_for_listing_with_budget("fld-stale", &client, &storage, 10, 1, BUDGET)
+            .await
+            .unwrap();
+        assert!(!restarted.complete);
+        assert_eq!(take(&delta_hits), 1 + BUDGET);
+        assert!(storage.get_mail_message("fld-stale-m-0001").unwrap().is_some());
+        assert!(delta_link_of(&storage, "mail_delta_resume:fld-stale")
+            .is_some_and(|l| l.contains("page=41")));
     }
 
     #[tokio::test]

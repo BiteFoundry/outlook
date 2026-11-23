@@ -126,7 +126,31 @@ paths:
             default: false
       responses:
         "200":
-          description: Folder metadata and matching messages
+          description: >-
+            Folder metadata and matching messages. A live filtered scan reads at most 20 Graph pages and
+            a first folder sync at most 40 delta pages per request.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [folder, messages, has_more]
+                properties:
+                  folder:
+                    type: object
+                  messages:
+                    type: array
+                    items:
+                      type: object
+                  has_more:
+                    type: [boolean, "null"]
+                    description: >-
+                      Whether more matching messages exist. Null when unknown: the filtered scan
+                      stopped at its page cap, or the response was served from the cache.
+                  sync_complete:
+                    type: boolean
+                    description: >-
+                      Present (and false) only while the first sync of a large folder is still in
+                      progress; messages then holds the newest messages.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":

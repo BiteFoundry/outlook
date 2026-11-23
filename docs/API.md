@@ -111,6 +111,11 @@ curl "http://127.0.0.1:3939/v1/mail/folders?refresh=true"
 
 Lists messages in a mail folder (`inbox`, `sent`, `drafts`, `archive`, `trash`, `junk`, folder name, or folder ID).
 
+Live requests are bounded:
+
+- With `unread`, `flagged` or `focused`, the scan reads at most 20 Graph pages. `has_more` is `true` or `false` when the scan could tell, and `null` when it stopped at the page cap (or the response came from the cache) and more matches may exist further back.
+- Without a filter, the first sync of a folder reads at most 40 delta pages (about 2,000 messages) per request. A larger folder answers with the newest messages and `"sync_complete": false`; later requests and the background sync continue from where it stopped. The key is absent once the folder is fully synced.
+
 ```bash
 curl "http://127.0.0.1:3939/v1/mail/messages?folder=inbox&limit=20&unread=true"
 ```
@@ -134,7 +139,8 @@ curl "http://127.0.0.1:3939/v1/mail/messages?folder=inbox&limit=20&unread=true"
       "body_loaded": false,
       "preview": "Attached are the Q4 numbers..."
     }
-  ]
+  ],
+  "has_more": false
 }
 ```
 

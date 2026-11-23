@@ -184,6 +184,16 @@ impl Storage {
         outlook::replace_mail_folders(&mut conn, folders)
     }
 
+    /// Stores a Graph folder listing. A complete listing replaces the cached tree (folders missing from
+    /// it are deleted); a partial one is merged so a throttled or failed sub-request never deletes folders.
+    pub fn store_mail_folder_listing(&self, folders: &[MailFolder], complete: bool) -> Result<()> {
+        if complete {
+            self.replace_mail_folders(folders)
+        } else {
+            self.upsert_mail_folders(folders)
+        }
+    }
+
     pub fn list_mail_folders(&self) -> Result<Vec<MailFolder>> {
         let conn = self.read_conn()?;
         outlook::list_mail_folders(&conn)
@@ -1372,6 +1382,27 @@ mod tests {
             }])
             .unwrap();
         assert_eq!(storage.list_mail_folders().unwrap().len(), 1);
+
+        // A partial Graph listing is merged: the folder it failed to list survives.
+        let partial_listing = [MailFolder {
+            id: "f3".into(),
+            display_name: "Projects".into(),
+            well_known_name: None,
+            parent_folder_id: Some("f1".into()),
+            child_folder_count: 0,
+            unread_item_count: 0,
+            total_item_count: 0,
+        }];
+        storage.store_mail_folder_listing(&partial_listing, false).unwrap();
+        let mut ids: Vec<String> =
+            storage.list_mail_folders().unwrap().into_iter().map(|f| f.id).collect();
+        ids.sort();
+        assert_eq!(ids, ["f1", "f3"]);
+        // The same listing reported complete replaces the tree.
+        storage.store_mail_folder_listing(&partial_listing, true).unwrap();
+        let ids: Vec<String> =
+            storage.list_mail_folders().unwrap().into_iter().map(|f| f.id).collect();
+        assert_eq!(ids, ["f3"]);
 
         storage
             .replace_todo_lists(&[TodoList {

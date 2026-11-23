@@ -597,14 +597,15 @@ async fn list_mail_folders(
     })
     .await?;
     let folders = if !query.offline && (query.refresh || cached.is_empty() || !fresh) {
-        let fetched = match state.graph.list_mail_folders().await {
+        let (fetched, complete) = match state.graph.list_mail_folders_complete().await {
             Ok(f) => f,
             Err(err) => return Err(map_graph_error(&state.graph, err).await),
         };
-        let fetched_clone = fetched.clone();
         with_storage(&state.storage, move |s| {
-            s.replace_mail_folders(&fetched_clone)?;
-            cli::record_cli_sync_cursor(s, "cli:mail_folders");
+            s.store_mail_folder_listing(&fetched, complete)?;
+            if complete {
+                cli::record_cli_sync_cursor(s, "cli:mail_folders");
+            }
             s.list_mail_folders()
         })
         .await?
@@ -645,17 +646,24 @@ async fn list_mail_messages(
     })
     .await?;
 
+    // `has_more` is known only for a live filtered scan; `sync_complete` turns false only when a first
+    // folder sync stopped at the interactive page budget.
+    let mut has_more: Option<bool> = None;
+    let mut sync_complete = true;
     let messages = if !query.offline && (query.refresh || !has_any_cached || !fresh) {
         if has_filter {
-            let (matched, fetched) = match state
+            let page = match state
                 .graph
-                .list_mail_messages_filtered(
+                .list_mail_messages_filtered_paged(
                     &resolved_folder.id,
                     unread,
                     flagged,
                     focused,
                     limit,
                     true,
+                    "",
+                    None,
+                    Some(cli::FILTER_SCAN_MAX_PAGES),
                 )
                 .await
             {
@@ -673,13 +681,16 @@ async fn list_mail_messages(
                             resolved_folder = new_folder;
                             match state
                                 .graph
-                                .list_mail_messages_filtered(
+                                .list_mail_messages_filtered_paged(
                                     &resolved_folder.id,
                                     unread,
                                     flagged,
                                     focused,
                                     limit,
                                     true,
+                                    "",
+                                    None,
+                                    Some(cli::FILTER_SCAN_MAX_PAGES),
                                 )
                                 .await
                             {
@@ -697,6 +708,8 @@ async fn list_mail_messages(
                 }
                 Err(err) => return Err(map_graph_error(&state.graph, err).await),
             };
+            has_more = page.has_more;
+            let (matched, fetched) = (page.matched, page.fetched);
             with_storage(&state.storage, move |s| {
                 s.upsert_mail_messages(&fetched)?;
                 Ok(matched
@@ -706,12 +719,11 @@ async fn list_mail_messages(
             })
             .await?
         } else {
-            let outcome = match crate::sync::sync_mail_folder_delta(
+            let outcome = match crate::sync::sync_mail_folder_for_listing(
                 &resolved_folder.id,
                 &state.graph,
                 &state.storage,
-                None,
-                false,
+                limit,
             )
             .await
             {
@@ -727,12 +739,11 @@ async fn list_mail_messages(
                     {
                         Ok(Some(new_folder)) => {
                             resolved_folder = new_folder;
-                            match crate::sync::sync_mail_folder_delta(
+                            match crate::sync::sync_mail_folder_for_listing(
                                 &resolved_folder.id,
                                 &state.graph,
                                 &state.storage,
-                                None,
-                                false,
+                                limit,
                             )
                             .await
                             {
@@ -750,6 +761,7 @@ async fn list_mail_messages(
                 }
                 Err(err) => return Err(map_graph_error(&state.graph, err).await),
             };
+            sync_complete = outcome.complete;
             let fid_for_store = outcome.folder_id;
             with_storage(&state.storage, move |s| {
                 cli::record_cli_sync_cursor(s, &format!("cli:mail:{fid_for_store}"));
@@ -761,10 +773,14 @@ async fn list_mail_messages(
         cached
     };
 
-    Ok(Json(json!({
-        "folder": resolved_folder,
-        "messages": messages,
-    })))
+    Ok(Json(cli::with_sync_complete_marker(
+        json!({
+            "folder": resolved_folder,
+            "messages": messages,
+            "has_more": has_more,
+        }),
+        sync_complete,
+    )))
 }
 
 async fn get_mail_message(
@@ -1644,6 +1660,126 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let data: Value = res.json().await.unwrap();
         assert!(data["folders"].is_array());
+    }
+
+    #[tokio::test]
+    async fn live_mail_listing_is_bounded_for_filtered_scans_and_first_syncs() {
+        use axum::extract::Query as AxumQuery;
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A folder that never runs out of pages: every list or delta page holds one unflagged message
+        // and another `@odata.nextLink`.
+        let list_hits = Arc::new(AtomicUsize::new(0));
+        let delta_hits = Arc::new(AtomicUsize::new(0));
+        let graph_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let graph_base = format!("http://{}/v1.0", graph_listener.local_addr().unwrap());
+
+        let endless = |hits: Arc<AtomicUsize>, base: String, path: &'static str| {
+            get(move |AxumQuery(params): AxumQuery<HashMap<String, String>>| {
+                let hits = Arc::clone(&hits);
+                let base = base.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let page: usize = params.get("page").and_then(|v| v.parse().ok()).unwrap_or(1);
+                    Json(json!({
+                        "value": [{
+                            "id": format!("{path}-{page}"),
+                            "parentFolderId": "folder-inbox",
+                            "subject": format!("Mail {page}"),
+                            "receivedDateTime": "2026-11-20T05:00:00Z",
+                            "isRead": true,
+                            "flag": { "flagStatus": "notFlagged" }
+                        }],
+                        "@odata.nextLink": format!("{base}/me/mailFolders/folder-inbox/{path}?page={}", page + 1)
+                    }))
+                }
+            })
+        };
+        let graph_app = Router::new()
+            .route(
+                "/v1.0/me/mailFolders/folder-inbox/messages",
+                endless(Arc::clone(&list_hits), graph_base.clone(), "messages"),
+            )
+            .route(
+                "/v1.0/me/mailFolders/folder-inbox/messages/delta",
+                endless(Arc::clone(&delta_hits), graph_base.clone(), "messages/delta"),
+            );
+        tokio::spawn(async move {
+            axum::serve(graph_listener, graph_app).await.unwrap();
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = graph_base;
+        let auth = AuthManager::from_tokens(
+            cfg.clone(),
+            crate::auth::StoredTokens {
+                access_token: "test-access-token".into(),
+                refresh_token: None,
+                expires_at: 9_999_999_999,
+                client_id: "c".into(),
+                tenant_id: "t".into(),
+                user_id: Some("me-123".into()),
+                user_display_name: None,
+                user_email: None,
+                auth_mode: "access_token".into(),
+            },
+        );
+        let graph = GraphClient::new(cfg.clone(), auth)
+            .unwrap()
+            .with_my_user_id("me-123");
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_mail_folders(&[MailFolder {
+                id: "folder-inbox".to_string(),
+                display_name: "Inbox".to_string(),
+                well_known_name: Some("inbox".to_string()),
+                parent_folder_id: None,
+                child_folder_count: 0,
+                unread_item_count: 0,
+                total_item_count: 0,
+            }])
+            .unwrap();
+
+        let router = build_router(cfg, graph, storage, None);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+
+        // Filtered listing with no match anywhere: the scan stops at the page cap instead of walking
+        // the whole folder, and reports that it does not know whether more matches exist.
+        let res = client
+            .get(format!("{base}/v1/mail/messages?folder=inbox&flagged=true"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(list_hits.swap(0, Ordering::SeqCst), cli::FILTER_SCAN_MAX_PAGES);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 0);
+        assert!(body.as_object().unwrap().contains_key("has_more"));
+        assert!(body["has_more"].is_null());
+        assert!(body.get("sync_complete").is_none());
+
+        // Unfiltered listing of a folder with no delta link: the first sync stops at the interactive
+        // budget, says so, and still returns the newest messages from a plain listing.
+        let res = client
+            .get(format!("{base}/v1/mail/messages?folder=inbox&limit=3&refresh=true"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(
+            delta_hits.load(Ordering::SeqCst),
+            crate::sync::INTERACTIVE_DELTA_MAX_PAGES
+        );
+        assert_eq!(body["sync_complete"], false);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+        assert!(list_hits.load(Ordering::SeqCst) >= 1);
     }
 
     #[tokio::test]

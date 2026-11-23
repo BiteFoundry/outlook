@@ -341,11 +341,13 @@ async fn call_tool(
                 .await
                 .map_err(format_error)?;
                 let folders = if !offline && (refresh || cached.is_empty() || !fresh) {
-                    let fetched = map_graph_result(graph, graph.list_mail_folders().await).await?;
-                    let fetched_clone = fetched.clone();
+                    let (fetched, complete) =
+                        map_graph_result(graph, graph.list_mail_folders_complete().await).await?;
                     with_storage(storage, move |s| {
-                        s.replace_mail_folders(&fetched_clone)?;
-                        cli::record_cli_sync_cursor(s, "cli:mail_folders");
+                        s.store_mail_folder_listing(&fetched, complete)?;
+                        if complete {
+                            cli::record_cli_sync_cursor(s, "cli:mail_folders");
+                        }
                         s.list_mail_folders()
                     })
                     .await
@@ -463,6 +465,7 @@ async fn call_tool(
                             messages,
                             has_more: filtered.has_more,
                             next_cursor: filtered.next_cursor,
+                            sync_complete: true,
                         }
                     }
                     cli::CursorPos::Offset(_) => unreachable!(),
@@ -584,14 +587,14 @@ async fn call_tool(
                     messages,
                     has_more: filtered.has_more,
                     next_cursor: filtered.next_cursor,
+                    sync_complete: true,
                 }
             } else {
-                let outcome = match crate::sync::sync_mail_folder_delta(
+                let outcome = match crate::sync::sync_mail_folder_for_listing(
                     &resolved.id,
                     graph,
                     storage,
-                    None,
-                    false,
+                    limit,
                 )
                 .await
                 {
@@ -613,12 +616,11 @@ async fn call_tool(
                                 resolved = new_folder;
                                 map_graph_result(
                                     graph,
-                                    crate::sync::sync_mail_folder_delta(
+                                    crate::sync::sync_mail_folder_for_listing(
                                         &resolved.id,
                                         graph,
                                         storage,
-                                        None,
-                                        false,
+                                        limit,
                                     )
                                     .await,
                                 )
@@ -636,8 +638,9 @@ async fn call_tool(
                     }
                 };
                 let fid = outcome.folder_id;
+                let sync_complete = outcome.complete;
                 let scope = cli::mail_cursor_scope(&fid, false, false, false);
-                with_storage(storage, move |s| {
+                let mut page = with_storage(storage, move |s| {
                     cli::record_cli_sync_cursor(s, &format!("cli:mail:{fid}"));
                     cli::load_cached_mail_list(
                         s,
@@ -652,16 +655,21 @@ async fn call_tool(
                     )
                 })
                 .await
-                .map_err(format_error)?
+                .map_err(format_error)?;
+                page.sync_complete = sync_complete;
+                page
             };
 
-            Ok(json!({
-                "folder": resolved,
-                "messages": cli::mail_list_json(&page.messages, compact),
-                "returned": page.messages.len(),
-                "has_more": page.has_more,
-                "next_cursor": page.next_cursor,
-            }))
+            Ok(cli::with_sync_complete_marker(
+                json!({
+                    "folder": resolved,
+                    "messages": cli::mail_list_json(&page.messages, compact),
+                    "returned": page.messages.len(),
+                    "has_more": page.has_more,
+                    "next_cursor": page.next_cursor,
+                }),
+                page.sync_complete,
+            ))
         }
 
         "get_message" => {

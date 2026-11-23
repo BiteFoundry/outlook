@@ -206,8 +206,8 @@ pub async fn resolve_mail_folder(
         }
     }
 
-    let fetched = graph.list_mail_folders().await?;
-    storage.replace_mail_folders(&fetched)?;
+    let (fetched, complete) = graph.list_mail_folders_complete().await?;
+    storage.store_mail_folder_listing(&fetched, complete)?;
 
     match resolve_mail_folder_from_slice(&fetched, q) {
         Ok(found) => Ok(found),
@@ -262,8 +262,8 @@ pub async fn refresh_mail_folder_after_not_found(
     if q.is_empty() || q == previous_folder_id.trim() {
         return Ok(None);
     }
-    let fetched = graph.list_mail_folders().await?;
-    storage.replace_mail_folders(&fetched)?;
+    let (fetched, complete) = graph.list_mail_folders_complete().await?;
+    storage.store_mail_folder_listing(&fetched, complete)?;
     let refreshed = match resolve_mail_folder_from_slice(&fetched, q) {
         Ok(found) => found,
         Err(err) => {
