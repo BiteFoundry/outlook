@@ -1072,7 +1072,7 @@ pub async fn run_with_persona(
         sync_ctrl.clone(),
         ui_tx.clone(),
     );
-    app.load_cached_initial();
+    app.load_cached_startup(&mut ui);
     draw_frame(&mut terminal, &mut app, &mut ui, &mut guard)?;
 
     spawn_sync_supervisor(
