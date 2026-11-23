@@ -730,7 +730,7 @@ fn is_known_subcommand_short_flag(arg: &std::ffi::OsStr, sub: &clap::Command) ->
 }
 
 /// Parses `outlook` CLI arguments while allowing separate hyphen-prefixed text literals
-/// (such as `"- 목록 항목"` or `"- first\n- second"`) for free-text options and positionals,
+/// (such as `"- list item"` or `"- first\n- second"`) for free-text options and positionals,
 /// without swallowing real flags, `--help`/`-h`, `--`, or flag-like tokens such as `--dry-run`.
 pub fn parse_cli_from<I, S>(args: I) -> std::result::Result<Cli, clap::Error>
 where
@@ -2790,7 +2790,7 @@ pub(crate) enum Surface {
     Mcp,
 }
 
-/// CLI/MCP JSON용 전체 메시지. 첨부 바이트는 싣지 않는다.
+/// Full message JSON for CLI/MCP output. Attachment bytes are omitted.
 pub(crate) fn mail_message_public_json(msg: &MailMessage) -> serde_json::Value {
     let mut value = json!(msg);
     if let Some(atts) = value.get_mut("attachments").and_then(|a| a.as_array_mut()) {
@@ -5140,7 +5140,7 @@ pub(crate) struct PageCursor {
     pub pos: CursorPos,
 }
 
-/// 범위 부분을 U+001F로 이은 문자열의 FNV-1a 32비트 해시, 16진 8자.
+/// 8-hex-character FNV-1a 32-bit hash of the scope parts joined with U+001F.
 pub(crate) fn cursor_scope(parts: &[&str]) -> String {
     let mut h: u32 = 0x811c9dc5;
     for b in parts.join("\u{1f}").bytes() {
@@ -5207,7 +5207,7 @@ impl PageCursor {
         })
     }
 
-    /// 현재 호출의 scope와 다르면 거부한다. I/O 전에 호출한다.
+    /// Rejects the cursor if its scope differs from the current call. Call before performing I/O.
     pub(crate) fn require_scope(&self, expected: &str) -> Result<()> {
         if self.scope.eq_ignore_ascii_case(expected) {
             Ok(())
