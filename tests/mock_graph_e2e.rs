@@ -1638,6 +1638,7 @@ async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
             bind: "0.0.0.0".to_string(),
             port: 0,
             api_key: None,
+            ..ServeOptions::default()
         },
     )
     .await

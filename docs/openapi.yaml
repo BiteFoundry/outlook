@@ -8,9 +8,15 @@ info:
     Backed by Microsoft Graph v1.0, local SQLite WAL/FTS5 caching, and the
     background sync engine. Binds to `127.0.0.1:3939` by default (non-loopback
     binds require `--api-key <KEY>` / `--token <KEY>` or
-    `OUTLOOK_ALLOW_INSECURE_SERVE=1`). When an API key is configured, every
-    endpoint except `GET /health` requires `Authorization: Bearer <key>` or
-    `x-api-key: <key>`.
+    `OUTLOOK_ALLOW_INSECURE_SERVE=1`). Every endpoint except `GET /health`
+    requires `Authorization: Bearer <key>` or `x-api-key: <key>`, where the key
+    is `--api-key` or, without one, the random token a loopback server prints
+    to stderr at startup. `--allow-keyless` turns authentication off.
+
+    Requests with an `Origin` header get `403` unless the origin was allowed
+    with `--cors-origin`. A keyless server also answers `403` to a `Host`
+    header that is not a loopback name or listed in
+    `OUTLOOK_SERVE_ALLOWED_HOSTS`.
 
     All errors return `{"error": "<message>"}` with an appropriate HTTP status.
 servers:
@@ -31,7 +37,7 @@ paths:
     get:
       tags: [system]
       summary: Health check (public)
-      description: Always public, even when `--api-key` is set.
+      description: No key needed; the `Origin` and keyless `Host` checks still apply.
       security: []
       responses:
         "200":

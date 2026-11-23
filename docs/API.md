@@ -5,17 +5,22 @@ Local HTTP/JSON server for AI agents, scripts, and integrations. Exposed by `out
 ## Starting the server
 
 ```bash
-outlook serve                         # http://127.0.0.1:3939
+outlook serve                         # http://127.0.0.1:3939, prints a generated Bearer token to stderr
 outlook serve --port 9000             # custom port
 outlook serve --bind 127.0.0.1 --port 3939
 outlook serve --api-key secret123     # require Bearer secret123 or x-api-key: secret123
 outlook serve --token secret123       # --token is an alias for --api-key
+outlook serve --allow-keyless         # loopback only, no authentication
+outlook serve --cors-origin http://localhost:5173   # let one browser app call the API
 outlook api                           # alias for `serve`
 ```
 
 - `--bind` defaults to `127.0.0.1` (loopback only). Binding to a non-loopback address (e.g. `0.0.0.0`) requires `--api-key <KEY>` (or `--token <KEY>`) unless `OUTLOOK_ALLOW_INSECURE_SERVE=1` is explicitly set.
 - `--port` defaults to `3939`.
-- `--api-key` (alias `--token`) is optional; when set, every endpoint except `GET /health` requires either `Authorization: Bearer <key>` or `x-api-key: <key>`.
+- `--api-key` (alias `--token`) sets the key. Every endpoint except `GET /health` requires either `Authorization: Bearer <key>` or `x-api-key: <key>`.
+- Without `--api-key`, a loopback server generates a random 32-byte token (64 hex characters) for that run and prints it once to stderr. It is not written to disk, and a new one is generated on every start; pass `--api-key` when clients need a stable key.
+- `--allow-keyless` turns authentication off for a loopback server instead of generating a token. It cannot be combined with `--api-key`.
+- `--cors-origin <ORIGIN>` (repeatable) allows one browser origin, written as `scheme://host[:port]`. No origin is allowed by default.
 - Requires an existing login (`outlook login`), `OUTLOOK_ACCESS_TOKEN`, `OUTLOOK_TOKEN_FILE`, or a shared M365 session (`teams-cli` / `TEAMS_TOKEN_FILE` when `OUTLOOK_SHARE_M365_AUTH=true`).
 - On startup, `outlook serve` spawns the background sync engine so the local SQLite cache stays warm while serving requests.
 
@@ -26,7 +31,16 @@ outlook api                           # alias for `serve`
 - `limit` is clamped to `1..=1000`.
 - Mail folder parameters accept a folder ID, display name/prefix, or well-known alias (`inbox`, `sent`, `drafts`, `archive`, `trash`, `junk`).
 - To Do list parameters default to `"tasks"` and accept a list ID, display name, or `"default"` / `"tasks"` / `"defaultList"`.
-- CORS is restricted to loopback (`localhost` / `127.0.0.1` / `[::1]`) origins when `--api-key` is unset, and permissive when `--api-key` is configured.
+- The `curl` examples below leave out the key. Add `-H "Authorization: Bearer <key>"`, or start the server with `--allow-keyless`.
+
+## Security
+
+The API can read and send mail as the signed-in user, so it refuses callers it cannot place:
+
+- **Authentication** is on by default (see `--api-key` and the generated token above). `GET /health` stays public.
+- **Browser origins**: a request with an `Origin` header is answered only when that origin was passed with `--cors-origin`, compared exactly. Every other origin gets `403`, preflight included, with or without a valid key. This applies to pages served from `localhost` too. Clients that send no `Origin` header (curl, scripts, agents) are unaffected.
+- **`Host` header** (keyless servers only): the request must be addressed to `localhost`, a loopback address (`127.0.0.1`, `[::1]`), or a name listed in `OUTLOOK_SERVE_ALLOWED_HOSTS` (comma-separated). Any other host gets `403`, `/health` included. This stops a web page that points its own domain at `127.0.0.1` (DNS rebinding) from reaching the API. A server with a key skips this check, so a reverse proxy can forward its own host name.
+- **Non-loopback binds** need `--api-key`. `OUTLOOK_ALLOW_INSECURE_SERVE=1` overrides that and serves without authentication; the bind address is then accepted as a `Host`, and `0.0.0.0` needs `OUTLOOK_SERVE_ALLOWED_HOSTS` for any non-loopback name.
 
 ## Endpoints
 
@@ -34,7 +48,7 @@ outlook api                           # alias for `serve`
 
 #### `GET /health`
 
-Always public, even when `--api-key` is configured.
+No key needed. The `Origin` and `Host` checks in [Security](#security) still apply.
 
 ```bash
 curl http://127.0.0.1:3939/health

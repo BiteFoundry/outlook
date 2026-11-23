@@ -1,12 +1,16 @@
 //! Local HTTP JSON API (`outlook serve` / `outlook api`) + OpenAPI 3.1 powered by `axum`.
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
     extract::{Path, Query, Request, State},
-    http::{header, Method, StatusCode},
+    http::{header, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, patch, post},
@@ -32,7 +36,12 @@ use crate::{
 pub struct ServeOptions {
     pub bind: String,
     pub port: u16,
+    /// Bearer key chosen by the operator. Without one, a loopback server generates a random token.
     pub api_key: Option<String>,
+    /// Run a loopback server without any authentication instead of generating a token.
+    pub allow_keyless: bool,
+    /// Browser origins allowed to call the API (exact match). Empty: no browser origin is allowed.
+    pub cors_origins: Vec<String>,
 }
 
 impl Default for ServeOptions {
@@ -41,8 +50,21 @@ impl Default for ServeOptions {
             bind: "127.0.0.1".to_string(),
             port: config::DEFAULT_SERVE_PORT,
             api_key: None,
+            allow_keyless: false,
+            cors_origins: Vec::new(),
         }
     }
+}
+
+/// Who may call a router, and from where.
+#[derive(Debug, Clone, Default)]
+pub struct RouterSecurity {
+    /// Bearer key required on every route except `/health`. `None` (or blank) means keyless.
+    pub api_key: Option<String>,
+    /// `Host` names accepted in keyless mode besides the loopback names.
+    pub allowed_hosts: Vec<String>,
+    /// Browser origins allowed to call the API, compared exactly with the `Origin` header.
+    pub cors_origins: Vec<String>,
 }
 
 /// Shared state passed to every axum request handler.
@@ -51,6 +73,8 @@ pub struct AppState {
     pub graph: GraphClient,
     pub storage: Storage,
     pub api_key: Option<String>,
+    pub allowed_hosts: Vec<String>,
+    pub cors_origins: Vec<String>,
 }
 
 /// JSON error returned by every failing handler.
@@ -290,41 +314,61 @@ pub struct ContactsQuery {
     pub offline: bool,
 }
 
-/// Build the `axum::Router` for the local Outlook HTTP JSON API.
+/// Build the `axum::Router` for the local Outlook HTTP JSON API with the given key (`None`: keyless)
+/// and no extra hosts or browser origins. `run` uses [`build_router_with_security`].
 pub fn build_router(
     config: AppConfig,
     graph: GraphClient,
     storage: Storage,
     api_key: Option<String>,
 ) -> axum::Router {
-    let has_key = api_key.as_deref().is_some_and(|t| !t.trim().is_empty());
+    build_router_with_security(
+        config,
+        graph,
+        storage,
+        RouterSecurity {
+            api_key,
+            ..RouterSecurity::default()
+        },
+    )
+}
+
+/// Build the router with explicit access rules (see [`RouterSecurity`]).
+pub fn build_router_with_security(
+    config: AppConfig,
+    graph: GraphClient,
+    storage: Storage,
+    security: RouterSecurity,
+) -> axum::Router {
     let state = Arc::new(AppState {
         config,
         graph,
         storage,
-        api_key,
+        api_key: security.api_key.filter(|key| !key.trim().is_empty()),
+        allowed_hosts: security.allowed_hosts,
+        cors_origins: security.cors_origins,
     });
 
-    let cors = if has_key {
-        CorsLayer::permissive()
-    } else {
-        CorsLayer::new()
-            .allow_origin(AllowOrigin::predicate(|origin, _| {
-                origin.to_str().ok().is_some_and(is_loopback_origin)
-            }))
-            .allow_methods([
-                Method::GET,
-                Method::POST,
-                Method::PATCH,
-                Method::DELETE,
-                Method::OPTIONS,
-            ])
-            .allow_headers([
-                header::CONTENT_TYPE,
-                header::AUTHORIZATION,
-                header::HeaderName::from_static("x-api-key"),
-            ])
-    };
+    // CORS answers only the origins that were opted in; with none, no response carries CORS headers.
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::list(
+            state
+                .cors_origins
+                .iter()
+                .filter_map(|origin| HeaderValue::from_str(origin).ok()),
+        ))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            header::HeaderName::from_static("x-api-key"),
+        ]);
 
     Router::new()
         .route("/health", get(health))
@@ -367,6 +411,9 @@ pub fn build_router(
         .route("/v1/contacts", get(list_contacts))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(cors)
+        // Outermost, so a request from a foreign host or origin is refused before CORS or auth see it
+        // (preflights included).
+        .layer(middleware::from_fn_with_state(state.clone(), request_guard))
         .with_state(state)
 }
 
@@ -382,6 +429,16 @@ pub async fn run(
         .with_context(|| format!("Invalid bind address: {}:{}", opts.bind, opts.port))?;
     let allow_insecure = std::env::var("OUTLOOK_ALLOW_INSECURE_SERVE").ok();
     check_bind_security(addr, opts.api_key.as_deref(), allow_insecure.as_deref())?;
+    let cors_origins = opts
+        .cors_origins
+        .iter()
+        .map(|origin| normalize_cors_origin(origin))
+        .collect::<Result<Vec<_>>>()?;
+    let key = resolve_serve_key(opts.api_key, opts.allow_keyless, addr.ip().is_loopback());
+    let allowed_hosts = extra_allowed_hosts(
+        addr.ip(),
+        std::env::var("OUTLOOK_SERVE_ALLOWED_HOSTS").ok().as_deref(),
+    );
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
@@ -390,7 +447,29 @@ pub async fn run(
         sync::spawn_sync_engine(config.clone(), graph.clone(), storage.clone(), event_tx);
     sync_ctl.request(sync::SyncCommand::Bootstrap);
 
-    let app = build_router(config, graph, storage, opts.api_key);
+    // Diagnostics go to stderr; stdout keeps its single "listening" line.
+    match &key {
+        ServeKey::Generated(token) => eprintln!(
+            "No --api-key given: generated a Bearer token for this run (not stored anywhere):\n\n    {token}\n\n\
+             Send it as `Authorization: Bearer <token>` or `x-api-key: <token>`. Pass --api-key <KEY> for a \
+             key of your own, or --allow-keyless to serve loopback clients without authentication."
+        ),
+        ServeKey::Keyless => eprintln!(
+            "Warning: authentication is off. Any process that can reach {addr} can read and send mail \
+             through this API."
+        ),
+        ServeKey::Provided(_) => {}
+    }
+    let app = build_router_with_security(
+        config,
+        graph,
+        storage,
+        RouterSecurity {
+            api_key: key.into_key(),
+            allowed_hosts,
+            cors_origins,
+        },
+    );
 
     let listener = TcpListener::bind(addr)
         .await
@@ -422,19 +501,150 @@ fn check_bind_security(
     Ok(())
 }
 
-fn is_loopback_origin(origin: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(origin) else {
+/// The key a server runs with, and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServeKey {
+    /// `--api-key` from the operator.
+    Provided(String),
+    /// Random token minted for this run because a loopback server was started without a key.
+    Generated(String),
+    /// No authentication: `--allow-keyless`, or a non-loopback bind allowed by
+    /// `OUTLOOK_ALLOW_INSECURE_SERVE=1`.
+    Keyless,
+}
+
+impl ServeKey {
+    fn into_key(self) -> Option<String> {
+        match self {
+            ServeKey::Provided(key) | ServeKey::Generated(key) => Some(key),
+            ServeKey::Keyless => None,
+        }
+    }
+}
+
+/// Decides the key for a server whose bind address already passed [`check_bind_security`].
+fn resolve_serve_key(api_key: Option<String>, allow_keyless: bool, loopback: bool) -> ServeKey {
+    match api_key.filter(|key| !key.trim().is_empty()) {
+        Some(key) => ServeKey::Provided(key),
+        // A keyless non-loopback bind only gets here through the explicit insecure override.
+        None if allow_keyless || !loopback => ServeKey::Keyless,
+        None => ServeKey::Generated(generate_serve_token()),
+    }
+}
+
+/// 32 random bytes from the OS generator, hex-encoded (64 characters).
+fn generate_serve_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// Host names accepted in keyless mode besides loopback: a specific non-loopback bind address and
+/// the comma-separated `OUTLOOK_SERVE_ALLOWED_HOSTS`.
+fn extra_allowed_hosts(bind_ip: IpAddr, env_hosts: Option<&str>) -> Vec<String> {
+    let mut hosts = Vec::new();
+    if !bind_ip.is_loopback() && !bind_ip.is_unspecified() {
+        hosts.push(bind_ip.to_string());
+    }
+    hosts.extend(
+        env_hosts
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .map(str::to_string),
+    );
+    hosts
+}
+
+/// Canonical `scheme://host[:port]` form of a `--cors-origin` value, as browsers send it.
+fn normalize_cors_origin(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    let parsed = url::Url::parse(trimmed).with_context(|| {
+        format!("Invalid --cors-origin '{trimmed}': expected e.g. http://localhost:5173")
+    })?;
+    let has_extra = !matches!(parsed.path(), "" | "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some();
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() || has_extra {
+        anyhow::bail!(
+            "Invalid --cors-origin '{trimmed}': expected scheme://host[:port] with an http or https scheme"
+        );
+    }
+    Ok(parsed.origin().ascii_serialization())
+}
+
+/// Host part of a `Host` header / URI authority, without port and lower-cased; `None` when the
+/// value is not a plain `host[:port]`.
+fn host_of_authority(authority: &str) -> Option<String> {
+    let trimmed = authority.trim();
+    if trimmed.is_empty() || trimmed.contains(['/', '@', '?', '#', ' ']) {
+        return None;
+    }
+    let parsed = url::Url::parse(&format!("http://{trimmed}")).ok()?;
+    Some(match parsed.host()? {
+        url::Host::Domain(host) => host.trim_end_matches('.').to_ascii_lowercase(),
+        url::Host::Ipv4(ip) => ip.to_string(),
+        url::Host::Ipv6(ip) => ip.to_string(),
+    })
+}
+
+/// Whether a keyless server answers a request addressed to `host_header`: `localhost`, a loopback
+/// address, or one of `extra`. Anything else may be a page that rebound its own name to 127.0.0.1.
+fn is_allowed_host(host_header: &str, extra: &[String]) -> bool {
+    let Some(host) = host_of_authority(host_header) else {
         return false;
     };
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return false;
+    host == "localhost"
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        || extra
+            .iter()
+            .any(|allowed| host_of_authority(allowed).is_some_and(|allowed| allowed == host))
+}
+
+/// Refuses requests that come through a foreign host name (keyless servers) or from a browser
+/// origin that was not opted in with `--cors-origin` (every server).
+async fn request_guard(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    // With a key the Host check is skipped: a page that rebinds its name cannot supply the key, and
+    // a reverse proxy may legitimately forward its own host name.
+    if state.api_key.is_none() {
+        let authority = request
+            .uri()
+            .authority()
+            .map(|a| a.as_str().to_string())
+            .or_else(|| {
+                request
+                    .headers()
+                    .get(header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            });
+        if !authority.is_some_and(|a| is_allowed_host(&a, &state.allowed_hosts)) {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "Host header not allowed; use http://127.0.0.1:<port> or pass --api-key",
+            ));
+        }
     }
-    match parsed.host() {
-        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
+
+    if let Some(origin) = request.headers().get(header::ORIGIN) {
+        let allowed = origin
+            .to_str()
+            .is_ok_and(|origin| state.cors_origins.iter().any(|allowed| allowed == origin));
+        if !allowed {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "Origin not allowed; start the server with --cors-origin <ORIGIN> to allow a browser app",
+            ));
+        }
     }
+
+    Ok(next.run(request).await)
 }
 
 async fn with_storage<T, F>(storage: &Storage, f: F) -> Result<T>
@@ -1604,13 +1814,21 @@ mod tests {
     };
 
     async fn spawn_test_server(api_key: Option<String>) -> String {
+        spawn_test_server_with(RouterSecurity {
+            api_key,
+            ..RouterSecurity::default()
+        })
+        .await
+    }
+
+    async fn spawn_test_server_with(security: RouterSecurity) -> String {
         let cfg = AppConfig::default();
         let auth = AuthManager::new(cfg.clone()).unwrap();
         let graph = GraphClient::new(cfg.clone(), auth)
             .unwrap()
             .with_my_user_id("me-123");
         let storage = Storage::open_in_memory().unwrap();
-        let router = build_router(cfg, graph, storage, api_key);
+        let router = build_router_with_security(cfg, graph, storage, security);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2094,25 +2312,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cors_restricts_unauthenticated_remote_origins_and_allows_loopback() {
-        let base_no_tok = spawn_test_server(None).await;
+    async fn keyless_server_refuses_foreign_hosts_and_every_browser_origin() {
+        let base = spawn_test_server(None).await;
+        let port = base.rsplit(':').next().unwrap().to_string();
         let client = reqwest::Client::new();
+        let url = format!("{base}/v1/mail/folders?offline=true");
 
+        // A plain local client (no Origin, loopback Host) is served.
+        let res = client.get(&url).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
         let res = client
-            .get(format!("{base_no_tok}/v1/mail/folders?offline=true"))
-            .header(header::ORIGIN, "https://evil.example.com")
+            .get(&url)
+            .header(header::HOST, format!("localhost:{port}"))
             .send()
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        assert!(res
-            .headers()
-            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-            .is_none());
+
+        // DNS rebinding: the page's own name resolves to 127.0.0.1, so the Host header is foreign.
+        for host in [
+            "evil.example.com".to_string(),
+            format!("evil.example.com:{port}"),
+            format!("127.0.0.1.evil.example.com:{port}"),
+            format!("localhost.evil.example.com:{port}"),
+        ] {
+            for path in ["/v1/mail/folders?offline=true", "/health", "/openapi.json"] {
+                let res = client
+                    .get(format!("{base}{path}"))
+                    .header(header::HOST, &host)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    res.status(),
+                    StatusCode::FORBIDDEN,
+                    "host {host} path {path}"
+                );
+            }
+        }
+
+        // No browser origin is allowed unless it was opted in - loopback pages included.
+        for origin in [
+            "https://evil.example.com",
+            "http://localhost:3000",
+            "http://127.0.0.1:5173",
+            "null",
+        ] {
+            let res = client
+                .get(&url)
+                .header(header::ORIGIN, origin)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "origin {origin}");
+            assert!(res
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none());
+
+            // The preflight is refused as well, so a browser never sends the real request.
+            let res = client
+                .request(Method::OPTIONS, &url)
+                .header(header::ORIGIN, origin)
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "preflight {origin}");
+            assert!(res
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_answers_only_origins_that_were_opted_in() {
+        let base = spawn_test_server_with(RouterSecurity {
+            api_key: Some("secret-key".to_string()),
+            allowed_hosts: Vec::new(),
+            cors_origins: vec!["http://localhost:5173".to_string()],
+        })
+        .await;
+        let client = reqwest::Client::new();
+        let url = format!("{base}/v1/mail/folders?offline=true");
 
         let res = client
-            .get(format!("{base_no_tok}/v1/mail/folders?offline=true"))
-            .header(header::ORIGIN, "http://localhost:3000")
+            .get(&url)
+            .bearer_auth("secret-key")
+            .header(header::ORIGIN, "http://localhost:5173")
             .send()
             .await
             .unwrap();
@@ -2121,11 +2409,193 @@ mod tests {
             res.headers()
                 .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
                 .and_then(|v| v.to_str().ok()),
-            Some("http://localhost:3000")
+            Some("http://localhost:5173")
         );
 
-        assert!(is_loopback_origin("http://[::1]:5173"));
-        assert!(!is_loopback_origin("https://localhost.evil.com"));
+        // The preflight carries no credentials and still succeeds for the opted-in origin.
+        let res = client
+            .request(Method::OPTIONS, &url)
+            .header(header::ORIGIN, "http://localhost:5173")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(
+                header::ACCESS_CONTROL_REQUEST_HEADERS,
+                "authorization,content-type",
+            )
+            .send()
+            .await
+            .unwrap();
+        assert!(res.status().is_success(), "preflight: {}", res.status());
+        assert_eq!(
+            res.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("http://localhost:5173")
+        );
+
+        // A key does not make the API permissive: other origins stay refused, valid key or not.
+        for origin in ["https://evil.example.com", "http://localhost:3000"] {
+            let res = client
+                .get(&url)
+                .bearer_auth("secret-key")
+                .header(header::ORIGIN, origin)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "origin {origin}");
+            assert!(res
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none());
+        }
+
+        // With a key the Host check is off (reverse proxies forward their own name); auth still applies.
+        let res = client
+            .get(&url)
+            .bearer_auth("secret-key")
+            .header(header::HOST, "outlook.internal.example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = client
+            .get(&url)
+            .header(header::HOST, "outlook.internal.example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn keyless_server_accepts_extra_allowed_hosts() {
+        let base = spawn_test_server_with(RouterSecurity {
+            api_key: None,
+            allowed_hosts: vec!["outlook.lan".to_string()],
+            cors_origins: Vec::new(),
+        })
+        .await;
+        let client = reqwest::Client::new();
+        let url = format!("{base}/v1/mail/folders?offline=true");
+
+        let res = client
+            .get(&url)
+            .header(header::HOST, "Outlook.LAN:3939")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = client
+            .get(&url)
+            .header(header::HOST, "other.lan:3939")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn allowed_host_matching_is_exact_on_the_host_part() {
+        for host in [
+            "localhost",
+            "LOCALHOST:3939",
+            "localhost.:3939",
+            "127.0.0.1",
+            "127.0.0.1:3939",
+            "127.8.9.10:1",
+            "[::1]",
+            "[::1]:3939",
+        ] {
+            assert!(is_allowed_host(host, &[]), "{host} should be allowed");
+        }
+        for host in [
+            "",
+            "evil.example.com",
+            "localhost.evil.example.com",
+            "127.0.0.1.evil.example.com:3939",
+            "evil-localhost",
+            "192.168.1.10:3939",
+            "0.0.0.0:3939",
+            "[::]:3939",
+            "localhost@evil.example.com",
+            "evil.example.com/localhost",
+            "localhost evil.example.com",
+        ] {
+            assert!(!is_allowed_host(host, &[]), "{host} should be refused");
+        }
+
+        let extra = vec!["192.168.1.10".to_string(), "Outlook.LAN".to_string()];
+        assert!(is_allowed_host("192.168.1.10:3939", &extra));
+        assert!(is_allowed_host("outlook.lan", &extra));
+        assert!(!is_allowed_host("192.168.1.11:3939", &extra));
+        assert!(!is_allowed_host("sub.outlook.lan", &extra));
+    }
+
+    #[test]
+    fn serve_key_is_generated_only_for_a_loopback_server_without_one() {
+        assert_eq!(
+            resolve_serve_key(Some("mine".to_string()), false, true),
+            ServeKey::Provided("mine".to_string())
+        );
+        assert_eq!(resolve_serve_key(None, true, true), ServeKey::Keyless);
+        // Non-loopback and keyless is only reachable through OUTLOOK_ALLOW_INSECURE_SERVE=1.
+        assert_eq!(resolve_serve_key(None, false, false), ServeKey::Keyless);
+
+        let ServeKey::Generated(first) = resolve_serve_key(None, false, true) else {
+            panic!("a loopback server without a key must generate one");
+        };
+        // A blank key counts as no key.
+        let ServeKey::Generated(second) = resolve_serve_key(Some("  ".to_string()), false, true)
+        else {
+            panic!("a blank key must not disable authentication");
+        };
+        for token in [&first, &second] {
+            assert_eq!(token.len(), 64);
+            assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        assert_ne!(first, second);
+        assert_eq!(ServeKey::Generated(first.clone()).into_key(), Some(first));
+        assert_eq!(ServeKey::Keyless.into_key(), None);
+    }
+
+    #[test]
+    fn extra_allowed_hosts_come_from_a_specific_bind_address_and_the_env_list() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let any: IpAddr = "0.0.0.0".parse().unwrap();
+        let lan: IpAddr = "192.168.1.10".parse().unwrap();
+
+        assert!(extra_allowed_hosts(loopback, None).is_empty());
+        assert!(extra_allowed_hosts(any, Some("")).is_empty());
+        assert_eq!(extra_allowed_hosts(lan, None), ["192.168.1.10"]);
+        assert_eq!(
+            extra_allowed_hosts(any, Some(" outlook.lan , ,box.local ")),
+            ["outlook.lan", "box.local"]
+        );
+    }
+
+    #[test]
+    fn cors_origins_are_normalised_to_what_browsers_send() {
+        assert_eq!(
+            normalize_cors_origin(" http://localhost:5173/ ").unwrap(),
+            "http://localhost:5173"
+        );
+        assert_eq!(
+            normalize_cors_origin("HTTPS://App.Example.com:443").unwrap(),
+            "https://app.example.com"
+        );
+        for bad in [
+            "",
+            "*",
+            "null",
+            "localhost:5173",
+            "file:///C:/app/index.html",
+            "http://localhost:5173/app",
+            "http://localhost:5173/?x=1",
+        ] {
+            assert!(
+                normalize_cors_origin(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
     }
 
     #[test]

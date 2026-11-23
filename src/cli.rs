@@ -41,6 +41,7 @@ Environment Variables:
   OUTLOOK_DISABLE_KEYRING=1             Disable the OS keyring (use credentials.json file only)
   OUTLOOK_CLIENT_ID / OUTLOOK_TENANT_ID Override Entra app Client ID / Tenant ID
   OUTLOOK_CONFIG_DIR / OUTLOOK_DATA_DIR Override config and local SQLite cache directories
+  OUTLOOK_SERVE_ALLOWED_HOSTS=<HOSTS>   Extra Host names (comma-separated) a keyless `serve` accepts besides loopback
   OUTLOOK_CLI_CACHE_SECS=<SECS>         Local cache TTL in seconds for CLI read commands [default: 0; --cached/--fast prefers cache]
   OUTLOOK_AUTO_DAEMON=1                 Auto-start/connect to background sync daemon (config.toml: auto_daemon = true) [default: false]
   OUTLOOK_IMAGE_PROTOCOL=<PROTO>        Terminal image protocol (auto, kitty, iterm2, sixel, halfblock)
@@ -589,9 +590,16 @@ pub enum Command {
         bind: String,
         #[arg(long, default_value_t = config::DEFAULT_SERVE_PORT)]
         port: u16,
-        /// Secret Bearer API key (mandatory when binding to a non-loopback address)
+        /// Secret Bearer API key (mandatory when binding to a non-loopback address). Without it a
+        /// loopback server generates a random token for the run and prints it to stderr
         #[arg(long = "api-key", visible_alias = "token", value_name = "KEY")]
         api_key: Option<String>,
+        /// Serve loopback clients without authentication instead of generating a token
+        #[arg(long = "allow-keyless", conflicts_with = "api_key")]
+        allow_keyless: bool,
+        /// Browser origin allowed to call the API, e.g. http://localhost:5173 (repeatable; none by default)
+        #[arg(long = "cors-origin", value_name = "ORIGIN")]
+        cors_origin: Vec<String>,
     },
     /// Start the stdio MCP (JSON-RPC 2.0) server for agents
     #[command(visible_alias = "mcp-server")]
@@ -1585,6 +1593,8 @@ async fn dispatch_command(
             bind,
             port,
             api_key,
+            allow_keyless,
+            cors_origin,
         }) => {
             let (_auth, graph, storage) = Box::pin(open_runtime(cfg, false)).await?;
             Box::pin(serve::run(
@@ -1595,6 +1605,8 @@ async fn dispatch_command(
                     bind,
                     port,
                     api_key,
+                    allow_keyless,
+                    cors_origins: cors_origin,
                 },
             ))
             .await
@@ -5884,10 +5896,14 @@ mod tests {
                 bind,
                 port,
                 api_key,
+                allow_keyless,
+                cors_origin,
             } => {
                 assert_eq!(bind, "127.0.0.1");
                 assert_eq!(port, 3939);
                 assert!(api_key.is_none());
+                assert!(!allow_keyless);
+                assert!(cors_origin.is_empty());
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -5908,6 +5924,7 @@ mod tests {
                 bind,
                 port,
                 api_key,
+                ..
             } => {
                 assert_eq!(bind, "0.0.0.0");
                 assert_eq!(port, 4040);
@@ -5915,6 +5932,35 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+
+        let cli = Cli::try_parse_from([
+            "outlook",
+            "serve",
+            "--allow-keyless",
+            "--cors-origin",
+            "http://localhost:5173",
+            "--cors-origin",
+            "https://app.example.com",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Serve {
+                allow_keyless,
+                cors_origin,
+                ..
+            } => {
+                assert!(allow_keyless);
+                assert_eq!(
+                    cors_origin,
+                    ["http://localhost:5173", "https://app.example.com"]
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["outlook", "serve", "--allow-keyless", "--api-key", "k"]).is_err(),
+            "--allow-keyless contradicts --api-key"
+        );
 
         assert!(matches!(
             Cli::try_parse_from(["outlook", "mcp-server"])

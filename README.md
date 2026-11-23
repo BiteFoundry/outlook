@@ -122,15 +122,19 @@ For `update-event`, calendar wall-clock times such as `2026-11-23T09:00` use the
 
 ### Local HTTP REST API (`outlook serve`)
 
-Start an Axum JSON server on `127.0.0.1:3939` (with live `/openapi.json` and optional `--api-key` auth):
+Start an Axum JSON server on `127.0.0.1:3939` (with live `/openapi.json`). Requests need a Bearer key: pass your own with `--api-key`, or use the random token the server prints to stderr at startup.
 
 ```bash
-outlook serve --port 3939
-curl http://127.0.0.1:3939/v1/mail/messages?folder=inbox&unread=true
+outlook serve --port 3939 --api-key "$OUTLOOK_API_KEY"
+curl -H "Authorization: Bearer $OUTLOOK_API_KEY" \
+  "http://127.0.0.1:3939/v1/mail/messages?folder=inbox&unread=true"
 curl -X POST http://127.0.0.1:3939/v1/mail/send \
+  -H "Authorization: Bearer $OUTLOOK_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"to":["elena.park@acme.dev"],"subject":"Build green","markdown":"All checks passed!"}'
 ```
+
+`--allow-keyless` serves loopback clients without a key. Browser apps are refused unless their origin is passed with `--cors-origin`; see [Security](docs/API.md#security).
 
 Full endpoint & schema docs: **[docs/API.md](docs/API.md)** · **[docs/openapi.yaml](docs/openapi.yaml)**
 
