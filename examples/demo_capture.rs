@@ -3,6 +3,10 @@
 //!
 //! Run with:
 //!   cargo run --example demo_capture
+//!
+//! Environment:
+//!   DEMO_RENDERER_SCRIPT  path to render_tui_gif.py (default: scripts/render_tui_gif.py)
+//!   DEMO_PREVIEW_DIR      where preview PNGs go (default: target/demo-previews)
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -45,8 +49,30 @@ use outlook_cli::{
 const WIDTH: u16 = 120;
 const HEIGHT: u16 = 34;
 
-const RENDERER_SCRIPT: &str = r"C:\Users\user\.gemini\antigravity-cli\brain\f9e7f082-6ac8-4e73-9827-8af29ccd4ff4\scratch\render_tui_gif.py";
-const PREVIEW_DIR: &str = r"C:\Users\user\.gemini\antigravity-cli\brain\f9e7f082-6ac8-4e73-9827-8af29ccd4ff4\scratch\gif-previews\outlook";
+/// A non-empty environment variable as a path.
+fn env_path(var: &str) -> Option<PathBuf> {
+    std::env::var_os(var)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The GIF renderer: `DEMO_RENDERER_SCRIPT`, else `scripts/render_tui_gif.py` in this crate.
+fn renderer_script() -> PathBuf {
+    env_path("DEMO_RENDERER_SCRIPT").unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts")
+            .join("render_tui_gif.py")
+    })
+}
+
+/// Preview PNG directory: `DEMO_PREVIEW_DIR`, else `target/demo-previews` (ignored by git).
+fn preview_dir() -> PathBuf {
+    env_path("DEMO_PREVIEW_DIR").unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("demo-previews")
+    })
+}
 
 fn color_to_json(c: Color) -> Value {
     match c {
@@ -928,12 +954,23 @@ fn main() {
         .join("assets")
         .join("demo.gif");
 
+    let script = renderer_script();
+    if !script.is_file() {
+        eprintln!(
+            "Renderer script not found at {}. Set DEMO_RENDERER_SCRIPT to render_tui_gif.py (optional: DEMO_PREVIEW_DIR).",
+            script.display()
+        );
+        std::process::exit(1);
+    }
+    let previews = preview_dir();
+    std::fs::create_dir_all(&previews).expect("create preview directory");
+
     let status = Command::new("python")
-        .arg(RENDERER_SCRIPT)
+        .arg(&script)
         .arg(&tmp_json)
         .arg(&out_gif)
         .arg("--preview-png")
-        .arg(PREVIEW_DIR)
+        .arg(&previews)
         .status()
         .expect("failed to invoke python render_tui_gif.py");
     assert!(status.success(), "render_tui_gif.py exited with {status}");
