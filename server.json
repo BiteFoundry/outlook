@@ -1,0 +1,35 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.BiteFoundry/outlook",
+  "title": "Microsoft Outlook (TUI, CLI & MCP)",
+  "description": "Microsoft Outlook mail, calendar, and tasks MCP server, CLI, and TUI in Rust with SQLite FTS5.",
+  "version": "0.3.2",
+  "websiteUrl": "https://bitefoundry.dev/#app-outlook",
+  "repository": {
+    "url": "https://github.com/BiteFoundry/outlook",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/bitefoundry/outlook:0.3.2",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "OUTLOOK_ACCESS_TOKEN",
+          "description": "Microsoft Graph delegated bearer token for Microsoft Outlook.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "OUTLOOK_TOKEN_FILE",
+          "description": "Path to a file containing a Microsoft Graph bearer token (read live on demand).",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}
