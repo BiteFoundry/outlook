@@ -1007,6 +1007,7 @@ mod tests {
             attachments: vec![],
             meeting_request: None,
             web_link: None,
+            ..Default::default()
         };
 
         let mut compose = MailComposeOverlay::reply(&mail, true, "me@contoso.com");

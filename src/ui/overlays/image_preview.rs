@@ -541,6 +541,7 @@ mod tests {
             ],
             meeting_request: None,
             web_link: None,
+            ..Default::default()
         }
     }
 

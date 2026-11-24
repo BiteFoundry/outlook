@@ -2028,6 +2028,7 @@ mod tests {
                 response_status: None,
             }),
             web_link: None,
+            ..Default::default()
         }
     }
 

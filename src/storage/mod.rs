@@ -613,6 +613,7 @@ mod tests {
             attachments: Vec::new(),
             meeting_request: None,
             web_link: Some(format!("https://outlook.office.com/mail/{id}")),
+            ..Default::default()
         }
     }
 
@@ -870,6 +871,7 @@ mod tests {
             body_plain: String::new(),
             is_cancelled: false,
             web_link: None,
+            ..Default::default()
         };
         storage.upsert_calendar_events(&[ev]).unwrap();
         storage
@@ -959,6 +961,7 @@ mod tests {
             body_plain: String::new(),
             is_cancelled: false,
             web_link: None,
+            ..Default::default()
         }
     }
 

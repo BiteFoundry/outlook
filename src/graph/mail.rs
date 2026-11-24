@@ -40,8 +40,8 @@ const WELL_KNOWN_FOLDER_NAMES: [&str; 6] = [
     "junkemail",
 ];
 
-const MAIL_HEADER_SELECT_FIELDS: &str = "id,internetMessageId,conversationId,parentFolderId,subject,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,lastModifiedDateTime,isRead,isDraft,flag,importance,inferenceClassification,hasAttachments,bodyPreview,webLink";
-const MAIL_FULL_SELECT_FIELDS: &str = "id,internetMessageId,conversationId,parentFolderId,subject,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,lastModifiedDateTime,isRead,isDraft,flag,importance,inferenceClassification,hasAttachments,bodyPreview,body,webLink";
+const MAIL_HEADER_SELECT_FIELDS: &str = "id,internetMessageId,conversationId,parentFolderId,subject,from,sender,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,lastModifiedDateTime,isRead,isDraft,flag,importance,inferenceClassification,categories,hasAttachments,bodyPreview,webLink";
+const MAIL_FULL_SELECT_FIELDS: &str = "id,internetMessageId,conversationId,parentFolderId,subject,from,sender,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,lastModifiedDateTime,isRead,isDraft,flag,importance,inferenceClassification,categories,hasAttachments,bodyPreview,body,webLink";
 
 // ---------------------------------------------------------------------------
 // Shared Graph Outlook Wire DTOs & Normalization Helpers
@@ -423,6 +423,8 @@ struct GraphMailMessage {
     subject: Option<String>,
     #[serde(default)]
     from: Option<GraphRecipient>,
+    #[serde(default)]
+    sender: Option<GraphRecipient>,
     #[serde(rename = "toRecipients", default)]
     to_recipients: Vec<GraphRecipient>,
     #[serde(rename = "ccRecipients", default)]
@@ -447,6 +449,8 @@ struct GraphMailMessage {
     importance: Option<String>,
     #[serde(rename = "inferenceClassification", default)]
     inference_classification: Option<String>,
+    #[serde(default)]
+    categories: Vec<String>,
     #[serde(rename = "hasAttachments", default)]
     has_attachments: Option<bool>,
     #[serde(rename = "bodyPreview", default)]
@@ -555,6 +559,23 @@ impl GraphMailMessage {
             .map(Into::into)
             .collect();
         let has_attachments = self.has_attachments.unwrap_or(!attachments.is_empty());
+        let from = self.from.and_then(GraphRecipient::into_email_recipient);
+        let sender = self
+            .sender
+            .and_then(GraphRecipient::into_email_recipient)
+            .filter(|s| match from.as_ref() {
+                Some(f) => {
+                    !s.address.eq_ignore_ascii_case(&f.address)
+                        || (s.name.is_some() && s.name != f.name)
+                }
+                None => true,
+            });
+        let categories: Vec<String> = self
+            .categories
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
 
         MailMessage {
             id: self.id,
@@ -564,7 +585,8 @@ impl GraphMailMessage {
             conversation_id: self.conversation_id.filter(|s| !s.trim().is_empty()),
             folder_id: self.parent_folder_id.filter(|s| !s.trim().is_empty()),
             subject: self.subject.unwrap_or_default(),
-            from: self.from.and_then(GraphRecipient::into_email_recipient),
+            from,
+            sender,
             to_recipients: self
                 .to_recipients
                 .into_iter()
@@ -600,6 +622,7 @@ impl GraphMailMessage {
             inference_classification: self
                 .inference_classification
                 .filter(|s| !s.trim().is_empty()),
+            categories,
             has_attachments,
             body_loaded,
             preview,
@@ -3486,5 +3509,46 @@ pub(crate) mod tests {
             splice_draft_body_preserving_quote("<p>Plain standalone draft</p>", "<p>Replacement</p>");
         assert!(!preserved_c);
         assert_eq!(out_c, "<p>Replacement</p>");
+    }
+
+    #[test]
+    fn graph_mail_preserves_categories_and_distinct_sender_and_select_fields() {
+        assert!(MAIL_HEADER_SELECT_FIELDS.contains("sender"));
+        assert!(MAIL_HEADER_SELECT_FIELDS.contains("categories"));
+        assert!(MAIL_FULL_SELECT_FIELDS.contains("sender"));
+        assert!(MAIL_FULL_SELECT_FIELDS.contains("categories"));
+
+        // Distinct sender + categories are preserved.
+        let raw_distinct: GraphMailMessage = serde_json::from_value(serde_json::json!({
+            "id": "m-cat-1",
+            "subject": "Board Update",
+            "from": { "emailAddress": { "name": "CEO", "address": "ceo@contoso.com" } },
+            "sender": { "emailAddress": { "name": "Chief of Staff", "address": "cos@contoso.com" } },
+            "categories": ["Executive", "  ", "Q4"],
+            "receivedDateTime": "2026-11-20T10:00:00Z"
+        }))
+        .unwrap();
+        let msg = raw_distinct.into_mail_message(true);
+        assert_eq!(msg.categories, vec!["Executive", "Q4"]);
+        let sender = msg.sender.as_ref().expect("distinct sender must be preserved");
+        assert_eq!(sender.address, "cos@contoso.com");
+        assert_eq!(sender.name.as_deref(), Some("Chief of Staff"));
+
+        // Identical sender == from is deduplicated to None so JSON stays compact.
+        let raw_same: GraphMailMessage = serde_json::from_value(serde_json::json!({
+            "id": "m-cat-2",
+            "subject": "Regular Mail",
+            "from": { "emailAddress": { "name": "Alice", "address": "alice@contoso.com" } },
+            "sender": { "emailAddress": { "name": "Alice", "address": "ALICE@contoso.com" } },
+            "categories": [],
+            "receivedDateTime": "2026-11-20T10:00:00Z"
+        }))
+        .unwrap();
+        let msg_same = raw_same.into_mail_message(true);
+        assert!(msg_same.sender.is_none());
+        assert!(msg_same.categories.is_empty());
+        let val = serde_json::to_value(&msg_same).unwrap();
+        assert!(val.get("sender").is_none(), "None sender skipped on serialize");
+        assert!(val.get("categories").is_none(), "empty categories skipped on serialize");
     }
 }

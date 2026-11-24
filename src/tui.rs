@@ -1598,6 +1598,7 @@ mod tests {
             }],
             meeting_request: None,
             web_link: None,
+            ..Default::default()
         };
         let modal = ImagePreviewOverlay::from_mail_message(&msg, None).unwrap();
 

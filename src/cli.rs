@@ -2902,20 +2902,36 @@ pub(crate) enum Surface {
     Mcp,
 }
 
+pub(crate) fn mail_attachments_public_json(
+    attachments: &[crate::models::MailAttachment],
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        attachments
+            .iter()
+            .map(|src| {
+                let mut val = json!(src);
+                if let Some(obj) = val.as_object_mut() {
+                    obj.remove("content_bytes_b64");
+                    let cached = src
+                        .content_bytes_b64
+                        .as_deref()
+                        .is_some_and(|s| !s.trim().is_empty());
+                    obj.insert("content_cached".into(), json!(cached));
+                }
+                val
+            })
+            .collect(),
+    )
+}
+
 /// Full message JSON for CLI/MCP output. Attachment bytes are omitted.
 pub(crate) fn mail_message_public_json(msg: &MailMessage) -> serde_json::Value {
     let mut value = json!(msg);
-    if let Some(atts) = value.get_mut("attachments").and_then(|a| a.as_array_mut()) {
-        for (att, src) in atts.iter_mut().zip(&msg.attachments) {
-            if let Some(obj) = att.as_object_mut() {
-                obj.remove("content_bytes_b64");
-                let cached = src
-                    .content_bytes_b64
-                    .as_deref()
-                    .is_some_and(|s| !s.trim().is_empty());
-                obj.insert("content_cached".into(), json!(cached));
-            }
-        }
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "attachments".into(),
+            mail_attachments_public_json(&msg.attachments),
+        );
     }
     value
 }
@@ -2964,41 +2980,48 @@ pub(crate) fn mail_read_json(
         Surface::Cli => format!("outlook read {} --json --full", msg.id),
         Surface::Mcp => "Call get_message with compact:false for body_html and attachment metadata; use download_attachment for attachment bytes.".to_string(),
     };
-    json!({
-        "message": {
-            "id": msg.id,
-            "conversation_id": msg.conversation_id,
-            "folder_id": msg.folder_id,
-            "subject": msg.subject,
-            "from": msg.from,
-            "to_recipients": msg.to_recipients,
-            "cc_recipients": msg.cc_recipients,
-            "bcc_recipients": msg.bcc_recipients,
-            "reply_to": msg.reply_to,
-            "received_at": msg.received_at,
-            "sent_at": msg.sent_at,
-            "is_read": msg.is_read,
-            "is_draft": msg.is_draft,
-            "flagged": msg.flagged,
-            "importance": msg.importance,
-            "has_attachments": msg.has_attachments,
-            "meeting_request": msg.meeting_request,
-            "body_loaded": msg.body_loaded,
-            "preview": msg.preview,
-            "body_plain": if msg.body_loaded { json!(msg.body_plain) } else { serde_json::Value::Null },
-            "omitted": {
-                "attachments": omitted_attachments,
-                "fields": [
-                    "body_html",
-                    "internet_message_id",
-                    "inference_classification",
-                    "last_modified_at",
-                    "web_link"
-                ],
-            },
-            "hint": hint,
+    let mut message_obj = json!({
+        "id": msg.id,
+        "conversation_id": msg.conversation_id,
+        "folder_id": msg.folder_id,
+        "subject": msg.subject,
+        "from": msg.from,
+        "to_recipients": msg.to_recipients,
+        "cc_recipients": msg.cc_recipients,
+        "bcc_recipients": msg.bcc_recipients,
+        "reply_to": msg.reply_to,
+        "received_at": msg.received_at,
+        "sent_at": msg.sent_at,
+        "is_read": msg.is_read,
+        "is_draft": msg.is_draft,
+        "flagged": msg.flagged,
+        "importance": msg.importance,
+        "has_attachments": msg.has_attachments,
+        "meeting_request": msg.meeting_request,
+        "body_loaded": msg.body_loaded,
+        "preview": msg.preview,
+        "body_plain": if msg.body_loaded { json!(msg.body_plain) } else { serde_json::Value::Null },
+        "omitted": {
+            "attachments": omitted_attachments,
+            "fields": [
+                "body_html",
+                "internet_message_id",
+                "inference_classification",
+                "last_modified_at",
+                "web_link"
+            ],
+        },
+        "hint": hint,
+    });
+    if let Some(obj) = message_obj.as_object_mut() {
+        if let Some(ref sender) = msg.sender {
+            obj.insert("sender".into(), json!(sender));
         }
-    })
+        if !msg.categories.is_empty() {
+            obj.insert("categories".into(), json!(msg.categories));
+        }
+    }
+    json!({ "message": message_obj })
 }
 
 fn print_mail_list_output(

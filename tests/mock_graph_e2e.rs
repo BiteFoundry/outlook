@@ -3052,6 +3052,7 @@ async fn regression_outlook_outlook_04_applies_computed_window_offline_and_cache
         body_plain: String::new(),
         is_cancelled: false,
         web_link: None,
+        ..Default::default()
     })
     .collect();
     storage.upsert_calendar_events(&seed_events).unwrap();
@@ -4363,6 +4364,7 @@ async fn regression_outlook_outlook_12_mcp_offline_attachment_download() {
             ],
             meeting_request: None,
             web_link: None,
+            ..Default::default()
         }])
         .unwrap();
 

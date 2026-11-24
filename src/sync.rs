@@ -2891,6 +2891,7 @@ mod tests {
             attachments: Vec::new(),
             meeting_request: None,
             web_link: None,
+            ..Default::default()
         }];
         let cand = find_new_unread_mail_candidate("inbox", &storage, &incoming).unwrap();
         assert_eq!(cand.item_id, "m-new");
@@ -3386,6 +3387,7 @@ mod tests {
             attachments: vec![],
             meeting_request: None,
             web_link: None,
+            ..Default::default()
         };
         storage
             .upsert_mail_messages(&[
@@ -3597,6 +3599,7 @@ mod tests {
                 attachments: vec![],
                 meeting_request: None,
                 web_link: None,
+                ..Default::default()
             }])
             .unwrap();
 
@@ -4034,6 +4037,7 @@ mod tests {
             attachments: vec![],
             meeting_request: None,
             web_link: None,
+            ..Default::default()
         };
         storage.upsert_mail_messages(&[orig.clone()]).unwrap();
         storage

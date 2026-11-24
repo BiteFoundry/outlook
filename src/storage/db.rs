@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-const SCHEMA_USER_VERSION_UNICODE61: i32 = 62;
-const SCHEMA_USER_VERSION_TRIGRAM: i32 = 63;
+const SCHEMA_USER_VERSION_UNICODE61: i32 = 64;
+const SCHEMA_USER_VERSION_TRIGRAM: i32 = 65;
 
 /// Initializes SQLite PRAGMAs, tables, indexes, and FTS5 virtual table.
 /// Returns `true` if `mail_fts` uses the `trigram` tokenizer, `false` if using `unicode61`.
@@ -98,6 +98,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             folder_id TEXT,
             subject TEXT NOT NULL,
             from_json TEXT,
+            sender_json TEXT,
             to_json TEXT NOT NULL,
             cc_json TEXT NOT NULL,
             bcc_json TEXT NOT NULL,
@@ -111,6 +112,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             flagged INTEGER NOT NULL DEFAULT 0,
             importance TEXT NOT NULL,
             inference_classification TEXT,
+            categories_json TEXT NOT NULL DEFAULT '[]',
             has_attachments INTEGER NOT NULL DEFAULT 0,
             body_loaded INTEGER NOT NULL DEFAULT 0,
             preview TEXT NOT NULL,
@@ -138,7 +140,14 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             body_html TEXT NOT NULL,
             body_plain TEXT NOT NULL,
             is_cancelled INTEGER NOT NULL DEFAULT 0,
-            web_link TEXT
+            web_link TEXT,
+            categories_json TEXT NOT NULL DEFAULT '[]',
+            show_as TEXT,
+            sensitivity TEXT,
+            event_type TEXT,
+            has_attachments INTEGER NOT NULL DEFAULT 0,
+            is_recurring INTEGER NOT NULL DEFAULT 0,
+            recurrence_json TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_calendar_events_start
@@ -296,11 +305,28 @@ fn migrate_legacy_outlook_columns(conn: &Connection) -> Result<()> {
         ("body_loaded", "ALTER TABLE mail_messages ADD COLUMN body_loaded INTEGER NOT NULL DEFAULT 0;"),
         ("meeting_request_json", "ALTER TABLE mail_messages ADD COLUMN meeting_request_json TEXT;"),
         ("last_modified_at", "ALTER TABLE mail_messages ADD COLUMN last_modified_at TEXT;"),
+        ("sender_json", "ALTER TABLE mail_messages ADD COLUMN sender_json TEXT;"),
+        ("categories_json", "ALTER TABLE mail_messages ADD COLUMN categories_json TEXT NOT NULL DEFAULT '[]';"),
     ];
     for (col, ddl) in mail_migrations {
         if !column_exists(conn, "mail_messages", col) {
             conn.execute_batch(ddl)
                 .with_context(|| format!("Failed to migrate mail_messages.{col}"))?;
+        }
+    }
+    let calendar_migrations = [
+        ("categories_json", "ALTER TABLE calendar_events ADD COLUMN categories_json TEXT NOT NULL DEFAULT '[]';"),
+        ("show_as", "ALTER TABLE calendar_events ADD COLUMN show_as TEXT;"),
+        ("sensitivity", "ALTER TABLE calendar_events ADD COLUMN sensitivity TEXT;"),
+        ("event_type", "ALTER TABLE calendar_events ADD COLUMN event_type TEXT;"),
+        ("has_attachments", "ALTER TABLE calendar_events ADD COLUMN has_attachments INTEGER NOT NULL DEFAULT 0;"),
+        ("is_recurring", "ALTER TABLE calendar_events ADD COLUMN is_recurring INTEGER NOT NULL DEFAULT 0;"),
+        ("recurrence_json", "ALTER TABLE calendar_events ADD COLUMN recurrence_json TEXT;"),
+    ];
+    for (col, ddl) in calendar_migrations {
+        if !column_exists(conn, "calendar_events", col) {
+            conn.execute_batch(ddl)
+                .with_context(|| format!("Failed to migrate calendar_events.{col}"))?;
         }
     }
     Ok(())

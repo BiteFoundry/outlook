@@ -750,6 +750,7 @@ impl AppState {
             folder_id: msg.folder_id.clone(),
             subject: msg.subject.clone(),
             from: msg.from.clone(),
+            sender: msg.sender.clone(),
             to_recipients: msg.to_recipients.first().cloned().into_iter().collect(),
             cc_recipients: Vec::new(),
             bcc_recipients: Vec::new(),
@@ -762,6 +763,7 @@ impl AppState {
             flagged: msg.flagged,
             importance: msg.importance.clone(),
             inference_classification: msg.inference_classification.clone(),
+            categories: msg.categories.clone(),
             has_attachments: msg.has_attachments || !msg.attachments.is_empty(),
             body_loaded: msg.body_loaded,
             preview: msg.preview.clone(),
@@ -4115,6 +4117,7 @@ mod tests {
             attachments: vec![],
             meeting_request: None,
             web_link: None,
+            ..Default::default()
         }
     }
 
@@ -4154,6 +4157,7 @@ mod tests {
             body_plain: String::new(),
             is_cancelled: false,
             web_link: None,
+            ..Default::default()
         }
     }
 
@@ -4287,6 +4291,7 @@ mod tests {
             body_plain: String::new(),
             is_cancelled: false,
             web_link: None,
+            ..Default::default()
         };
         app.calendar_events = vec![ev.clone()];
         app.storage.upsert_calendar_events(&[ev]).unwrap();

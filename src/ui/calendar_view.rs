@@ -573,6 +573,7 @@ mod tests {
             body_plain: String::new(),
             is_cancelled: false,
             web_link: None,
+            ..Default::default()
         }
     }
 

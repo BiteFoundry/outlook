@@ -148,6 +148,18 @@ struct GraphCalendarEvent {
     is_cancelled: Option<bool>,
     #[serde(rename = "webLink", default)]
     web_link: Option<String>,
+    #[serde(default)]
+    categories: Vec<String>,
+    #[serde(rename = "showAs", default)]
+    show_as: Option<String>,
+    #[serde(default)]
+    sensitivity: Option<String>,
+    #[serde(rename = "hasAttachments", default)]
+    has_attachments: Option<bool>,
+    #[serde(default)]
+    recurrence: Option<serde_json::Value>,
+    #[serde(rename = "seriesMasterId", default)]
+    series_master_id: Option<String>,
 }
 
 /// Normalises a Graph `dateTimeTimeZone.dateTime` value for a timed event into RFC3339 UTC.
@@ -372,6 +384,36 @@ impl From<GraphCalendarEvent> for CalendarEvent {
             None => (None, None),
         };
 
+        let categories: Vec<String> = raw
+            .categories
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let show_as = raw
+            .show_as
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let sensitivity = raw
+            .sensitivity
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let event_type = raw
+            .event_type
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let has_attachments = raw.has_attachments.unwrap_or(false);
+        let recurrence = raw.recurrence.filter(|v| !v.is_null());
+        let is_recurring = recurrence.is_some()
+            || matches!(
+                event_type.as_deref(),
+                Some("seriesMaster" | "occurrence" | "exception")
+            )
+            || raw
+                .series_master_id
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+
         Self {
             id: raw.id,
             subject: raw.subject.unwrap_or_default(),
@@ -402,6 +444,13 @@ impl From<GraphCalendarEvent> for CalendarEvent {
             body_plain,
             is_cancelled: raw.is_cancelled.unwrap_or(false),
             web_link: raw.web_link.filter(|s| !s.trim().is_empty()),
+            categories,
+            show_as,
+            sensitivity,
+            event_type,
+            has_attachments,
+            is_recurring,
+            recurrence,
         }
     }
 }
@@ -1256,5 +1305,74 @@ mod tests {
                 "outlook.timezone=\"UTC\", odata.maxpagesize=50"
             ]
         );
+    }
+
+    #[test]
+    fn graph_calendar_event_preserves_metadata_and_recurrence_with_backcompat_serde() {
+        let raw: GraphCalendarEvent = serde_json::from_value(serde_json::json!({
+            "id": "ev-meta-1",
+            "subject": "Weekly Staff",
+            "start": { "dateTime": "2026-11-20T09:00:00Z", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-11-20T10:00:00Z", "timeZone": "UTC" },
+            "categories": ["Team", "  ", "Recurring"],
+            "showAs": "tentative",
+            "sensitivity": "private",
+            "type": "seriesMaster",
+            "hasAttachments": true,
+            "recurrence": {
+                "pattern": { "type": "weekly", "interval": 1, "daysOfWeek": ["friday"] },
+                "range": { "type": "noEnd", "startDate": "2026-11-20" }
+            }
+        }))
+        .unwrap();
+        let ev = CalendarEvent::from(raw);
+        assert_eq!(ev.categories, vec!["Team", "Recurring"]);
+        assert_eq!(ev.show_as.as_deref(), Some("tentative"));
+        assert_eq!(ev.sensitivity.as_deref(), Some("private"));
+        assert_eq!(ev.event_type.as_deref(), Some("seriesMaster"));
+        assert!(ev.has_attachments);
+        assert!(ev.is_recurring);
+        assert_eq!(
+            ev.recurrence.as_ref().unwrap()["pattern"]["type"],
+            "weekly"
+        );
+
+        // Occurrence without recurrence payload still marks is_recurring = true.
+        let occ: GraphCalendarEvent = serde_json::from_value(serde_json::json!({
+            "id": "ev-occ-1",
+            "subject": "Weekly Staff",
+            "type": "occurrence",
+            "seriesMasterId": "ev-meta-1"
+        }))
+        .unwrap();
+        let occ_ev = CalendarEvent::from(occ);
+        assert!(occ_ev.is_recurring);
+        assert_eq!(occ_ev.event_type.as_deref(), Some("occurrence"));
+        assert!(occ_ev.recurrence.is_none());
+
+        // Plain single event skips all empty/false/None new fields on serialization (backcompat).
+        let plain: GraphCalendarEvent = serde_json::from_value(serde_json::json!({
+            "id": "ev-plain",
+            "subject": "One-off"
+        }))
+        .unwrap();
+        let plain_ev = CalendarEvent::from(plain);
+        assert!(!plain_ev.is_recurring);
+        assert!(!plain_ev.has_attachments);
+        let serialized = serde_json::to_value(&plain_ev).unwrap();
+        for key in [
+            "categories",
+            "show_as",
+            "sensitivity",
+            "event_type",
+            "has_attachments",
+            "is_recurring",
+            "recurrence",
+        ] {
+            assert!(
+                serialized.get(key).is_none(),
+                "expected {key} to be omitted when default/empty"
+            );
+        }
     }
 }

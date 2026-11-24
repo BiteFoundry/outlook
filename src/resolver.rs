@@ -899,6 +899,7 @@ mod tests {
             attachments: Vec::new(),
             meeting_request: None,
             web_link: None,
+            ..Default::default()
         };
         let msgs = vec![
             make_msg("msg-dup-1", "Weekly Sync Notes"),
@@ -942,6 +943,7 @@ mod tests {
             body_plain: String::new(),
             is_cancelled: false,
             web_link: None,
+            ..Default::default()
         };
         let events = vec![
             make_ev("ev-1", "Design Review Alpha"),

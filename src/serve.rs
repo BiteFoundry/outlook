@@ -2048,6 +2048,7 @@ mod tests {
                 attachments: Vec::new(),
                 meeting_request: None,
                 web_link: None,
+                ..Default::default()
             }])
             .unwrap();
         storage
@@ -2069,6 +2070,7 @@ mod tests {
                 body_plain: String::new(),
                 is_cancelled: false,
                 web_link: None,
+                ..Default::default()
             }])
             .unwrap();
         storage

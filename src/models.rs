@@ -92,7 +92,11 @@ pub struct MeetingRequestInfo {
     pub response_status: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MailMessage {
     pub id: String,
     pub internet_message_id: Option<String>,
@@ -100,6 +104,8 @@ pub struct MailMessage {
     pub folder_id: Option<String>,
     pub subject: String,
     pub from: Option<EmailRecipient>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<EmailRecipient>,
     pub to_recipients: Vec<EmailRecipient>,
     pub cc_recipients: Vec<EmailRecipient>,
     pub bcc_recipients: Vec<EmailRecipient>,
@@ -113,6 +119,8 @@ pub struct MailMessage {
     pub flagged: bool,
     pub importance: String,
     pub inference_classification: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<String>,
     pub has_attachments: bool,
     pub body_loaded: bool,
     pub preview: String,
@@ -244,7 +252,7 @@ impl EventRsvpAction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CalendarEvent {
     pub id: String,
     pub subject: String,
@@ -264,6 +272,20 @@ pub struct CalendarEvent {
     pub body_plain: String,
     pub is_cancelled: bool,
     pub web_link: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_as: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensitivity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub has_attachments: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_recurring: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recurrence: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -530,6 +552,7 @@ mod tests {
             attachments: Vec::new(),
             meeting_request: None,
             web_link: None,
+            ..Default::default()
         }
     }
 

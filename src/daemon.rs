@@ -553,41 +553,65 @@ fn cleanup_owned_files(paths: &DaemonPaths, our_secret: &str, sock_path: Option<
     let _ = sock_path;
 }
 
+fn config_dir_short_hash(config_dir: &Path) -> String {
+    let canonical = crate::config::canonicalize_existing_ancestor(config_dir);
+    let mut hasher = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(canonical.as_os_str().as_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        hasher.update(canonical.to_string_lossy().as_bytes());
+    }
+    let digest = hex::encode(hasher.finalize());
+    digest[..12].to_string()
+}
+
 #[cfg(windows)]
 fn select_windows_pipe_name(config_dir: &Path) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(config_dir.to_string_lossy().as_bytes());
-    let digest = hex::encode(hasher.finalize());
-    let short_hash = &digest[..12];
+    let short_hash = config_dir_short_hash(config_dir);
     format!(r"\\.\pipe\outlook-cli-daemon-{short_hash}")
+}
+
+#[cfg(any(unix, test))]
+fn select_unix_socket_path_with(config_dir: &Path, xdg_runtime_dir: Option<&str>) -> PathBuf {
+    let byte_len = |p: &Path| -> usize {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            p.as_os_str().as_bytes().len()
+        }
+        #[cfg(not(unix))]
+        {
+            p.to_string_lossy().len()
+        }
+    };
+
+    let candidate = config_dir.join("outlook-daemon.sock");
+    if byte_len(&candidate) <= 90 {
+        return candidate;
+    }
+
+    let short_hash = config_dir_short_hash(config_dir);
+
+    if let Some(trimmed) = xdg_runtime_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        let xdg_candidate = PathBuf::from(trimmed)
+            .join("outlook-cli")
+            .join(format!("outlook-daemon-{short_hash}.sock"));
+        if byte_len(&xdg_candidate) <= 90 {
+            return xdg_candidate;
+        }
+    }
+
+    PathBuf::from(format!("/tmp/outlook-cli-{short_hash}/outlook-daemon.sock"))
 }
 
 #[cfg(unix)]
 fn select_unix_socket_path(config_dir: &Path) -> PathBuf {
-    use std::os::unix::ffi::OsStrExt;
-
-    let candidate = config_dir.join("outlook-daemon.sock");
-    if candidate.as_os_str().as_bytes().len() <= 90 {
-        return candidate;
-    }
-
-    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        let trimmed = xdg.trim();
-        if !trimmed.is_empty() {
-            let xdg_candidate = PathBuf::from(trimmed)
-                .join("outlook-cli")
-                .join("outlook-daemon.sock");
-            if xdg_candidate.as_os_str().as_bytes().len() <= 90 {
-                return xdg_candidate;
-            }
-        }
-    }
-
-    let mut hasher = Sha256::new();
-    hasher.update(config_dir.as_os_str().as_bytes());
-    let digest = hex::encode(hasher.finalize());
-    let short_hash = &digest[..12];
-    PathBuf::from(format!("/tmp/outlook-cli-{short_hash}/outlook-daemon.sock"))
+    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+    select_unix_socket_path_with(config_dir, xdg.as_deref())
 }
 
 #[cfg(unix)]
@@ -1649,11 +1673,11 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
             if status.transport.as_deref() == Some("unix") {
-                assert!(status
-                    .endpoint
-                    .as_deref()
-                    .unwrap()
-                    .ends_with("outlook-daemon.sock"));
+                let endpoint = status.endpoint.as_deref().unwrap();
+                assert!(
+                    endpoint.ends_with(".sock") && endpoint.contains("outlook-daemon"),
+                    "unexpected unix socket endpoint: {endpoint}"
+                );
             }
         }
 
@@ -1944,5 +1968,60 @@ mod tests {
             Some("{\"ok\":false}")
         );
         assert_eq!(read_limited_line(&mut valid_reader).await.unwrap(), None);
+    }
+
+    #[test]
+    fn unix_socket_path_isolates_long_multi_profiles_and_canonicalizes_hash() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Short path stays directly inside config_dir.
+        let short = Path::new("/tmp/o1");
+        assert_eq!(
+            select_unix_socket_path_with(short, Some("/run/user/1000")),
+            short.join("outlook-daemon.sock")
+        );
+
+        // Two distinct long profile paths must not collide under XDG_RUNTIME_DIR.
+        let long_a = dir
+            .path()
+            .join("very-long-profile-directory-name-exceeding-unix-sun-path-limit-segment-one")
+            .join("profile-work-account-a");
+        let long_b = dir
+            .path()
+            .join("very-long-profile-directory-name-exceeding-unix-sun-path-limit-segment-one")
+            .join("profile-personal-account-b");
+
+        let sock_a = select_unix_socket_path_with(&long_a, Some("/run/user/1000"));
+        let sock_b = select_unix_socket_path_with(&long_b, Some("/run/user/1000"));
+        assert_ne!(sock_a, sock_b, "multi-profile XDG fallback sockets must not collide");
+        let sock_a_str = sock_a.to_string_lossy();
+        let hash_a = config_dir_short_hash(&long_a);
+        assert!(
+            sock_a_str.contains(&format!("outlook-daemon-{hash_a}.sock")),
+            "expected short_hash in XDG socket path, got: {sock_a_str}"
+        );
+
+        // Equivalent unnormalized path (with trailing dot component) produces the same hash & socket path.
+        let long_a_dot = long_a.join(".");
+        assert_eq!(
+            config_dir_short_hash(&long_a),
+            config_dir_short_hash(&long_a_dot)
+        );
+        assert_eq!(
+            select_unix_socket_path_with(&long_a, Some("/run/user/1000")),
+            select_unix_socket_path_with(&long_a_dot, Some("/run/user/1000"))
+        );
+
+        // Without XDG_RUNTIME_DIR (or when XDG path itself exceeds 90 bytes), falls back to /tmp with short_hash.
+        let tmp_sock = select_unix_socket_path_with(&long_a, None);
+        assert_eq!(
+            tmp_sock,
+            PathBuf::from(format!("/tmp/outlook-cli-{hash_a}/outlook-daemon.sock"))
+        );
+        let huge_xdg = "/run/user/1000/extremely-long-xdg-runtime-dir-path-that-exceeds-ninety-bytes-easily";
+        assert_eq!(
+            select_unix_socket_path_with(&long_a, Some(huge_xdg)),
+            PathBuf::from(format!("/tmp/outlook-cli-{hash_a}/outlook-daemon.sock"))
+        );
     }
 }

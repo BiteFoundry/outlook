@@ -155,6 +155,235 @@ async fn resolve_todo_list_mcp(
     .await
 }
 
+const COMPACT_MAIL_LIST_OMITTED_FIELDS: &[&str] = &[
+    "internet_message_id",
+    "conversation_id",
+    "folder_id",
+    "sender",
+    "to_recipients",
+    "cc_recipients",
+    "bcc_recipients",
+    "reply_to",
+    "sent_at",
+    "last_modified_at",
+    "importance",
+    "inference_classification",
+    "categories",
+    "body_loaded",
+    "preview",
+    "body_plain",
+    "body_html",
+    "attachments",
+    "meeting_request",
+    "web_link",
+];
+
+const COMPACT_EVENT_LIST_OMITTED_FIELDS: &[&str] = &["body_html", "recurrence"];
+
+fn with_compact_mail_list_metadata(mut payload: Value, compact: bool, tool_name: &str) -> Value {
+    if compact {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert(
+                "omitted".into(),
+                json!({ "fields": COMPACT_MAIL_LIST_OMITTED_FIELDS }),
+            );
+            obj.insert(
+                "hint".into(),
+                json!(format!(
+                    "Compact {tool_name} omits recipients (to/cc/bcc/reply_to), sender, preview, body, importance, categories, meeting_request, attachments, and metadata — omitted fields are NOT absent. Call get_message (optionally with fields: [...] or compact: false) or re-run {tool_name} with compact: false."
+                )),
+            );
+        }
+    }
+    payload
+}
+
+fn compact_event_list_item_json(ev: &crate::models::CalendarEvent, compact: bool) -> Value {
+    let mut val = cli::event_json(ev, compact);
+    if compact {
+        if let Some(obj) = val.as_object_mut() {
+            obj.remove("recurrence");
+        }
+    }
+    val
+}
+
+fn with_compact_event_list_metadata(mut payload: Value, compact: bool) -> Value {
+    if compact {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert(
+                "omitted".into(),
+                json!({ "fields": COMPACT_EVENT_LIST_OMITTED_FIELDS }),
+            );
+            obj.insert(
+                "hint".into(),
+                json!(
+                    "Compact list_events omits body_html and recurrence — omitted fields are NOT absent. Call get_event (optionally with fields: [...] or compact: false) or re-run list_events with compact: false."
+                ),
+            );
+        }
+    }
+    payload
+}
+
+fn event_read_json(ev: &crate::models::CalendarEvent, compact: bool) -> Value {
+    if !compact {
+        return json!({ "event": ev });
+    }
+    let mut val = cli::event_json(ev, true);
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("omitted".into(), json!({ "fields": ["body_html"] }));
+        obj.insert(
+            "hint".into(),
+            json!("Call get_event with compact:false or fields:[\"body_html\"] for HTML content."),
+        );
+    }
+    json!({ "event": val })
+}
+
+fn project_mail_message_fields(
+    msg: &crate::models::MailMessage,
+    requested: &[String],
+) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("id".into(), json!(msg.id));
+    let mut matched_fields: Vec<String> = Vec::new();
+    let mut missing_fields: Vec<String> = Vec::new();
+
+    for raw in requested {
+        let key = raw.trim().to_ascii_lowercase();
+        let mapped: Option<(&str, Value)> = match key.as_str() {
+            "id" => Some(("id", json!(msg.id))),
+            "internet_message_id" => Some(("internet_message_id", json!(msg.internet_message_id))),
+            "conversation_id" => Some(("conversation_id", json!(msg.conversation_id))),
+            "folder_id" => Some(("folder_id", json!(msg.folder_id))),
+            "subject" => Some(("subject", json!(msg.subject))),
+            "from" => Some(("from", json!(msg.from))),
+            "sender" => Some(("sender", json!(msg.sender))),
+            "to" | "to_recipients" => Some(("to_recipients", json!(msg.to_recipients))),
+            "cc" | "cc_recipients" => Some(("cc_recipients", json!(msg.cc_recipients))),
+            "bcc" | "bcc_recipients" => Some(("bcc_recipients", json!(msg.bcc_recipients))),
+            "reply_to" => Some(("reply_to", json!(msg.reply_to))),
+            "received_at" | "received" => Some(("received_at", json!(msg.received_at))),
+            "sent_at" | "sent" => Some(("sent_at", json!(msg.sent_at))),
+            "last_modified_at" => Some(("last_modified_at", json!(msg.last_modified_at))),
+            "is_read" => Some(("is_read", json!(msg.is_read))),
+            "is_draft" => Some(("is_draft", json!(msg.is_draft))),
+            "flagged" => Some(("flagged", json!(msg.flagged))),
+            "importance" => Some(("importance", json!(msg.importance))),
+            "inference_classification" => Some((
+                "inference_classification",
+                json!(msg.inference_classification),
+            )),
+            "categories" => Some(("categories", json!(msg.categories))),
+            "has_attachments" => Some(("has_attachments", json!(msg.has_attachments))),
+            "body_loaded" => Some(("body_loaded", json!(msg.body_loaded))),
+            "preview" => Some(("preview", json!(msg.preview))),
+            "body_plain" | "body" => Some((
+                "body_plain",
+                if msg.body_loaded {
+                    json!(msg.body_plain)
+                } else {
+                    Value::Null
+                },
+            )),
+            "body_html" | "html" => Some(("body_html", json!(msg.body_html))),
+            "attachments" => Some((
+                "attachments",
+                cli::mail_attachments_public_json(&msg.attachments),
+            )),
+            "meeting_request" => Some(("meeting_request", json!(msg.meeting_request))),
+            "web_link" => Some(("web_link", json!(msg.web_link))),
+            _ => None,
+        };
+        if let Some((canonical, value)) = mapped {
+            out.insert(canonical.into(), value);
+            if !matched_fields.iter().any(|f| f == canonical) {
+                matched_fields.push(canonical.to_string());
+            }
+        } else if !missing_fields.iter().any(|f| f == raw) {
+            missing_fields.push(raw.clone());
+        }
+    }
+
+    let mut payload = json!({
+        "message": Value::Object(out),
+        "fields": matched_fields,
+    });
+    if !missing_fields.is_empty() {
+        payload["missing_fields"] = json!(missing_fields);
+    }
+    payload
+}
+
+fn project_calendar_event_fields(
+    ev: &crate::models::CalendarEvent,
+    requested: &[String],
+) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("id".into(), json!(ev.id));
+    let mut matched_fields: Vec<String> = Vec::new();
+    let mut missing_fields: Vec<String> = Vec::new();
+
+    for raw in requested {
+        let key = raw.trim().to_ascii_lowercase();
+        if key == "organizer" {
+            out.insert("organizer_name".into(), json!(ev.organizer_name));
+            out.insert("organizer_email".into(), json!(ev.organizer_email));
+            for canonical in ["organizer_name", "organizer_email"] {
+                if !matched_fields.iter().any(|f| f == canonical) {
+                    matched_fields.push(canonical.to_string());
+                }
+            }
+            continue;
+        }
+        let mapped: Option<(&str, Value)> = match key.as_str() {
+            "id" => Some(("id", json!(ev.id))),
+            "subject" => Some(("subject", json!(ev.subject))),
+            "start" | "start_iso" => Some(("start_iso", json!(ev.start_iso))),
+            "end" | "end_iso" => Some(("end_iso", json!(ev.end_iso))),
+            "time_zone" => Some(("time_zone", json!(ev.time_zone))),
+            "is_all_day" => Some(("is_all_day", json!(ev.is_all_day))),
+            "location" => Some(("location", json!(ev.location))),
+            "organizer_name" => Some(("organizer_name", json!(ev.organizer_name))),
+            "organizer_email" => Some(("organizer_email", json!(ev.organizer_email))),
+            "attendees" => Some(("attendees", json!(ev.attendees))),
+            "response_status" => Some(("response_status", json!(ev.response_status))),
+            "is_online_meeting" => Some(("is_online_meeting", json!(ev.is_online_meeting))),
+            "online_meeting_url" => Some(("online_meeting_url", json!(ev.online_meeting_url))),
+            "body_html" | "html" => Some(("body_html", json!(ev.body_html))),
+            "body_plain" | "body" => Some(("body_plain", json!(ev.body_plain))),
+            "is_cancelled" => Some(("is_cancelled", json!(ev.is_cancelled))),
+            "web_link" => Some(("web_link", json!(ev.web_link))),
+            "categories" => Some(("categories", json!(ev.categories))),
+            "show_as" => Some(("show_as", json!(ev.show_as))),
+            "sensitivity" => Some(("sensitivity", json!(ev.sensitivity))),
+            "event_type" | "type" => Some(("event_type", json!(ev.event_type))),
+            "has_attachments" => Some(("has_attachments", json!(ev.has_attachments))),
+            "is_recurring" => Some(("is_recurring", json!(ev.is_recurring))),
+            "recurrence" => Some(("recurrence", json!(ev.recurrence))),
+            _ => None,
+        };
+        if let Some((canonical, value)) = mapped {
+            out.insert(canonical.into(), value);
+            if !matched_fields.iter().any(|f| f == canonical) {
+                matched_fields.push(canonical.to_string());
+            }
+        } else if !missing_fields.iter().any(|f| f == raw) {
+            missing_fields.push(raw.clone());
+        }
+    }
+
+    let mut payload = json!({
+        "event": Value::Object(out),
+        "fields": matched_fields,
+    });
+    if !missing_fields.is_empty() {
+        payload["missing_fields"] = json!(missing_fields);
+    }
+    payload
+}
+
 /// Run the stdio MCP server until stdin reaches EOF.
 pub async fn run(config: AppConfig, graph: GraphClient, storage: Storage) -> Result<()> {
     let is_empty = with_storage(&storage, |s| Ok(s.list_mail_folders()?.is_empty()))
@@ -471,13 +700,17 @@ async fn call_tool(
                     cli::CursorPos::Offset(_) => unreachable!(),
                 };
 
-                return Ok(json!({
-                    "folder": resolved,
-                    "messages": cli::mail_list_json(&page.messages, compact),
-                    "returned": page.messages.len(),
-                    "has_more": page.has_more,
-                    "next_cursor": page.next_cursor,
-                }));
+                return Ok(with_compact_mail_list_metadata(
+                    json!({
+                        "folder": resolved,
+                        "messages": cli::mail_list_json(&page.messages, compact),
+                        "returned": page.messages.len(),
+                        "has_more": page.has_more,
+                        "next_cursor": page.next_cursor,
+                    }),
+                    compact,
+                    "list_messages",
+                ));
             }
 
             let mut resolved = resolve_mail_folder_mcp(storage, graph, &folder, offline).await?;
@@ -660,15 +893,19 @@ async fn call_tool(
                 page
             };
 
-            Ok(cli::with_sync_complete_marker(
-                json!({
-                    "folder": resolved,
-                    "messages": cli::mail_list_json(&page.messages, compact),
-                    "returned": page.messages.len(),
-                    "has_more": page.has_more,
-                    "next_cursor": page.next_cursor,
-                }),
-                page.sync_complete,
+            Ok(with_compact_mail_list_metadata(
+                cli::with_sync_complete_marker(
+                    json!({
+                        "folder": resolved,
+                        "messages": cli::mail_list_json(&page.messages, compact),
+                        "returned": page.messages.len(),
+                        "has_more": page.has_more,
+                        "next_cursor": page.next_cursor,
+                    }),
+                    page.sync_complete,
+                ),
+                compact,
+                "list_messages",
             ))
         }
 
@@ -677,6 +914,7 @@ async fn call_tool(
             let offline = args.optional_bool("offline")?.unwrap_or(false);
             let mark_read = args.optional_bool("mark_read")?.unwrap_or(false);
             let compact = args.optional_bool("compact")?.unwrap_or(true);
+            let fields = args.optional_str_array("fields")?;
 
             let mut msg = if offline {
                 let id_owned = message_id.clone();
@@ -702,7 +940,11 @@ async fn call_tool(
                 let _ = with_storage(storage, move |s| s.set_mail_read_local(&mid, true)).await;
             }
 
-            Ok(cli::mail_read_json(&msg, compact, cli::Surface::Mcp))
+            if let Some(requested) = fields.filter(|f| !f.is_empty()) {
+                Ok(project_mail_message_fields(&msg, &requested))
+            } else {
+                Ok(cli::mail_read_json(&msg, compact, cli::Surface::Mcp))
+            }
         }
 
         "send_mail" => {
@@ -1106,13 +1348,17 @@ async fn call_tool(
                 .await?;
                 let msgs_clone = page.messages.clone();
                 let _ = with_storage(storage, move |s| s.upsert_mail_messages(&msgs_clone)).await;
-                return Ok(json!({
-                    "query": query,
-                    "messages": cli::mail_list_json(&page.messages, compact),
-                    "returned": page.messages.len(),
-                    "has_more": page.has_more,
-                    "next_cursor": page.next_cursor,
-                }));
+                return Ok(with_compact_mail_list_metadata(
+                    json!({
+                        "query": query,
+                        "messages": cli::mail_list_json(&page.messages, compact),
+                        "returned": page.messages.len(),
+                        "has_more": page.has_more,
+                        "next_cursor": page.next_cursor,
+                    }),
+                    compact,
+                    "search_mail",
+                ));
             }
 
             let folder_id = match folder.as_deref() {
@@ -1144,13 +1390,17 @@ async fn call_tool(
                 .await?;
                 let msgs_clone = page.messages.clone();
                 let _ = with_storage(storage, move |s| s.upsert_mail_messages(&msgs_clone)).await;
-                Ok(json!({
-                    "query": query,
-                    "messages": cli::mail_list_json(&page.messages, compact),
-                    "returned": page.messages.len(),
-                    "has_more": page.has_more,
-                    "next_cursor": page.next_cursor,
-                }))
+                Ok(with_compact_mail_list_metadata(
+                    json!({
+                        "query": query,
+                        "messages": cli::mail_list_json(&page.messages, compact),
+                        "returned": page.messages.len(),
+                        "has_more": page.has_more,
+                        "next_cursor": page.next_cursor,
+                    }),
+                    compact,
+                    "search_mail",
+                ))
             }
         }
 
@@ -1217,15 +1467,48 @@ async fn call_tool(
 
             let events_json: Vec<Value> = events
                 .iter()
-                .map(|ev| cli::event_json(ev, compact))
+                .map(|ev| compact_event_list_item_json(ev, compact))
                 .collect();
-            Ok(json!({
-                "start": start_iso,
-                "end": end_iso,
-                "events": events_json,
-                "returned": events.len(),
-                "has_more": has_more,
-            }))
+            Ok(with_compact_event_list_metadata(
+                json!({
+                    "start": start_iso,
+                    "end": end_iso,
+                    "events": events_json,
+                    "returned": events.len(),
+                    "has_more": has_more,
+                }),
+                compact,
+            ))
+        }
+
+        "get_event" => {
+            let event_id = args.required_str("event_id")?;
+            let offline = args.optional_bool("offline")?.unwrap_or(false);
+            let compact = args.optional_bool("compact")?.unwrap_or(true);
+            let fields = args.optional_str_array("fields")?;
+
+            let ev = if offline {
+                let id_owned = event_id.clone();
+                with_storage(storage, move |s| s.get_calendar_event(&id_owned))
+                    .await
+                    .map_err(format_error)?
+                    .ok_or_else(|| format!("calendar event not found in cache: {event_id}"))?
+            } else {
+                let fetched =
+                    map_graph_result(graph, graph.get_calendar_event(&event_id).await).await?;
+                let fetched_clone = fetched.clone();
+                let _ = with_storage(storage, move |s| {
+                    s.upsert_calendar_events(std::slice::from_ref(&fetched_clone))
+                })
+                .await;
+                fetched
+            };
+
+            if let Some(requested) = fields.filter(|f| !f.is_empty()) {
+                Ok(project_calendar_event_fields(&ev, &requested))
+            } else {
+                Ok(event_read_json(&ev, compact))
+            }
         }
 
         "create_event" => {
@@ -1614,7 +1897,7 @@ fn initialize_result(request: &Value) -> Value {
             "name": SERVER_NAME,
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": "Microsoft Outlook MCP server (Mail, Calendar, To Do, Contacts). Pass `offline: true` on read/search tools to query the local SQLite cache without network calls. `delete_message` and `delete_event` require `confirm: true`. Reads are compact by default; pass compact: false for full fields. Follow next_cursor to continue a listing.",
+        "instructions": "Microsoft Outlook MCP server (Mail, Calendar, To Do, Contacts). Pass `offline: true` on read/search tools to query the local SQLite cache without network calls. `delete_message` and `delete_event` require `confirm: true`. Reads are compact by default (omitted fields are explicitly listed in `omitted.fields` — never assume omitted fields are absent); pass `fields: [...]` on `get_message`/`get_event` for selective projection or `compact: false` for full fields. Follow next_cursor to continue a listing.",
     })
 }
 
@@ -1703,7 +1986,7 @@ pub fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "get_message",
-            "description": "Read an email by ID. Compact by default; set compact:false for HTML and attachment metadata. 1 Graph request unless offline (plus 1 when mark_read changes the state); compact:false can be large.",
+            "description": "Read an email by ID. Compact by default; pass fields: [...] for selective field projection (e.g. ['cc', 'bcc', 'categories', 'attachments']) without pulling full HTML, or set compact:false for HTML and attachment metadata. 1 Graph request unless offline (plus 1 when mark_read changes the state); compact:false can be large.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -1711,6 +1994,11 @@ pub fn tool_catalog() -> Vec<Value> {
                     "message_id": { "type": "string" },
                     "mark_read": { "type": "boolean" },
                     "compact": { "type": "boolean", "description": "Default true. Set false for HTML and attachment metadata (no attachment bytes)" },
+                    "fields": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional selective field projection (e.g. ['cc', 'bcc', 'categories', 'attachments']) returning only matched fields plus missing_fields if unrecognized."
+                    },
                     "offline": { "type": "boolean", "description": "Read the local cache only; no Graph request." }
                 },
                 "required": ["message_id"]
@@ -1824,7 +2112,7 @@ pub fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "list_events",
-            "description": "List calendar events within a date/time window (defaults to next 7 days). 1 Graph request per 100 events in the window; offline: true reads the cache only.",
+            "description": "List calendar events within a date/time window (defaults to next 7 days). Compact by default (omits body_html and recurrence, listed in omitted.fields). 1 Graph request per 100 events in the window; offline: true reads the cache only.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -1835,9 +2123,28 @@ pub fn tool_catalog() -> Vec<Value> {
                     "end": { "type": "string", "description": "Alias for to" },
                     "days": { "type": "integer", "minimum": 1, "maximum": 365 },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
-                    "compact": { "type": "boolean", "description": "Default true. Set false to include body_html on each event" },
+                    "compact": { "type": "boolean", "description": "Default true. Set false to include body_html and recurrence on each event" },
                     "offline": { "type": "boolean", "description": "Read the local cache only; no Graph request." }
                 }
+            }
+        }),
+        json!({
+            "name": "get_event",
+            "description": "Read a calendar event by ID. Compact by default (omits body_html); pass fields: [...] for selective field projection (e.g. ['attendees', 'body_plain', 'recurrence', 'categories']) without pulling full HTML, or compact:false for all fields. 1 Graph request unless offline.",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "event_id": { "type": "string" },
+                    "compact": { "type": "boolean", "description": "Default true. Set false to include body_html and all fields" },
+                    "fields": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional selective field projection (e.g. ['attendees', 'body_plain', 'recurrence', 'categories']) returning only matched fields plus missing_fields if unrecognized."
+                    },
+                    "offline": { "type": "boolean", "description": "Read the local cache only; no Graph request." }
+                },
+                "required": ["event_id"]
             }
         }),
         json!({
@@ -2035,11 +2342,12 @@ pub fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             Ok(())
         }
         "get_message" => {
-            args.only(name, &["message_id", "mark_read", "compact", "offline"])?;
+            args.only(name, &["message_id", "mark_read", "compact", "fields", "offline"])?;
             args.required_str("message_id")?;
             args.optional_bool("mark_read")?;
             args.optional_bool("offline")?;
             args.optional_bool("compact")?;
+            args.optional_str_array("fields")?;
             Ok(())
         }
         "send_mail" => {
@@ -2203,6 +2511,14 @@ pub fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
                 bounds("limit", limit, 1, 200)?;
             }
             args.optional_bool("compact")?;
+            args.optional_bool("offline")?;
+            Ok(())
+        }
+        "get_event" => {
+            args.only(name, &["event_id", "compact", "fields", "offline"])?;
+            args.required_str("event_id")?;
+            args.optional_bool("compact")?;
+            args.optional_str_array("fields")?;
             args.optional_bool("offline")?;
             Ok(())
         }
@@ -2593,6 +2909,7 @@ mod tests {
                 "download_attachment",
                 "search_mail",
                 "list_events",
+                "get_event",
                 "create_event",
                 "respond_event",
                 "delete_event",
@@ -2792,6 +3109,7 @@ mod tests {
                     attachments: Vec::new(),
                     meeting_request: None,
                     web_link: None,
+                    ..Default::default()
                 },
                 MailMessage {
                     id: "msg-2".to_string(),
@@ -2820,6 +3138,7 @@ mod tests {
                     attachments: Vec::new(),
                     meeting_request: None,
                     web_link: None,
+                    ..Default::default()
                 },
             ])
             .unwrap();
@@ -3008,6 +3327,7 @@ mod tests {
                 ],
                 meeting_request: None,
                 web_link: None,
+                ..Default::default()
             }])
             .unwrap();
 
@@ -3163,5 +3483,384 @@ mod tests {
             })
         )
         .is_ok());
+
+        // get_message and get_event selective `fields` schema validation
+        assert!(validate_tool_args(
+            "get_message",
+            &json!({
+                "message_id": "m1",
+                "fields": ["cc", "bcc", "categories", "attachments"]
+            })
+        )
+        .is_ok());
+        assert!(validate_tool_args(
+            "get_message",
+            &json!({
+                "message_id": "m1",
+                "fields": "cc"
+            })
+        )
+        .is_err());
+        assert!(validate_tool_args(
+            "get_event",
+            &json!({
+                "event_id": "ev1",
+                "fields": ["attendees", "body_plain", "recurrence", "categories"],
+                "offline": true
+            })
+        )
+        .is_ok());
+        assert_eq!(
+            validate_tool_args("get_event", &json!({ "event_id": "ev1", "full": true }))
+                .unwrap_err(),
+            "unsupported argument for get_event: full"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_list_and_search_emit_honest_omitted_metadata_and_hint() {
+        use axum::{routing::get, Json, Router};
+        use crate::{
+            auth::StoredTokens,
+            models::{CalendarEvent, EmailRecipient, EventAttendee, MailAttachment},
+        };
+
+        let (cfg, graph, storage) = test_ctx();
+        storage
+            .upsert_mail_folders(&[MailFolder {
+                id: "folder-inbox".to_string(),
+                display_name: "Inbox".to_string(),
+                well_known_name: Some("inbox".to_string()),
+                parent_folder_id: None,
+                child_folder_count: 0,
+                unread_item_count: 1,
+                total_item_count: 1,
+            }])
+            .unwrap();
+        storage
+            .upsert_mail_messages(&[MailMessage {
+                id: "msg-rich".to_string(),
+                internet_message_id: Some("<rich@contoso.com>".to_string()),
+                conversation_id: Some("conv-rich".to_string()),
+                folder_id: Some("folder-inbox".to_string()),
+                subject: "Q4 Planning".to_string(),
+                from: Some(EmailRecipient {
+                    name: Some("CEO".to_string()),
+                    address: "ceo@contoso.com".to_string(),
+                }),
+                sender: Some(EmailRecipient {
+                    name: Some("EA".to_string()),
+                    address: "ea@contoso.com".to_string(),
+                }),
+                to_recipients: vec![EmailRecipient {
+                    name: Some("Alice".to_string()),
+                    address: "alice@contoso.com".to_string(),
+                }],
+                cc_recipients: vec![EmailRecipient {
+                    name: Some("Bob".to_string()),
+                    address: "bob@contoso.com".to_string(),
+                }],
+                bcc_recipients: vec![EmailRecipient {
+                    name: None,
+                    address: "audit@contoso.com".to_string(),
+                }],
+                reply_to: vec![EmailRecipient {
+                    name: None,
+                    address: "reply@contoso.com".to_string(),
+                }],
+                received_at: "2026-11-20T09:00:00Z".to_string(),
+                sent_at: Some("2026-11-20T08:59:00Z".to_string()),
+                last_modified_at: Some("2026-11-20T09:05:00Z".to_string()),
+                is_read: false,
+                is_draft: false,
+                flagged: true,
+                importance: "high".to_string(),
+                inference_classification: Some("focused".to_string()),
+                categories: vec!["Executive".to_string(), "Finance".to_string()],
+                has_attachments: true,
+                body_loaded: true,
+                preview: "See attached deck".to_string(),
+                body_html: "<html><body><p>Huge HTML body</p></body></html>".to_string(),
+                body_plain: "Huge HTML body".to_string(),
+                attachments: vec![MailAttachment {
+                    id: "att-1".to_string(),
+                    name: "deck.pdf".to_string(),
+                    content_type: "application/pdf".to_string(),
+                    size: 2048,
+                    is_inline: false,
+                    content_id: None,
+                    content_bytes_b64: Some("cGRm".to_string()),
+                }],
+                meeting_request: None,
+                web_link: Some("https://outlook.office.com/mail/msg-rich".to_string()),
+            }])
+            .unwrap();
+
+        storage
+            .upsert_calendar_events(&[CalendarEvent {
+                id: "ev-series".to_string(),
+                subject: "Weekly Architecture Sync".to_string(),
+                start_iso: "2026-11-20T15:00:00Z".to_string(),
+                end_iso: "2026-11-20T16:00:00Z".to_string(),
+                time_zone: "UTC".to_string(),
+                is_all_day: false,
+                location: Some("Room 42".to_string()),
+                organizer_name: Some("Alice".to_string()),
+                organizer_email: Some("alice@contoso.com".to_string()),
+                attendees: vec![EventAttendee {
+                    name: Some("Bob".to_string()),
+                    address: "bob@contoso.com".to_string(),
+                    attendee_type: "required".to_string(),
+                    response_status: "accepted".to_string(),
+                }],
+                response_status: "organizer".to_string(),
+                is_online_meeting: true,
+                online_meeting_url: Some("https://teams.microsoft.com/l/meetup-join/sync".to_string()),
+                body_html: "<div><p>Agenda HTML</p></div>".to_string(),
+                body_plain: "Agenda HTML".to_string(),
+                is_cancelled: false,
+                web_link: Some("https://outlook.office.com/calendar/ev-series".to_string()),
+                categories: vec!["Engineering".to_string()],
+                show_as: Some("busy".to_string()),
+                sensitivity: Some("normal".to_string()),
+                event_type: Some("seriesMaster".to_string()),
+                has_attachments: true,
+                is_recurring: true,
+                recurrence: Some(json!({
+                    "pattern": { "type": "weekly", "interval": 1, "daysOfWeek": ["friday"] },
+                    "range": { "type": "noEnd", "startDate": "2026-11-20" }
+                })),
+            }])
+            .unwrap();
+
+        // 1. Compact list_messages includes honest `omitted.fields` and `hint`; compact:false omits them.
+        let list_compact = call_tool(
+            &cfg,
+            &graph,
+            &storage,
+            "list_messages",
+            &json!({ "folder": "inbox", "offline": true }),
+        )
+        .await
+        .unwrap();
+        let omitted_fields = list_compact["omitted"]["fields"].as_array().unwrap();
+        for expected in [
+            "to_recipients",
+            "cc_recipients",
+            "bcc_recipients",
+            "reply_to",
+            "sender",
+            "preview",
+            "body_plain",
+            "importance",
+            "categories",
+            "meeting_request",
+            "attachments",
+        ] {
+            assert!(
+                omitted_fields.iter().any(|v| v == expected),
+                "list_messages omitted.fields missing {expected}: {omitted_fields:?}"
+            );
+        }
+        let hint = list_compact["hint"].as_str().unwrap();
+        assert!(hint.contains("get_message") && hint.contains("NOT absent"), "{hint}");
+
+        let list_full = call_tool(
+            &cfg,
+            &graph,
+            &storage,
+            "list_messages",
+            &json!({ "folder": "inbox", "offline": true, "compact": false }),
+        )
+        .await
+        .unwrap();
+        assert!(list_full.get("omitted").is_none());
+        assert!(list_full.get("hint").is_none());
+        assert_eq!(list_full["messages"][0]["categories"], json!(["Executive", "Finance"]));
+        assert_eq!(list_full["messages"][0]["sender"]["address"], "ea@contoso.com");
+
+        // 2. Compact list_events emits omitted.fields (body_html, recurrence) and hint; strips recurrence on list items.
+        let ev_list_compact = call_tool(
+            &cfg,
+            &graph,
+            &storage,
+            "list_events",
+            &json!({ "from": "2026-11-19", "to": "2026-11-22", "offline": true }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ev_list_compact["omitted"]["fields"],
+            json!(["body_html", "recurrence"])
+        );
+        let ev_hint = ev_list_compact["hint"].as_str().unwrap();
+        assert!(ev_hint.contains("get_event") && ev_hint.contains("NOT absent"), "{ev_hint}");
+        assert!(ev_list_compact["events"][0].get("body_html").is_none());
+        assert!(ev_list_compact["events"][0].get("recurrence").is_none());
+        assert_eq!(ev_list_compact["events"][0]["is_recurring"], true);
+        assert_eq!(ev_list_compact["events"][0]["categories"], json!(["Engineering"]));
+        assert_eq!(ev_list_compact["events"][0]["show_as"], "busy");
+        assert_eq!(ev_list_compact["events"][0]["sensitivity"], "normal");
+        assert_eq!(ev_list_compact["events"][0]["event_type"], "seriesMaster");
+        assert_eq!(ev_list_compact["events"][0]["has_attachments"], true);
+
+        let ev_list_full = call_tool(
+            &cfg,
+            &graph,
+            &storage,
+            "list_events",
+            &json!({ "from": "2026-11-19", "to": "2026-11-22", "offline": true, "compact": false }),
+        )
+        .await
+        .unwrap();
+        assert!(ev_list_full.get("omitted").is_none());
+        assert_eq!(ev_list_full["events"][0]["body_html"], "<div><p>Agenda HTML</p></div>");
+        assert_eq!(
+            ev_list_full["events"][0]["recurrence"]["pattern"]["type"],
+            "weekly"
+        );
+
+        // 3. Selective `fields` projection on get_message (aliases cc/bcc + canonical categories/attachments + missing_fields).
+        let msg_proj = call_tool(
+            &cfg,
+            &graph,
+            &storage,
+            "get_message",
+            &json!({
+                "message_id": "msg-rich",
+                "offline": true,
+                "fields": ["cc", "bcc", "categories", "sender", "attachments", "not_a_real_field"]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(msg_proj["message"]["id"], "msg-rich");
+        assert_eq!(msg_proj["message"]["cc_recipients"][0]["address"], "bob@contoso.com");
+        assert_eq!(msg_proj["message"]["bcc_recipients"][0]["address"], "audit@contoso.com");
+        assert_eq!(msg_proj["message"]["categories"], json!(["Executive", "Finance"]));
+        assert_eq!(msg_proj["message"]["sender"]["address"], "ea@contoso.com");
+        assert_eq!(msg_proj["message"]["attachments"][0]["name"], "deck.pdf");
+        assert_eq!(msg_proj["message"]["attachments"][0]["content_cached"], true);
+        assert!(msg_proj["message"]["attachments"][0].get("content_bytes_b64").is_none());
+        assert!(msg_proj["message"].get("body_html").is_none());
+        assert!(msg_proj["message"].get("body_plain").is_none());
+        assert_eq!(msg_proj["missing_fields"], json!(["not_a_real_field"]));
+
+        // 4. Selective `fields` projection on get_event + compact/full get_event.
+        let ev_proj = call_tool(
+            &cfg,
+            &graph,
+            &storage,
+            "get_event",
+            &json!({
+                "event_id": "ev-series",
+                "offline": true,
+                "fields": ["attendees", "body_plain", "recurrence", "categories", "show_as", "bogus_key"]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ev_proj["event"]["id"], "ev-series");
+        assert_eq!(ev_proj["event"]["attendees"][0]["address"], "bob@contoso.com");
+        assert_eq!(ev_proj["event"]["body_plain"], "Agenda HTML");
+        assert_eq!(ev_proj["event"]["recurrence"]["pattern"]["type"], "weekly");
+        assert_eq!(ev_proj["event"]["categories"], json!(["Engineering"]));
+        assert_eq!(ev_proj["event"]["show_as"], "busy");
+        assert!(ev_proj["event"].get("body_html").is_none());
+        assert!(ev_proj["event"].get("subject").is_none());
+        assert_eq!(ev_proj["missing_fields"], json!(["bogus_key"]));
+
+        let ev_compact = call_tool(
+            &cfg,
+            &graph,
+            &storage,
+            "get_event",
+            &json!({ "event_id": "ev-series", "offline": true }),
+        )
+        .await
+        .unwrap();
+        assert!(ev_compact["event"].get("body_html").is_none());
+        assert_eq!(ev_compact["event"]["omitted"]["fields"], json!(["body_html"]));
+        assert_eq!(ev_compact["event"]["recurrence"]["pattern"]["type"], "weekly");
+
+        // 5. Online search_mail (compact: true) also emits honest `omitted` and `hint`.
+        let router = Router::new().route(
+            "/v1.0/me/messages",
+            get(|| async {
+                Json(json!({
+                    "value": [{
+                        "id": "msg-search-1",
+                        "subject": "Budget Review",
+                        "from": { "emailAddress": { "name": "Alice", "address": "alice@contoso.com" } },
+                        "sender": { "emailAddress": { "name": "Mailer", "address": "mailer@contoso.com" } },
+                        "receivedDateTime": "2026-11-20T10:00:00Z",
+                        "isRead": false,
+                        "isDraft": false,
+                        "categories": ["Budget"],
+                        "hasAttachments": false,
+                        "bodyPreview": "Numbers inside"
+                    }]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let mut online_cfg = AppConfig::default();
+        online_cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tokens = StoredTokens {
+            access_token: "test-token".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: "cid".to_string(),
+            tenant_id: "tid".to_string(),
+            user_id: Some("u1".to_string()),
+            user_display_name: Some("Tester".to_string()),
+            user_email: Some("tester@contoso.com".to_string()),
+            auth_mode: "token".to_string(),
+        };
+        let online_auth = AuthManager::from_tokens(online_cfg.clone(), tokens);
+        let online_graph = GraphClient::new(online_cfg.clone(), online_auth).unwrap();
+
+        let search_compact = call_tool(
+            &online_cfg,
+            &online_graph,
+            &storage,
+            "search_mail",
+            &json!({ "query": "Budget", "offline": false }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(search_compact["messages"].as_array().unwrap().len(), 1);
+        assert!(search_compact["omitted"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "categories"));
+        assert!(search_compact["hint"]
+            .as_str()
+            .unwrap()
+            .contains("get_message"));
+
+        let search_full = call_tool(
+            &online_cfg,
+            &online_graph,
+            &storage,
+            "search_mail",
+            &json!({ "query": "Budget", "offline": false, "compact": false }),
+        )
+        .await
+        .unwrap();
+        assert!(search_full.get("omitted").is_none());
+        assert_eq!(search_full["messages"][0]["categories"], json!(["Budget"]));
+        assert_eq!(
+            search_full["messages"][0]["sender"]["address"],
+            "mailer@contoso.com"
+        );
+
+        server.abort();
     }
 }

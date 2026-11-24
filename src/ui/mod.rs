@@ -954,6 +954,7 @@ mod tests {
             }],
             meeting_request: None,
             web_link: None,
+            ..Default::default()
         };
         app.mail_messages.push(msg);
         app.active_mail_id = Some("msg-btn-1".into());

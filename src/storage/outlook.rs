@@ -16,7 +16,7 @@ const MAIL_SELECT_COLS: &str = "
     m.received_at, m.sent_at, m.last_modified_at, m.is_read, m.is_draft, m.flagged,
     m.importance, m.inference_classification, m.has_attachments, m.body_loaded,
     m.preview, m.body_html, m.body_plain, m.attachments_json,
-    m.meeting_request_json, m.web_link
+    m.meeting_request_json, m.web_link, m.sender_json, m.categories_json
 ";
 
 pub(crate) const MAIL_SUMMARY_SELECT_COLS: &str = "
@@ -28,7 +28,17 @@ pub(crate) const MAIL_SUMMARY_SELECT_COLS: &str = "
     END,
     m.received_at, m.sent_at, m.last_modified_at, m.is_read, m.is_draft,
     m.flagged, m.importance, m.inference_classification, m.has_attachments,
-    m.body_loaded, m.preview, m.meeting_request_json, m.web_link
+    m.body_loaded, m.preview, m.meeting_request_json, m.web_link,
+    m.sender_json, m.categories_json
+";
+
+const CALENDAR_SELECT_COLS: &str = "
+    id, subject, start_iso, end_iso, time_zone, is_all_day,
+    location, organizer_name, organizer_email, attendees_json,
+    response_status, is_online_meeting, online_meeting_url,
+    body_html, body_plain, is_cancelled, web_link,
+    categories_json, show_as, sensitivity, event_type,
+    has_attachments, is_recurring, recurrence_json
 ";
 
 pub(crate) const FOLDER_FILTER_PREDICATE: &str = "
@@ -217,6 +227,8 @@ struct ExistingMailRow {
     attachments_json: String,
     meeting_request_json: Option<String>,
     web_link: Option<String>,
+    sender_json: Option<String>,
+    categories_json: String,
 }
 
 /// Compares two RFC 3339 / ISO 8601 timestamps, falling back to lexicographical order.
@@ -260,7 +272,8 @@ fn upsert_mail_messages_in_tx(tx: &Transaction<'_>, messages: &[MailMessage]) ->
             from_json, to_json, cc_json, bcc_json, reply_to_json,
             from_display, received_at, sent_at, last_modified_at, is_read, is_draft,
             flagged, importance, inference_classification, has_attachments, body_loaded,
-            preview, body_html, body_plain, attachments_json, meeting_request_json, web_link
+            preview, body_html, body_plain, attachments_json, meeting_request_json, web_link,
+            sender_json, categories_json
         FROM mail_messages
         WHERE id = ?1
         ",
@@ -273,13 +286,15 @@ fn upsert_mail_messages_in_tx(tx: &Transaction<'_>, messages: &[MailMessage]) ->
             from_json, to_json, cc_json, bcc_json, reply_to_json,
             from_display, received_at, sent_at, last_modified_at, is_read, is_draft,
             flagged, importance, inference_classification, has_attachments, body_loaded,
-            preview, body_html, body_plain, attachments_json, meeting_request_json, web_link
+            preview, body_html, body_plain, attachments_json, meeting_request_json, web_link,
+            sender_json, categories_json
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
             ?6, ?7, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14, ?15, ?16,
             ?17, ?18, ?19, ?20, ?21,
-            ?22, ?23, ?24, ?25, ?26, ?27
+            ?22, ?23, ?24, ?25, ?26, ?27,
+            ?28, ?29
         )
         ON CONFLICT(id) DO UPDATE SET
             internet_message_id = excluded.internet_message_id,
@@ -307,7 +322,9 @@ fn upsert_mail_messages_in_tx(tx: &Transaction<'_>, messages: &[MailMessage]) ->
             body_plain = excluded.body_plain,
             attachments_json = excluded.attachments_json,
             meeting_request_json = excluded.meeting_request_json,
-            web_link = excluded.web_link
+            web_link = excluded.web_link,
+            sender_json = excluded.sender_json,
+            categories_json = excluded.categories_json
         ",
     )?;
 
@@ -325,6 +342,12 @@ fn upsert_mail_messages_in_tx(tx: &Transaction<'_>, messages: &[MailMessage]) ->
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let sender_json = msg
+            .sender
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let categories_json = serde_json::to_string(&msg.categories)?;
         let to_json = serde_json::to_string(&msg.to_recipients)?;
         let cc_json = serde_json::to_string(&msg.cc_recipients)?;
         let bcc_json = serde_json::to_string(&msg.bcc_recipients)?;
@@ -372,6 +395,8 @@ fn upsert_mail_messages_in_tx(tx: &Transaction<'_>, messages: &[MailMessage]) ->
                     attachments_json: row.get(24)?,
                     meeting_request_json: row.get(25)?,
                     web_link: row.get(26)?,
+                    sender_json: row.get(27)?,
+                    categories_json: row.get(28)?,
                 })
             })
             .optional()?;
@@ -415,6 +440,7 @@ fn upsert_mail_messages_in_tx(tx: &Transaction<'_>, messages: &[MailMessage]) ->
                 .as_deref()
                 .or(ex.meeting_request_json.as_deref());
             let eff_web_link = msg.web_link.as_deref().or(ex.web_link.as_deref());
+            let eff_sender_json = sender_json.as_deref().or(ex.sender_json.as_deref());
 
             let eff_preview = if msg.preview.is_empty() && !ex.preview.is_empty() {
                 ex.preview.as_str()
@@ -433,6 +459,13 @@ fn upsert_mail_messages_in_tx(tx: &Transaction<'_>, messages: &[MailMessage]) ->
                     || incoming_newer_modified);
 
             let preserve_hydrated = header_over_hydrated && !invalidate_body;
+
+            let eff_categories_json =
+                if !msg.body_loaded && categories_json == "[]" && ex.categories_json != "[]" && !incoming_newer_modified {
+                    ex.categories_json.as_str()
+                } else {
+                    categories_json.as_str()
+                };
 
             let eff_to_json = if preserve_hydrated && to_json == "[]" && ex.to_json != "[]" {
                 ex.to_json.as_str()
@@ -528,7 +561,9 @@ fn upsert_mail_messages_in_tx(tx: &Transaction<'_>, messages: &[MailMessage]) ->
                 && eff_body_plain == ex.body_plain
                 && eff_attachments_json == ex.attachments_json
                 && eff_meeting_req == ex.meeting_request_json.as_deref()
-                && eff_web_link == ex.web_link.as_deref();
+                && eff_web_link == ex.web_link.as_deref()
+                && eff_sender_json == ex.sender_json.as_deref()
+                && eff_categories_json == ex.categories_json;
 
             if row_unchanged {
                 continue;
@@ -569,6 +604,8 @@ fn upsert_mail_messages_in_tx(tx: &Transaction<'_>, messages: &[MailMessage]) ->
                 eff_attachments_json,
                 eff_meeting_req,
                 eff_web_link,
+                eff_sender_json,
+                eff_categories_json,
             ])?;
             changed_count += 1;
 
@@ -612,6 +649,8 @@ fn upsert_mail_messages_in_tx(tx: &Transaction<'_>, messages: &[MailMessage]) ->
                 attachments_json,
                 meeting_request_json,
                 msg.web_link,
+                sender_json,
+                categories_json,
             ])?;
             changed_count += 1;
             let rowid = tx.last_insert_rowid();
@@ -1113,6 +1152,12 @@ pub fn replace_moved_mail_local_ex(
             if effective.from.is_none() {
                 effective.from = old.from.clone();
             }
+            if effective.sender.is_none() {
+                effective.sender = old.sender.clone();
+            }
+            if effective.categories.is_empty() {
+                effective.categories = old.categories.clone();
+            }
             if effective.preview.is_empty() {
                 effective.preview = old.preview.clone();
             }
@@ -1382,12 +1427,16 @@ fn upsert_calendar_events_in_tx(tx: &Transaction<'_>, events: &[CalendarEvent]) 
             id, subject, start_iso, end_iso, time_zone, is_all_day,
             location, organizer_name, organizer_email, attendees_json,
             response_status, is_online_meeting, online_meeting_url,
-            body_html, body_plain, is_cancelled, web_link
+            body_html, body_plain, is_cancelled, web_link,
+            categories_json, show_as, sensitivity, event_type,
+            has_attachments, is_recurring, recurrence_json
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6,
             ?7, ?8, ?9, ?10,
             ?11, ?12, ?13,
-            ?14, ?15, ?16, ?17
+            ?14, ?15, ?16, ?17,
+            ?18, ?19, ?20, ?21,
+            ?22, ?23, ?24
         )
         ON CONFLICT(id) DO UPDATE SET
             subject = excluded.subject,
@@ -1405,11 +1454,24 @@ fn upsert_calendar_events_in_tx(tx: &Transaction<'_>, events: &[CalendarEvent]) 
             body_html = excluded.body_html,
             body_plain = excluded.body_plain,
             is_cancelled = excluded.is_cancelled,
-            web_link = COALESCE(excluded.web_link, calendar_events.web_link)
+            web_link = COALESCE(excluded.web_link, calendar_events.web_link),
+            categories_json = excluded.categories_json,
+            show_as = COALESCE(excluded.show_as, calendar_events.show_as),
+            sensitivity = COALESCE(excluded.sensitivity, calendar_events.sensitivity),
+            event_type = COALESCE(excluded.event_type, calendar_events.event_type),
+            has_attachments = excluded.has_attachments,
+            is_recurring = excluded.is_recurring,
+            recurrence_json = COALESCE(excluded.recurrence_json, calendar_events.recurrence_json)
         ",
     )?;
     for ev in events {
         let attendees_json = serde_json::to_string(&ev.attendees)?;
+        let categories_json = serde_json::to_string(&ev.categories)?;
+        let recurrence_json = ev
+            .recurrence
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         stmt.execute(params![
             ev.id,
             ev.subject,
@@ -1428,6 +1490,13 @@ fn upsert_calendar_events_in_tx(tx: &Transaction<'_>, events: &[CalendarEvent]) 
             ev.body_plain,
             bool_to_i32(ev.is_cancelled),
             ev.web_link,
+            categories_json,
+            ev.show_as,
+            ev.sensitivity,
+            ev.event_type,
+            bool_to_i32(ev.has_attachments),
+            bool_to_i32(ev.is_recurring),
+            recurrence_json,
         ])?;
     }
     Ok(())
@@ -1533,70 +1602,34 @@ pub fn list_calendar_events(
 
     match (start, end) {
         (Some(s), Some(e)) => {
-            let mut stmt = conn.prepare_cached(
-                "
-                SELECT
-                    id, subject, start_iso, end_iso, time_zone, is_all_day,
-                    location, organizer_name, organizer_email, attendees_json,
-                    response_status, is_online_meeting, online_meeting_url,
-                    body_html, body_plain, is_cancelled, web_link
-                FROM calendar_events
-                WHERE (end_iso >= ?1 OR start_iso >= ?1)
-                  AND start_iso <= ?2
-                ORDER BY start_iso ASC, id ASC
-                LIMIT ?3
-                ",
-            )?;
+            let sql = format!(
+                "SELECT {CALENDAR_SELECT_COLS} FROM calendar_events WHERE (end_iso >= ?1 OR start_iso >= ?1) AND start_iso <= ?2 ORDER BY start_iso ASC, id ASC LIMIT ?3"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
             let rows = stmt.query_map(params![s, e, limit as i64], map_calendar_event_row)?;
             rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
         }
         (Some(s), None) => {
-            let mut stmt = conn.prepare_cached(
-                "
-                SELECT
-                    id, subject, start_iso, end_iso, time_zone, is_all_day,
-                    location, organizer_name, organizer_email, attendees_json,
-                    response_status, is_online_meeting, online_meeting_url,
-                    body_html, body_plain, is_cancelled, web_link
-                FROM calendar_events
-                WHERE end_iso >= ?1 OR start_iso >= ?1
-                ORDER BY start_iso ASC, id ASC
-                LIMIT ?2
-                ",
-            )?;
+            let sql = format!(
+                "SELECT {CALENDAR_SELECT_COLS} FROM calendar_events WHERE end_iso >= ?1 OR start_iso >= ?1 ORDER BY start_iso ASC, id ASC LIMIT ?2"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
             let rows = stmt.query_map(params![s, limit as i64], map_calendar_event_row)?;
             rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
         }
         (None, Some(e)) => {
-            let mut stmt = conn.prepare_cached(
-                "
-                SELECT
-                    id, subject, start_iso, end_iso, time_zone, is_all_day,
-                    location, organizer_name, organizer_email, attendees_json,
-                    response_status, is_online_meeting, online_meeting_url,
-                    body_html, body_plain, is_cancelled, web_link
-                FROM calendar_events
-                WHERE start_iso <= ?1
-                ORDER BY start_iso ASC, id ASC
-                LIMIT ?2
-                ",
-            )?;
+            let sql = format!(
+                "SELECT {CALENDAR_SELECT_COLS} FROM calendar_events WHERE start_iso <= ?1 ORDER BY start_iso ASC, id ASC LIMIT ?2"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
             let rows = stmt.query_map(params![e, limit as i64], map_calendar_event_row)?;
             rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
         }
         (None, None) => {
-            let mut stmt = conn.prepare_cached(
-                "
-                SELECT
-                    id, subject, start_iso, end_iso, time_zone, is_all_day,
-                    location, organizer_name, organizer_email, attendees_json,
-                    response_status, is_online_meeting, online_meeting_url,
-                    body_html, body_plain, is_cancelled, web_link
-                FROM calendar_events
-                ORDER BY start_iso ASC, id ASC
-                LIMIT ?1
-                ",
-            )?;
+            let sql = format!(
+                "SELECT {CALENDAR_SELECT_COLS} FROM calendar_events ORDER BY start_iso ASC, id ASC LIMIT ?1"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
             let rows = stmt.query_map(params![limit as i64], map_calendar_event_row)?;
             rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
         }
@@ -1604,17 +1637,8 @@ pub fn list_calendar_events(
 }
 
 pub fn get_calendar_event(conn: &Connection, event_id: &str) -> Result<Option<CalendarEvent>> {
-    let mut stmt = conn.prepare_cached(
-        "
-        SELECT
-            id, subject, start_iso, end_iso, time_zone, is_all_day,
-            location, organizer_name, organizer_email, attendees_json,
-            response_status, is_online_meeting, online_meeting_url,
-            body_html, body_plain, is_cancelled, web_link
-        FROM calendar_events
-        WHERE id = ?1
-        ",
-    )?;
+    let sql = format!("SELECT {CALENDAR_SELECT_COLS} FROM calendar_events WHERE id = ?1");
+    let mut stmt = conn.prepare_cached(&sql)?;
     stmt.query_row(params![event_id], map_calendar_event_row)
         .optional()
         .map_err(Into::into)
@@ -2081,8 +2105,12 @@ fn map_mail_message_row(row: &Row<'_>) -> rusqlite::Result<MailMessage> {
     let body_loaded_int: i32 = row.get(19)?;
     let attachments_json: String = row.get(23)?;
     let meeting_req_json: Option<String> = row.get(24)?;
+    let sender_json: Option<String> = row.get(26)?;
+    let categories_json: String = row.get(27)?;
 
     let from: Option<EmailRecipient> = from_json.and_then(|s| serde_json::from_str(&s).ok());
+    let sender: Option<EmailRecipient> = sender_json.and_then(|s| serde_json::from_str(&s).ok());
+    let categories: Vec<String> = serde_json::from_str(&categories_json).unwrap_or_default();
     let to_recipients: Vec<EmailRecipient> = serde_json::from_str(&to_json).unwrap_or_default();
     let cc_recipients: Vec<EmailRecipient> = serde_json::from_str(&cc_json).unwrap_or_default();
     let bcc_recipients: Vec<EmailRecipient> = serde_json::from_str(&bcc_json).unwrap_or_default();
@@ -2099,6 +2127,7 @@ fn map_mail_message_row(row: &Row<'_>) -> rusqlite::Result<MailMessage> {
         folder_id: row.get(3)?,
         subject: row.get(4)?,
         from,
+        sender,
         to_recipients,
         cc_recipients,
         bcc_recipients,
@@ -2111,6 +2140,7 @@ fn map_mail_message_row(row: &Row<'_>) -> rusqlite::Result<MailMessage> {
         flagged: flagged_int != 0,
         importance: row.get(16)?,
         inference_classification: row.get(17)?,
+        categories,
         has_attachments: has_att_int != 0,
         body_loaded: body_loaded_int != 0,
         preview: row.get(20)?,
@@ -2131,8 +2161,12 @@ fn map_mail_summary_row(row: &Row<'_>) -> rusqlite::Result<MailMessage> {
     let has_att_int: i32 = row.get(15)?;
     let body_loaded_int: i32 = row.get(16)?;
     let meeting_req_json: Option<String> = row.get(18)?;
+    let sender_json: Option<String> = row.get(20)?;
+    let categories_json: String = row.get(21)?;
 
     let from: Option<EmailRecipient> = from_json.and_then(|s| serde_json::from_str(&s).ok());
+    let sender: Option<EmailRecipient> = sender_json.and_then(|s| serde_json::from_str(&s).ok());
+    let categories: Vec<String> = serde_json::from_str(&categories_json).unwrap_or_default();
     let to_recipients: Vec<EmailRecipient> = first_to_json
         .and_then(|s| serde_json::from_str::<EmailRecipient>(&s).ok())
         .into_iter()
@@ -2147,6 +2181,7 @@ fn map_mail_summary_row(row: &Row<'_>) -> rusqlite::Result<MailMessage> {
         folder_id: row.get(3)?,
         subject: row.get(4)?,
         from,
+        sender,
         to_recipients,
         cc_recipients: Vec::new(),
         bcc_recipients: Vec::new(),
@@ -2159,6 +2194,7 @@ fn map_mail_summary_row(row: &Row<'_>) -> rusqlite::Result<MailMessage> {
         flagged: flagged_int != 0,
         importance: row.get(13)?,
         inference_classification: row.get(14)?,
+        categories,
         has_attachments: has_att_int != 0,
         body_loaded: body_loaded_int != 0,
         preview: row.get(17)?,
@@ -2175,7 +2211,15 @@ fn map_calendar_event_row(row: &Row<'_>) -> rusqlite::Result<CalendarEvent> {
     let attendees_json: String = row.get(9)?;
     let is_online_int: i32 = row.get(11)?;
     let is_cancelled_int: i32 = row.get(15)?;
+    let categories_json: String = row.get(17)?;
+    let has_attachments_int: i32 = row.get(21)?;
+    let is_recurring_int: i32 = row.get(22)?;
+    let recurrence_json: Option<String> = row.get(23)?;
     let attendees: Vec<EventAttendee> = serde_json::from_str(&attendees_json).unwrap_or_default();
+    let categories: Vec<String> = serde_json::from_str(&categories_json).unwrap_or_default();
+    let recurrence: Option<serde_json::Value> = recurrence_json
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .filter(|v: &serde_json::Value| !v.is_null());
 
     // Rows cached by <= 0.3.0 hold Graph's offset-less UTC values; make the offset explicit on read.
     let is_all_day = is_all_day_int != 0;
@@ -2205,6 +2249,13 @@ fn map_calendar_event_row(row: &Row<'_>) -> rusqlite::Result<CalendarEvent> {
         body_plain: row.get(14)?,
         is_cancelled: is_cancelled_int != 0,
         web_link: row.get(16)?,
+        categories,
+        show_as: row.get(18)?,
+        sensitivity: row.get(19)?,
+        event_type: row.get(20)?,
+        has_attachments: has_attachments_int != 0,
+        is_recurring: is_recurring_int != 0,
+        recurrence,
     })
 }
 

@@ -33,9 +33,19 @@ struct GitHubAsset {
     browser_download_url: String,
 }
 
+fn resolve_target_executable_from(exe: &Path) -> PathBuf {
+    std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf())
+}
+
+/// Resolves the real target executable path, following any symlinks on `std::env::current_exe()`.
+pub(crate) fn resolve_target_executable() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("Unable to determine current executable path")?;
+    Ok(resolve_target_executable_from(&exe))
+}
+
 /// Silently cleans up any `<current_exe>.old` left behind by a previous self-update.
 pub fn cleanup_stale_old_binary() {
-    if let Ok(exe) = std::env::current_exe() {
+    if let Ok(exe) = resolve_target_executable() {
         let old_path = append_ext_suffix(&exe, ".old");
         if old_path.symlink_metadata().is_ok() {
             let _ = std::fs::remove_file(&old_path);
@@ -59,8 +69,7 @@ pub async fn check_or_apply_update_with_api_base(
     check_only: bool,
     force: bool,
 ) -> Result<UpdateCheckResult> {
-    let binary_path =
-        std::env::current_exe().context("Unable to determine current executable path")?;
+    let binary_path = resolve_target_executable()?;
     let token = discover_github_token(api_base_url).await;
     check_or_apply_update_at(api_base_url, repo, check_only, force, &binary_path, token).await
 }
@@ -1021,5 +1030,52 @@ mod tests {
         assert_eq!(std::fs::read(&fake_exe).unwrap(), b"ORIGINAL-SAFE-BINARY");
 
         server.abort();
+    }
+
+    #[test]
+    fn test_resolve_target_executable_follows_symlink_and_keeps_new_symlink_refusal() {
+        let current = resolve_target_executable().unwrap();
+        assert!(current.is_absolute());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real_bin = tmp.path().join("real-outlook");
+        std::fs::write(&real_bin, b"v1").unwrap();
+        let missing_bin = tmp.path().join("nonexistent-outlook");
+        assert_eq!(resolve_target_executable_from(&missing_bin), missing_bin);
+
+        let link_bin = tmp.path().join("linked-outlook");
+        #[cfg(unix)]
+        let sym_res = std::os::unix::fs::symlink(&real_bin, &link_bin);
+        #[cfg(windows)]
+        let sym_res = std::os::windows::fs::symlink_file(&real_bin, &link_bin);
+
+        if let Err(err) = sym_res {
+            if cfg!(windows) && err.raw_os_error() == Some(1314) {
+                return;
+            }
+            panic!("failed to create symlink: {err}");
+        }
+
+        assert_eq!(
+            resolve_target_executable_from(&link_bin),
+            std::fs::canonicalize(&real_bin).unwrap()
+        );
+
+        // Verify .new symlink refusal remains intact.
+        let decoy = tmp.path().join("decoy");
+        std::fs::write(&decoy, b"untouched").unwrap();
+        let new_symlink = append_ext_suffix(&real_bin, ".new");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&decoy, &new_symlink).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&decoy, &new_symlink).unwrap();
+
+        let err = replace_executable_at(&real_bin, b"v2").unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink refusal error, got: {err}"
+        );
+        assert_eq!(std::fs::read(&decoy).unwrap(), b"untouched");
+        assert_eq!(std::fs::read(&real_bin).unwrap(), b"v1");
     }
 }

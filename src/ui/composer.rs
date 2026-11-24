@@ -795,17 +795,23 @@ pub fn external_edit(current: &str) -> std::io::Result<String> {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(default_editor);
 
-    let parts = parse_editor_command(&editor);
-    let program = parts.first().map(String::as_str).unwrap_or("vi");
-    let args = parts.get(1..).unwrap_or(&[]);
+    let (program, args) = resolve_editor_command(&editor);
 
-    let status = Command::new(program).args(args).arg(&path).status();
+    let status = Command::new(&program).args(&args).arg(&path).status();
 
     let contents = std::fs::read_to_string(&path);
     let _ = std::fs::remove_file(&path);
 
     let _ = status?;
     Ok(normalize(&contents?).trim_end().to_string())
+}
+
+fn resolve_editor_command(editor: &str) -> (std::path::PathBuf, Vec<String>) {
+    let parts = parse_editor_command(editor);
+    let program_raw = parts.first().map(String::as_str).unwrap_or("vi");
+    let program = crate::config::expand_tilde(program_raw);
+    let args = parts.get(1..).unwrap_or(&[]).to_vec();
+    (program, args)
 }
 
 fn parse_editor_command(raw: &str) -> Vec<String> {
@@ -952,5 +958,27 @@ mod tests {
             parse_editor_command(r#""C:\Program Files\Sublime Text\subl.exe" -w"#),
             vec![r"C:\Program Files\Sublime Text\subl.exe", "-w"]
         );
+    }
+
+    #[test]
+    fn resolve_editor_command_expands_tilde_on_program_path() {
+        let (plain_prog, plain_args) = resolve_editor_command("nvim -u NONE");
+        assert_eq!(plain_prog, std::path::PathBuf::from("nvim"));
+        assert_eq!(plain_args, vec!["-u", "NONE"]);
+
+        let (empty_prog, empty_args) = resolve_editor_command("   ");
+        assert_eq!(empty_prog, std::path::PathBuf::from("vi"));
+        assert!(empty_args.is_empty());
+
+        if let Some(home) = dirs::home_dir() {
+            let (prog, args) = resolve_editor_command("~/bin/my-editor --wait");
+            assert_eq!(prog, home.join("bin/my-editor"));
+            assert_eq!(args, vec!["--wait"]);
+
+            let (quoted_prog, quoted_args) =
+                resolve_editor_command(r#"'~/my tools/editor' -f --no-fork"#);
+            assert_eq!(quoted_prog, home.join("my tools/editor"));
+            assert_eq!(quoted_args, vec!["-f", "--no-fork"]);
+        }
     }
 }
