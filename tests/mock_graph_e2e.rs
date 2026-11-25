@@ -1831,7 +1831,13 @@ async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
         .as_str()
         .unwrap();
     assert!(search_remote_text.contains("Q4 Metrics & Architecture"));
-    assert!(!search_remote_text.contains("body_html"));
+    let search_remote_val: serde_json::Value = serde_json::from_str(search_remote_text).unwrap();
+    let remote_msgs = search_remote_val["messages"].as_array().unwrap();
+    assert!(!remote_msgs.is_empty());
+    assert!(remote_msgs.iter().all(|m| m.get("body_html").is_none()));
+    assert!(search_remote_val["omitted"]["fields"]
+        .as_array()
+        .is_some_and(|f| f.iter().any(|v| v.as_str() == Some("body_html"))));
 
     let search_remote_full_call = mcp::handle_rpc_line(
         &cfg,
