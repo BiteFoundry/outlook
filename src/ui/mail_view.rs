@@ -1110,10 +1110,18 @@ fn build_reader_lines_with_selected(
                         &att.content_type,
                         Some(&att.name),
                     );
+                let is_md = !is_img
+                    && !is_html
+                    && crate::ui::overlays::html_preview::is_markdown_mime_or_name(
+                        &att.content_type,
+                        Some(&att.name),
+                    );
                 let tag = if is_img {
                     "IMG"
                 } else if is_html {
                     "HTML"
+                } else if is_md {
+                    "MD"
                 } else {
                     "FILE"
                 };

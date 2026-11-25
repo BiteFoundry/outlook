@@ -259,6 +259,7 @@ pub enum UiMsg {
     },
     HtmlAttachmentLoaded {
         title: String,
+        content_type: Option<String>,
         html: String,
     },
     UpdateChecked(crate::models::UpdateCheckResult),
@@ -3303,7 +3304,11 @@ impl AppState {
             return;
         };
         let title = if att.name.trim().is_empty() {
-            "attachment.html".to_string()
+            if super::overlays::html_preview::is_markdown_mime_or_name(&att.content_type, None) {
+                "attachment.md".to_string()
+            } else {
+                "attachment.html".to_string()
+            }
         } else {
             att.name.clone()
         };
@@ -3317,12 +3322,20 @@ impl AppState {
             let cleaned: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
             match B64_STANDARD.decode(cleaned) {
                 Ok(bytes) => {
-                    let html = String::from_utf8_lossy(&bytes).into_owned();
+                    let kind = super::overlays::html_preview::classify_markup_content(
+                        Some(&att.content_type),
+                        Some(&title),
+                        &bytes,
+                    );
+                    let raw = String::from_utf8_lossy(&bytes).into_owned();
+                    let mut overlay = if kind == bitefoundry_html::ContentKind::Markdown {
+                        HtmlPreviewOverlay::new_markdown(Some(title), raw)
+                    } else {
+                        HtmlPreviewOverlay::new(Some(title), raw)
+                    };
+                    overlay.show_link_urls = ui.show_link_urls;
                     ui.close_overlays_of(OverlayKind::HtmlPreview);
-                    ui.push_overlay(Overlay::html_preview(HtmlPreviewOverlay::new(
-                        Some(title),
-                        html,
-                    )));
+                    ui.push_overlay(Overlay::html_preview(overlay));
                     return;
                 }
                 Err(err) => {
@@ -3334,12 +3347,20 @@ impl AppState {
 
         let raw_key = Self::raw_image_cache_key(&msg_id, &att.id);
         if let Some(bytes) = self.touch_raw_image_cache(&raw_key) {
-            let html = String::from_utf8_lossy(&bytes).into_owned();
+            let kind = super::overlays::html_preview::classify_markup_content(
+                Some(&att.content_type),
+                Some(&title),
+                &bytes,
+            );
+            let raw = String::from_utf8_lossy(&bytes).into_owned();
+            let mut overlay = if kind == bitefoundry_html::ContentKind::Markdown {
+                HtmlPreviewOverlay::new_markdown(Some(title), raw)
+            } else {
+                HtmlPreviewOverlay::new(Some(title), raw)
+            };
+            overlay.show_link_urls = ui.show_link_urls;
             ui.close_overlays_of(OverlayKind::HtmlPreview);
-            ui.push_overlay(Overlay::html_preview(HtmlPreviewOverlay::new(
-                Some(title),
-                html,
-            )));
+            ui.push_overlay(Overlay::html_preview(overlay));
             return;
         }
 
@@ -3348,16 +3369,29 @@ impl AppState {
             return;
         }
 
-        let task_label = format!("Load HTML {title}");
+        let task_label = format!("Load {title}");
         ui.tasks.begin(task_label.clone());
         let graph = self.graph.clone();
         let tx = self.ui_tx.clone();
+        let att_content_type = att.content_type.clone();
         tokio::spawn(async move {
-            let res: anyhow::Result<Vec<u8>> =
+            let res: anyhow::Result<(Option<String>, Vec<u8>)> =
                 if att.id.starts_with("https://") || att.id.starts_with("http://") {
                     match graph.http().get(&att.id).send().await {
                         Ok(resp) if resp.status().is_success() => {
-                            resp.bytes().await.map(|b| b.to_vec()).map_err(Into::into)
+                            let mime = resp
+                                .headers()
+                                .get(reqwest::header::CONTENT_TYPE)
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string)
+                                .or_else(|| {
+                                    (!att_content_type.trim().is_empty())
+                                        .then(|| att_content_type.clone())
+                                });
+                            resp.bytes()
+                                .await
+                                .map(|b| (mime, b.to_vec()))
+                                .map_err(Into::into)
                         }
                         Ok(resp) => Err(anyhow::anyhow!("HTTP {}", resp.status())),
                         Err(err) => Err(err.into()),
@@ -3366,13 +3400,25 @@ impl AppState {
                     graph
                         .fetch_mail_attachment_bytes(&msg_id, &att.id)
                         .await
-                        .map(|(_, _, b)| b)
+                        .map(|(_, ct, b)| {
+                            let mime = if ct.trim().is_empty() {
+                                (!att_content_type.trim().is_empty())
+                                    .then(|| att_content_type.clone())
+                            } else {
+                                Some(ct)
+                            };
+                            (mime, b)
+                        })
                 };
 
             match res {
-                Ok(bytes) => {
+                Ok((content_type, bytes)) => {
                     let html = String::from_utf8_lossy(&bytes).into_owned();
-                    let _ = tx.send(UiMsg::HtmlAttachmentLoaded { title, html });
+                    let _ = tx.send(UiMsg::HtmlAttachmentLoaded {
+                        title,
+                        content_type,
+                        html,
+                    });
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: None,
@@ -4446,12 +4492,24 @@ impl AppState {
                     ui.info("Received HTML content — opened in interactive HTML Preview");
                 }
             }
-            UiMsg::HtmlAttachmentLoaded { title, html } => {
+            UiMsg::HtmlAttachmentLoaded {
+                title,
+                content_type,
+                html,
+            } => {
+                let kind = super::overlays::html_preview::classify_markup_content(
+                    content_type.as_deref(),
+                    Some(&title),
+                    html.as_bytes(),
+                );
+                let mut overlay = if kind == bitefoundry_html::ContentKind::Markdown {
+                    HtmlPreviewOverlay::new_markdown(Some(title), html)
+                } else {
+                    HtmlPreviewOverlay::new(Some(title), html)
+                };
+                overlay.show_link_urls = ui.show_link_urls;
                 ui.close_overlays_of(OverlayKind::HtmlPreview);
-                ui.push_overlay(Overlay::html_preview(HtmlPreviewOverlay::new(
-                    Some(title),
-                    html,
-                )));
+                ui.push_overlay(Overlay::html_preview(overlay));
             }
             UiMsg::UpdateChecked(_) => {}
             UiMsg::DaemonAttached { pid, sync_busy } => {

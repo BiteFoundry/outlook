@@ -30,6 +30,7 @@ pub struct MailAttachmentRow {
     pub size: u64,
     pub is_image: bool,
     pub is_html: bool,
+    pub is_markdown: bool,
 }
 
 impl MailAttachmentRow {
@@ -38,9 +39,15 @@ impl MailAttachmentRow {
             "[IMG]"
         } else if self.is_html {
             "[HTML]"
+        } else if self.is_markdown {
+            "[MD]"
         } else {
             "[FILE]"
         }
+    }
+
+    pub fn is_markup(&self) -> bool {
+        self.is_html || self.is_markdown
     }
 
     pub fn label(&self) -> String {
@@ -71,6 +78,9 @@ pub fn rows_from_mail(msg: &MailMessage) -> Vec<MailAttachmentRow> {
                 img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name));
             let is_html = !is_image
                 && html_preview::is_html_mime_or_name(&att.content_type, Some(&att.name));
+            let is_markdown = !is_image
+                && !is_html
+                && html_preview::is_markdown_mime_or_name(&att.content_type, Some(&att.name));
             MailAttachmentRow {
                 msg_id: msg.id.clone(),
                 attach_index,
@@ -80,6 +90,7 @@ pub fn rows_from_mail(msg: &MailMessage) -> Vec<MailAttachmentRow> {
                 size: att.size,
                 is_image,
                 is_html,
+                is_markdown,
             }
         })
         .collect()
@@ -124,7 +135,7 @@ impl AttachmentsState {
             Action::Activate => {
                 let idx = self.selected.min(items.len().saturating_sub(1));
                 match items.get(idx) {
-                    Some(row) if row.is_html => {
+                    Some(row) if row.is_markup() => {
                         OverlayOutcome::CloseAndDispatch(Action::OpenMailHtmlAttachment {
                             msg_id: row.msg_id.clone(),
                             attach_index: row.attach_index,
@@ -153,7 +164,7 @@ impl AttachmentsState {
             | Action::Input('H') => {
                 let idx = self.selected.min(items.len().saturating_sub(1));
                 match items.get(idx) {
-                    Some(row) if row.is_html => {
+                    Some(row) if row.is_markup() => {
                         OverlayOutcome::CloseAndDispatch(Action::OpenMailHtmlAttachment {
                             msg_id: row.msg_id.clone(),
                             attach_index: row.attach_index,

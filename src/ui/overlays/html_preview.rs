@@ -1,13 +1,15 @@
-//! Interactive native HTML viewer modal (`H` on emails, `.html`/`.htm` attachments,
-//! or auto-routed when an image preview fetch returns HTML bytes).
+//! Interactive native HTML & Markdown viewer modal (`H` on emails, `.html`/`.htm`/`.md`
+//! attachments, or auto-routed when an image preview fetch returns HTML bytes).
 //!
-//! Backed by `bitefoundry_html::HtmlViewSession` (0 MB idle on static HTML, on-demand
+//! Backed by `bitefoundry_html::HtmlViewSession` (0 MB idle on static HTML / Markdown, on-demand
 //! sandboxed 8 MiB QuickJS-NG when `<script>` / `on*` handlers exist, dropped on close).
 
 use std::collections::HashMap;
 use std::fmt;
 
-use bitefoundry_html::{HtmlEffect, HtmlTheme, HtmlViewSession, RenderedGraphic};
+use bitefoundry_html::{
+    ContentKind, HtmlEffect, HtmlTheme, HtmlViewSession, RenderedGraphic, SourceKind,
+};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -34,10 +36,40 @@ use crate::{
 /// Returns `true` when MIME type or filename identifies HTML content.
 pub fn is_html_mime_or_name(content_type: &str, file_name: Option<&str>) -> bool {
     let mime = (!content_type.trim().is_empty()).then_some(content_type);
-    bitefoundry_html::sniff_content_kind(mime, file_name, None)
-        == bitefoundry_html::ContentKind::Html
-        || bitefoundry_html::sniff_content_kind(None, file_name, None)
-            == bitefoundry_html::ContentKind::Html
+    bitefoundry_html::sniff_content_kind(mime, file_name, None) == ContentKind::Html
+        || bitefoundry_html::sniff_content_kind(None, file_name, None) == ContentKind::Html
+}
+
+/// Returns `true` when MIME type or filename identifies Markdown content.
+pub fn is_markdown_mime_or_name(content_type: &str, file_name: Option<&str>) -> bool {
+    let mime = (!content_type.trim().is_empty()).then_some(content_type);
+    bitefoundry_html::sniff_content_kind(mime, file_name, None) == ContentKind::Markdown
+        || bitefoundry_html::sniff_content_kind(None, file_name, None) == ContentKind::Markdown
+}
+
+/// Returns `true` when MIME type or filename identifies previewable markup (HTML or Markdown).
+pub fn is_markup_mime_or_name(content_type: &str, file_name: Option<&str>) -> bool {
+    is_html_mime_or_name(content_type, file_name)
+        || is_markdown_mime_or_name(content_type, file_name)
+}
+
+/// Classifies fetched markup attachment bytes as HTML or Markdown while honoring explicit
+/// Markdown filenames when servers send `text/plain` or `application/octet-stream`.
+pub fn classify_markup_content(
+    content_type: Option<&str>,
+    file_name: Option<&str>,
+    bytes: &[u8],
+) -> ContentKind {
+    let mime = content_type.map(str::trim).filter(|s| !s.is_empty());
+    let kind = bitefoundry_html::sniff_content_kind(mime, file_name, Some(bytes));
+    if kind == ContentKind::PlainText
+        && bitefoundry_html::sniff_content_kind(None, file_name, Some(bytes))
+            == ContentKind::Markdown
+    {
+        ContentKind::Markdown
+    } else {
+        kind
+    }
 }
 
 /// Maps Outlook's active `Theme` palette onto `bitefoundry_html::HtmlTheme`.
@@ -101,8 +133,7 @@ impl fmt::Debug for HtmlPreviewOverlay {
 }
 
 impl HtmlPreviewOverlay {
-    pub fn new(title: Option<String>, raw_html: String) -> Self {
-        let mut session = HtmlViewSession::new(title, raw_html);
+    fn from_session(mut session: HtmlViewSession) -> Self {
         // Drain initial script side-effects; startup alerts are already reflected in `last_status`.
         let _ = session.take_pending_effects();
         Self {
@@ -113,6 +144,18 @@ impl HtmlPreviewOverlay {
             graphic_cache: HashMap::new(),
             graphic_cache_env: None,
         }
+    }
+
+    pub fn new(title: Option<String>, raw_html: String) -> Self {
+        Self::from_session(HtmlViewSession::new(title, raw_html))
+    }
+
+    pub fn new_markdown(title: Option<String>, raw_md: String) -> Self {
+        Self::from_session(HtmlViewSession::new_markdown(title, raw_md))
+    }
+
+    pub fn from_content(title: Option<String>, kind: ContentKind, raw: String) -> Self {
+        Self::from_session(HtmlViewSession::from_content(title, kind, raw))
     }
 
     pub fn modal_rect(area: Rect) -> Rect {
@@ -128,11 +171,15 @@ impl HtmlPreviewOverlay {
     }
 
     pub fn title_or_default(&self) -> String {
+        let fallback = match self.session.source_kind() {
+            SourceKind::Markdown => "Markdown Preview",
+            SourceKind::Html => "HTML Preview",
+        };
         self.session
             .title()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or("HTML Preview")
+            .unwrap_or(fallback)
             .to_string()
     }
 
@@ -222,7 +269,7 @@ impl HtmlPreviewOverlay {
                     OverlayOutcome::Handled
                 }
             }
-            Action::Input('m') => {
+            Action::Input('m') | Action::Input('r') => {
                 self.session.toggle_raw_mode();
                 self.session.scroll_y = 0;
                 OverlayOutcome::Handled
@@ -411,7 +458,14 @@ impl HtmlPreviewOverlay {
             )
         };
 
-        let mode_badge = if self.session.raw_mode { "Raw" } else { "HTML" };
+        let mode_badge = if self.session.raw_mode {
+            "Raw"
+        } else {
+            match self.session.source_kind() {
+                SourceKind::Markdown => "MD",
+                SourceKind::Html => "HTML",
+            }
+        };
         let js_badge = if self.session.js_active { " · JS" } else { "" };
         let ctrl_badge = if !self.session.raw_mode && control_count > 0 {
             match self.session.focused_control {
@@ -586,8 +640,12 @@ impl HtmlPreviewOverlay {
         }
 
         if lines.is_empty() {
+            let empty_msg = match self.session.source_kind() {
+                SourceKind::Markdown => " (Empty Markdown document)",
+                SourceKind::Html => " (Empty HTML document)",
+            };
             frame.render_widget(
-                Paragraph::new(Span::styled(" (Empty HTML document)", theme.muted_style())),
+                Paragraph::new(Span::styled(empty_msg, theme.muted_style())),
                 content_area,
             );
         } else {
@@ -1222,5 +1280,149 @@ mod tests {
             (pending.rect.width as usize) * (pending.rect.height as usize),
             "expected active Kitty placement cells to be marked set_skip(true)"
         );
+    }
+
+    #[tokio::test]
+    async fn md_attachment_preview_badge_routing_raw_toggle_and_serve_html() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+        let (mut app, mut ui, _ui_rx) = make_test_app_ui();
+        let md_payload = "# Title\n\n**bold** | [link](https://example.com)\n\n- [x] Ready";
+        let att_md_mime = crate::models::MailAttachment {
+            id: "att-md-1".to_string(),
+            name: "README.md".to_string(),
+            content_type: "text/markdown".to_string(),
+            size: md_payload.len() as u64,
+            is_inline: false,
+            content_id: None,
+            content_bytes_b64: Some(B64.encode(md_payload.as_bytes())),
+        };
+        let att_md_octet = crate::models::MailAttachment {
+            id: "att-md-2".to_string(),
+            name: "GUIDE.md".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            size: md_payload.len() as u64,
+            is_inline: false,
+            content_id: None,
+            content_bytes_b64: Some(B64.encode(md_payload.as_bytes())),
+        };
+        let msg = sample_html_mail(
+            "m-md-att",
+            "<p>See attached README</p>",
+            vec![att_md_mime, att_md_octet],
+        );
+
+        // Both text/markdown and application/octet-stream .md attachments show [MD]
+        let rows = crate::ui::overlays::attachments::rows_from_mail(&msg);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].is_markdown);
+        assert_eq!(rows[0].icon(), "[MD]");
+        assert!(rows[1].is_markdown);
+        assert_eq!(rows[1].icon(), "[MD]");
+
+        app.active_mail_id = Some(msg.id.clone());
+        app.mail_messages = vec![msg];
+
+        // Open Attachments overlay and press Enter -> opens HtmlPreview in Markdown mode
+        let _ = crate::ui::action::dispatch(
+            Action::OpenOverlay(crate::ui::overlays::OverlayKind::Attachments),
+            &mut app,
+            &mut ui,
+        );
+        let _ = crate::ui::action::dispatch(Action::Activate, &mut app, &mut ui);
+        assert_eq!(
+            ui.overlays.last().map(crate::ui::overlays::Overlay::kind),
+            Some(crate::ui::overlays::OverlayKind::HtmlPreview)
+        );
+
+        {
+            let Some(crate::ui::overlays::Overlay::HtmlPreview(preview)) = ui.overlays.last_mut()
+            else {
+                panic!("expected HtmlPreview overlay for README.md");
+            };
+            assert_eq!(preview.session.source_kind(), SourceKind::Markdown);
+            assert!(!preview.session.js_active);
+            assert_eq!(preview.title_or_default(), "README.md");
+
+            let rendered_screen = render_overlay_text(preview, 90, 20);
+            assert!(
+                rendered_screen.contains("Title"),
+                "expected heading text in rendered markdown:\n{rendered_screen}"
+            );
+            assert!(
+                rendered_screen.contains("bold"),
+                "expected bold text in rendered markdown:\n{rendered_screen}"
+            );
+            assert!(
+                !rendered_screen.contains("**"),
+                "rendered markdown must not leak raw **:\n{rendered_screen}"
+            );
+            assert!(
+                !rendered_screen.contains("# Title"),
+                "rendered markdown must not show raw # Title before toggle:\n{rendered_screen}"
+            );
+
+            // Pressing 'r' toggles Raw mode showing raw `# Title`
+            assert_eq!(preview.handle(&Action::Input('r')), OverlayOutcome::Handled);
+            assert!(preview.session.raw_mode);
+            let raw_screen = render_overlay_text(preview, 90, 20);
+            assert!(
+                raw_screen.contains("# Title"),
+                "expected raw '# Title' after pressing r:\n{raw_screen}"
+            );
+
+            // session.serve_html() produces standalone HTML5 document for 'o' browser preview
+            let served = preview.session.serve_html();
+            assert!(served.starts_with("<!DOCTYPE html>"));
+            assert!(served.contains("<strong>bold</strong>"));
+        }
+
+        // Verify UiMsg::HtmlAttachmentLoaded also detects ContentKind::Markdown
+        ui.overlays.clear();
+        app.handle_ui_msg(
+            &mut ui,
+            crate::ui::app::UiMsg::HtmlAttachmentLoaded {
+                title: "NOTES.md".to_string(),
+                content_type: Some("application/octet-stream".to_string()),
+                html: md_payload.to_string(),
+            },
+        );
+        let Some(crate::ui::overlays::Overlay::HtmlPreview(loaded_preview)) = ui.overlays.last()
+        else {
+            panic!("expected HtmlPreview overlay from UiMsg::HtmlAttachmentLoaded");
+        };
+        assert_eq!(loaded_preview.session.source_kind(), SourceKind::Markdown);
+        assert!(!loaded_preview.session.js_active);
+
+        // Verify inline attachment chip click routes .md through OpenMailHtmlAttachment
+        ui.overlays.clear();
+        let area = Rect::new(0, 0, 140, 32);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                crate::ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+        let chip_rect = ui
+            .hitmap
+            .region_of(HitTarget::Attachment {
+                thread_pos: 0,
+                attach_index: 1,
+            })
+            .expect("expected inline [MD GUIDE.md] chip in hitmap");
+        let _ = crate::ui::action::dispatch(
+            Action::Click {
+                column: chip_rect.x + 1,
+                row: chip_rect.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        let Some(crate::ui::overlays::Overlay::HtmlPreview(chip_preview)) = ui.overlays.last()
+        else {
+            panic!("expected clicking .md chip to open HtmlPreview");
+        };
+        assert_eq!(chip_preview.title_or_default(), "GUIDE.md");
+        assert_eq!(chip_preview.session.source_kind(), SourceKind::Markdown);
     }
 }

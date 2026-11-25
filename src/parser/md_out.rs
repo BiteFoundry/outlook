@@ -2,7 +2,20 @@
 
 use std::collections::{HashMap, HashSet};
 
+use bitefoundry_html::pulldown_cmark::{
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+};
+
 use crate::{models::InlineImageUpload, parser::html_in::normalize_content_id};
+
+const TABLE_STYLE: &str = "border-collapse:collapse;margin:8px 0;";
+const TH_STYLE: &str =
+    "border:1px solid #d0d7de;padding:4px 8px;background:#f6f8fa;font-weight:600;";
+const TD_STYLE: &str = "border:1px solid #d0d7de;padding:4px 8px;";
+const BLOCKQUOTE_STYLE: &str =
+    "border-left:3px solid #d0d7de;margin:8px 0;padding:4px 12px;color:#57606a;";
+const PRE_STYLE: &str =
+    "background:#f6f8fa;padding:8px 12px;border-radius:4px;overflow-x:auto;";
 
 /// Compiles GitHub-Flavored Markdown, inline `cid:` images, and an optional quoted reply HTML block
 /// into clean, email-client-safe HTML.
@@ -70,369 +83,275 @@ fn render_markdown_to_html(
     markdown: &str,
     cid_aliases: &HashMap<String, String>,
 ) -> (String, HashSet<String>) {
-    let normalized: std::borrow::Cow<'_, str> = if markdown.contains('\r') {
-        std::borrow::Cow::Owned(markdown.replace("\r\n", "\n"))
-    } else {
-        std::borrow::Cow::Borrowed(markdown)
-    };
-    let lines: Vec<&str> = normalized.split('\n').collect();
-    let mut blocks: Vec<String> = Vec::new();
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_GFM;
+
+    let mut out = String::with_capacity(markdown.len().saturating_mul(2));
     let mut referenced_cids: HashSet<String> = HashSet::new();
-    let mut i = 0;
+    let mut link_open_stack: Vec<bool> = Vec::new();
+    let mut image_stack: Vec<(String, String, String)> = Vec::new();
+    let mut in_code_block = false;
+    let mut code_lang: Option<String> = None;
+    let mut code_buf = String::new();
+    let mut table_alignments: Vec<Alignment> = Vec::new();
+    let mut in_table_head = false;
+    let mut cell_col: usize = 0;
 
-    while i < lines.len() {
-        let line = lines[i];
-        let trimmed = line.trim();
-
-        // Fenced code block ```lang ... ```
-        if let Some(fence_rest) = line.trim_start().strip_prefix("```") {
-            let lang = fence_rest.trim();
-            i += 1;
-            let mut code_lines = Vec::new();
-            while i < lines.len() {
-                if lines[i].trim_start().starts_with("```") {
-                    i += 1;
-                    break;
+    for event in Parser::new_ext(markdown, options) {
+        if !image_stack.is_empty() {
+            match event {
+                Event::Text(t) | Event::Code(t) => {
+                    if let Some((_, _, alt)) = image_stack.last_mut() {
+                        alt.push_str(&t);
+                    }
                 }
-                code_lines.push(lines[i]);
-                i += 1;
+                Event::SoftBreak | Event::HardBreak => {
+                    if let Some((_, _, alt)) = image_stack.last_mut() {
+                        alt.push(' ');
+                    }
+                }
+                Event::End(TagEnd::Image) => {
+                    if let Some((dest_url, title, alt)) = image_stack.pop() {
+                        if !image_stack.is_empty() {
+                            if let Some((_, _, parent_alt)) = image_stack.last_mut() {
+                                parent_alt.push_str(&alt);
+                            }
+                        } else if is_safe_image_url(&dest_url) {
+                            let resolved_src =
+                                resolve_image_src(&dest_url, cid_aliases, &mut referenced_cids);
+                            out.push_str("<img src=\"");
+                            out.push_str(&escape_html_attr(&resolved_src));
+                            out.push_str("\" alt=\"");
+                            out.push_str(&escape_html_attr(&alt));
+                            out.push('"');
+                            if !title.is_empty() {
+                                out.push_str(" title=\"");
+                                out.push_str(&escape_html_attr(&title));
+                                out.push('"');
+                            }
+                            out.push_str(" style=\"max-width:100%;height:auto;\">");
+                        } else {
+                            out.push_str(&escape_html(&alt));
+                        }
+                    }
+                }
+                Event::Start(Tag::Image {
+                    dest_url, title, ..
+                }) => {
+                    image_stack.push((dest_url.to_string(), title.to_string(), String::new()));
+                }
+                _ => {}
             }
-            let code_escaped = escape_html(&code_lines.join("\n"));
-            if lang.is_empty() {
-                blocks.push(format!("<pre><code>{code_escaped}</code></pre>"));
-            } else {
-                blocks.push(format!(
-                    "<pre><code class=\"language-{}\">{code_escaped}</code></pre>",
-                    escape_html_attr(lang)
-                ));
-            }
             continue;
         }
 
-        // Blank line separator
-        if trimmed.is_empty() {
-            i += 1;
-            continue;
-        }
-
-        // Horizontal rule
-        if is_horizontal_rule(trimmed) {
-            blocks.push("<hr>".to_string());
-            i += 1;
-            continue;
-        }
-
-        // ATX Heading: # .. ######
-        if let Some((level, heading_text)) = parse_atx_heading(line) {
-            blocks.push(format!(
-                "<h{level}>{}</h{level}>",
-                render_inline(heading_text, cid_aliases, &mut referenced_cids)
-            ));
-            i += 1;
-            continue;
-        }
-
-        // Blockquote lines starting with ">"
-        if line.starts_with("> ") || line == ">" {
-            let mut quote_lines = Vec::new();
-            while i < lines.len() && (lines[i].starts_with("> ") || lines[i] == ">") {
-                let content = lines[i]
-                    .strip_prefix("> ")
-                    .or_else(|| lines[i].strip_prefix('>'))
-                    .unwrap_or("");
-                quote_lines.push(render_inline(content, cid_aliases, &mut referenced_cids));
-                i += 1;
-            }
-            blocks.push(format!("<blockquote>{}</blockquote>", quote_lines.join("<br>")));
-            continue;
-        }
-
-        // Unordered list (- item or * item)
-        if parse_unordered_list_item(line).is_some() {
-            let mut items = Vec::new();
-            while i < lines.len() {
-                if let Some(item_text) = parse_unordered_list_item(lines[i]) {
-                    items.push(format!(
-                        "<li>{}</li>",
-                        render_inline(item_text, cid_aliases, &mut referenced_cids)
+        match event {
+            Event::Start(tag) => match tag {
+                Tag::Paragraph => out.push_str("<p>"),
+                Tag::Heading { level, .. } => {
+                    out.push_str(&format!("<h{}>", heading_level_u8(level)));
+                }
+                Tag::BlockQuote(kind) => {
+                    out.push_str(&format!("<blockquote style=\"{BLOCKQUOTE_STYLE}\">"));
+                    if let Some(alert) = kind {
+                        let label = match alert {
+                            BlockQuoteKind::Note => "Note",
+                            BlockQuoteKind::Tip => "Tip",
+                            BlockQuoteKind::Important => "Important",
+                            BlockQuoteKind::Warning => "Warning",
+                            BlockQuoteKind::Caution => "Caution",
+                        };
+                        out.push_str(&format!("<p><strong>{label}</strong></p>"));
+                    }
+                }
+                Tag::CodeBlock(kind) => {
+                    in_code_block = true;
+                    code_buf.clear();
+                    code_lang = match kind {
+                        CodeBlockKind::Fenced(info) => {
+                            let lang = info.split_whitespace().next().unwrap_or("").trim();
+                            (!lang.is_empty()).then(|| lang.to_string())
+                        }
+                        CodeBlockKind::Indented => None,
+                    };
+                }
+                Tag::List(None) => out.push_str("<ul>"),
+                Tag::List(Some(1)) => out.push_str("<ol>"),
+                Tag::List(Some(start)) => out.push_str(&format!("<ol start=\"{start}\">")),
+                Tag::Item => out.push_str("<li>"),
+                Tag::Table(alignments) => {
+                    table_alignments = alignments;
+                    in_table_head = false;
+                    cell_col = 0;
+                    out.push_str(&format!("<table style=\"{TABLE_STYLE}\">"));
+                }
+                Tag::TableHead => {
+                    in_table_head = true;
+                    cell_col = 0;
+                    out.push_str("<thead><tr>");
+                }
+                Tag::TableRow => {
+                    cell_col = 0;
+                    out.push_str("<tr>");
+                }
+                Tag::TableCell => {
+                    let tag_name = if in_table_head { "th" } else { "td" };
+                    let base_style = if in_table_head { TH_STYLE } else { TD_STYLE };
+                    let align_css = match table_alignments.get(cell_col) {
+                        Some(Alignment::Left) => "text-align:left;",
+                        Some(Alignment::Center) => "text-align:center;",
+                        Some(Alignment::Right) => "text-align:right;",
+                        _ => "",
+                    };
+                    out.push_str(&format!(
+                        "<{tag_name} style=\"{base_style}{align_css}\">"
                     ));
-                    i += 1;
+                }
+                Tag::Strong => out.push_str("<strong>"),
+                Tag::Emphasis => out.push_str("<em>"),
+                Tag::Strikethrough => out.push_str("<s>"),
+                Tag::Link {
+                    dest_url, title, ..
+                } => {
+                    if is_safe_url(&dest_url) {
+                        out.push_str("<a href=\"");
+                        out.push_str(&escape_html_attr(dest_url.trim()));
+                        out.push('"');
+                        if !title.is_empty() {
+                            out.push_str(" title=\"");
+                            out.push_str(&escape_html_attr(&title));
+                            out.push('"');
+                        }
+                        out.push('>');
+                        link_open_stack.push(true);
+                    } else {
+                        link_open_stack.push(false);
+                    }
+                }
+                Tag::Image {
+                    dest_url, title, ..
+                } => {
+                    image_stack.push((dest_url.to_string(), title.to_string(), String::new()));
+                }
+                _ => {}
+            },
+            Event::End(tag_end) => match tag_end {
+                TagEnd::Paragraph => out.push_str("</p>"),
+                TagEnd::Heading(level) => {
+                    out.push_str(&format!("</h{}>", heading_level_u8(level)));
+                }
+                TagEnd::BlockQuote(_) => out.push_str("</blockquote>"),
+                TagEnd::CodeBlock => {
+                    in_code_block = false;
+                    let trimmed = code_buf.trim_end_matches('\n');
+                    let escaped = escape_html(trimmed);
+                    if let Some(lang) = code_lang.take() {
+                        out.push_str(&format!(
+                            "<pre style=\"{PRE_STYLE}\"><code class=\"language-{}\">{escaped}</code></pre>",
+                            escape_html_attr(&lang)
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "<pre style=\"{PRE_STYLE}\"><code>{escaped}</code></pre>"
+                        ));
+                    }
+                    code_buf.clear();
+                }
+                TagEnd::List(ordered) => {
+                    out.push_str(if ordered { "</ol>" } else { "</ul>" });
+                }
+                TagEnd::Item => out.push_str("</li>"),
+                TagEnd::TableHead => {
+                    in_table_head = false;
+                    out.push_str("</tr></thead><tbody>");
+                }
+                TagEnd::TableRow => out.push_str("</tr>"),
+                TagEnd::TableCell => {
+                    out.push_str(if in_table_head { "</th>" } else { "</td>" });
+                    cell_col += 1;
+                }
+                TagEnd::Table => {
+                    out.push_str("</tbody></table>");
+                    table_alignments.clear();
+                }
+                TagEnd::Strong => out.push_str("</strong>"),
+                TagEnd::Emphasis => out.push_str("</em>"),
+                TagEnd::Strikethrough => out.push_str("</s>"),
+                TagEnd::Link => {
+                    if link_open_stack.pop().unwrap_or(false) {
+                        out.push_str("</a>");
+                    }
+                }
+                _ => {}
+            },
+            Event::Text(text) => {
+                if in_code_block {
+                    code_buf.push_str(&text);
                 } else {
-                    break;
+                    push_escaped_str(&mut out, &text);
                 }
             }
-            blocks.push(format!("<ul>{}</ul>", items.join("")));
-            continue;
-        }
-
-        // Ordered list (1. item)
-        if parse_ordered_list_item(line).is_some() {
-            let mut items = Vec::new();
-            while i < lines.len() {
-                if let Some(item_text) = parse_ordered_list_item(lines[i]) {
-                    items.push(format!(
-                        "<li>{}</li>",
-                        render_inline(item_text, cid_aliases, &mut referenced_cids)
-                    ));
-                    i += 1;
+            Event::Code(code) => {
+                out.push_str("<code>");
+                push_escaped_str(&mut out, &code);
+                out.push_str("</code>");
+            }
+            Event::Html(raw) | Event::InlineHtml(raw) => {
+                if in_code_block {
+                    code_buf.push_str(&raw);
                 } else {
-                    break;
+                    push_escaped_str(&mut out, &raw);
                 }
             }
-            blocks.push(format!("<ol>{}</ol>", items.join("")));
-            continue;
-        }
-
-        // Paragraph until blank line or another block opener
-        let mut para_lines = Vec::new();
-        while i < lines.len() {
-            let cur = lines[i];
-            let cur_trim = cur.trim();
-            if cur_trim.is_empty()
-                || cur.trim_start().starts_with("```")
-                || is_horizontal_rule(cur_trim)
-                || parse_atx_heading(cur).is_some()
-                || cur.starts_with("> ")
-                || cur == ">"
-                || parse_unordered_list_item(cur).is_some()
-                || parse_ordered_list_item(cur).is_some()
-            {
-                break;
+            Event::SoftBreak | Event::HardBreak => {
+                if in_code_block {
+                    code_buf.push('\n');
+                } else {
+                    out.push_str("<br>");
+                }
             }
-            para_lines.push(render_inline(cur, cid_aliases, &mut referenced_cids));
-            i += 1;
+            Event::Rule => out.push_str("<hr>"),
+            Event::TaskListMarker(checked) => {
+                out.push_str(if checked { "☑ " } else { "☐ " });
+            }
+            _ => {}
         }
-        if !para_lines.is_empty() {
-            blocks.push(format!("<p>{}</p>", para_lines.join("<br>")));
-        }
     }
 
-    (blocks.join(""), referenced_cids)
+    (out, referenced_cids)
 }
 
-fn is_horizontal_rule(trimmed: &str) -> bool {
-    if trimmed.len() < 3 {
-        return false;
-    }
-    let mut chars = trimmed.chars().filter(|c| !c.is_whitespace());
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !matches!(first, '-' | '*' | '_') {
-        return false;
-    }
-    let mut count = 1usize;
-    for ch in chars {
-        if ch != first {
-            return false;
-        }
-        count += 1;
-    }
-    count >= 3
-}
-
-fn parse_atx_heading(line: &str) -> Option<(u8, &str)> {
-    let trimmed = line.trim_start();
-    let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
-    if !(1..=6).contains(&hashes) {
-        return None;
-    }
-    let rest = trimmed[hashes..].strip_prefix(' ')?;
-    let content = rest.trim();
-    if content.is_empty() {
-        None
-    } else {
-        Some((hashes as u8, content))
+fn heading_level_u8(level: HeadingLevel) -> u8 {
+    match level {
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
     }
 }
 
-fn parse_unordered_list_item(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start();
-    trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))
-        .map(str::trim)
-}
-
-fn parse_ordered_list_item(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start();
-    let digits = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
-    if digits == 0 {
-        return None;
-    }
-    trimmed[digits..].strip_prefix(". ").map(str::trim)
-}
-
-fn render_inline(
-    input: &str,
+fn resolve_image_src(
+    src: &str,
     cid_aliases: &HashMap<String, String>,
     referenced_cids: &mut HashSet<String>,
 ) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut i = 0;
-    let mut no_closing_backtick = false;
-    let mut no_closing_image = false;
-    let mut no_closing_bracket = false;
-    let mut no_closing_double_star = false;
-    let mut no_closing_tilde = false;
-    let mut no_closing_star = false;
-
-    while i < input.len() {
-        let rest = &input[i..];
-
-        // Inline code: `...`
-        if !no_closing_backtick {
-            if let Some(after_tick) = rest.strip_prefix('`') {
-                if let Some(end_idx) = after_tick.find('`') {
-                    let code = &after_tick[..end_idx];
-                    out.push_str("<code>");
-                    out.push_str(&escape_html(code));
-                    out.push_str("</code>");
-                    i += 1 + end_idx + 1;
-                    continue;
-                } else {
-                    no_closing_backtick = true;
-                }
-            }
+    let trimmed = src.trim();
+    if trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("cid:") {
+        let raw_cid = normalize_content_id(&trimmed[4..]);
+        if !raw_cid.is_empty() {
+            let resolved = cid_aliases
+                .get(&raw_cid.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or(raw_cid);
+            referenced_cids.insert(resolved.to_ascii_lowercase());
+            return format!("cid:{resolved}");
         }
-
-        // Inline image: ![alt](src)
-        if !no_closing_image && rest.starts_with("![") {
-            match parse_markdown_link(&rest[1..]) {
-                Some((alt, src, consumed)) => {
-                    if is_safe_image_url(src) {
-                        let normalized_src = if src.len() >= 4 && src[..4].eq_ignore_ascii_case("cid:") {
-                            let raw_cid = normalize_content_id(&src[4..]);
-                            if !raw_cid.is_empty() {
-                                let resolved = cid_aliases
-                                    .get(&raw_cid.to_ascii_lowercase())
-                                    .cloned()
-                                    .unwrap_or(raw_cid);
-                                referenced_cids.insert(resolved.to_ascii_lowercase());
-                                format!("cid:{resolved}")
-                            } else {
-                                src.to_string()
-                            }
-                        } else {
-                            src.to_string()
-                        };
-                        out.push_str(&format!(
-                            "<img src=\"{}\" alt=\"{}\" style=\"max-width:100%;height:auto;\">",
-                            escape_html_attr(&normalized_src),
-                            escape_html_attr(alt)
-                        ));
-                        i += 1 + consumed;
-                        continue;
-                    }
-                }
-                None => {
-                    no_closing_image = true;
-                }
-            }
-        }
-
-        // Markdown link: [label](url)
-        if !no_closing_bracket && rest.starts_with('[') {
-            match parse_markdown_link(rest) {
-                Some((label, url, consumed)) => {
-                    if is_safe_url(url) {
-                        out.push_str(&format!(
-                            "<a href=\"{}\">{}</a>",
-                            escape_html_attr(url),
-                            render_inline(label, cid_aliases, referenced_cids)
-                        ));
-                        i += consumed;
-                        continue;
-                    }
-                }
-                None => {
-                    no_closing_bracket = true;
-                }
-            }
-        }
-
-        // Bold: **...**
-        if !no_closing_double_star {
-            if let Some(after_stars) = rest.strip_prefix("**") {
-                match after_stars.find("**") {
-                    Some(end_idx) => {
-                        if end_idx > 0 {
-                            let inner = &after_stars[..end_idx];
-                            out.push_str("<strong>");
-                            out.push_str(&render_inline(inner, cid_aliases, referenced_cids));
-                            out.push_str("</strong>");
-                            i += 2 + end_idx + 2;
-                            continue;
-                        }
-                    }
-                    None => {
-                        no_closing_double_star = true;
-                    }
-                }
-            }
-        }
-
-        // Strikethrough: ~~...~~
-        if !no_closing_tilde {
-            if let Some(after_tilde) = rest.strip_prefix("~~") {
-                match after_tilde.find("~~") {
-                    Some(end_idx) => {
-                        if end_idx > 0 {
-                            let inner = &after_tilde[..end_idx];
-                            out.push_str("<s>");
-                            out.push_str(&render_inline(inner, cid_aliases, referenced_cids));
-                            out.push_str("</s>");
-                            i += 2 + end_idx + 2;
-                            continue;
-                        }
-                    }
-                    None => {
-                        no_closing_tilde = true;
-                    }
-                }
-            }
-        }
-
-        // Italic: *...* (single asterisk, not **)
-        if !no_closing_star && rest.starts_with('*') && !rest.starts_with("**") {
-            match find_closing_single_asterisk(&rest[1..]) {
-                Some(end_idx) => {
-                    if end_idx > 0 {
-                        let inner = &rest[1..1 + end_idx];
-                        out.push_str("<em>");
-                        out.push_str(&render_inline(inner, cid_aliases, referenced_cids));
-                        out.push_str("</em>");
-                        i += 1 + end_idx + 1;
-                        continue;
-                    }
-                }
-                None => {
-                    no_closing_star = true;
-                }
-            }
-        }
-
-        // Escape next character literally and safely
-        let ch = rest.chars().next().unwrap();
-        push_escaped_char(&mut out, ch);
-        i += ch.len_utf8();
     }
-
-    out
-}
-
-fn parse_markdown_link(rest: &str) -> Option<(&str, &str, usize)> {
-    let after_open = rest.strip_prefix('[')?;
-    let close_bracket = after_open.find("](")?;
-    let label = &after_open[..close_bracket];
-    let after_mid = &after_open[close_bracket + 2..];
-    let close_paren = after_mid.find(')')?;
-    let url = after_mid[..close_paren].trim();
-    if url.is_empty() {
-        return None;
-    }
-    let consumed = 1 + close_bracket + 2 + close_paren + 1;
-    Some((label, url, consumed))
+    trimmed.to_string()
 }
 
 fn is_safe_url(url: &str) -> bool {
@@ -449,23 +368,6 @@ fn is_safe_image_url(url: &str) -> bool {
         || lower.starts_with("http://")
 }
 
-fn find_closing_single_asterisk(s: &str) -> Option<usize> {
-    let bytes = s.as_bytes();
-    let mut idx = 0;
-    while idx < bytes.len() {
-        if bytes[idx] == b'*' {
-            let next_is_star = idx + 1 < bytes.len() && bytes[idx + 1] == b'*';
-            if !next_is_star {
-                return Some(idx);
-            }
-            idx += 2;
-            continue;
-        }
-        idx += 1;
-    }
-    None
-}
-
 fn push_escaped_char(out: &mut String, ch: char) {
     match ch {
         '&' => out.push_str("&amp;"),
@@ -477,11 +379,15 @@ fn push_escaped_char(out: &mut String, ch: char) {
     }
 }
 
+fn push_escaped_str(out: &mut String, input: &str) {
+    for ch in input.chars() {
+        push_escaped_char(out, ch);
+    }
+}
+
 pub fn escape_html(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
-        push_escaped_char(&mut out, ch);
-    }
+    push_escaped_str(&mut out, input);
     out
 }
 
@@ -523,7 +429,8 @@ mod tests {
         assert!(html.contains("&lt;script&gt;bad&lt;/script&gt;"));
         assert!(html.contains("<ul><li>First</li><li>Second</li></ul>"));
         assert!(html.contains("<ol><li>Step one</li><li>Step two</li></ol>"));
-        assert!(html.contains("<pre><code class=\"language-rust\">let x = 1 &lt; 2;</code></pre>"));
+        assert!(html.contains("<pre style="));
+        assert!(html.contains("<code class=\"language-rust\">let x = 1 &lt; 2;</code></pre>"));
         assert!(html.contains("<img src=\"cid:chart@01\" alt=\"chart\""));
         // Unreferenced inline image is appended once, while chart@01 is not duplicated
         assert_eq!(html.matches("cid:chart@01").count(), 1);
@@ -545,5 +452,31 @@ mod tests {
         let (html, _) = render_markdown_to_html(&payload, &HashMap::new());
         assert!(html.contains("<a href=\"https://example.com\">ok</a>"));
         assert!(!html.contains("<a href=\"javascript:"));
+    }
+
+    #[test]
+    fn md_out_gfm_table_tasklist() {
+        let md = "| Service | Status |\n| :--- | ---: |\n| Mail | **Healthy** |\n| Sync | `OK` |\n\n- [x] Done\n- [ ] Pending\n\n> Quoted _summary_";
+        let html = compile_outgoing_mail_html(md, &[], None);
+
+        assert!(
+            html.contains("<table ") && html.contains("</table>"),
+            "expected styled <table> in outgoing HTML:\n{html}"
+        );
+        assert!(html.contains("<thead><tr><th "));
+        assert!(html.contains("<strong>Healthy</strong>"));
+        assert!(html.contains("<code>OK</code>"));
+        assert!(
+            html.contains("☑ Done"),
+            "expected checked tasklist glyph in outgoing HTML:\n{html}"
+        );
+        assert!(
+            html.contains("☐ Pending"),
+            "expected unchecked tasklist glyph in outgoing HTML:\n{html}"
+        );
+        assert!(
+            html.contains("<blockquote style=") && html.contains("<em>summary</em>"),
+            "expected styled <blockquote> with italic in outgoing HTML:\n{html}"
+        );
     }
 }

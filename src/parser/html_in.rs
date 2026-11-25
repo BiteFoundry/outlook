@@ -4,6 +4,10 @@ use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use bitefoundry_html::pulldown_cmark::{
+    CodeBlockKind, Event as MdEvent, HeadingLevel, Options as MdOptions, Parser as MdParser,
+    Tag as MdTag, TagEnd as MdTagEnd,
+};
 use scraper::{ElementRef, Html, Node};
 
 use crate::models::{MailAttachment, RichBlock, RichSpan, TextStyleFlags};
@@ -145,6 +149,26 @@ fn has_plain_quote_or_reply_marker(text: &str) -> bool {
     })
 }
 
+fn has_plain_markdown_syntax(text: &str) -> bool {
+    if text.contains('\n') || text.contains('\r') {
+        return true;
+    }
+    if text.bytes().any(|b| {
+        matches!(
+            b,
+            b'*' | b'_' | b'`' | b'[' | b']' | b'~' | b'#' | b'\\' | b'|' | b'>'
+        )
+    }) {
+        return true;
+    }
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("- ") || trimmed.starts_with("+ ") || trimmed.starts_with("---") {
+        return true;
+    }
+    let digits = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
+    digits > 0 && trimmed[digits..].starts_with(". ")
+}
+
 fn try_fast_path_plain_or_empty(
     html: &str,
     attachments: &[MailAttachment],
@@ -152,23 +176,19 @@ fn try_fast_path_plain_or_empty(
     if !attachments.is_empty() {
         return None;
     }
-    if html.trim().is_empty() {
+    let trimmed = html.trim();
+    if trimmed.is_empty() {
         return Some(Arc::from([]));
     }
     if !html.contains('<')
         && !html.contains('&')
         && !html.contains('\0')
         && !has_plain_quote_or_reply_marker(html)
+        && !has_plain_markdown_syntax(html)
     {
-        let collapsed = collapse_html_whitespace(html);
-        let trimmed = collapsed.trim();
-        if trimmed.is_empty() {
-            return Some(Arc::from([]));
-        }
-        return Some(Arc::from([RichBlock::Paragraph(vec![RichSpan {
-            text: trimmed.to_string(),
-            style: TextStyleFlags::default(),
-        }])]));
+        return Some(Arc::from([RichBlock::Paragraph(vec![RichSpan::plain(
+            trimmed,
+        )])]));
     }
     None
 }
@@ -513,13 +533,13 @@ impl ParserContext {
     fn parse_plain_text_lines(&mut self, text: &str) {
         let mut normal_lines: Vec<&str> = Vec::new();
         let mut quote_lines: Vec<String> = Vec::new();
+        let mut in_fence: Option<char> = None;
 
         let flush_normal = |ctx: &mut Self, buf: &mut Vec<&str>| {
             if !buf.is_empty() {
                 let joined = buf.join("\n");
-                let trimmed = joined.trim();
-                if !trimmed.is_empty() {
-                    ctx.push_block(RichBlock::Paragraph(vec![RichSpan::plain(trimmed)]));
+                if !joined.trim().is_empty() {
+                    ctx.parse_plain_markdown_segment(&joined);
                 }
                 buf.clear();
             }
@@ -527,9 +547,8 @@ impl ParserContext {
         let flush_quote = |ctx: &mut Self, buf: &mut Vec<String>| {
             if !buf.is_empty() {
                 let joined = buf.join("\n");
-                let trimmed = joined.trim();
-                if !trimmed.is_empty() {
-                    ctx.push_block(RichBlock::Quote(vec![RichSpan::plain(trimmed)]));
+                if !joined.trim().is_empty() {
+                    ctx.parse_plain_quote_segment(&joined);
                 }
                 buf.clear();
             }
@@ -537,19 +556,382 @@ impl ParserContext {
 
         for line in text.lines() {
             let trimmed_start = line.trim_start();
+            if let Some(fence_ch) = in_fence {
+                normal_lines.push(line.trim_end());
+                if trimmed_start.starts_with(if fence_ch == '`' { "```" } else { "~~~" }) {
+                    in_fence = None;
+                }
+                continue;
+            }
+
             if let Some(after_gt) = trimmed_start.strip_prefix('>') {
                 flush_normal(self, &mut normal_lines);
-                quote_lines.push(after_gt.strip_prefix(' ').unwrap_or(after_gt).trim_end().to_string());
+                quote_lines.push(
+                    after_gt
+                        .strip_prefix(' ')
+                        .unwrap_or(after_gt)
+                        .trim_end()
+                        .to_string(),
+                );
             } else if trimmed_start.is_empty() {
-                flush_normal(self, &mut normal_lines);
-                flush_quote(self, &mut quote_lines);
+                if !quote_lines.is_empty() {
+                    flush_quote(self, &mut quote_lines);
+                } else {
+                    normal_lines.push("");
+                }
             } else {
                 flush_quote(self, &mut quote_lines);
+                if trimmed_start.starts_with("```") {
+                    in_fence = Some('`');
+                } else if trimmed_start.starts_with("~~~") {
+                    in_fence = Some('~');
+                }
                 normal_lines.push(line.trim_end());
             }
         }
         flush_normal(self, &mut normal_lines);
         flush_quote(self, &mut quote_lines);
+    }
+
+    fn parse_plain_quote_segment(&mut self, segment: &str) {
+        let spans = parse_markdown_inline_spans_block(segment);
+        if !spans_are_blank(&spans) {
+            self.push_block(RichBlock::Quote(trim_spans(spans)));
+        }
+    }
+
+    fn parse_plain_markdown_segment(&mut self, segment: &str) {
+        let opts = plain_markdown_options();
+        let mut style_stack: Vec<TextStyleFlags> = vec![TextStyleFlags::default()];
+        let mut cur_spans: Vec<RichSpan> = Vec::new();
+        let mut heading_level: Option<u8> = None;
+        let mut in_code_block = false;
+        let mut code_lang: Option<String> = None;
+        let mut code_buf = String::new();
+        let mut list_items: Option<Vec<Vec<RichSpan>>> = None;
+        let mut list_depth: usize = 0;
+        let mut in_list_item = false;
+        let mut ordered_counters: Vec<Option<u64>> = Vec::new();
+        let mut blockquote_depth: usize = 0;
+        let mut quote_spans: Vec<RichSpan> = Vec::new();
+        let mut in_table_head = false;
+        let mut table_headers: Vec<Vec<RichSpan>> = Vec::new();
+        let mut table_rows: Vec<Vec<Vec<RichSpan>>> = Vec::new();
+        let mut table_cur_row: Vec<Vec<RichSpan>> = Vec::new();
+        let mut in_table_cell = false;
+
+        let flush_paragraph = |ctx: &mut Self, spans: &mut Vec<RichSpan>| {
+            let taken = std::mem::take(spans);
+            if !spans_are_blank(&taken) {
+                ctx.push_block(RichBlock::Paragraph(trim_spans(taken)));
+            }
+        };
+
+        let flush_list_item = |spans: &mut Vec<RichSpan>,
+                               items: &mut Option<Vec<Vec<RichSpan>>>,
+                               depth: usize| {
+            let taken = std::mem::take(spans);
+            if !spans_are_blank(&taken) {
+                let cleaned = if depth > 1 {
+                    trim_spans_end(taken)
+                } else {
+                    trim_spans(taken)
+                };
+                if let Some(list) = items.as_mut() {
+                    list.push(cleaned);
+                }
+            }
+        };
+
+        for event in MdParser::new_ext(segment, opts) {
+            match event {
+                MdEvent::Start(tag) => match tag {
+                    MdTag::Paragraph => {
+                        if blockquote_depth > 0 {
+                            if !quote_spans.is_empty() {
+                                push_rich_span(&mut quote_spans, "\n", &TextStyleFlags::default());
+                            }
+                        } else if in_list_item && !cur_spans.is_empty() {
+                            push_rich_span(&mut cur_spans, "\n", &TextStyleFlags::default());
+                        }
+                    }
+                    MdTag::Heading { level, .. } => {
+                        if blockquote_depth == 0 && list_depth == 0 {
+                            flush_paragraph(self, &mut cur_spans);
+                        }
+                        heading_level = Some(md_heading_level_u8(level));
+                    }
+                    MdTag::BlockQuote(_) => {
+                        if blockquote_depth == 0 && list_depth == 0 {
+                            flush_paragraph(self, &mut cur_spans);
+                        }
+                        blockquote_depth += 1;
+                    }
+                    MdTag::CodeBlock(kind) => {
+                        if blockquote_depth == 0 && list_depth == 0 {
+                            flush_paragraph(self, &mut cur_spans);
+                        }
+                        in_code_block = true;
+                        code_buf.clear();
+                        code_lang = match kind {
+                            CodeBlockKind::Fenced(info) => {
+                                non_empty(info.split_whitespace().next().unwrap_or(""))
+                            }
+                            CodeBlockKind::Indented => None,
+                        };
+                    }
+                    MdTag::List(start_num) => {
+                        if list_depth == 0 {
+                            if blockquote_depth == 0 {
+                                flush_paragraph(self, &mut cur_spans);
+                            }
+                            list_items = Some(Vec::new());
+                        } else if in_list_item {
+                            flush_list_item(&mut cur_spans, &mut list_items, list_depth);
+                        }
+                        list_depth += 1;
+                        ordered_counters.push(start_num);
+                    }
+                    MdTag::Item => {
+                        in_list_item = true;
+                        let target = if blockquote_depth > 0 {
+                            &mut quote_spans
+                        } else {
+                            &mut cur_spans
+                        };
+                        if blockquote_depth > 0 && !target.is_empty() {
+                            push_rich_span(target, "\n", &TextStyleFlags::default());
+                        }
+                        if list_depth > 1 {
+                            let indent = "  ".repeat(list_depth - 1);
+                            push_rich_span(target, &indent, &TextStyleFlags::default());
+                        }
+                        if let Some(Some(n)) = ordered_counters.last_mut() {
+                            let prefix = format!("{n}. ");
+                            *n += 1;
+                            push_rich_span(target, &prefix, &TextStyleFlags::default());
+                        } else if blockquote_depth > 0 {
+                            push_rich_span(target, "- ", &TextStyleFlags::default());
+                        }
+                    }
+                    MdTag::Table(_) => {
+                        if blockquote_depth == 0 && list_depth == 0 {
+                            flush_paragraph(self, &mut cur_spans);
+                        }
+                        table_headers.clear();
+                        table_rows.clear();
+                        table_cur_row.clear();
+                        in_table_head = false;
+                        in_table_cell = false;
+                    }
+                    MdTag::TableHead => {
+                        in_table_head = true;
+                        table_cur_row.clear();
+                    }
+                    MdTag::TableRow => {
+                        table_cur_row.clear();
+                    }
+                    MdTag::TableCell => {
+                        in_table_cell = true;
+                        cur_spans.clear();
+                    }
+                    MdTag::Strong => {
+                        let mut next = style_stack.last().cloned().unwrap_or_default();
+                        next.bold = true;
+                        style_stack.push(next);
+                    }
+                    MdTag::Emphasis => {
+                        let mut next = style_stack.last().cloned().unwrap_or_default();
+                        next.italic = true;
+                        style_stack.push(next);
+                    }
+                    MdTag::Strikethrough => {
+                        let mut next = style_stack.last().cloned().unwrap_or_default();
+                        next.strike = true;
+                        style_stack.push(next);
+                    }
+                    MdTag::Link { dest_url, .. } | MdTag::Image { dest_url, .. } => {
+                        let mut next = style_stack.last().cloned().unwrap_or_default();
+                        if let Some(url) = non_empty(&dest_url) {
+                            next.link_url = Some(url);
+                        }
+                        style_stack.push(next);
+                    }
+                    _ => {}
+                },
+                MdEvent::End(tag_end) => match tag_end {
+                    MdTagEnd::Paragraph => {
+                        if blockquote_depth == 0 && !in_list_item && !in_table_cell {
+                            flush_paragraph(self, &mut cur_spans);
+                        }
+                    }
+                    MdTagEnd::Heading(_) => {
+                        let level = heading_level.take().unwrap_or(1);
+                        if blockquote_depth == 0 && !in_list_item {
+                            let spans = std::mem::take(&mut cur_spans);
+                            if !spans_are_blank(&spans) {
+                                self.push_block(RichBlock::Heading {
+                                    level,
+                                    spans: trim_spans(spans),
+                                });
+                            }
+                        }
+                    }
+                    MdTagEnd::BlockQuote(_) => {
+                        blockquote_depth = blockquote_depth.saturating_sub(1);
+                        if blockquote_depth == 0 {
+                            let spans = std::mem::take(&mut quote_spans);
+                            if !spans_are_blank(&spans) {
+                                self.push_block(RichBlock::Quote(trim_spans(spans)));
+                            }
+                        }
+                    }
+                    MdTagEnd::CodeBlock => {
+                        in_code_block = false;
+                        let trimmed = code_buf.trim_matches(|c| c == '\r' || c == '\n');
+                        if !trimmed.is_empty() {
+                            if blockquote_depth > 0 {
+                                if !quote_spans.is_empty() {
+                                    push_rich_span(
+                                        &mut quote_spans,
+                                        "\n",
+                                        &TextStyleFlags::default(),
+                                    );
+                                }
+                                let code_style = TextStyleFlags {
+                                    code: true,
+                                    ..TextStyleFlags::default()
+                                };
+                                push_rich_span(&mut quote_spans, trimmed, &code_style);
+                            } else {
+                                self.push_block(RichBlock::CodeBlock {
+                                    lang: code_lang.take(),
+                                    code: trimmed.to_string(),
+                                });
+                            }
+                        }
+                        code_lang = None;
+                        code_buf.clear();
+                    }
+                    MdTagEnd::Item => {
+                        if blockquote_depth == 0 {
+                            flush_list_item(&mut cur_spans, &mut list_items, list_depth);
+                        }
+                        in_list_item = false;
+                    }
+                    MdTagEnd::List(_) => {
+                        ordered_counters.pop();
+                        list_depth = list_depth.saturating_sub(1);
+                        if list_depth == 0 {
+                            if let Some(items) = list_items.take() {
+                                if !items.is_empty() && blockquote_depth == 0 {
+                                    self.push_block(RichBlock::BulletList(items));
+                                }
+                            }
+                        }
+                    }
+                    MdTagEnd::TableHead => {
+                        in_table_head = false;
+                        if !table_cur_row.is_empty() {
+                            table_headers = std::mem::take(&mut table_cur_row);
+                        }
+                    }
+                    MdTagEnd::TableRow => {
+                        if !table_cur_row.is_empty() {
+                            table_rows.push(std::mem::take(&mut table_cur_row));
+                        }
+                    }
+                    MdTagEnd::TableCell => {
+                        in_table_cell = false;
+                        table_cur_row.push(trim_spans(std::mem::take(&mut cur_spans)));
+                    }
+                    MdTagEnd::Table => {
+                        if !table_headers.is_empty() || !table_rows.is_empty() {
+                            self.push_block(RichBlock::Table {
+                                headers: std::mem::take(&mut table_headers),
+                                rows: std::mem::take(&mut table_rows),
+                            });
+                        }
+                        let _ = in_table_head;
+                    }
+                    MdTagEnd::Strong
+                    | MdTagEnd::Emphasis
+                    | MdTagEnd::Strikethrough
+                    | MdTagEnd::Link
+                    | MdTagEnd::Image => {
+                        if style_stack.len() > 1 {
+                            style_stack.pop();
+                        }
+                    }
+                    _ => {}
+                },
+                MdEvent::Text(text) => {
+                    if in_code_block {
+                        code_buf.push_str(&text);
+                    } else {
+                        let style = style_stack.last().cloned().unwrap_or_default();
+                        let target = if blockquote_depth > 0 {
+                            &mut quote_spans
+                        } else {
+                            &mut cur_spans
+                        };
+                        push_rich_span(target, &text, &style);
+                    }
+                }
+                MdEvent::Code(code) => {
+                    if in_code_block {
+                        code_buf.push_str(&code);
+                    } else {
+                        let mut style = style_stack.last().cloned().unwrap_or_default();
+                        style.code = true;
+                        let target = if blockquote_depth > 0 {
+                            &mut quote_spans
+                        } else {
+                            &mut cur_spans
+                        };
+                        push_rich_span(target, &code, &style);
+                    }
+                }
+                MdEvent::SoftBreak | MdEvent::HardBreak => {
+                    if in_code_block {
+                        code_buf.push('\n');
+                    } else {
+                        let target = if blockquote_depth > 0 {
+                            &mut quote_spans
+                        } else {
+                            &mut cur_spans
+                        };
+                        push_rich_span(target, "\n", &TextStyleFlags::default());
+                    }
+                }
+                MdEvent::TaskListMarker(checked) => {
+                    let target = if blockquote_depth > 0 {
+                        &mut quote_spans
+                    } else {
+                        &mut cur_spans
+                    };
+                    push_rich_span(
+                        target,
+                        if checked { "☑ " } else { "☐ " },
+                        &TextStyleFlags::default(),
+                    );
+                }
+                MdEvent::Rule => {
+                    if blockquote_depth == 0 && list_depth == 0 {
+                        flush_paragraph(self, &mut cur_spans);
+                        self.push_block(RichBlock::Divider);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !spans_are_blank(&cur_spans) {
+            flush_paragraph(self, &mut cur_spans);
+        }
+        if !spans_are_blank(&quote_spans) {
+            self.push_block(RichBlock::Quote(trim_spans(quote_spans)));
+        }
     }
 
     fn walk_children(&mut self, parent: ElementRef<'_>, style: &TextStyleFlags) {
@@ -1545,6 +1927,172 @@ fn collapse_html_whitespace(input: &str) -> String {
     out
 }
 
+fn plain_markdown_options() -> MdOptions {
+    MdOptions::ENABLE_TABLES
+        | MdOptions::ENABLE_TASKLISTS
+        | MdOptions::ENABLE_STRIKETHROUGH
+        | MdOptions::ENABLE_GFM
+}
+
+fn md_heading_level_u8(level: HeadingLevel) -> u8 {
+    match level {
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
+    }
+}
+
+fn push_rich_span(spans: &mut Vec<RichSpan>, text: &str, style: &TextStyleFlags) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = spans.last_mut() {
+        if &last.style == style {
+            last.text.push_str(text);
+            return;
+        }
+    }
+    spans.push(RichSpan {
+        text: text.to_string(),
+        style: style.clone(),
+    });
+}
+
+fn trim_spans_end(mut spans: Vec<RichSpan>) -> Vec<RichSpan> {
+    while let Some(last) = spans.last_mut() {
+        let trimmed_len = last.text.trim_end_matches([' ', '\t', '\n', '\r']).len();
+        if trimmed_len == 0 {
+            spans.pop();
+        } else {
+            if trimmed_len < last.text.len() {
+                last.text.truncate(trimmed_len);
+            }
+            break;
+        }
+    }
+    spans
+}
+
+fn parse_markdown_inline_spans_block(segment: &str) -> Vec<RichSpan> {
+    let mut style_stack: Vec<TextStyleFlags> = vec![TextStyleFlags::default()];
+    let mut spans: Vec<RichSpan> = Vec::new();
+    let mut in_code_block = false;
+    let mut ordered_counters: Vec<Option<u64>> = Vec::new();
+
+    for event in MdParser::new_ext(segment, plain_markdown_options()) {
+        match event {
+            MdEvent::Start(tag) => match tag {
+                MdTag::Paragraph | MdTag::Heading { .. } => {
+                    if !spans.is_empty() {
+                        push_rich_span(&mut spans, "\n", &TextStyleFlags::default());
+                    }
+                    if matches!(tag, MdTag::Heading { .. }) {
+                        let mut next = style_stack.last().cloned().unwrap_or_default();
+                        next.bold = true;
+                        style_stack.push(next);
+                    }
+                }
+                MdTag::CodeBlock(_) => {
+                    if !spans.is_empty() {
+                        push_rich_span(&mut spans, "\n", &TextStyleFlags::default());
+                    }
+                    in_code_block = true;
+                }
+                MdTag::List(start_num) => {
+                    ordered_counters.push(start_num);
+                }
+                MdTag::Item => {
+                    if !spans.is_empty() {
+                        push_rich_span(&mut spans, "\n", &TextStyleFlags::default());
+                    }
+                    if let Some(Some(n)) = ordered_counters.last_mut() {
+                        let prefix = format!("{n}. ");
+                        *n += 1;
+                        push_rich_span(&mut spans, &prefix, &TextStyleFlags::default());
+                    } else {
+                        push_rich_span(&mut spans, "- ", &TextStyleFlags::default());
+                    }
+                }
+                MdTag::Strong => {
+                    let mut next = style_stack.last().cloned().unwrap_or_default();
+                    next.bold = true;
+                    style_stack.push(next);
+                }
+                MdTag::Emphasis => {
+                    let mut next = style_stack.last().cloned().unwrap_or_default();
+                    next.italic = true;
+                    style_stack.push(next);
+                }
+                MdTag::Strikethrough => {
+                    let mut next = style_stack.last().cloned().unwrap_or_default();
+                    next.strike = true;
+                    style_stack.push(next);
+                }
+                MdTag::Link { dest_url, .. } | MdTag::Image { dest_url, .. } => {
+                    let mut next = style_stack.last().cloned().unwrap_or_default();
+                    if let Some(url) = non_empty(&dest_url) {
+                        next.link_url = Some(url);
+                    }
+                    style_stack.push(next);
+                }
+                _ => {}
+            },
+            MdEvent::End(tag_end) => match tag_end {
+                MdTagEnd::CodeBlock => {
+                    in_code_block = false;
+                }
+                MdTagEnd::List(_) => {
+                    ordered_counters.pop();
+                }
+                MdTagEnd::Heading(_)
+                | MdTagEnd::Strong
+                | MdTagEnd::Emphasis
+                | MdTagEnd::Strikethrough
+                | MdTagEnd::Link
+                | MdTagEnd::Image => {
+                    if style_stack.len() > 1 {
+                        style_stack.pop();
+                    }
+                }
+                _ => {}
+            },
+            MdEvent::Text(text) => {
+                if in_code_block {
+                    let style = TextStyleFlags {
+                        code: true,
+                        ..TextStyleFlags::default()
+                    };
+                    push_rich_span(&mut spans, text.trim_end_matches('\n'), &style);
+                } else {
+                    let style = style_stack.last().cloned().unwrap_or_default();
+                    push_rich_span(&mut spans, &text, &style);
+                }
+            }
+            MdEvent::Code(code) => {
+                let mut style = style_stack.last().cloned().unwrap_or_default();
+                style.code = true;
+                push_rich_span(&mut spans, &code, &style);
+            }
+            MdEvent::SoftBreak | MdEvent::HardBreak => {
+                push_rich_span(&mut spans, "\n", &TextStyleFlags::default());
+            }
+            MdEvent::TaskListMarker(checked) => {
+                push_rich_span(
+                    &mut spans,
+                    if checked { "☑ " } else { "☐ " },
+                    &TextStyleFlags::default(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    spans
+}
+
 fn spans_are_blank(spans: &[RichSpan]) -> bool {
     spans.iter().all(|s| s.text.trim().is_empty())
 }
@@ -1934,5 +2482,71 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn plain_text_mail_preserves_newlines_and_md() {
+        let plain_md = "# Release Notes\n\nLine 1\nLine 2\n\n- **Item** with `code` and [link](https://example.com)\n- *Second* item\n\n> Quoted **important** note";
+        let blocks = parse_message_blocks(plain_md, &[]);
+
+        assert!(
+            matches!(&blocks[0], RichBlock::Heading { level: 1, spans } if spans_to_plain(spans) == "Release Notes"),
+            "expected H1 heading, got: {blocks:?}"
+        );
+        match &blocks[1] {
+            RichBlock::Paragraph(spans) => {
+                assert_eq!(spans_to_plain(spans), "Line 1\nLine 2");
+            }
+            other => panic!("expected Paragraph preserving newline, got: {other:?}"),
+        }
+        match &blocks[2] {
+            RichBlock::BulletList(items) => {
+                assert_eq!(items.len(), 2);
+                assert!(
+                    items[0].iter().any(|s| s.text == "Item" && s.style.bold),
+                    "expected bold span for **Item**, got: {:?}",
+                    items[0]
+                );
+                assert!(
+                    items[0].iter().any(|s| s.text == "code" && s.style.code),
+                    "expected inline code span, got: {:?}",
+                    items[0]
+                );
+                assert!(
+                    items[0]
+                        .iter()
+                        .any(|s| s.text == "link"
+                            && s.style.link_url.as_deref() == Some("https://example.com")),
+                    "expected link span, got: {:?}",
+                    items[0]
+                );
+                assert!(
+                    items[1].iter().any(|s| s.text == "Second" && s.style.italic),
+                    "expected italic span for *Second*, got: {:?}",
+                    items[1]
+                );
+            }
+            other => panic!("expected BulletList, got: {other:?}"),
+        }
+
+        let plain_out = blocks_to_plain(&blocks);
+        assert!(
+            !plain_out.contains("**"),
+            "raw markdown asterisks must not leak into plain output:\n{plain_out}"
+        );
+        assert!(plain_out.contains("Line 1\nLine 2"));
+
+        // Focused requirement fixture: `Line 1\n\n- **Item**`
+        let short_blocks = parse_message_blocks("Line 1\n\n- **Item**", &[]);
+        assert_eq!(short_blocks.len(), 2, "got: {short_blocks:?}");
+        assert!(matches!(&short_blocks[0], RichBlock::Paragraph(s) if spans_to_plain(s) == "Line 1"));
+        match &short_blocks[1] {
+            RichBlock::BulletList(items) => {
+                assert_eq!(items.len(), 1);
+                assert!(items[0].iter().any(|s| s.text == "Item" && s.style.bold));
+            }
+            other => panic!("expected BulletList, got: {other:?}"),
+        }
+        assert_eq!(blocks_to_plain(&short_blocks), "Line 1\n- Item");
     }
 }

@@ -945,7 +945,7 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::ServeHtmlPreview => {
             if let Some(Overlay::HtmlPreview(preview)) = ui.overlays.last() {
                 let title = preview.title_or_default();
-                let html = preview.session.raw_html().to_string();
+                let html = preview.session.serve_html();
                 app.serve_html_in_browser(ui, title, html);
             }
         }
@@ -1449,7 +1449,7 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
             if let Some(msg) = target_msg {
                 let eff = parser::effective_mail_attachments(&msg);
                 if let Some(att) = eff.get(attach_index) {
-                    if html_preview::is_html_mime_or_name(&att.content_type, Some(&att.name)) {
+                    if html_preview::is_markup_mime_or_name(&att.content_type, Some(&att.name)) {
                         return dispatch(
                             Action::OpenMailHtmlAttachment {
                                 msg_id: msg.id,
