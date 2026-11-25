@@ -5,7 +5,7 @@
 # seconds and match the published release artifact.
 FROM debian:bookworm-slim
 
-ARG OUTLOOK_VERSION=0.3.2
+ARG OUTLOOK_VERSION=0.3.3
 ARG TARGETARCH
 
 LABEL org.opencontainers.image.title="outlook" \
