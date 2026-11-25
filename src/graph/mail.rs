@@ -4,10 +4,12 @@
 use std::{
     collections::{BTreeMap, HashSet},
     path::Path,
+    sync::atomic::Ordering,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use futures::stream::{self, StreamExt};
 use scraper::{Html, Node};
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
@@ -765,7 +767,7 @@ impl GraphClient {
             })
             .collect();
 
-        if !missing_wk.is_empty() {
+        if !missing_wk.is_empty() && !self.batch_unsupported.load(Ordering::Relaxed) {
             let wk_requests: Vec<BatchSubRequest> = missing_wk
                 .iter()
                 .enumerate()
@@ -780,30 +782,36 @@ impl GraphClient {
                 })
                 .collect();
 
-            if let Ok(responses) = self.batch(&wk_requests).await {
-                for resp in responses {
-                    if resp.status != 200 {
-                        continue;
-                    }
-                    let Ok(idx) = resp.id.parse::<usize>() else {
-                        continue;
-                    };
-                    let Some(&wk) = missing_wk.get(idx) else {
-                        continue;
-                    };
-                    let Ok(raw) = serde_json::from_value::<GraphMailFolder>(resp.body) else {
-                        continue;
-                    };
-                    if let Some(existing) = folders.iter_mut().find(|f| f.id == raw.id) {
-                        existing.well_known_name = Some(wk.to_string());
-                    } else {
-                        let mut folder = raw.into_mail_folder(true, None);
-                        folder.well_known_name = Some(wk.to_string());
-                        if seen_ids.insert(folder.id.clone()) {
-                            folders.push(folder);
+            match self.batch(&wk_requests).await {
+                Ok(responses) => {
+                    for resp in responses {
+                        if resp.status != 200 {
+                            continue;
+                        }
+                        let Ok(idx) = resp.id.parse::<usize>() else {
+                            continue;
+                        };
+                        let Some(&wk) = missing_wk.get(idx) else {
+                            continue;
+                        };
+                        let Ok(raw) = serde_json::from_value::<GraphMailFolder>(resp.body) else {
+                            continue;
+                        };
+                        if let Some(existing) = folders.iter_mut().find(|f| f.id == raw.id) {
+                            existing.well_known_name = Some(wk.to_string());
+                        } else {
+                            let mut folder = raw.into_mail_folder(true, None);
+                            folder.well_known_name = Some(wk.to_string());
+                            if seen_ids.insert(folder.id.clone()) {
+                                folders.push(folder);
+                            }
                         }
                     }
                 }
+                Err(err) if is_batch_fallback_status(&err) => {
+                    self.batch_unsupported.store(true, Ordering::Relaxed);
+                }
+                Err(_) => {}
             }
         }
 
@@ -821,72 +829,53 @@ impl GraphClient {
                 break;
             }
 
-            let requests: Vec<BatchSubRequest> = frontier
-                .iter()
-                .enumerate()
-                .map(|(idx, folder_id)| BatchSubRequest {
-                    id: idx.to_string(),
-                    method: "GET".to_string(),
-                    url: format!(
-                        "/me/mailFolders/{}/childFolders?$top=100&includeHiddenFolders=false",
-                        urlencoding::encode(folder_id)
-                    ),
-                    body: None,
-                    headers: None,
-                })
-                .collect();
-
             let mut next_frontier = Vec::new();
-            match self.batch(&requests).await {
-                Ok(responses) => {
-                    let mut ordered: BTreeMap<usize, BatchSubResponse> = BTreeMap::new();
-                    for resp in responses {
-                        if let Ok(idx) = resp.id.parse::<usize>() {
-                            ordered.insert(idx, resp);
-                        }
-                    }
-                    if (0..frontier.len()).any(|idx| !ordered.contains_key(&idx)) {
-                        // Graph answered the batch without a sub-response for some parent.
-                        complete = false;
-                    }
-                    for (idx, resp) in ordered {
-                        if !(200..300).contains(&resp.status) {
-                            if resp.status != 404 {
-                                complete = false;
-                            }
-                            continue;
-                        }
-                        let Some(parent_id) = frontier.get(idx) else {
-                            continue;
-                        };
-                        let Ok(page) =
-                            serde_json::from_value::<GraphListPage<GraphMailFolder>>(resp.body)
-                        else {
-                            complete = false;
-                            continue;
-                        };
-                        if !self
-                            .collect_child_folder_page(
-                                page,
-                                parent_id,
-                                &mut seen_ids,
-                                &mut folders,
-                                &mut next_frontier,
-                            )
-                            .await
-                        {
-                            complete = false;
-                        }
-                    }
-                }
-                Err(err) if is_batch_fallback_status(&err) => {
-                    for parent_id in &frontier {
-                        let url = format!(
+            let use_parallel_fallback = if self.batch_unsupported.load(Ordering::Relaxed) {
+                true
+            } else {
+                let requests: Vec<BatchSubRequest> = frontier
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, folder_id)| BatchSubRequest {
+                        id: idx.to_string(),
+                        method: "GET".to_string(),
+                        url: format!(
                             "/me/mailFolders/{}/childFolders?$top=100&includeHiddenFolders=false",
-                            urlencoding::encode(parent_id)
-                        );
-                        if let Ok(page) = self.get_json::<GraphListPage<GraphMailFolder>>(&url).await
-                        {
+                            urlencoding::encode(folder_id)
+                        ),
+                        body: None,
+                        headers: None,
+                    })
+                    .collect();
+
+                match self.batch(&requests).await {
+                    Ok(responses) => {
+                        let mut ordered: BTreeMap<usize, BatchSubResponse> = BTreeMap::new();
+                        for resp in responses {
+                            if let Ok(idx) = resp.id.parse::<usize>() {
+                                ordered.insert(idx, resp);
+                            }
+                        }
+                        if (0..frontier.len()).any(|idx| !ordered.contains_key(&idx)) {
+                            // Graph answered the batch without a sub-response for some parent.
+                            complete = false;
+                        }
+                        for (idx, resp) in ordered {
+                            if !(200..300).contains(&resp.status) {
+                                if resp.status != 404 {
+                                    complete = false;
+                                }
+                                continue;
+                            }
+                            let Some(parent_id) = frontier.get(idx) else {
+                                continue;
+                            };
+                            let Ok(page) =
+                                serde_json::from_value::<GraphListPage<GraphMailFolder>>(resp.body)
+                            else {
+                                complete = false;
+                                continue;
+                            };
                             if !self
                                 .collect_child_folder_page(
                                     page,
@@ -899,16 +888,53 @@ impl GraphClient {
                             {
                                 complete = false;
                             }
-                        } else {
-                            complete = false;
                         }
+                        false
+                    }
+                    Err(err) if is_batch_fallback_status(&err) => {
+                        self.batch_unsupported.store(true, Ordering::Relaxed);
+                        true
+                    }
+                    Err(_) => {
+                        complete = false;
+                        next_frontier.clear();
+                        frontier.clear();
+                        break;
                     }
                 }
-                Err(_) => {
-                    complete = false;
-                    next_frontier.clear();
-                    frontier.clear();
-                    break;
+            };
+
+            if use_parallel_fallback {
+                let results: Vec<(String, Result<GraphListPage<GraphMailFolder>>)> =
+                    stream::iter(frontier.iter().cloned())
+                        .map(|parent_id| async move {
+                            let url = format!(
+                                "/me/mailFolders/{}/childFolders?$top=100&includeHiddenFolders=false",
+                                urlencoding::encode(&parent_id)
+                            );
+                            let res = self.get_json::<GraphListPage<GraphMailFolder>>(&url).await;
+                            (parent_id, res)
+                        })
+                        .buffered(4)
+                        .collect()
+                        .await;
+                for (parent_id, page_res) in results {
+                    if let Ok(page) = page_res {
+                        if !self
+                            .collect_child_folder_page(
+                                page,
+                                &parent_id,
+                                &mut seen_ids,
+                                &mut folders,
+                                &mut next_frontier,
+                            )
+                            .await
+                        {
+                            complete = false;
+                        }
+                    } else {
+                        complete = false;
+                    }
                 }
             }
 
@@ -1302,22 +1328,42 @@ impl GraphClient {
             })
             .collect();
 
-        let responses = self.batch(&requests).await?;
-        let mut by_idx: std::collections::BTreeMap<usize, MailMessage> =
-            std::collections::BTreeMap::new();
-        for resp in responses {
-            let Ok(idx) = resp.id.parse::<usize>() else {
-                continue;
-            };
-            if !(200..300).contains(&resp.status) {
-                continue;
+        let responses = if self.batch_unsupported.load(Ordering::Relaxed) {
+            None
+        } else {
+            match self.batch(&requests).await {
+                Ok(resps) => Some(resps),
+                Err(err) if is_batch_fallback_status(&err) => {
+                    self.batch_unsupported.store(true, Ordering::Relaxed);
+                    None
+                }
+                Err(err) => return Err(err),
             }
-            if let Ok(raw) = serde_json::from_value::<GraphMailMessage>(resp.body) {
-                by_idx.insert(idx, raw.into_mail_message(true));
+        };
+
+        if let Some(responses) = responses {
+            let mut by_idx: std::collections::BTreeMap<usize, MailMessage> =
+                std::collections::BTreeMap::new();
+            for resp in responses {
+                let Ok(idx) = resp.id.parse::<usize>() else {
+                    continue;
+                };
+                if !(200..300).contains(&resp.status) {
+                    continue;
+                }
+                if let Ok(raw) = serde_json::from_value::<GraphMailMessage>(resp.body) {
+                    by_idx.insert(idx, raw.into_mail_message(true));
+                }
             }
+            return Ok(by_idx.into_values().collect());
         }
 
-        Ok(by_idx.into_values().collect())
+        let results: Vec<Result<MailMessage>> = stream::iter(unique_ids)
+            .map(|id| async move { self.get_mail_message(&id).await })
+            .buffered(4)
+            .collect()
+            .await;
+        Ok(results.into_iter().filter_map(Result::ok).collect())
     }
 
     /// Sends an email via `/me/sendMail` (or draft + chunked upload session when total attachments exceed 3 MiB
@@ -1404,7 +1450,7 @@ impl GraphClient {
 
     /// Creates a new draft (`POST /me/messages`) or updates an existing draft (`PATCH /me/messages/{draft_id}`).
     pub async fn save_draft(&self, mail: &OutgoingMail) -> Result<MailMessage> {
-        self.save_draft_with_progress(mail, None, None, |_| {})
+        self.save_draft_with_progress(mail, None, None, true, |_| {})
             .await?
             .context("Graph did not return a saved draft")
     }
@@ -1414,6 +1460,7 @@ impl GraphClient {
         mail: &OutgoingMail,
         changed_fields: Option<&[&str]>,
         thread_quote_html: Option<&str>,
+        fetch_saved: bool,
         mut progress: impl FnMut(DraftSaveChange),
     ) -> Result<Option<MailMessage>> {
         let (staged, total_size, any_over_limit) = stage_file_attachments(&mail.attachments).await?;
@@ -1574,6 +1621,9 @@ impl GraphClient {
             self.upload_draft_file_attachment(&draft_id_enc, &f).await?;
             progress(DraftSaveChange::File(f.path.to_path_buf()));
         }
+        if !fetch_saved {
+            return Ok(None);
+        }
         self.get_mail_message(&draft_id).await.map(Some)
     }
 
@@ -1730,19 +1780,36 @@ impl GraphClient {
     }
 
     pub async fn set_mail_read(&self, message_id: &str, is_read: bool) -> Result<()> {
-        let path = format!("/me/messages/{}", urlencoding::encode(message_id.trim()));
-        self.patch_json(&path, &serde_json::json!({ "isRead": is_read }))
-            .await
+        self.update_mail_flags(message_id, Some(is_read), None).await
     }
 
     pub async fn set_mail_flag(&self, message_id: &str, flagged: bool) -> Result<()> {
+        self.update_mail_flags(message_id, None, Some(flagged)).await
+    }
+
+    /// Updates `isRead` and/or `flag.flagStatus` in a single Graph `PATCH /me/messages/{id}` request.
+    pub async fn update_mail_flags(
+        &self,
+        message_id: &str,
+        is_read: Option<bool>,
+        flagged: Option<bool>,
+    ) -> Result<()> {
+        let mut body = serde_json::Map::new();
+        if let Some(read_val) = is_read {
+            body.insert("isRead".into(), serde_json::Value::Bool(read_val));
+        }
+        if let Some(flag_val) = flagged {
+            let status = if flag_val { "flagged" } else { "notFlagged" };
+            body.insert(
+                "flag".into(),
+                serde_json::json!({ "flagStatus": status }),
+            );
+        }
+        if body.is_empty() {
+            return Ok(());
+        }
         let path = format!("/me/messages/{}", urlencoding::encode(message_id.trim()));
-        let status = if flagged { "flagged" } else { "notFlagged" };
-        self.patch_json(
-            &path,
-            &serde_json::json!({ "flag": { "flagStatus": status } }),
-        )
-        .await
+        self.patch_json(&path, &serde_json::Value::Object(body)).await
     }
 
     /// Moves a mail message to `destination_folder_id` (supports well-known names such as
@@ -2460,7 +2527,7 @@ pub(crate) mod tests {
         };
         let mut created = None;
         let failure = graph
-            .save_draft_with_progress(&outgoing, Some(&["body"]), None, |change| {
+            .save_draft_with_progress(&outgoing, Some(&["body"]), None, true, |change| {
                 if let DraftSaveChange::ThreadCreated { id, quoted_html } = change {
                     created = Some((id, quoted_html));
                 }
@@ -2470,7 +2537,7 @@ pub(crate) mod tests {
         let (id, quoted_html) = created.unwrap();
         outgoing.draft_id = Some(id.clone());
         let saved = graph
-            .save_draft_with_progress(&outgoing, Some(&["body"]), Some(&quoted_html), |_| {})
+            .save_draft_with_progress(&outgoing, Some(&["body"]), Some(&quoted_html), true, |_| {})
             .await
             .unwrap()
             .unwrap();
@@ -3556,5 +3623,216 @@ pub(crate) mod tests {
         let val = serde_json::to_value(&msg_same).unwrap();
         assert!(val.get("sender").is_none(), "None sender skipped on serialize");
         assert!(val.get("categories").is_none(), "empty categories skipped on serialize");
+    }
+
+    #[tokio::test]
+    async fn test_list_mail_folders_caches_batch_unsupported_and_parallelizes_fallback() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let batch_hits = Arc::new(AtomicUsize::new(0));
+        let batch_hits_srv = Arc::clone(&batch_hits);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let barrier_p1 = Arc::clone(&barrier);
+        let barrier_p2 = Arc::clone(&barrier);
+        let barrier_enabled = Arc::new(AtomicBool::new(true));
+        let en_p1 = Arc::clone(&barrier_enabled);
+        let en_p2 = Arc::clone(&barrier_enabled);
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/mailFolders",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [
+                            { "id": "f-p1", "displayName": "Inbox", "wellKnownName": "inbox", "childFolderCount": 1, "unreadItemCount": 0, "totalItemCount": 1 },
+                            { "id": "f-p2", "displayName": "Archive", "wellKnownName": "archive", "childFolderCount": 1, "unreadItemCount": 0, "totalItemCount": 1 },
+                            { "id": "f-s", "displayName": "Sent", "wellKnownName": "sentitems", "childFolderCount": 0, "unreadItemCount": 0, "totalItemCount": 0 },
+                            { "id": "f-d", "displayName": "Drafts", "wellKnownName": "drafts", "childFolderCount": 0, "unreadItemCount": 0, "totalItemCount": 0 },
+                            { "id": "f-del", "displayName": "Deleted", "wellKnownName": "deleteditems", "childFolderCount": 0, "unreadItemCount": 0, "totalItemCount": 0 },
+                            { "id": "f-j", "displayName": "Junk", "wellKnownName": "junkemail", "childFolderCount": 0, "unreadItemCount": 0, "totalItemCount": 0 }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/$batch",
+                post(move || {
+                    let hits = Arc::clone(&batch_hits_srv);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({ "error": { "code": "NotFound" } })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/f-p1/childFolders",
+                get(move || {
+                    let b = Arc::clone(&barrier_p1);
+                    let en = Arc::clone(&en_p1);
+                    async move {
+                        if en.load(Ordering::SeqCst) {
+                            b.wait().await;
+                        }
+                        Json(serde_json::json!({
+                            "value": [{ "id": "f-c1", "displayName": "Sub1", "parentFolderId": "f-p1", "childFolderCount": 0 }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/f-p2/childFolders",
+                get(move || {
+                    let b = Arc::clone(&barrier_p2);
+                    let en = Arc::clone(&en_p2);
+                    async move {
+                        if en.load(Ordering::SeqCst) {
+                            b.wait().await;
+                        }
+                        Json(serde_json::json!({
+                            "value": [{ "id": "f-c2", "displayName": "Sub2", "parentFolderId": "f-p2", "childFolderCount": 0 }]
+                        }))
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = test_graph_client(&format!("http://{addr}/v1.0"));
+
+        let (folders, complete) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.list_mail_folders_complete(),
+        )
+        .await
+        .expect("fallback childFolder GETs must run concurrently")
+        .unwrap();
+        assert!(complete);
+        assert!(folders.iter().any(|f| f.id == "f-c1"));
+        assert!(folders.iter().any(|f| f.id == "f-c2"));
+        assert_eq!(batch_hits.load(Ordering::SeqCst), 1);
+
+        // Second listing must remember batch_unsupported and make 0 $batch requests.
+        barrier_enabled.store(false, Ordering::SeqCst);
+        let (folders2, complete2) = client.list_mail_folders_complete().await.unwrap();
+        assert!(complete2);
+        assert_eq!(folders2.len(), folders.len());
+        assert_eq!(
+            batch_hits.load(Ordering::SeqCst),
+            1,
+            "second list_mail_folders_complete must skip /$batch after 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_mail_flags_combines_read_and_flag_in_single_patch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let patch_hits = Arc::new(AtomicUsize::new(0));
+        let patch_hits_srv = Arc::clone(&patch_hits);
+        let last_body = Arc::new(Mutex::new(serde_json::Value::Null));
+        let last_body_srv = Arc::clone(&last_body);
+
+        let app = Router::new().route(
+            "/v1.0/me/messages/m-flag-1",
+            patch(move |Json(body): Json<serde_json::Value>| {
+                let hits = Arc::clone(&patch_hits_srv);
+                let lb = Arc::clone(&last_body_srv);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    *lb.lock().unwrap() = body;
+                    StatusCode::OK
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = test_graph_client(&format!("http://{addr}/v1.0"));
+        client
+            .update_mail_flags("m-flag-1", Some(true), Some(true))
+            .await
+            .unwrap();
+
+        assert_eq!(patch_hits.load(Ordering::SeqCst), 1);
+        let body = last_body.lock().unwrap().clone();
+        assert_eq!(body["isRead"], serde_json::json!(true));
+        assert_eq!(body["flag"]["flagStatus"], serde_json::json!("flagged"));
+    }
+
+    #[tokio::test]
+    async fn test_save_draft_with_progress_skips_trailing_get_when_fetch_saved_false() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let patch_hits = Arc::new(AtomicUsize::new(0));
+        let patch_hits_srv = Arc::clone(&patch_hits);
+        let get_hits = Arc::new(AtomicUsize::new(0));
+        let get_hits_srv = Arc::clone(&get_hits);
+
+        let app = Router::new().route(
+            "/v1.0/me/messages/d-send-1",
+            patch(move || {
+                let hits = Arc::clone(&patch_hits_srv);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "id": "d-send-1",
+                            "subject": "Ready to send",
+                            "isDraft": true
+                        })),
+                    )
+                }
+            })
+            .get(move || {
+                let hits = Arc::clone(&get_hits_srv);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "id": "d-send-1",
+                            "subject": "Ready to send",
+                            "isDraft": true
+                        })),
+                    )
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = test_graph_client(&format!("http://{addr}/v1.0"));
+        let outgoing = OutgoingMail {
+            subject: "Ready to send".into(),
+            draft_id: Some("d-send-1".into()),
+            ..Default::default()
+        };
+        let saved = client
+            .save_draft_with_progress(&outgoing, Some(&["subject"]), None, false, |_| {})
+            .await
+            .unwrap();
+        assert!(saved.is_none());
+        assert_eq!(patch_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            get_hits.load(Ordering::SeqCst),
+            0,
+            "fetch_saved=false must skip trailing GET /me/messages/{{id}}"
+        );
     }
 }

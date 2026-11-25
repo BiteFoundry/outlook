@@ -1,11 +1,16 @@
 //! Microsoft Graph v1.0 Outlook Contacts & Organization Directory search (`/me/contacts`, `/users`).
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::atomic::Ordering};
 
 use anyhow::Result;
 use serde::Deserialize;
 
-use super::{client::GraphListPage, mail::GraphEmailAddress, GraphClient};
+use super::{
+    client::GraphListPage,
+    mail::GraphEmailAddress,
+    media::is_auth_or_forbidden_error,
+    GraphClient,
+};
 use crate::models::{ContactItem, OutgoingContact};
 
 const DIRECTORY_USER_SELECT: &str = "id,displayName,givenName,surname,mail,userPrincipalName,mobilePhone,businessPhones,companyName,jobTitle,department";
@@ -216,13 +221,14 @@ impl GraphClient {
         let q = query.trim();
         let q_lower = q.to_lowercase();
 
-        let personal = self.list_contacts(limit.max(100)).await?;
+        let (personal_res, (directory_items, directory_error)) = tokio::join!(
+            self.list_contacts(limit.max(100)),
+            self.fetch_directory_matches(q, &q_lower, limit),
+        );
+        let personal = personal_res?;
         let matching_personal = personal
             .into_iter()
             .filter(|c| q_lower.is_empty() || contact_matches_query(c, &q_lower));
-
-        let (directory_items, directory_error) =
-            self.fetch_directory_matches(q, &q_lower, limit).await;
 
         let mut merged = Vec::new();
         let mut seen_emails: HashSet<String> = HashSet::new();
@@ -267,18 +273,30 @@ impl GraphClient {
             };
         }
 
-        let escaped = query.replace('\\', "\\\\").replace('"', "\\\"");
-        let search_expr = format!("\"displayName:{escaped}\" OR \"mail:{escaped}\"");
-        let search_path = format!(
-            "/users?$top={limit}&$select={DIRECTORY_USER_SELECT}&$search={}",
-            urlencoding::encode(&search_expr)
-        );
+        let mut mark_search_unsupported = false;
+        if !self.users_search_unsupported.load(Ordering::Relaxed) {
+            let escaped = query.replace('\\', "\\\\").replace('"', "\\\"");
+            let search_expr = format!("\"displayName:{escaped}\" OR \"mail:{escaped}\"");
+            let search_path = format!(
+                "/users?$top={limit}&$select={DIRECTORY_USER_SELECT}&$search={}",
+                urlencoding::encode(&search_expr)
+            );
 
-        if let Ok(page) = self
-            .get_json_with_headers::<GraphListPage<GraphDirectoryUser>>(&search_path, &headers)
-            .await
-        {
-            return (page.value.into_iter().map(ContactItem::from).collect(), None);
+            match self
+                .get_json_with_headers::<GraphListPage<GraphDirectoryUser>>(&search_path, &headers)
+                .await
+            {
+                Ok(page) => {
+                    return (page.value.into_iter().map(ContactItem::from).collect(), None);
+                }
+                Err(err) => {
+                    // 401/403 on `/users` will also fail the fallback GET; return immediately.
+                    if is_auth_or_forbidden_error(&err) {
+                        return (Vec::new(), Some(err));
+                    }
+                    mark_search_unsupported = is_users_search_unsupported_error(&err);
+                }
+            }
         }
 
         // Graceful fallback when `$search` is unsupported; if `/users` fails, preserve the error.
@@ -288,15 +306,20 @@ impl GraphClient {
             .get_json::<GraphListPage<GraphDirectoryUser>>(&fallback_path)
             .await
         {
-            Ok(page) => (
-                page.value
-                    .into_iter()
-                    .map(ContactItem::from)
-                    .filter(|c| contact_matches_query(c, query_lower))
-                    .take(limit)
-                    .collect(),
-                None,
-            ),
+            Ok(page) => {
+                if mark_search_unsupported {
+                    self.users_search_unsupported.store(true, Ordering::Relaxed);
+                }
+                (
+                    page.value
+                        .into_iter()
+                        .map(ContactItem::from)
+                        .filter(|c| contact_matches_query(c, query_lower))
+                        .take(limit)
+                        .collect(),
+                    None,
+                )
+            }
             Err(e) => (Vec::new(), Some(e)),
         }
     }
@@ -350,6 +373,21 @@ impl GraphClient {
         let path = format!("/me/contacts/{}", urlencoding::encode(contact_id.trim()));
         self.delete_req(&path).await
     }
+}
+
+fn is_users_search_unsupported_error(err: &anyhow::Error) -> bool {
+    let lower = format!("{err:#}").to_ascii_lowercase();
+    let detail = if let Some(idx) = lower.find("graph api error (") {
+        let rest = &lower[idx..];
+        rest.split_once("): ").map(|(_, tail)| tail).unwrap_or(rest)
+    } else {
+        lower.as_str()
+    };
+    detail.contains("400")
+        || detail.contains("501")
+        || lower.contains("request_unsupportedquery")
+        || lower.contains("not supported")
+        || lower.contains("unsupported")
 }
 
 fn contact_matches_query(c: &ContactItem, q_lower: &str) -> bool {
@@ -580,5 +618,143 @@ mod tests {
             .unwrap();
         assert_eq!(fallback_res.len(), 1);
         assert_eq!(fallback_res[0].id, "c1");
+    }
+
+    #[tokio::test]
+    async fn test_search_contacts_and_directory_runs_concurrently_and_caches_unsupported_search() {
+        use std::sync::atomic::AtomicUsize;
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let barrier_contacts = Arc::clone(&barrier);
+        let barrier_users = Arc::clone(&barrier);
+        let barrier_enabled = Arc::new(AtomicBool::new(true));
+        let barrier_en_c = Arc::clone(&barrier_enabled);
+        let barrier_en_u = Arc::clone(&barrier_enabled);
+
+        let users_mode = Arc::new(AtomicUsize::new(0)); // 0=403, 1=400 on $search else 200
+        let users_mode_srv = Arc::clone(&users_mode);
+        let users_hits = Arc::new(AtomicUsize::new(0));
+        let users_hits_srv = Arc::clone(&users_hits);
+        let users_search_hits = Arc::new(AtomicUsize::new(0));
+        let users_search_hits_srv = Arc::clone(&users_search_hits);
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/contacts",
+                get(move || {
+                    let b = Arc::clone(&barrier_contacts);
+                    let en = Arc::clone(&barrier_en_c);
+                    async move {
+                        if en.load(Ordering::SeqCst) {
+                            b.wait().await;
+                        }
+                        Json(serde_json::json!({
+                            "value": [{
+                                "id": "c-p1",
+                                "displayName": "Alice Personal",
+                                "emailAddresses": [{ "address": "alice@personal.example" }]
+                            }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/users",
+                get(move |Query(params): Query<HashMap<String, String>>| {
+                    let b = Arc::clone(&barrier_users);
+                    let en = Arc::clone(&barrier_en_u);
+                    let mode = users_mode_srv.load(Ordering::SeqCst);
+                    let hits = Arc::clone(&users_hits_srv);
+                    let search_hits = Arc::clone(&users_search_hits_srv);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let has_search = params.contains_key("$search");
+                        if has_search {
+                            search_hits.fetch_add(1, Ordering::SeqCst);
+                        }
+                        if en.load(Ordering::SeqCst) {
+                            b.wait().await;
+                        }
+                        if mode == 0 {
+                            return (
+                                StatusCode::FORBIDDEN,
+                                Json(serde_json::json!({
+                                    "error": { "code": "Authorization_RequestDenied", "message": "Forbidden" }
+                                })),
+                            );
+                        }
+                        if has_search {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": { "code": "Request_UnsupportedQuery", "message": "$search not supported" }
+                                })),
+                            );
+                        }
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "value": [{
+                                    "id": "u-dir-1",
+                                    "displayName": "Alice Directory",
+                                    "mail": "alice@corp.example"
+                                }]
+                            })),
+                        )
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = test_graph_client(&format!("http://{addr}/v1.0"));
+
+        // 1. Concurrency proof via Barrier + 403 short-circuit (must NOT issue fallback GET /users).
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.search_contacts_and_directory_detailed("alice", 10),
+        )
+        .await
+        .expect("contacts and directory search must execute concurrently")
+        .unwrap();
+        assert_eq!(outcome.contacts.len(), 1);
+        assert!(outcome.directory_error.is_some());
+        assert_eq!(
+            users_hits.load(Ordering::SeqCst),
+            1,
+            "403 on /users?$search must not trigger a doomed fallback GET /users"
+        );
+
+        // 2. Unsupported $search (400) falls back to /users?$top and caches users_search_unsupported.
+        barrier_enabled.store(false, Ordering::SeqCst);
+        users_mode.store(1, Ordering::SeqCst);
+        users_hits.store(0, Ordering::SeqCst);
+        users_search_hits.store(0, Ordering::SeqCst);
+
+        let first = client
+            .search_contacts_and_directory_detailed("alice", 10)
+            .await
+            .unwrap();
+        assert_eq!(first.contacts.len(), 2);
+        assert!(first.directory_error.is_none());
+        assert_eq!(users_search_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(users_hits.load(Ordering::SeqCst), 2);
+
+        // Second search must skip $search completely (0 $search hits, 1 plain /users hit).
+        let second = client
+            .search_contacts_and_directory_detailed("alice", 10)
+            .await
+            .unwrap();
+        assert_eq!(second.contacts.len(), 2);
+        assert_eq!(
+            users_search_hits.load(Ordering::SeqCst),
+            1,
+            "subsequent search must remember users_search_unsupported and skip $search"
+        );
+        assert_eq!(users_hits.load(Ordering::SeqCst), 3);
     }
 }

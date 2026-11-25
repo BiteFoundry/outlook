@@ -3797,15 +3797,8 @@ async fn cmd_mail_mark(
         bail!("Specify at least one of --read, --unread, --flag, or --unflag.");
     }
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    if let Some(read_val) = is_read {
-        if let Err(err) = graph.set_mail_read(mail_id, read_val).await {
-            return Err(wrap_graph_permission_error(&graph, err).await);
-        }
-    }
-    if let Some(flag_val) = flagged {
-        if let Err(err) = graph.set_mail_flag(mail_id, flag_val).await {
-            return Err(wrap_graph_permission_error(&graph, err).await);
-        }
+    if let Err(err) = graph.update_mail_flags(mail_id, is_read, flagged).await {
+        return Err(wrap_graph_permission_error(&graph, err).await);
     }
     if let Some(read_val) = is_read {
         let _ = storage.set_mail_read_local(mail_id, read_val);
@@ -5064,7 +5057,39 @@ async fn cmd_sync(cfg: &AppConfig, days: i64, limit: usize, json_out: bool) -> R
         )),
     }
 
-    match crate::sync::sync_mail_folder_delta("inbox", &graph, &storage, None, false).await {
+    let todo_lists_for_tasks = match lists_res {
+        Ok(lists) => {
+            todo_list_count = lists.len();
+            storage.replace_todo_lists(&lists)?;
+            record_cli_sync_cursor(&storage, "cli:todo_lists");
+            lists
+        }
+        Err(err) => {
+            errors.push(format!(
+                "todo_lists: {:#}",
+                wrap_graph_permission_error(&graph, err).await
+            ));
+            Vec::new()
+        }
+    };
+
+    // Wave 2: overlap inbox delta with bounded-concurrent To Do task fetches across lists.
+    let (inbox_res, todo_task_results) = tokio::join!(
+        crate::sync::sync_mail_folder_delta("inbox", &graph, &storage, None, false),
+        async {
+            use futures::stream::{self, StreamExt};
+            stream::iter(todo_lists_for_tasks.iter())
+                .map(|list| {
+                    let g = &graph;
+                    async move { (list, g.list_todo_tasks_complete(&list.id, true, limit).await) }
+                })
+                .buffered(4)
+                .collect::<Vec<_>>()
+                .await
+        }
+    );
+
+    match inbox_res {
         Ok(outcome) => {
             record_cli_sync_cursor(&storage, &format!("cli:mail:{}", outcome.folder_id));
             message_count = storage
@@ -5094,30 +5119,19 @@ async fn cmd_sync(cfg: &AppConfig, days: i64, limit: usize, json_out: bool) -> R
         )),
     }
 
-    match lists_res {
-        Ok(lists) => {
-            todo_list_count = lists.len();
-            storage.replace_todo_lists(&lists)?;
-            record_cli_sync_cursor(&storage, "cli:todo_lists");
-            for list in &lists {
-                match graph.list_todo_tasks_complete(&list.id, true, limit).await {
-                    Ok((tasks, reached_end)) => {
-                        todo_task_count += tasks.len();
-                        if reached_end {
-                            let _ = storage.replace_todo_tasks_for_list(&list.id, true, &tasks);
-                        } else {
-                            let _ = storage.upsert_todo_tasks(&tasks);
-                        }
-                        record_cli_sync_cursor(&storage, &format!("cli:todo_tasks:{}", list.id));
-                    }
-                    Err(err) => errors.push(format!("todo_tasks({}): {err:#}", list.display_name)),
+    for (list, tasks_res) in todo_task_results {
+        match tasks_res {
+            Ok((tasks, reached_end)) => {
+                todo_task_count += tasks.len();
+                if reached_end {
+                    let _ = storage.replace_todo_tasks_for_list(&list.id, true, &tasks);
+                } else {
+                    let _ = storage.upsert_todo_tasks(&tasks);
                 }
+                record_cli_sync_cursor(&storage, &format!("cli:todo_tasks:{}", list.id));
             }
+            Err(err) => errors.push(format!("todo_tasks({}): {err:#}", list.display_name)),
         }
-        Err(err) => errors.push(format!(
-            "todo_lists: {:#}",
-            wrap_graph_permission_error(&graph, err).await
-        )),
     }
 
     match contacts_res {

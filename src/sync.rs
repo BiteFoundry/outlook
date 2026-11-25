@@ -15,7 +15,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{mpsc, watch, Semaphore},
     time::{self, MissedTickBehavior},
 };
 
@@ -24,7 +24,7 @@ use crate::{
     graph::GraphClient,
     models::{
         CoreEvent, MailFolder, MailMessage, NotificationCandidate, SyncCursor, TodoList,
-        POLL_RETRY_SUMMARY,
+        UserProfile, POLL_RETRY_SUMMARY,
     },
     storage::Storage,
 };
@@ -38,6 +38,8 @@ const MAX_ERROR_BACKOFF_MS: u64 = 300_000;
 const HISTORY_EOF_MARKER: &str = "__eof__";
 pub(crate) const MAIL_HISTORY_PAGE_SIZE: usize = 50;
 const INBOX_PREFETCH_UNREAD_LIMIT: usize = 5;
+const ADJACENT_PREFETCH_MAX: usize = 4;
+const LANE1_FOLDER_CONCURRENCY: usize = 4;
 
 pub(crate) struct SyncSharedState {
     epoch: Instant,
@@ -362,6 +364,7 @@ pub enum SyncCommand {
         seq: u64,
     },
     HydrateMessage { message_id: String },
+    PrefetchMessages { message_ids: Vec<String> },
     SyncCalendar,
     SyncTodo { list_id: Option<String> },
     SyncContacts,
@@ -468,6 +471,15 @@ fn pick_default_todo_list(lists: &[TodoList]) -> Option<&TodoList> {
 /// calendar window `now - 7d .. now + 30d`, contacts, and To Do lists/tasks) into SQLite.
 /// Best-effort per optional capability so missing scopes never abort bootstrap.
 pub async fn bootstrap_outlook(graph: &GraphClient, storage: &Storage) -> Result<()> {
+    bootstrap_outlook_with_profile(graph, storage).await.0
+}
+
+/// Same as `bootstrap_outlook`, returning the fetched `UserProfile` from Wave 1 so callers
+/// (such as TUI startup) do not need a redundant second `GET /me` round-trip.
+pub(crate) async fn bootstrap_outlook_with_profile(
+    graph: &GraphClient,
+    storage: &Storage,
+) -> (Result<()>, Option<UserProfile>) {
     let (start_iso, end_iso) = default_calendar_window();
     let (me_res, folders_res, events_res, contacts_res, lists_res) = tokio::join!(
         graph.get_me(),
@@ -477,66 +489,75 @@ pub async fn bootstrap_outlook(graph: &GraphClient, storage: &Storage) -> Result
         graph.list_todo_lists(),
     );
 
-    let _ = me_res;
+    let me = me_res.ok();
 
     if let Ok((folders, complete)) = folders_res {
-        run_storage(storage, move |st| st.store_mail_folder_listing(&folders, complete)).await?;
-    }
-
-    let (inbox_res, sent_res) = tokio::join!(
-        sync_mail_folder_delta("inbox", graph, storage, None, false),
-        sync_mail_folder_delta("sentitems", graph, storage, None, false),
-    );
-    inbox_res?;
-    let _ = sent_res;
-
-    if let Ok((events, reached_end)) = events_res {
-        let s_iso = start_iso.clone();
-        let e_iso = end_iso.clone();
-        let _ = run_storage(storage, move |st| {
-            if reached_end {
-                st.replace_calendar_events_in_window(&s_iso, &e_iso, &events)?;
-                Ok(())
-            } else {
-                st.upsert_calendar_events(&events)
-            }
-        })
-        .await;
-    }
-
-    if let Ok((contacts, reached_end)) = contacts_res {
-        let _ = run_storage(storage, move |st| {
-            if reached_end {
-                st.replace_personal_contacts(&contacts)
-            } else {
-                st.upsert_contacts(&contacts)
-            }
-        })
-        .await;
-    }
-
-    if let Ok(lists) = lists_res {
-        let default_list_id = pick_default_todo_list(&lists).map(|l| l.id.clone());
-        let _ = run_storage(storage, move |st| st.replace_todo_lists(&lists)).await;
-        if let Some(list_id) = default_list_id {
-            if let Ok((tasks, reached_end)) =
-                graph.list_todo_tasks_complete(&list_id, true, 100).await
-            {
-                let lid = list_id.clone();
-                let _ = run_storage(storage, move |st| {
-                    if reached_end {
-                        st.replace_todo_tasks_for_list(&lid, true, &tasks)
-                    } else {
-                        st.upsert_todo_tasks(&tasks)
-                    }
-                })
-                .await;
-            }
+        if let Err(err) =
+            run_storage(storage, move |st| st.store_mail_folder_listing(&folders, complete)).await
+        {
+            return (Err(err), me);
         }
     }
 
-    let _ = prefetch_unread_bodies("inbox", INBOX_PREFETCH_UNREAD_LIMIT, graph, storage, None).await;
-    Ok(())
+    // Wave 2: overlap Inbox delta (+ unread body prefetch), Sent Items delta,
+    // and persisting events/contacts/To Do lists + fetching default To Do tasks.
+    let inbox_branch = async {
+        let outcome = sync_mail_folder_delta("inbox", graph, storage, None, false).await?;
+        let _ =
+            prefetch_unread_bodies("inbox", INBOX_PREFETCH_UNREAD_LIMIT, graph, storage, None)
+                .await;
+        Ok::<_, anyhow::Error>(outcome)
+    };
+    let sent_branch = sync_mail_folder_delta("sentitems", graph, storage, None, false);
+    let slow_branch = async {
+        if let Ok((events, reached_end)) = events_res {
+            let s_iso = start_iso.clone();
+            let e_iso = end_iso.clone();
+            let _ = run_storage(storage, move |st| {
+                if reached_end {
+                    st.replace_calendar_events_in_window(&s_iso, &e_iso, &events)?;
+                    Ok(())
+                } else {
+                    st.upsert_calendar_events(&events)
+                }
+            })
+            .await;
+        }
+
+        if let Ok((contacts, reached_end)) = contacts_res {
+            let _ = run_storage(storage, move |st| {
+                if reached_end {
+                    st.replace_personal_contacts(&contacts)
+                } else {
+                    st.upsert_contacts(&contacts)
+                }
+            })
+            .await;
+        }
+
+        if let Ok(lists) = lists_res {
+            let default_list_id = pick_default_todo_list(&lists).map(|l| l.id.clone());
+            let _ = run_storage(storage, move |st| st.replace_todo_lists(&lists)).await;
+            if let Some(list_id) = default_list_id {
+                if let Ok((tasks, reached_end)) =
+                    graph.list_todo_tasks_complete(&list_id, true, 100).await
+                {
+                    let lid = list_id.clone();
+                    let _ = run_storage(storage, move |st| {
+                        if reached_end {
+                            st.replace_todo_tasks_for_list(&lid, true, &tasks)
+                        } else {
+                            st.upsert_todo_tasks(&tasks)
+                        }
+                    })
+                    .await;
+                }
+            }
+        }
+    };
+
+    let (inbox_res, _sent_res, _) = tokio::join!(inbox_branch, sent_branch, slow_branch);
+    (inbox_res.map(|_| ()), me)
 }
 
 /// Spawns the quiet two-lane background sync engine (Fast Interactive Lane + Background Poll Lane)
@@ -574,8 +595,11 @@ pub fn spawn_sync_engine(
     tokio::spawn(async move {
         let mut active_tick = time::interval(Duration::from_millis(active_ms));
         active_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut active_err_backoff = ErrorBackoffState::new(active_ms);
-        let mut restricted_folders: HashSet<String> = HashSet::new();
+        let folder_state = Arc::new(std::sync::Mutex::new(ActiveFolderSyncState {
+            err_backoff: ErrorBackoffState::new(active_ms),
+            restricted_folders: HashSet::new(),
+        }));
+        let folder_sem = Arc::new(Semaphore::new(LANE1_FOLDER_CONCURRENCY));
         let mut prev_focus = FocusTarget::default();
 
         // Consume initial immediate tick so startup waits for explicit bootstrap/focus.
@@ -608,8 +632,9 @@ pub fn spawn_sync_engine(
                             fast_shared.record_activity(Instant::now());
                             fast_shared.clear_auth_pause();
                             if matches!(cmd, SyncCommand::RefreshAll) {
-                                restricted_folders.clear();
-                                active_err_backoff.reset_window();
+                                let mut st = folder_state.lock().unwrap_or_else(|e| e.into_inner());
+                                st.restricted_folders.clear();
+                                st.err_backoff.reset_window();
                             }
                             let _ = bg_tx.send(cmd);
                         }
@@ -626,37 +651,39 @@ pub fn spawn_sync_engine(
                                 &in_flight_hydrations,
                             );
                         }
+                        Some(SyncCommand::PrefetchMessages { message_ids }) => {
+                            if !fast_shared.is_auth_paused(Instant::now()) {
+                                spawn_prefetch_messages(
+                                    message_ids,
+                                    &fast_graph,
+                                    &fast_storage,
+                                    &fast_event_tx,
+                                    &fast_shared,
+                                    &in_flight_hydrations,
+                                    &folder_sem,
+                                );
+                            }
+                        }
                         Some(SyncCommand::SyncFolder { folder_id }) => {
                             fast_shared.record_activity(Instant::now());
                             fast_shared.clear_auth_pause();
-                            restricted_folders.remove(&folder_id);
-                            active_err_backoff.reset_window();
-                            match sync_mail_folder_deduped(
-                                &folder_id,
+                            {
+                                let mut st = folder_state.lock().unwrap_or_else(|e| e.into_inner());
+                                st.restricted_folders.remove(&folder_id);
+                                st.err_backoff.reset_window();
+                            }
+                            spawn_folder_sync(
+                                folder_id,
+                                false,
                                 &fast_graph,
                                 &fast_storage,
                                 &fast_event_tx,
-                                false,
+                                &fast_shared,
                                 &fast_deduper,
-                                Some(dedup_window),
-                            )
-                            .await
-                            {
-                                Ok(true) => {
-                                    emit_recovered_if_needed(&mut active_err_backoff, &fast_event_tx);
-                                }
-                                Ok(false) => {}
-                                Err(err) => {
-                                    handle_quiet_mail_error(
-                                        &err,
-                                        Some(&folder_id),
-                                        &fast_shared,
-                                        &mut restricted_folders,
-                                        &mut active_err_backoff,
-                                        &fast_event_tx,
-                                    );
-                                }
-                            }
+                                dedup_window,
+                                &folder_state,
+                                &folder_sem,
+                            );
                             active_tick.reset();
                         }
                         Some(SyncCommand::LoadOlderMail {
@@ -666,32 +693,30 @@ pub fn spawn_sync_engine(
                         }) => {
                             fast_shared.record_activity(Instant::now());
                             fast_shared.clear_auth_pause();
-                            let has_more = if restricted_folders.contains(&folder_id) {
-                                None
+                            let restricted = folder_state
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .restricted_folders
+                                .contains(&folder_id);
+                            if restricted {
+                                let _ = fast_event_tx.send(CoreEvent::MailHistoryPageFinished {
+                                    folder_id,
+                                    has_more: None,
+                                    seq,
+                                });
                             } else {
-                                match load_older_mail_page(&folder_id, explicit, &fast_graph, &fast_storage).await {
-                                    Ok(has_more) => {
-                                        emit_recovered_if_needed(&mut active_err_backoff, &fast_event_tx);
-                                        Some(has_more)
-                                    }
-                                    Err(err) => {
-                                        handle_quiet_mail_error(
-                                            &err,
-                                            Some(&folder_id),
-                                            &fast_shared,
-                                            &mut restricted_folders,
-                                            &mut active_err_backoff,
-                                            &fast_event_tx,
-                                        );
-                                        None
-                                    }
-                                }
-                            };
-                            let _ = fast_event_tx.send(CoreEvent::MailHistoryPageFinished {
-                                folder_id,
-                                has_more,
-                                seq,
-                            });
+                                spawn_load_older_mail(
+                                    folder_id,
+                                    explicit,
+                                    seq,
+                                    &fast_graph,
+                                    &fast_storage,
+                                    &fast_event_tx,
+                                    &fast_shared,
+                                    &folder_state,
+                                    &folder_sem,
+                                );
+                            }
                         }
                         Some(SyncCommand::NotifyUserActivity) => {
                             fast_shared.record_activity(Instant::now());
@@ -725,33 +750,24 @@ pub fn spawn_sync_engine(
                         }
                         if focus.active_view == ActiveView::Mail {
                             if let (true, Some(fid)) = (folder_changed, focus.active_folder_id.as_deref()) {
-                                if !restricted_folders.contains(fid) {
-                                    match sync_mail_folder_deduped(
-                                        fid,
+                                let restricted = folder_state
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .restricted_folders
+                                    .contains(fid);
+                                if !restricted {
+                                    spawn_folder_sync(
+                                        fid.to_string(),
+                                        false,
                                         &fast_graph,
                                         &fast_storage,
                                         &fast_event_tx,
-                                        false,
+                                        &fast_shared,
                                         &fast_deduper,
-                                        Some(dedup_window),
-                                    )
-                                    .await
-                                    {
-                                        Ok(true) => {
-                                            emit_recovered_if_needed(&mut active_err_backoff, &fast_event_tx);
-                                        }
-                                        Ok(false) => {}
-                                        Err(err) => {
-                                            handle_quiet_mail_error(
-                                                &err,
-                                                Some(fid),
-                                                &fast_shared,
-                                                &mut restricted_folders,
-                                                &mut active_err_backoff,
-                                                &fast_event_tx,
-                                            );
-                                        }
-                                    }
+                                        dedup_window,
+                                        &folder_state,
+                                        &folder_sem,
+                                    );
                                 }
                             }
                         }
@@ -767,39 +783,28 @@ pub fn spawn_sync_engine(
                 }
                 _ = active_tick.tick() => {
                     let now = Instant::now();
-                    if !fast_shared.is_auth_paused(now)
-                        && !active_err_backoff.is_backed_off(now)
-                    {
+                    if !fast_shared.is_auth_paused(now) {
                         let focus = focus_rx.borrow().clone();
                         if focus.active_view == ActiveView::Mail {
                             if let Some(fid) = focus.active_folder_id.as_deref() {
-                                if !restricted_folders.contains(fid) {
-                                    match sync_mail_folder_deduped(
-                                        fid,
+                                let can_poll = {
+                                    let st = folder_state.lock().unwrap_or_else(|e| e.into_inner());
+                                    !st.err_backoff.is_backed_off(now)
+                                        && !st.restricted_folders.contains(fid)
+                                };
+                                if can_poll {
+                                    spawn_folder_sync(
+                                        fid.to_string(),
+                                        true,
                                         &fast_graph,
                                         &fast_storage,
                                         &fast_event_tx,
-                                        true,
+                                        &fast_shared,
                                         &fast_deduper,
-                                        Some(dedup_window),
-                                    )
-                                    .await
-                                    {
-                                        Ok(true) => {
-                                            emit_recovered_if_needed(&mut active_err_backoff, &fast_event_tx);
-                                        }
-                                        Ok(false) => {}
-                                        Err(err) => {
-                                            handle_quiet_mail_error(
-                                                &err,
-                                                Some(fid),
-                                                &fast_shared,
-                                                &mut restricted_folders,
-                                                &mut active_err_backoff,
-                                                &fast_event_tx,
-                                            );
-                                        }
-                                    }
+                                        dedup_window,
+                                        &folder_state,
+                                        &folder_sem,
+                                    );
                                 }
                             }
                         }
@@ -1039,60 +1044,93 @@ pub fn spawn_sync_engine(
                     {
                         let focus = bg_focus_rx.borrow().clone();
                         let token_fp = current_token_fingerprint(&graph).await;
-                        if focus.active_view != ActiveView::Calendar {
-                            if let Some(_slot) = try_acquire_sync_slot(
-                                &bg_deduper,
-                                "calendar",
-                                Some(dedup_window),
-                            ) {
-                                poll_calendar_quiet(
-                                    &graph,
-                                    &storage,
-                                    &event_tx,
-                                    &bg_shared,
-                                    &mut slow_err_backoff,
-                                    &mut breakers,
-                                    &token_fp,
-                                )
-                                .await;
-                            }
-                        }
-                        if focus.active_view != ActiveView::Tasks {
+                        let cal_slot = if focus.active_view != ActiveView::Calendar {
+                            try_acquire_sync_slot(&bg_deduper, "calendar", Some(dedup_window))
+                        } else {
+                            None
+                        };
+                        let todo_target = if focus.active_view != ActiveView::Tasks {
                             let target_lid = focus.active_todo_list_id.as_deref();
                             let key = resolve_todo_dedup_key(target_lid, &storage).await;
-                            if let Some(_slot) = try_acquire_sync_slot(
-                                &bg_deduper,
-                                &key,
-                                Some(dedup_window),
-                            ) {
-                                poll_todo_quiet(
-                                    target_lid,
-                                    &graph,
-                                    &storage,
-                                    &event_tx,
-                                    &bg_shared,
-                                    &mut slow_err_backoff,
-                                    &mut breakers,
-                                    &token_fp,
-                                )
-                                .await;
-                            }
-                        }
-                        if let Some(_slot) = try_acquire_sync_slot(
+                            try_acquire_sync_slot(&bg_deduper, &key, Some(dedup_window))
+                                .map(|slot| (slot, target_lid))
+                        } else {
+                            None
+                        };
+                        let contacts_slot = try_acquire_sync_slot(
                             &bg_deduper,
                             "contacts",
                             Some(DEDUP_COALESCE_WINDOW),
-                        ) {
-                            poll_contacts_quiet(
-                                &graph,
-                                &storage,
-                                &event_tx,
-                                &bg_shared,
-                                &mut slow_err_backoff,
-                                &mut breakers,
-                                &token_fp,
-                            )
-                            .await;
+                        );
+
+                        let ran_any =
+                            cal_slot.is_some() || todo_target.is_some() || contacts_slot.is_some();
+                        if ran_any {
+                            let mut cal_backoff = ErrorBackoffState::new(calendar_ms);
+                            let mut todo_backoff = ErrorBackoffState::new(calendar_ms);
+                            let mut contacts_backoff = ErrorBackoffState::new(calendar_ms);
+                            let mut cal_disabled = breakers.calendar_disabled.take();
+                            let mut todo_disabled = breakers.todo_disabled.take();
+                            let mut contacts_disabled = breakers.contacts_disabled.take();
+
+                            tokio::join!(
+                                async {
+                                    if let Some(_slot) = cal_slot {
+                                        poll_calendar_with_flag(
+                                            &graph,
+                                            &storage,
+                                            &event_tx,
+                                            &bg_shared,
+                                            &mut cal_backoff,
+                                            &mut cal_disabled,
+                                            &token_fp,
+                                        )
+                                        .await;
+                                    }
+                                },
+                                async {
+                                    if let Some((_slot, target_lid)) = todo_target {
+                                        poll_todo_with_flag(
+                                            target_lid,
+                                            &graph,
+                                            &storage,
+                                            &event_tx,
+                                            &bg_shared,
+                                            &mut todo_backoff,
+                                            &mut todo_disabled,
+                                            &token_fp,
+                                        )
+                                        .await;
+                                    }
+                                },
+                                async {
+                                    if let Some(_slot) = contacts_slot {
+                                        poll_contacts_with_flag(
+                                            &graph,
+                                            &storage,
+                                            &event_tx,
+                                            &bg_shared,
+                                            &mut contacts_backoff,
+                                            &mut contacts_disabled,
+                                            &token_fp,
+                                        )
+                                        .await;
+                                    }
+                                },
+                            );
+
+                            breakers.calendar_disabled = cal_disabled;
+                            breakers.todo_disabled = todo_disabled;
+                            breakers.contacts_disabled = contacts_disabled;
+
+                            if cal_backoff.is_degraded()
+                                || todo_backoff.is_degraded()
+                                || contacts_backoff.is_degraded()
+                            {
+                                slow_err_backoff.record_transient_failure(Instant::now());
+                            } else {
+                                emit_recovered_if_needed(&mut slow_err_backoff, &event_tx);
+                            }
                         }
                     }
                 }
@@ -1158,6 +1196,233 @@ impl Drop for InFlightHydrationGuard {
         let mut guard = self.set.lock().unwrap_or_else(|e| e.into_inner());
         guard.remove(&self.key);
     }
+}
+
+struct ActiveFolderSyncState {
+    err_backoff: ErrorBackoffState,
+    restricted_folders: HashSet<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_folder_sync(
+    folder_id: String,
+    is_periodic: bool,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    shared: &Arc<SyncSharedState>,
+    deduper: &Arc<std::sync::Mutex<SyncDeduper>>,
+    dedup_window: Duration,
+    folder_state: &Arc<std::sync::Mutex<ActiveFolderSyncState>>,
+    sem: &Arc<Semaphore>,
+) {
+    let graph = graph.clone();
+    let storage = storage.clone();
+    let event_tx = event_tx.clone();
+    let shared = Arc::clone(shared);
+    let deduper = Arc::clone(deduper);
+    let folder_state = Arc::clone(folder_state);
+    let sem = Arc::clone(sem);
+    tokio::spawn(async move {
+        let Ok(_permit) = sem.acquire_owned().await else {
+            return;
+        };
+        match sync_mail_folder_deduped(
+            &folder_id,
+            &graph,
+            &storage,
+            &event_tx,
+            is_periodic,
+            &deduper,
+            Some(dedup_window),
+        )
+        .await
+        {
+            Ok(true) => {
+                let mut st = folder_state.lock().unwrap_or_else(|e| e.into_inner());
+                emit_recovered_if_needed(&mut st.err_backoff, &event_tx);
+            }
+            Ok(false) => {}
+            Err(err) => {
+                let mut st = folder_state.lock().unwrap_or_else(|e| e.into_inner());
+                let ActiveFolderSyncState {
+                    err_backoff,
+                    restricted_folders,
+                } = &mut *st;
+                handle_quiet_mail_error(
+                    &err,
+                    Some(&folder_id),
+                    &shared,
+                    restricted_folders,
+                    err_backoff,
+                    &event_tx,
+                );
+            }
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_load_older_mail(
+    folder_id: String,
+    explicit: bool,
+    seq: u64,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    shared: &Arc<SyncSharedState>,
+    folder_state: &Arc<std::sync::Mutex<ActiveFolderSyncState>>,
+    sem: &Arc<Semaphore>,
+) {
+    let graph = graph.clone();
+    let storage = storage.clone();
+    let event_tx = event_tx.clone();
+    let shared = Arc::clone(shared);
+    let folder_state = Arc::clone(folder_state);
+    let sem = Arc::clone(sem);
+    tokio::spawn(async move {
+        let Ok(_permit) = sem.acquire_owned().await else {
+            return;
+        };
+        let has_more = match load_older_mail_page(&folder_id, explicit, &graph, &storage).await {
+            Ok(has_more) => {
+                let mut st = folder_state.lock().unwrap_or_else(|e| e.into_inner());
+                emit_recovered_if_needed(&mut st.err_backoff, &event_tx);
+                Some(has_more)
+            }
+            Err(err) => {
+                let mut st = folder_state.lock().unwrap_or_else(|e| e.into_inner());
+                let ActiveFolderSyncState {
+                    err_backoff,
+                    restricted_folders,
+                } = &mut *st;
+                handle_quiet_mail_error(
+                    &err,
+                    Some(&folder_id),
+                    &shared,
+                    restricted_folders,
+                    err_backoff,
+                    &event_tx,
+                );
+                None
+            }
+        };
+        let _ = event_tx.send(CoreEvent::MailHistoryPageFinished {
+            folder_id,
+            has_more,
+            seq,
+        });
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_prefetch_messages(
+    message_ids: Vec<String>,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    shared: &Arc<SyncSharedState>,
+    in_flight: &Arc<std::sync::Mutex<HashSet<String>>>,
+    sem: &Arc<Semaphore>,
+) {
+    let mut unique = Vec::new();
+    let mut seen = HashSet::new();
+    for id in message_ids {
+        let trimmed = id.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+            unique.push(trimmed.to_string());
+            if unique.len() >= ADJACENT_PREFETCH_MAX {
+                break;
+            }
+        }
+    }
+    if unique.is_empty() {
+        return;
+    }
+
+    let graph = graph.clone();
+    let storage = storage.clone();
+    let event_tx = event_tx.clone();
+    let shared = Arc::clone(shared);
+    let in_flight = Arc::clone(in_flight);
+    let sem = Arc::clone(sem);
+    tokio::spawn(async move {
+        let Ok(_permit) = sem.acquire_owned().await else {
+            return;
+        };
+        if shared.is_auth_paused(Instant::now()) {
+            return;
+        }
+        let uncached: Vec<String> = match run_storage(&storage, move |st| {
+            let mut needed = Vec::new();
+            for id in unique {
+                let loaded = st
+                    .get_mail_message(&id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|m| m.body_loaded);
+                if !loaded {
+                    needed.push(id);
+                }
+            }
+            Ok(needed)
+        })
+        .await
+        {
+            Ok(ids) => ids,
+            Err(_) => return,
+        };
+        if uncached.is_empty() {
+            return;
+        }
+
+        let mut guards = Vec::with_capacity(uncached.len());
+        let mut to_fetch = Vec::with_capacity(uncached.len());
+        {
+            let mut set = in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            for id in uncached {
+                if set.insert(id.clone()) {
+                    to_fetch.push(id.clone());
+                    guards.push(InFlightHydrationGuard {
+                        key: id,
+                        set: Arc::clone(&in_flight),
+                    });
+                }
+            }
+        }
+        if to_fetch.is_empty() {
+            return;
+        }
+        let _guards = guards;
+
+        match graph.batch_get_mail_messages(&to_fetch).await {
+            Ok(mut hydrated) => {
+                if hydrated.is_empty() {
+                    return;
+                }
+                for msg in &mut hydrated {
+                    msg.body_loaded = true;
+                }
+                let to_store = hydrated.clone();
+                if run_storage(&storage, move |st| {
+                    st.upsert_mail_messages(&to_store)?;
+                    Ok(())
+                })
+                .await
+                .is_ok()
+                {
+                    for msg in hydrated {
+                        let _ = event_tx.send(CoreEvent::MailMessageHydrated(Box::new(msg)));
+                    }
+                }
+            }
+            Err(err) => {
+                if classify_sync_error(&err) == SyncErrorKind::Unauthorized401 {
+                    shared.pause_auth(Instant::now(), Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS));
+                }
+            }
+        }
+    });
 }
 
 fn spawn_hydrate_message(
@@ -1983,25 +2248,50 @@ async fn poll_mail_lane2_quiet_with_dedup(
     sync_inbox: bool,
     deduper: Option<&Arc<std::sync::Mutex<SyncDeduper>>>,
 ) {
-    let folders_res = poll_mail_folders_quiet(graph, storage, event_tx, last_folders).await;
-    let inbox_res = if sync_inbox {
-        if let Some(d) = deduper {
-            sync_mail_folder_deduped(
-                "inbox",
-                graph,
-                storage,
-                event_tx,
-                true,
-                d,
-                Some(DEDUP_COALESCE_WINDOW),
-            )
-            .await
-            .map(|_| ())
-        } else {
-            sync_mail_folder("inbox", graph, storage, event_tx, true).await
-        }
+    let (folders_res, inbox_res) = if sync_inbox && last_folders.is_some() {
+        let inbox_fut = async {
+            if let Some(d) = deduper {
+                sync_mail_folder_deduped(
+                    "inbox",
+                    graph,
+                    storage,
+                    event_tx,
+                    true,
+                    d,
+                    Some(DEDUP_COALESCE_WINDOW),
+                )
+                .await
+                .map(|_| ())
+            } else {
+                sync_mail_folder("inbox", graph, storage, event_tx, true).await
+            }
+        };
+        tokio::join!(
+            poll_mail_folders_quiet(graph, storage, event_tx, last_folders),
+            inbox_fut,
+        )
     } else {
-        Ok(())
+        let folders_res = poll_mail_folders_quiet(graph, storage, event_tx, last_folders).await;
+        let inbox_res = if sync_inbox {
+            if let Some(d) = deduper {
+                sync_mail_folder_deduped(
+                    "inbox",
+                    graph,
+                    storage,
+                    event_tx,
+                    true,
+                    d,
+                    Some(DEDUP_COALESCE_WINDOW),
+                )
+                .await
+                .map(|_| ())
+            } else {
+                sync_mail_folder("inbox", graph, storage, event_tx, true).await
+            }
+        } else {
+            Ok(())
+        };
+        (folders_res, inbox_res)
     };
 
     if let Err(err) = folders_res.and(inbox_res) {
@@ -2385,7 +2675,9 @@ async fn poll_contacts_with_flag(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_bootstrap_core(
+    focus: Option<&FocusTarget>,
     graph: &GraphClient,
     storage: &Storage,
     event_tx: &mpsc::UnboundedSender<CoreEvent>,
@@ -2399,36 +2691,19 @@ async fn run_bootstrap_core(
         summary: "Syncing Outlook...".to_string(),
     });
 
-    if let Ok(profile) = graph.get_me().await {
-        let _ = event_tx.send(CoreEvent::ProfileLoaded(profile));
-    }
-
     let token_fp = current_token_fingerprint(graph).await;
-    let folders_res = poll_mail_folders_quiet(graph, storage, event_tx, last_folders).await;
-    let inbox_res = sync_mail_folder("inbox", graph, storage, event_tx, false).await;
-
-    let mail_ok = match folders_res.and(inbox_res) {
-        Ok(()) => {
-            mail_err_backoff.record_success();
-            let _ = prefetch_unread_bodies(
-                "inbox",
-                INBOX_PREFETCH_UNREAD_LIMIT,
-                graph,
-                storage,
-                Some(event_tx),
-            )
-            .await;
-            true
-        }
-        Err(err) => {
-            if classify_sync_error(&err) == SyncErrorKind::Unauthorized401 {
-                shared.pause_auth(Instant::now(), Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS));
-            } else {
-                mail_err_backoff.record_transient_failure(Instant::now());
-            }
-            false
-        }
-    };
+    let active_fid = focus
+        .and_then(|f| f.active_folder_id.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let active_mid = focus
+        .and_then(|f| f.active_message_id.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let target_todo_list_id = focus
+        .and_then(|f| f.active_todo_list_id.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     let mut cal_backoff = ErrorBackoffState::new(60_000);
     let mut todo_backoff = ErrorBackoffState::new(60_000);
@@ -2437,7 +2712,60 @@ async fn run_bootstrap_core(
     let mut todo_disabled = breakers.todo_disabled.take();
     let mut contacts_disabled = breakers.contacts_disabled.take();
 
-    tokio::join!(
+    let profile_fut = async {
+        if let Ok(profile) = graph.get_me().await {
+            let _ = event_tx.send(CoreEvent::ProfileLoaded(profile));
+        }
+    };
+
+    let mail_fut = async {
+        let folders_res = poll_mail_folders_quiet(graph, storage, event_tx, last_folders).await;
+        let extra_fid = if let Some(fid) = active_fid {
+            let (inbox_real, _) = resolve_canonical_folder_id("inbox", graph, storage).await;
+            if !fid.eq_ignore_ascii_case("inbox") && fid != inbox_real {
+                Some(fid)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let folders_ok = folders_res.is_ok();
+        let inbox_branch = async {
+            let inbox_res = sync_mail_folder("inbox", graph, storage, event_tx, false).await;
+            if folders_ok && inbox_res.is_ok() {
+                let _ = prefetch_unread_bodies(
+                    "inbox",
+                    INBOX_PREFETCH_UNREAD_LIMIT,
+                    graph,
+                    storage,
+                    Some(event_tx),
+                )
+                .await;
+            }
+            inbox_res
+        };
+        let active_folder_branch = async {
+            if let Some(fid) = extra_fid {
+                let _ = sync_mail_folder(fid, graph, storage, event_tx, false).await;
+            }
+        };
+
+        let (inbox_res, _) = tokio::join!(inbox_branch, active_folder_branch);
+        folders_res.and(inbox_res)
+    };
+
+    let active_msg_fut = async {
+        if let Some(mid) = active_mid {
+            let _ = hydrate_message_if_needed(mid, true, graph, storage, event_tx).await;
+        }
+    };
+
+    let (_, mail_res, _, _, _, _) = tokio::join!(
+        profile_fut,
+        mail_fut,
+        active_msg_fut,
         poll_calendar_with_flag(
             graph,
             storage,
@@ -2448,7 +2776,7 @@ async fn run_bootstrap_core(
             &token_fp,
         ),
         poll_todo_with_flag(
-            None,
+            target_todo_list_id,
             graph,
             storage,
             event_tx,
@@ -2467,11 +2795,25 @@ async fn run_bootstrap_core(
             &token_fp,
         ),
     );
+
     breakers.calendar_disabled = cal_disabled;
     breakers.todo_disabled = todo_disabled;
     breakers.contacts_disabled = contacts_disabled;
 
-    mail_ok
+    match mail_res {
+        Ok(()) => {
+            mail_err_backoff.record_success();
+            true
+        }
+        Err(err) => {
+            if classify_sync_error(&err) == SyncErrorKind::Unauthorized401 {
+                shared.pause_auth(Instant::now(), Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS));
+            } else {
+                mail_err_backoff.record_transient_failure(Instant::now());
+            }
+            false
+        }
+    }
 }
 
 async fn run_bootstrap_and_emit(
@@ -2484,6 +2826,7 @@ async fn run_bootstrap_and_emit(
     last_folders: &mut Option<Vec<MailFolder>>,
 ) {
     let mail_ok = run_bootstrap_core(
+        None,
         graph,
         storage,
         event_tx,
@@ -2517,6 +2860,7 @@ async fn run_refresh_all_and_emit(
     last_folders: &mut Option<Vec<MailFolder>>,
 ) {
     let mail_ok = run_bootstrap_core(
+        Some(focus),
         graph,
         storage,
         event_tx,
@@ -2526,48 +2870,6 @@ async fn run_refresh_all_and_emit(
         last_folders,
     )
     .await;
-
-    if let Some(active_fid) = focus
-        .active_folder_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let (inbox_real, _) = resolve_canonical_folder_id("inbox", graph, storage).await;
-        if !active_fid.eq_ignore_ascii_case("inbox") && active_fid != inbox_real {
-            let _ = sync_mail_folder(active_fid, graph, storage, event_tx, false).await;
-        }
-    }
-
-    if let Some(active_mid) = focus
-        .active_message_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let _ = hydrate_message_if_needed(active_mid, true, graph, storage, event_tx).await;
-    }
-
-    if let Some(active_lid) = focus
-        .active_todo_list_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let token_fp = current_token_fingerprint(graph).await;
-        let mut local_todo_backoff = ErrorBackoffState::new(60_000);
-        poll_todo_quiet(
-            Some(active_lid),
-            graph,
-            storage,
-            event_tx,
-            shared,
-            &mut local_todo_backoff,
-            breakers,
-            &token_fp,
-        )
-        .await;
-    }
 
     slow_err_backoff.record_success();
 
@@ -5254,5 +5556,558 @@ mod tests {
             busy_false_positions[0] > sent_pos && busy_false_positions[0] > work_todo_pos,
             "SyncStateChanged(busy=false) must only fire after active folder & active todo list finish"
         );
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_outlook_with_profile_overlaps_wave2_and_returns_profile() {
+        use axum::{http::StatusCode, routing::get, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let me_hits = Arc::new(AtomicUsize::new(0));
+        let me_hits_srv = Arc::clone(&me_hits);
+        let wave2_barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let b_inbox = Arc::clone(&wave2_barrier);
+        let b_sent = Arc::clone(&wave2_barrier);
+        let b_tasks = Arc::clone(&wave2_barrier);
+
+        let router = Router::new()
+            .route(
+                "/v1.0/me",
+                get(move || {
+                    let hits = Arc::clone(&me_hits_srv);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "id": "u-boot",
+                                "displayName": "Boot User",
+                                "mail": "boot@example.com"
+                            })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "value": [
+                                { "id": "f-inbox", "displayName": "Inbox", "wellKnownName": "inbox", "childFolderCount": 0 },
+                                { "id": "f-sent", "displayName": "Sent Items", "wellKnownName": "sentitems", "childFolderCount": 0 },
+                                { "id": "f-d", "displayName": "Drafts", "wellKnownName": "drafts", "childFolderCount": 0 },
+                                { "id": "f-a", "displayName": "Archive", "wellKnownName": "archive", "childFolderCount": 0 },
+                                { "id": "f-del", "displayName": "Deleted", "wellKnownName": "deleteditems", "childFolderCount": 0 },
+                                { "id": "f-j", "displayName": "Junk", "wellKnownName": "junkemail", "childFolderCount": 0 }
+                            ]
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/f-inbox/messages/delta",
+                get(move || {
+                    let b = Arc::clone(&b_inbox);
+                    async move {
+                        b.wait().await;
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({ "@odata.deltaLink": "d-in", "value": [] })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/f-sent/messages/delta",
+                get(move || {
+                    let b = Arc::clone(&b_sent);
+                    async move {
+                        b.wait().await;
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({ "@odata.deltaLink": "d-sent", "value": [] })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/calendarView",
+                get(|| async { (StatusCode::OK, Json(serde_json::json!({ "value": [] }))) }),
+            )
+            .route(
+                "/v1.0/me/contacts",
+                get(|| async { (StatusCode::OK, Json(serde_json::json!({ "value": [] }))) }),
+            )
+            .route(
+                "/v1.0/me/todo/lists",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "value": [{ "id": "l-def", "displayName": "Tasks", "wellknownListName": "defaultList", "isOwner": true, "isShared": false }]
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/todo/lists/l-def/tasks",
+                get(move || {
+                    let b = Arc::clone(&b_tasks);
+                    async move {
+                        b.wait().await;
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "value": [{ "id": "t-1", "title": "Wave 2 task", "status": "notStarted", "importance": "normal" }]
+                            })),
+                        )
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tok = crate::auth::StoredTokens {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("u".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = crate::auth::AuthManager::from_tokens(cfg.clone(), tok);
+        let graph = GraphClient::new(cfg, auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+
+        let (res, profile) = tokio::time::timeout(
+            Duration::from_secs(3),
+            bootstrap_outlook_with_profile(&graph, &storage),
+        )
+        .await
+        .expect("Wave 2 inbox, sentitems, and todo tasks must overlap concurrently");
+        res.unwrap();
+        assert_eq!(profile.as_ref().map(|p| p.id.as_str()), Some("u-boot"));
+        assert_eq!(me_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.list_todo_tasks(Some("l-def"), true).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_all_overlaps_domains_and_deduplicates_todo_lists() {
+        use axum::{http::StatusCode, routing::get, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(6));
+        let b_me = Arc::clone(&barrier);
+        let b_folders = Arc::clone(&barrier);
+        let b_msg = Arc::clone(&barrier);
+        let b_cal = Arc::clone(&barrier);
+        let b_todo = Arc::clone(&barrier);
+        let b_contacts = Arc::clone(&barrier);
+        let todo_list_hits = Arc::new(AtomicUsize::new(0));
+        let todo_list_hits_srv = Arc::clone(&todo_list_hits);
+
+        let router = Router::new()
+            .route(
+                "/v1.0/me",
+                get(move || {
+                    let b = Arc::clone(&b_me);
+                    async move {
+                        b.wait().await;
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({ "id": "u1", "displayName": "U" })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders",
+                get(move || {
+                    let b = Arc::clone(&b_folders);
+                    async move {
+                        b.wait().await;
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "value": [
+                                    { "id": "f-inbox", "displayName": "Inbox", "wellKnownName": "inbox", "childFolderCount": 0 },
+                                    { "id": "f-sent", "displayName": "Sent", "wellKnownName": "sentitems", "childFolderCount": 0 },
+                                    { "id": "f-d", "displayName": "Drafts", "wellKnownName": "drafts", "childFolderCount": 0 },
+                                    { "id": "f-a", "displayName": "Archive", "wellKnownName": "archive", "childFolderCount": 0 },
+                                    { "id": "f-del", "displayName": "Deleted", "wellKnownName": "deleteditems", "childFolderCount": 0 },
+                                    { "id": "f-j", "displayName": "Junk", "wellKnownName": "junkemail", "childFolderCount": 0 }
+                                ]
+                            })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/f-inbox/messages/delta",
+                get(|| async {
+                    (StatusCode::OK, Json(serde_json::json!({ "@odata.deltaLink": "d1", "value": [] })))
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/f-sent/messages/delta",
+                get(|| async {
+                    (StatusCode::OK, Json(serde_json::json!({ "@odata.deltaLink": "d2", "value": [] })))
+                }),
+            )
+            .route(
+                "/v1.0/me/messages/m-active",
+                get(move || {
+                    let b = Arc::clone(&b_msg);
+                    async move {
+                        b.wait().await;
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "id": "m-active",
+                                "parentFolderId": "f-sent",
+                                "subject": "Active",
+                                "receivedDateTime": "2026-11-25T10:00:00Z",
+                                "body": { "contentType": "text", "content": "Body" }
+                            })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/calendarView/delta",
+                get(move || {
+                    let b = Arc::clone(&b_cal);
+                    async move {
+                        b.wait().await;
+                        (StatusCode::OK, Json(serde_json::json!({ "@odata.deltaLink": "dc1", "value": [] })))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/contacts",
+                get(move || {
+                    let b = Arc::clone(&b_contacts);
+                    async move {
+                        b.wait().await;
+                        (StatusCode::OK, Json(serde_json::json!({ "value": [] })))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/todo/lists",
+                get(move || {
+                    let b = Arc::clone(&b_todo);
+                    let hits = Arc::clone(&todo_list_hits_srv);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        b.wait().await;
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "value": [
+                                    { "id": "l-def", "displayName": "Tasks", "wellknownListName": "defaultList", "isOwner": true, "isShared": false },
+                                    { "id": "l-work", "displayName": "Work", "isOwner": true, "isShared": false }
+                                ]
+                            })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/todo/lists/l-work/tasks",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "value": [{ "id": "tw-1", "title": "Work task", "status": "notStarted", "importance": "normal" }]
+                        })),
+                    )
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tok = crate::auth::StoredTokens {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("u".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = crate::auth::AuthManager::from_tokens(cfg.clone(), tok);
+        let graph = GraphClient::new(cfg, auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let shared = SyncSharedState::new();
+        let mut mail_backoff = ErrorBackoffState::new(1000);
+        let mut slow_backoff = ErrorBackoffState::new(1000);
+        let mut breakers = CapabilityCircuitBreakers::default();
+        let mut last_folders = None;
+        let focus = FocusTarget {
+            active_view: ActiveView::Mail,
+            active_folder_id: Some("f-sent".into()),
+            active_message_id: Some("m-active".into()),
+            active_todo_list_id: Some("l-work".into()),
+        };
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            run_refresh_all_and_emit(
+                &focus,
+                &graph,
+                &storage,
+                &tx,
+                &shared,
+                &mut mail_backoff,
+                &mut slow_backoff,
+                &mut breakers,
+                &mut last_folders,
+            ),
+        )
+        .await
+        .expect("RefreshAll must overlap profile, mail, active hydration, calendar, todo, and contacts");
+
+        assert_eq!(
+            todo_list_hits.load(Ordering::SeqCst),
+            1,
+            "RefreshAll must fetch /me/todo/lists only once when active_todo_list_id is set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lane1_hydrate_message_not_blocked_by_inflight_folder_sync() {
+        use axum::{http::StatusCode, routing::get, Json, Router};
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let b_folder = Arc::clone(&barrier);
+        let b_msg = Arc::clone(&barrier);
+
+        let router = Router::new()
+            .route(
+                "/v1.0/me/mailFolders/f-slow/messages/delta",
+                get(move || {
+                    let b = Arc::clone(&b_folder);
+                    async move {
+                        b.wait().await;
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({ "@odata.deltaLink": "d-slow", "value": [] })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/messages/m-fast",
+                get(move || {
+                    let b = Arc::clone(&b_msg);
+                    async move {
+                        b.wait().await;
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "id": "m-fast",
+                                "parentFolderId": "f-slow",
+                                "subject": "Fast Hydrate",
+                                "receivedDateTime": "2026-11-25T10:00:00Z",
+                                "body": { "contentType": "text", "content": "Fast body" }
+                            })),
+                        )
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        cfg.active_poll_ms = 60_000;
+        cfg.mail_poll_ms = 60_000;
+        cfg.calendar_poll_ms = 60_000;
+        let tok = crate::auth::StoredTokens {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("u".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = crate::auth::AuthManager::from_tokens(cfg.clone(), tok);
+        let graph = GraphClient::new(cfg.clone(), auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_mail_folders(&[MailFolder {
+                id: "f-slow".into(),
+                display_name: "Slow".into(),
+                well_known_name: None,
+                parent_folder_id: None,
+                child_folder_count: 0,
+                unread_item_count: 0,
+                total_item_count: 0,
+            }])
+            .unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ctrl = spawn_sync_engine(cfg, graph, storage, tx);
+        ctrl.request(SyncCommand::SyncFolder {
+            folder_id: "f-slow".into(),
+        });
+        ctrl.request(SyncCommand::HydrateMessage {
+            message_id: "m-fast".into(),
+        });
+
+        let hydrated = tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(ev) = rx.recv().await {
+                if let CoreEvent::MailMessageHydrated(msg) = ev {
+                    if msg.id == "m-fast" {
+                        return msg;
+                    }
+                }
+            }
+            panic!("channel closed before hydration");
+        })
+        .await
+        .expect("HydrateMessage must run concurrently while SyncFolder is in-flight");
+        assert_eq!(hydrated.subject, "Fast Hydrate");
+        ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_messages_batches_uncached_and_skips_loaded() {
+        use axum::{http::StatusCode, routing::post, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let batch_hits = Arc::new(AtomicUsize::new(0));
+        let batch_hits_srv = Arc::clone(&batch_hits);
+        let requested_urls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let requested_urls_srv = Arc::clone(&requested_urls);
+
+        let router = Router::new().route(
+            "/v1.0/$batch",
+            post(move |Json(payload): Json<serde_json::Value>| {
+                let hits = Arc::clone(&batch_hits_srv);
+                let urls = Arc::clone(&requested_urls_srv);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let mut responses = Vec::new();
+                    if let Some(reqs) = payload["requests"].as_array() {
+                        for req in reqs {
+                            let id = req["id"].as_str().unwrap_or("").to_string();
+                            let url = req["url"].as_str().unwrap_or("").to_string();
+                            urls.lock().unwrap().push(url.clone());
+                            let msg_id = if url.contains("m-p2") {
+                                "m-p2"
+                            } else {
+                                "m-p3"
+                            };
+                            responses.push(serde_json::json!({
+                                "id": id,
+                                "status": 200,
+                                "body": {
+                                    "id": msg_id,
+                                    "parentFolderId": "f-inbox",
+                                    "subject": format!("Prefetched {msg_id}"),
+                                    "receivedDateTime": "2026-11-25T10:00:00Z",
+                                    "body": { "contentType": "text", "content": format!("Body {msg_id}") }
+                                }
+                            }));
+                        }
+                    }
+                    (StatusCode::OK, Json(serde_json::json!({ "responses": responses })))
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        cfg.active_poll_ms = 60_000;
+        cfg.mail_poll_ms = 60_000;
+        cfg.calendar_poll_ms = 60_000;
+        let tok = crate::auth::StoredTokens {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("u".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = crate::auth::AuthManager::from_tokens(cfg.clone(), tok);
+        let graph = GraphClient::new(cfg.clone(), auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let mk = |id: &str, body_loaded: bool| MailMessage {
+            id: id.into(),
+            folder_id: Some("f-inbox".into()),
+            subject: id.into(),
+            received_at: "2026-11-25T10:00:00Z".into(),
+            body_loaded,
+            body_plain: if body_loaded { "Already loaded".into() } else { String::new() },
+            ..Default::default()
+        };
+        storage
+            .upsert_mail_messages(&[mk("m-p1", true), mk("m-p2", false), mk("m-p3", false)])
+            .unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ctrl = spawn_sync_engine(cfg, graph, storage.clone(), tx);
+        ctrl.request(SyncCommand::PrefetchMessages {
+            message_ids: vec!["m-p1".into(), "m-p2".into(), "m-p3".into()],
+        });
+
+        let mut hydrated_ids = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while hydrated_ids.len() < 2 {
+                if let Some(CoreEvent::MailMessageHydrated(msg)) = rx.recv().await {
+                    hydrated_ids.push(msg.id);
+                }
+            }
+        })
+        .await
+        .expect("expected 2 prefetched MailMessageHydrated events");
+
+        hydrated_ids.sort();
+        assert_eq!(hydrated_ids, vec!["m-p2", "m-p3"]);
+        assert_eq!(batch_hits.load(Ordering::SeqCst), 1);
+        let urls = requested_urls.lock().unwrap();
+        assert_eq!(urls.len(), 2);
+        assert!(urls.iter().all(|u| !u.contains("m-p1")));
+        assert!(storage.get_mail_message("m-p2").unwrap().unwrap().body_loaded);
+        assert!(storage.get_mail_message("m-p3").unwrap().unwrap().body_loaded);
+        ctrl.request(SyncCommand::Shutdown);
     }
 }

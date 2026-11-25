@@ -8,7 +8,7 @@ pub mod media;
 pub mod todo;
 
 use std::{
-    sync::{Arc, OnceLock},
+    sync::{atomic::AtomicBool, Arc, OnceLock},
     time::Duration,
 };
 
@@ -27,6 +27,12 @@ pub struct GraphClient {
     my_user_id: Option<String>,
     cached_my_user_id: Arc<OnceLock<String>>,
     resolve_user_mutex: Arc<tokio::sync::Mutex<()>>,
+    /// Remembered per client when `/users?$search=...` returns an unsupported-query error
+    /// and the plain `/users?$top=...` fallback succeeds, avoiding a doomed `$search` on every call.
+    pub(crate) users_search_unsupported: Arc<AtomicBool>,
+    /// Remembered per client when `POST /$batch` returns 404/405 so subsequent folder/body
+    /// listings skip the failing `$batch` probe and go straight to parallel GETs.
+    pub(crate) batch_unsupported: Arc<AtomicBool>,
 }
 
 impl GraphClient {
@@ -47,6 +53,8 @@ impl GraphClient {
             my_user_id: None,
             cached_my_user_id: Arc::new(OnceLock::new()),
             resolve_user_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            users_search_unsupported: Arc::new(AtomicBool::new(false)),
+            batch_unsupported: Arc::new(AtomicBool::new(false)),
         })
     }
 

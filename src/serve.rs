@@ -1160,13 +1160,12 @@ async fn patch_mail_message(
         ));
     }
 
-    if let Some(is_read) = body.is_read {
-        if let Err(err) = state.graph.set_mail_read(&id, is_read).await {
-            return Err(map_graph_error(&state.graph, err).await);
-        }
-    }
-    if let Some(flagged) = body.flagged {
-        if let Err(err) = state.graph.set_mail_flag(&id, flagged).await {
+    if body.is_read.is_some() || body.flagged.is_some() {
+        if let Err(err) = state
+            .graph
+            .update_mail_flags(&id, body.is_read, body.flagged)
+            .await
+        {
             return Err(map_graph_error(&state.graph, err).await);
         }
     }

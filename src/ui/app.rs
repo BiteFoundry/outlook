@@ -1235,15 +1235,16 @@ impl AppState {
         let tx = self.ui_tx.clone();
 
         tokio::spawn(async move {
-            let _ = crate::sync::bootstrap_outlook(&graph, &storage).await;
-            let (tok, me_res) = tokio::join!(auth.current_tokens(), graph.get_me());
+            let (tok, (_bootstrap_res, me)) = tokio::join!(
+                auth.current_tokens(),
+                crate::sync::bootstrap_outlook_with_profile(&graph, &storage),
+            );
             let scope_warning = tok.as_ref().and_then(|t| {
                 auth::diagnose_access_token_scopes(&t.access_token)
                     .warnings
                     .into_iter()
                     .next()
             });
-            let me = me_res.ok();
             if let Some(ref u) = me {
                 let _ = auth
                     .update_identity(u.id.clone(), u.display_name.clone(), u.email.clone())
@@ -1400,6 +1401,10 @@ impl AppState {
             .unwrap_or_default();
 
         self.select_first_visible_mail(ui);
+        let rows = self.visible_mail_rows(ui);
+        if let Some(sel) = ui.mail_list_scroll.selected_idx {
+            self.queue_adjacent_mail_prefetch(&rows, sel);
+        }
         self.push_focus_to_sync();
 
         if folder_id != VIRTUAL_UNREAD_FOLDER && folder_id != VIRTUAL_FLAGGED_FOLDER {
@@ -1407,6 +1412,47 @@ impl AppState {
                 self.loading_mail = true;
             }
             self.sync_ctrl.request(SyncCommand::SyncFolder { folder_id });
+        }
+    }
+
+    /// Opportunistically prefetches uncached message bodies for rows adjacent to `selected_row_idx`
+    /// (next 2 + previous 1) in a single bounded `$batch` call on interactive navigation only.
+    fn queue_adjacent_mail_prefetch(&self, rows: &[MailListRow], selected_row_idx: usize) {
+        if rows.len() <= 1 {
+            return;
+        }
+        let mut candidate_rows = Vec::with_capacity(3);
+        if selected_row_idx + 1 < rows.len() {
+            candidate_rows.push(selected_row_idx + 1);
+        }
+        if selected_row_idx + 2 < rows.len() {
+            candidate_rows.push(selected_row_idx + 2);
+        }
+        if let Some(prev) = selected_row_idx.checked_sub(1) {
+            candidate_rows.push(prev);
+        }
+
+        let active_id = self.active_mail_id.as_deref();
+        let mut message_ids = Vec::with_capacity(candidate_rows.len());
+        for idx in candidate_rows {
+            let Some(msg) = self.mail_messages.get(rows[idx].primary_msg_idx) else {
+                continue;
+            };
+            if active_id == Some(msg.id.as_str())
+                || msg.body_loaded
+                || self
+                    .mail_detail_cache
+                    .get(&msg.id)
+                    .is_some_and(|cached| cached.body_loaded)
+                || message_ids.iter().any(|id| id == &msg.id)
+            {
+                continue;
+            }
+            message_ids.push(msg.id.clone());
+        }
+        if !message_ids.is_empty() {
+            self.sync_ctrl
+                .request(SyncCommand::PrefetchMessages { message_ids });
         }
     }
 
@@ -1455,6 +1501,7 @@ impl AppState {
             }
             self.active_mail_id = Some(msg_id);
             self.sync_displayed_mail_details(ui.group_threads, true);
+            self.queue_adjacent_mail_prefetch(&rows, clamped);
             self.push_focus_to_sync();
         }
 
@@ -2168,14 +2215,33 @@ impl AppState {
         let tx = self.ui_tx.clone();
         let quote = entry.synced.thread_quote_html;
         tokio::spawn(async move {
+            let captured_draft_id: Arc<std::sync::Mutex<Option<String>>> =
+                Arc::new(std::sync::Mutex::new(outgoing.draft_id.clone()));
+            let captured_for_cb = Arc::clone(&captured_draft_id);
             let mut result = graph
-                .save_draft_with_progress(&outgoing, Some(&changed), quote.as_deref(), |change| {
-                    let _ = tx.send(UiMsg::MailDraftProgress {
-                        draft_key: draft_key.clone(),
-                        compose_id: compose_id.clone(),
-                        change,
-                    });
-                })
+                .save_draft_with_progress(
+                    &outgoing,
+                    Some(&changed),
+                    quote.as_deref(),
+                    !send,
+                    |change| {
+                        match &change {
+                            DraftSaveChange::ThreadCreated { id, .. }
+                            | DraftSaveChange::Fields { id, .. } => {
+                                if !id.trim().is_empty() {
+                                    *captured_for_cb.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        Some(id.clone());
+                                }
+                            }
+                            _ => {}
+                        }
+                        let _ = tx.send(UiMsg::MailDraftProgress {
+                            draft_key: draft_key.clone(),
+                            compose_id: compose_id.clone(),
+                            change,
+                        });
+                    },
+                )
                 .await;
             let mut sent_draft_id: Option<String> = None;
             if let Ok(saved) = &result {
@@ -2184,7 +2250,13 @@ impl AppState {
                         .draft_id
                         .as_deref()
                         .or_else(|| saved.as_ref().map(|msg| msg.id.as_str()))
-                        .map(str::to_string);
+                        .map(str::to_string)
+                        .or_else(|| {
+                            captured_draft_id
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone()
+                        });
                     match id {
                         Some(id) => {
                             if let Err(err) = graph.send_saved_draft(&id).await {
@@ -3921,14 +3993,47 @@ impl AppState {
                 match result {
                     Ok(saved) => {
                         let saved_id = saved.as_ref().map(|m| m.id.clone());
-                        if let Some(saved) = saved {
+                        if let Some(mut saved) = saved {
+                            self.mail_detail_missing.remove(&saved.id);
                             if !send {
+                                saved.body_loaded = true;
                                 let _ = self
                                     .storage
                                     .upsert_mail_messages(std::slice::from_ref(&saved));
+                                let in_list_pos = self
+                                    .mail_messages
+                                    .iter()
+                                    .position(|m| m.id == saved.id);
+                                let is_active_drafts = self.message_matches_active_folder(&saved)
+                                    || (saved.is_draft
+                                        && self
+                                            .mail_folders
+                                            .iter()
+                                            .find(|f| f.id == self.active_folder_id)
+                                            .is_some_and(|f| {
+                                                f.well_known_name
+                                                    .as_deref()
+                                                    .is_some_and(|w| w.eq_ignore_ascii_case("drafts"))
+                                                    || f.display_name.eq_ignore_ascii_case("drafts")
+                                            }));
+                                if let Some(pos) = in_list_pos {
+                                    self.mail_messages[pos] = Self::mail_summary_from(&saved);
+                                } else if is_active_drafts {
+                                    self.mail_messages
+                                        .insert(0, Self::mail_summary_from(&saved));
+                                    if self.active_mail_id.is_none() {
+                                        self.active_mail_id = Some(saved.id.clone());
+                                        ui.mail_list_scroll.selected_idx = Some(0);
+                                    }
+                                }
+                                if self.active_mail_id.as_deref() == Some(saved.id.as_str())
+                                    || self.mail_detail_cache.contains_key(&saved.id)
+                                {
+                                    self.mail_detail_cache.insert(saved.id.clone(), saved);
+                                }
+                            } else {
+                                self.mail_detail_cache.remove(&saved.id);
                             }
-                            self.mail_detail_cache.remove(&saved.id);
-                            self.mail_detail_missing.remove(&saved.id);
                         }
                         if send {
                             self.handle_ui_msg(
@@ -7036,5 +7141,107 @@ mod tests {
         let svg_img = svg_decoded.expect("expected ImageDecoded for data:image/svg+xml");
         assert_eq!(svg_img.format_label, "SVG");
         assert!(!svg_img.lines.is_empty());
+    }
+
+    #[test]
+    fn mail_draft_saved_updates_drafts_view_and_detail_cache_immediately() {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _) = tokio::sync::watch::channel(FocusTarget::default());
+        let (nudge_tx, _) = mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+        let (ui_tx, _) = mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+
+        app.mail_folders = vec![MailFolder {
+            id: "f-drafts".into(),
+            display_name: "Drafts".into(),
+            well_known_name: Some("drafts".into()),
+            parent_folder_id: None,
+            child_folder_count: 0,
+            unread_item_count: 0,
+            total_item_count: 0,
+        }];
+        app.active_folder_id = "f-drafts".into();
+
+        let saved = MailMessage {
+            id: "d-new-1".into(),
+            folder_id: Some("f-drafts".into()),
+            subject: "Draft Subject".into(),
+            received_at: "2026-11-25T12:00:00Z".into(),
+            is_draft: true,
+            body_loaded: true,
+            body_plain: "Local draft body".into(),
+            body_html: "<p>Local draft body</p>".into(),
+            ..Default::default()
+        };
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::MailDraftSaved {
+                draft_key: "new".into(),
+                compose_id: "cmp-1".into(),
+                result: Ok(Some(saved)),
+                send: false,
+                sent_draft_id: None,
+            },
+        );
+
+        assert_eq!(app.mail_messages.len(), 1);
+        assert_eq!(app.mail_messages[0].id, "d-new-1");
+        assert_eq!(app.active_mail_id.as_deref(), Some("d-new-1"));
+        let cached = app
+            .mail_detail_cache
+            .get("d-new-1")
+            .expect("saved draft must populate mail_detail_cache immediately");
+        assert!(cached.body_loaded);
+        assert_eq!(cached.body_plain, "Local draft body");
+    }
+
+    #[test]
+    fn select_mail_row_queues_bounded_adjacent_prefetch_for_uncached_rows() {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _) = tokio::sync::watch::channel(FocusTarget::default());
+        let (nudge_tx, mut nudge_rx) = mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+        let (ui_tx, _) = mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+        ui.group_threads = false;
+
+        let mk = |id: &str, ts: &str, loaded: bool| MailMessage {
+            id: id.into(),
+            folder_id: Some("f-inbox".into()),
+            subject: id.into(),
+            received_at: ts.into(),
+            body_loaded: loaded,
+            ..Default::default()
+        };
+        app.mail_messages = vec![
+            mk("m0", "2026-11-25T10:04:00Z", true),
+            mk("m1", "2026-11-25T10:03:00Z", true),
+            mk("m2", "2026-11-25T10:02:00Z", false),
+            mk("m3", "2026-11-25T10:01:00Z", false),
+            mk("m4", "2026-11-25T10:00:00Z", false),
+        ];
+
+        app.select_mail_row(&mut ui, 1);
+
+        let mut prefetched = Vec::new();
+        while let Ok(cmd) = nudge_rx.try_recv() {
+            if let SyncCommand::PrefetchMessages { message_ids } = cmd {
+                prefetched.extend(message_ids);
+            }
+        }
+        assert_eq!(
+            prefetched,
+            vec!["m2".to_string(), "m3".to_string()],
+            "must prefetch next 2 uncached rows while skipping loaded m0, active m1, and out-of-window m4"
+        );
     }
 }

@@ -1122,11 +1122,12 @@ async fn call_tool(
                 );
             }
 
-            if let Some(read_val) = is_read {
-                map_graph_result(graph, graph.set_mail_read(&message_id, read_val).await).await?;
-            }
-            if let Some(flag_val) = flagged {
-                map_graph_result(graph, graph.set_mail_flag(&message_id, flag_val).await).await?;
+            if is_read.is_some() || flagged.is_some() {
+                map_graph_result(
+                    graph,
+                    graph.update_mail_flags(&message_id, is_read, flagged).await,
+                )
+                .await?;
             }
 
             let mid_clone = message_id.clone();
