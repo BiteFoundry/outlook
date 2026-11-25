@@ -8,6 +8,7 @@
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-565f89)](docs/NPM.md)
 [![Built with Rust & Ratatui](https://img.shields.io/badge/Rust-Ratatui-e0af68?logo=rust&logoColor=white)](https://ratatui.rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-9ece6a)](LICENSE)
+[![BiteFoundry/outlook MCP server](https://glama.ai/mcp/servers/BiteFoundry/outlook/badges/score.svg)](https://glama.ai/mcp/servers/BiteFoundry/outlook)
 
 [BiteFoundry](https://bitefoundry.dev/#app-outlook) · [Latest release notes](https://github.com/BiteFoundry/outlook/releases/latest)
 
@@ -175,6 +176,7 @@ Full tool schemas & client setups: **[docs/MCP.md](docs/MCP.md)** · **[docs/NPM
 | [`@bitefoundry/sharepoint`](https://github.com/BiteFoundry/sharepoint) | `sharepoint`, `bitefoundry-onedrive` | SharePoint & OneDrive (Sites, Drives, Lists, Files) | TUI · CLI · HTTP · MCP |
 | [`@bitefoundry/atlassian`](https://github.com/BiteFoundry/atlassian) | `atlassian`, `confluence`, `conf` | Jira & Confluence (Issues, Boards, Sprints, Wiki) | TUI · CLI · HTTP · MCP |
 | [`@bitefoundry/notion`](https://github.com/BiteFoundry/notion) | `notion` | Notion (Pages, Databases, Blocks, Comments) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/obsidian`](https://github.com/BiteFoundry/obsidian) | `bitefoundry-obsidian` | Obsidian (Local Vaults, Backlinks & Knowledge Graph) | TUI · CLI · HTTP · MCP |
 
 ---
 
