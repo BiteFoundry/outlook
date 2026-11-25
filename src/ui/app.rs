@@ -289,6 +289,9 @@ pub struct PendingPixelGraphic {
     pub cache_key: String,
     pub rect: Rect,
     pub protocol: TerminalImageProtocol,
+    /// Optional pre-encoded terminal escape sequence (used by `HtmlPreviewOverlay` graphics
+    /// cached on the overlay rather than in `AppState::image_cache`).
+    pub payload: Option<String>,
 }
 
 pub struct UiState {
@@ -332,8 +335,8 @@ pub struct UiState {
     pub spinner_tick: u8,
     pub graphics_caps: TerminalGraphicsCaps,
     pub cell_px_refresh_pending: bool,
-    pub pending_pixel_graphic: Option<PendingPixelGraphic>,
-    pub active_pixel_graphic: Option<(String, Rect, TerminalImageProtocol)>,
+    pub pending_pixel_graphics: Vec<PendingPixelGraphic>,
+    pub active_pixel_graphics: Vec<(String, Rect, TerminalImageProtocol)>,
 }
 
 impl Default for UiState {
@@ -386,8 +389,8 @@ impl UiState {
             spinner_tick: 0,
             graphics_caps: TerminalGraphicsCaps::default(),
             cell_px_refresh_pending: false,
-            pending_pixel_graphic: None,
-            active_pixel_graphic: None,
+            pending_pixel_graphics: Vec::new(),
+            active_pixel_graphics: Vec::new(),
         }
     }
 
@@ -3115,6 +3118,13 @@ impl AppState {
                             }
                             Err(e) => Err(anyhow::anyhow!("Invalid base64 image: {e}")),
                         }
+                    } else if att.id.trim().len() >= 11
+                        && att.id.trim()[..11].eq_ignore_ascii_case("data:image/")
+                    {
+                        match bitefoundry_html::graphics::decode_data_image_uri(att.id.trim()) {
+                            Ok(decoded) => Ok((Arc::from(decoded.bytes), Some(decoded.mime), true)),
+                            Err(e) => Err(e),
+                        }
                     } else if att.id.starts_with("https://") || att.id.starts_with("http://") {
                         match graph.http().get(&att.id).send().await {
                             Ok(resp) if resp.status().is_success() => {
@@ -3128,18 +3138,12 @@ impl AppState {
                                     .unwrap_or("")
                                     .trim()
                                     .to_ascii_lowercase();
-                                if resp_ct == "image/svg+xml" || resp_ct.contains("svg") {
-                                    Err(anyhow::anyhow!(
-                                        "SVG vector images ({resp_ct}) are not supported for raster terminal preview"
-                                    ))
-                                } else {
-                                    match resp.bytes().await {
-                                        Ok(b) => {
-                                            let mime = (!resp_ct.is_empty()).then_some(resp_ct);
-                                            Ok((Arc::from(b.to_vec()), mime, true))
-                                        }
-                                        Err(e) => Err(anyhow::anyhow!(e)),
+                                match resp.bytes().await {
+                                    Ok(b) => {
+                                        let mime = (!resp_ct.is_empty()).then_some(resp_ct);
+                                        Ok((Arc::from(b.to_vec()), mime, true))
                                     }
+                                    Err(e) => Err(anyhow::anyhow!(e)),
                                 }
                             }
                             Ok(resp) => Err(anyhow::anyhow!("HTTP {}", resp.status())),
@@ -3178,16 +3182,6 @@ impl AppState {
                             title: att_title,
                             html,
                             from_preview,
-                        });
-                        return;
-                    }
-                    if kind == bitefoundry_html::ContentKind::Svg {
-                        let _ = tx.send(UiMsg::ImageDecodeFailed {
-                            cache_key: key,
-                            owner_id: msg_id,
-                            att_id,
-                            error: "SVG vector images are not supported for raster terminal preview"
-                                .to_string(),
                         });
                         return;
                     }
@@ -6883,5 +6877,106 @@ mod tests {
             },
         );
         assert!(!app.todo_tasks.iter().find(|t| t.id == "t1").unwrap().is_completed());
+    }
+
+    #[tokio::test]
+    async fn data_image_png_and_svg_decode_locally_without_graph_fetch() {
+        use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba, RgbaImage};
+        use std::io::Cursor;
+
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _) = tokio::sync::watch::channel(crate::sync::FocusTarget::default());
+        let (cmd_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let sync_ctrl = crate::sync::SyncController::from_channels(focus_tx, cmd_tx);
+        let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg, auth, graph, storage, sync_ctrl, ui_tx);
+
+        // Build a valid 8x4 PNG data URI
+        let img: RgbaImage = ImageBuffer::from_pixel(8, 4, Rgba([220, 40, 60, 255]));
+        let mut png_buf = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(img)
+            .write_to(&mut png_buf, ImageFormat::Png)
+            .unwrap();
+        let png_uri = format!(
+            "data:image/png;base64,{}",
+            B64_STANDARD.encode(png_buf.into_inner())
+        );
+
+        let png_att = MailAttachment {
+            id: png_uri,
+            name: "inline-image-1.png".to_string(),
+            content_type: "image/png".to_string(),
+            size: 0,
+            is_inline: true,
+            content_id: None,
+            content_bytes_b64: None,
+        };
+        app.request_mail_image("m-data".into(), png_att, 20, 10, (8, 16), (20, 22, 28));
+
+        let mut png_decoded = None;
+        for _ in 0..4 {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
+                .await
+                .expect("timed out waiting for data:image/png decode")
+                .expect("ui channel closed");
+            match msg {
+                UiMsg::ImageDecoded { rendered, .. } => {
+                    png_decoded = Some(rendered);
+                    break;
+                }
+                UiMsg::ImageBytesFetched { .. } => continue,
+                UiMsg::ImageDecodeFailed { error, .. } => {
+                    panic!("data:image/png decode failed: {error}");
+                }
+                _ => panic!("unexpected UiMsg for data:image/png"),
+            }
+        }
+        let png_img = png_decoded.expect("expected ImageDecoded for data:image/png");
+        assert_eq!(png_img.format_label, "PNG");
+        assert_eq!(png_img.width_px, 8);
+        assert_eq!(png_img.height_px, 4);
+        assert!(!png_img.lines.is_empty());
+
+        // Also verify data:image/svg+xml decodes and rasterizes locally without network/Graph calls
+        let svg_raw = r##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20" fill="#2563eb"/></svg>"##;
+        let svg_uri = format!(
+            "data:image/svg+xml;base64,{}",
+            B64_STANDARD.encode(svg_raw.as_bytes())
+        );
+        let svg_att = MailAttachment {
+            id: svg_uri,
+            name: "inline-vector.svg".to_string(),
+            content_type: "image/svg+xml".to_string(),
+            size: 0,
+            is_inline: true,
+            content_id: None,
+            content_bytes_b64: None,
+        };
+        app.request_mail_image("m-data".into(), svg_att, 20, 10, (8, 16), (20, 22, 28));
+
+        let mut svg_decoded = None;
+        for _ in 0..4 {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
+                .await
+                .expect("timed out waiting for data:image/svg+xml decode")
+                .expect("ui channel closed");
+            match msg {
+                UiMsg::ImageDecoded { rendered, .. } => {
+                    svg_decoded = Some(rendered);
+                    break;
+                }
+                UiMsg::ImageBytesFetched { .. } => continue,
+                UiMsg::ImageDecodeFailed { error, .. } => {
+                    panic!("data:image/svg+xml decode failed: {error}");
+                }
+                _ => panic!("unexpected UiMsg for data:image/svg+xml"),
+            }
+        }
+        let svg_img = svg_decoded.expect("expected ImageDecoded for data:image/svg+xml");
+        assert_eq!(svg_img.format_label, "SVG");
+        assert!(!svg_img.lines.is_empty());
     }
 }

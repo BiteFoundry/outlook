@@ -95,10 +95,17 @@ fn collect_inline_image_attachments(
                     let lower_src = src.trim().to_ascii_lowercase();
                     let fname = filename_from_src(src)
                         .unwrap_or_else(|| format!("inline-image-{}.png", index + 1));
-                    let mime = if lower_src.starts_with("data:image/svg+xml") {
-                        "image/svg+xml".to_string()
-                    } else if lower_src.starts_with("data:text/html") {
-                        "text/html".to_string()
+                    let mime = if let Some(rest) = lower_src.strip_prefix("data:") {
+                        let data_mime = rest
+                            .split([';', ','])
+                            .next()
+                            .map(str::trim)
+                            .unwrap_or("");
+                        if !data_mime.is_empty() {
+                            data_mime.to_string()
+                        } else {
+                            guess_image_mime(&fname)
+                        }
                     } else {
                         guess_image_mime(&fname)
                     };
@@ -255,7 +262,7 @@ mod tests {
         assert_eq!(eff_mixed[1].content_type, "image/jpeg");
         assert!(eff_mixed[1].is_inline);
 
-        // Case 3: Inline SVG / HTML redirect URLs must never be misclassified as raster images
+        // Case 3: Inline SVG is supported as native image preview, while HTML redirect URLs remain excluded
         let msg_non_raster = sample_mail_with_html(
             r#"<img src="https://cdn.example.com/logo.svg?v=2"><img src="https://track.example.com/pixel.html"><img src="data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=">"#,
             Vec::new(),
@@ -265,12 +272,18 @@ mod tests {
         assert_eq!(eff_non_raster[0].content_type, "image/svg+xml");
         assert_eq!(eff_non_raster[1].content_type, "text/html");
         assert_eq!(eff_non_raster[2].content_type, "image/svg+xml");
-        for att in eff_non_raster.iter() {
-            assert!(
-                !crate::img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name)),
-                "non-raster inline img must not be classified as raster image: {att:?}"
-            );
-        }
+        assert!(crate::img_preview::is_image_mime_or_name(
+            &eff_non_raster[0].content_type,
+            Some(&eff_non_raster[0].name)
+        ));
+        assert!(!crate::img_preview::is_image_mime_or_name(
+            &eff_non_raster[1].content_type,
+            Some(&eff_non_raster[1].name)
+        ));
+        assert!(crate::img_preview::is_image_mime_or_name(
+            &eff_non_raster[2].content_type,
+            Some(&eff_non_raster[2].name)
+        ));
     }
 
     #[test]

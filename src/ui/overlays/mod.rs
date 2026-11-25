@@ -300,7 +300,7 @@ impl Overlay {
         frame: &mut Frame,
         area: Rect,
         app: &AppState,
-        ui: &UiState,
+        ui: &mut UiState,
         hitmap: &mut HitMap,
     ) -> Option<(u16, u16)> {
         match self {

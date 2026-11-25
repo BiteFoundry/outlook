@@ -327,7 +327,7 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
     draw_status_bar(frame, plan.status, app, ui, &mut hitmap);
     draw_toasts(frame, area, ui);
 
-    ui.pending_pixel_graphic = None;
+    ui.pending_pixel_graphics.clear();
     let mut overlays = std::mem::take(&mut ui.overlays);
     let last_idx = overlays.len().saturating_sub(1);
     for (idx, overlay) in overlays.iter_mut().enumerate() {
@@ -336,13 +336,21 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
         }
         match overlay {
             overlays::Overlay::ImagePreview(preview) => {
+                ui.pending_pixel_graphics.clear();
                 preview.draw_sync(frame, area, app, ui, &mut hitmap);
                 if idx == last_idx {
                     cursor_pos = None;
                 }
             }
+            overlays::Overlay::HtmlPreview(preview) => {
+                ui.pending_pixel_graphics.clear();
+                preview.draw(frame, area, ui, &mut hitmap);
+                if idx == last_idx {
+                    cursor_pos = None;
+                }
+            }
             other => {
-                ui.pending_pixel_graphic = None;
+                ui.pending_pixel_graphics.clear();
                 let overlay_cursor = other.draw(frame, area, app, ui, &mut hitmap);
                 if idx == last_idx {
                     cursor_pos = overlay_cursor;

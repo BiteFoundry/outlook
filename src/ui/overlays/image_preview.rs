@@ -258,9 +258,9 @@ impl ImagePreviewOverlay {
         ui: &mut UiState,
         hitmap: &mut HitMap,
     ) {
-        let mut pending = None;
+        let mut pending = Vec::new();
         self.draw_inner(frame, area, app, ui, Some(&mut pending), hitmap);
-        ui.pending_pixel_graphic = pending;
+        ui.pending_pixel_graphics = pending;
     }
 
     fn draw_inner(
@@ -269,7 +269,7 @@ impl ImagePreviewOverlay {
         area: Rect,
         app: &AppState,
         ui: &UiState,
-        pending_out: Option<&mut Option<PendingPixelGraphic>>,
+        pending_out: Option<&mut Vec<PendingPixelGraphic>>,
         hitmap: &mut HitMap,
     ) {
         let theme = &ui.theme;
@@ -411,14 +411,17 @@ impl ImagePreviewOverlay {
             if is_pixel {
                 let cropped_key = format!("{cache_key}#crop:{sx},{sy},{avail_w},{avail_h}");
                 if let Some(out) = pending_out {
-                    *out = Some(PendingPixelGraphic {
+                    out.push(PendingPixelGraphic {
                         cache_key: cropped_key.clone(),
                         rect: target_rect,
                         protocol: rendered.protocol,
+                        payload: None,
                     });
                 }
-                if ui.active_pixel_graphic.as_ref()
-                    == Some(&(cropped_key, target_rect, rendered.protocol))
+                if ui
+                    .active_pixel_graphics
+                    .iter()
+                    .any(|entry| entry == &(cropped_key.clone(), target_rect, rendered.protocol))
                     && target_rect.width > 0
                     && target_rect.height > 0
                 {
@@ -714,8 +717,8 @@ mod tests {
             (img_preview::TerminalImageProtocol::Halfblock, "[Halfblock]"),
         ] {
             ui.graphics_caps.protocol = proto;
-            ui.active_pixel_graphic = None;
-            ui.pending_pixel_graphic = None;
+            ui.active_pixel_graphics.clear();
+            ui.pending_pixel_graphics.clear();
             let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
             let mut hitmap = HitMap::default();
             terminal
@@ -767,13 +770,14 @@ mod tests {
             })
             .unwrap();
         let pending = ui
-            .pending_pixel_graphic
-            .clone()
-            .expect("pending_pixel_graphic must be set for Sixel");
+            .pending_pixel_graphics
+            .first()
+            .cloned()
+            .expect("pending_pixel_graphics must be populated for Sixel");
         assert!(pending.cache_key.starts_with(&format!("{cache_key}#crop:")));
         assert_eq!(pending.protocol, proto);
 
-        ui.active_pixel_graphic = Some((pending.cache_key.clone(), pending.rect, pending.protocol));
+        ui.active_pixel_graphics = vec![(pending.cache_key.clone(), pending.rect, pending.protocol)];
 
         let mut skipped_inside = 0usize;
         terminal
@@ -858,7 +862,7 @@ mod tests {
             // Initial draw at scroll_y = 0
             terminal
                 .draw(|frame| {
-                    ui.pending_pixel_graphic = None;
+                    ui.pending_pixel_graphics.clear();
                     hitmap.clear();
                     overlay.draw_sync(frame, area, &app, &mut ui, &mut hitmap);
                 })
@@ -885,8 +889,9 @@ mod tests {
 
             if proto == TerminalImageProtocol::Sixel {
                 let pg0 = ui
-                    .pending_pixel_graphic
-                    .clone()
+                    .pending_pixel_graphics
+                    .first()
+                    .cloned()
                     .expect("expected pending pixel graphic for Sixel");
                 assert!(
                     pg0.cache_key.starts_with(&format!("{base_key}#crop:0,0,")),
@@ -900,7 +905,7 @@ mod tests {
             assert_eq!(overlay.scroll_y, u16::MAX);
             terminal
                 .draw(|frame| {
-                    ui.pending_pixel_graphic = None;
+                    ui.pending_pixel_graphics.clear();
                     hitmap.clear();
                     overlay.draw_sync(frame, area, &app, &mut ui, &mut hitmap);
                 })
@@ -909,8 +914,9 @@ mod tests {
 
             if proto == TerminalImageProtocol::Sixel {
                 let pg_bottom = ui
-                    .pending_pixel_graphic
-                    .clone()
+                    .pending_pixel_graphics
+                    .first()
+                    .cloned()
                     .expect("expected pending pixel graphic at bottom for Sixel");
                 assert!(
                     pg_bottom

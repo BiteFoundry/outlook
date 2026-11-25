@@ -1237,7 +1237,17 @@ fn is_quoted_history_boundary(el_ref: ElementRef<'_>) -> bool {
 fn is_ignored_noise_tag(tag: &str) -> bool {
     matches!(
         tag,
-        "head" | "style" | "script" | "meta" | "title" | "xml" | "o:p" | "noscript" | "template"
+        "head"
+            | "style"
+            | "script"
+            | "meta"
+            | "title"
+            | "xml"
+            | "o:p"
+            | "noscript"
+            | "template"
+            | "svg"
+            | "canvas"
     )
 }
 
@@ -1869,5 +1879,60 @@ mod tests {
         let plain = blocks_to_plain(&blocks);
         assert!(plain.contains("Notice"));
         assert!(plain.contains("Deeply nested corporate content"));
+    }
+
+    #[test]
+    fn strips_inline_svg_canvas_style_and_display_none_without_leaking_noise() {
+        let html = r#"
+            <style>@media (max-width: 600px) { .banner { color: red; } } .x { display: none; }</style>
+            <div style="display:none">hidden-preheader-secret</div>
+            <p>Visible top text</p>
+            <svg width="100" height="50">
+                <desc>secret</desc>
+                <title>svg-hidden-title</title>
+                <rect width="10" height="10"/>
+                <path d="M0 0 L10 10"/>
+            </svg>
+            <canvas width="200" height="100">canvas-fallback-noise</canvas>
+            <blockquote>
+                <style>.q { font-size: 12px; }</style>
+                <span style="display:none">hidden-in-quote</span>
+                <svg><desc>quote-svg-secret</desc><rect width="5" height="5"/></svg>
+                <p>Quoted visible sentence</p>
+            </blockquote>
+            <p>Visible bottom text</p>
+        "#;
+
+        let blocks = parse_message_blocks(html, &[]);
+        let plain = blocks_to_plain(&blocks);
+        let md = blocks_to_markdown(&blocks);
+
+        for out in [&plain, &md] {
+            assert!(out.contains("Visible top text"), "missing top text: {out}");
+            assert!(out.contains("Visible bottom text"), "missing bottom text: {out}");
+            assert!(
+                out.contains("Quoted visible sentence"),
+                "missing quoted text: {out}"
+            );
+            for leaked in [
+                "secret",
+                "svg-hidden-title",
+                "quote-svg-secret",
+                "canvas-fallback-noise",
+                "hidden-preheader-secret",
+                "hidden-in-quote",
+                "color: red",
+                "@media",
+                "font-size",
+                "<svg",
+                "<rect",
+                "<path",
+            ] {
+                assert!(
+                    !out.contains(leaked),
+                    "HTML parser leaked raw SVG/CSS/hidden noise `{leaked}` into output:\n{out}"
+                );
+            }
+        }
     }
 }

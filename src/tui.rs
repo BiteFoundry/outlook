@@ -250,12 +250,16 @@ impl PixelLayerTracker {
 }
 
 /// Overlay Z-order guard: blocks inline pixel graphics whenever any modal overlay is active,
-/// and blocks modal pixel graphics whenever another modal (e.g., `ConfirmDialog`) sits on top of `ImagePreview`.
+/// allows `ImagePreview` modal graphics only when `ImagePreview` is topmost,
+/// allows `HtmlPreview` inline graphics (`html:...`) only when `HtmlPreview` is topmost,
+/// and blocks everything when another modal (e.g., `ConfirmDialog`) sits on top.
 fn pixel_graphics_allowed_for_overlays(overlays: &[Overlay], cache_key: &str) -> bool {
     if overlays.is_empty() {
-        !cache_key.starts_with("modal:")
+        !cache_key.starts_with("modal:") && !cache_key.starts_with("html:")
     } else if matches!(overlays.last(), Some(Overlay::ImagePreview(_))) {
-        !cache_key.starts_with("inline:")
+        !cache_key.starts_with("inline:") && !cache_key.starts_with("html:")
+    } else if matches!(overlays.last(), Some(Overlay::HtmlPreview(_))) {
+        cache_key.starts_with("html:")
     } else {
         false
     }
@@ -676,55 +680,59 @@ fn draw_frame(
 
         let term_size = (ui.term_width, ui.term_height);
         let mut desired: Vec<ActivePixelGraphic> = Vec::new();
-        let mut desired_payload: Option<String> = None;
+        let mut desired_payloads: Vec<String> = Vec::new();
 
-        if let Some(pg) = ui.pending_pixel_graphic.clone() {
-            if pixel_graphics_allowed_for_overlays(&ui.overlays, &pg.cache_key) {
+        for pg in ui.pending_pixel_graphics.clone() {
+            if !pixel_graphics_allowed_for_overlays(&ui.overlays, &pg.cache_key) {
+                continue;
+            }
+            let resolved: Option<(Cow<'_, str>, u16, u16)> = if let Some(payload) = pg.payload {
+                Some((Cow::Owned(payload), pg.rect.width, pg.rect.height))
+            } else {
                 let (base_key, crop) = parse_pixel_key(&pg.cache_key);
-                let resolved: Option<(Cow<'_, str>, u16, u16)> =
-                    app.image_cache.get(base_key).and_then(|rendered| {
-                        if let Some((sx, sy, vw, vh)) = crop {
-                            rendered
-                                .viewport_pixel_payload(sx, sy, vw, vh)
-                                .map(|(p, c, r)| (Cow::Owned(p), c, r))
-                                .or_else(|| {
-                                    if rendered.cols <= vw && rendered.rows <= vh {
-                                        rendered
-                                            .pixel_payload
-                                            .as_deref()
-                                            .map(|p| (Cow::Borrowed(p), rendered.cols, rendered.rows))
-                                    } else {
-                                        None
-                                    }
-                                })
-                        } else {
-                            rendered
-                                .pixel_payload
-                                .as_deref()
-                                .map(|p| (Cow::Borrowed(p), rendered.cols, rendered.rows))
-                        }
-                    });
-
-                if let Some((payload, draw_cols, draw_rows)) = resolved {
-                    // Never allow any pixel graphic to touch the bottom-most status row.
-                    let safe_max_h = ui.term_height.saturating_sub(1).saturating_sub(pg.rect.y);
-                    let safe_max_w = ui.term_width.saturating_sub(pg.rect.x);
-                    if draw_cols > 0
-                        && draw_rows > 0
-                        && draw_cols <= safe_max_w
-                        && draw_rows <= safe_max_h
-                    {
-                        let placement_rect = Rect::new(pg.rect.x, pg.rect.y, draw_cols, draw_rows);
-                        desired.push(ActivePixelGraphic {
-                            cache_key: pg.cache_key,
-                            rect: placement_rect,
-                            protocol: pg.protocol,
-                            cols: draw_cols,
-                            rows: draw_rows,
-                            payload_len: payload.len(),
-                        });
-                        desired_payload = Some(payload.into_owned());
+                app.image_cache.get(base_key).and_then(|rendered| {
+                    if let Some((sx, sy, vw, vh)) = crop {
+                        rendered
+                            .viewport_pixel_payload(sx, sy, vw, vh)
+                            .map(|(p, c, r)| (Cow::Owned(p), c, r))
+                            .or_else(|| {
+                                if rendered.cols <= vw && rendered.rows <= vh {
+                                    rendered
+                                        .pixel_payload
+                                        .as_deref()
+                                        .map(|p| (Cow::Borrowed(p), rendered.cols, rendered.rows))
+                                } else {
+                                    None
+                                }
+                            })
+                    } else {
+                        rendered
+                            .pixel_payload
+                            .as_deref()
+                            .map(|p| (Cow::Borrowed(p), rendered.cols, rendered.rows))
                     }
+                })
+            };
+
+            if let Some((payload, draw_cols, draw_rows)) = resolved {
+                // Never allow any pixel graphic to touch the bottom-most status row.
+                let safe_max_h = ui.term_height.saturating_sub(1).saturating_sub(pg.rect.y);
+                let safe_max_w = ui.term_width.saturating_sub(pg.rect.x);
+                if draw_cols > 0
+                    && draw_rows > 0
+                    && draw_cols <= safe_max_w
+                    && draw_rows <= safe_max_h
+                {
+                    let placement_rect = Rect::new(pg.rect.x, pg.rect.y, draw_cols, draw_rows);
+                    desired.push(ActivePixelGraphic {
+                        cache_key: pg.cache_key,
+                        rect: placement_rect,
+                        protocol: pg.protocol,
+                        cols: draw_cols,
+                        rows: draw_rows,
+                        payload_len: payload.len(),
+                    });
+                    desired_payloads.push(payload.into_owned());
                 }
             }
         }
@@ -742,7 +750,7 @@ fn draw_frame(
                 == parse_pixel_key(&desired[0].cache_key).0;
 
         if sixel_crop_only_update {
-            if let Some(payload) = desired_payload {
+            if let Some(payload) = desired_payloads.first() {
                 let graphic = &desired[0];
                 crossterm::queue!(
                     terminal.backend_mut(),
@@ -750,8 +758,8 @@ fn draw_frame(
                 )?;
                 terminal.backend_mut().write_all(payload.as_bytes())?;
                 terminal.backend_mut().flush()?;
-                ui.active_pixel_graphic =
-                    Some((graphic.cache_key.clone(), graphic.rect, graphic.protocol));
+                ui.active_pixel_graphics =
+                    vec![(graphic.cache_key.clone(), graphic.rect, graphic.protocol)];
                 guard.pixel_tracker.commit(desired, term_size);
             }
         } else {
@@ -783,35 +791,54 @@ fn draw_frame(
                 }
                 terminal.backend_mut().flush()?;
                 terminal.clear()?;
-                ui.active_pixel_graphic = None;
+                ui.active_pixel_graphics.clear();
                 terminal.draw(|frame| {
                     cursor_pos = ui::draw(frame, app, ui);
                 })?;
             }
 
             if plan.emit_desired {
-                if let (Some(graphic), Some(payload)) = (desired.first(), desired_payload) {
-                    if graphic.protocol == TerminalImageProtocol::Kitty {
-                        terminal
-                            .backend_mut()
-                            .write_all(img_preview::kitty_delete_preview_sequence().as_bytes())?;
-                        guard.kitty_used = true;
-                        KITTY_USED_GLOBAL.store(true, Ordering::Relaxed);
-                    }
+                let any_kitty = desired
+                    .iter()
+                    .any(|g| g.protocol == TerminalImageProtocol::Kitty);
+                if any_kitty {
+                    terminal
+                        .backend_mut()
+                        .write_all(img_preview::kitty_delete_preview_sequence().as_bytes())?;
+                    terminal
+                        .backend_mut()
+                        .write_all(img_preview::kitty_delete_all_sequence().as_bytes())?;
+                    guard.kitty_used = true;
+                    KITTY_USED_GLOBAL.store(true, Ordering::Relaxed);
+                }
+                for (idx, (graphic, payload)) in desired.iter().zip(desired_payloads.iter()).enumerate() {
+                    let emitted: Cow<'_, str> =
+                        if graphic.protocol == TerminalImageProtocol::Kitty && idx > 0 {
+                            let from = format!(",i={},", img_preview::KITTY_PREVIEW_IMAGE_ID);
+                            let to = format!(
+                                ",i={},",
+                                img_preview::KITTY_PREVIEW_IMAGE_ID.saturating_add(idx as u32)
+                            );
+                            Cow::Owned(payload.replacen(&from, &to, 1))
+                        } else {
+                            Cow::Borrowed(payload.as_str())
+                        };
                     crossterm::queue!(
                         terminal.backend_mut(),
                         crossterm::cursor::MoveTo(graphic.rect.x, graphic.rect.y)
                     )?;
-                    terminal.backend_mut().write_all(payload.as_bytes())?;
-                    terminal.backend_mut().flush()?;
-                    ui.active_pixel_graphic =
-                        Some((graphic.cache_key.clone(), graphic.rect, graphic.protocol));
+                    terminal.backend_mut().write_all(emitted.as_bytes())?;
                 }
+                terminal.backend_mut().flush()?;
+                ui.active_pixel_graphics = desired
+                    .iter()
+                    .map(|g| (g.cache_key.clone(), g.rect, g.protocol))
+                    .collect();
             } else if plan.delete_kitty {
                 guard.kitty_used = false;
-                ui.active_pixel_graphic = None;
+                ui.active_pixel_graphics.clear();
             } else if desired.is_empty() {
-                ui.active_pixel_graphic = None;
+                ui.active_pixel_graphics.clear();
             }
 
             guard.pixel_tracker.commit(desired, term_size);
@@ -1138,9 +1165,9 @@ pub async fn run_with_persona(
             ui.editor_requested = false;
             if guard.kitty_used
                 || ui
-                    .active_pixel_graphic
-                    .as_ref()
-                    .is_some_and(|(_, _, p)| *p == TerminalImageProtocol::Kitty)
+                    .active_pixel_graphics
+                    .iter()
+                    .any(|(_, _, p)| *p == TerminalImageProtocol::Kitty)
             {
                 let _ = terminal
                     .backend_mut()
@@ -1165,7 +1192,7 @@ pub async fn run_with_persona(
             }
             let _ = terminal.backend_mut().flush();
             guard.pixel_tracker.clear();
-            ui.active_pixel_graphic = None;
+            ui.active_pixel_graphics.clear();
             guard.restore();
             let initial_body = match ui.overlays.last() {
                 Some(Overlay::MailCompose(c)) => c.body.text().to_string(),
@@ -1731,6 +1758,35 @@ mod tests {
         assert!(!pixel_graphics_allowed_for_overlays(
             &stacked,
             "m1:att1:80x24:sixel"
+        ));
+
+        // HtmlPreview on top: html: graphics allowed, inline: blocked; ConfirmDialog over HtmlPreview blocks html:
+        let html_only = vec![Overlay::html_preview(
+            crate::ui::overlays::html_preview::HtmlPreviewOverlay::new(
+                Some("Chart".into()),
+                "<p>Hi</p>".into(),
+            ),
+        )];
+        assert!(pixel_graphics_allowed_for_overlays(
+            &html_only,
+            "html:3:80x8:sixel:crop:0,0,80,8"
+        ));
+        assert!(!pixel_graphics_allowed_for_overlays(
+            &html_only,
+            "inline:m1:att1"
+        ));
+        let html_stacked = vec![
+            Overlay::html_preview(
+                crate::ui::overlays::html_preview::HtmlPreviewOverlay::new(
+                    Some("Chart".into()),
+                    "<p>Hi</p>".into(),
+                ),
+            ),
+            Overlay::confirm("Quit Outlook?", None),
+        ];
+        assert!(!pixel_graphics_allowed_for_overlays(
+            &html_stacked,
+            "html:3:80x8:sixel:crop:0,0,80,8"
         ));
     }
 
