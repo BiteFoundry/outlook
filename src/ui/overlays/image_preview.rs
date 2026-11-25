@@ -17,7 +17,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    img_preview::{self, TerminalImageProtocol},
+    img_preview::{self, FitBox, TerminalImageProtocol},
     models::{MailAttachment, MailMessage},
     parser,
     ui::{
@@ -113,20 +113,16 @@ impl ImagePreviewOverlay {
         )
     }
 
-    pub fn target_dimensions(&self, term_width: u16, term_height: u16) -> (u16, u16) {
+    pub fn viewport_dimensions(term_width: u16, term_height: u16) -> (u16, u16) {
         let rect = Self::modal_rect(Rect::new(0, 0, term_width.max(24), term_height.max(12)));
-        let inner_w = rect.width.saturating_sub(2).max(12);
-        let inner_h = rect.height.saturating_sub(3).max(6);
-        let base_cols = rect.width.saturating_sub(4).max(12);
-        let max_cols = inner_w.saturating_mul(2).max(base_cols).min(240);
-        let scaled_cols =
-            ((base_cols as u32 * self.zoom_pct as u32) / 100).clamp(8, max_cols as u32) as u16;
-        // Pass `scrollable_max_rows >= scaled_cols` so `img_preview` fits tall images to width
-        // and lets them scroll vertically immediately at 100% zoom.
-        let scrollable_max_rows = ((inner_h as u32 * 4 * self.zoom_pct as u32) / 100)
-            .max(scaled_cols as u32)
-            .clamp(6, 240) as u16;
-        (scaled_cols, scrollable_max_rows)
+        let img_w = rect.width.saturating_sub(2).max(1);
+        let img_h = rect.height.saturating_sub(3).max(1);
+        (img_w, img_h)
+    }
+
+    pub fn fit_box(&self, term_width: u16, term_height: u16) -> FitBox {
+        let (view_cols, view_rows) = Self::viewport_dimensions(term_width, term_height);
+        FitBox::scrollable(view_cols, view_rows, self.zoom_pct)
     }
 
     pub fn next_image(&mut self) {
@@ -289,7 +285,7 @@ impl ImagePreviewOverlay {
             .saturating_sub(2 + if show_close_pill { close_w + 2 } else { 0 })
             as usize;
 
-        let (cols, rows) = self.target_dimensions(area.width, area.height);
+        let (view_cols, view_rows) = Self::viewport_dimensions(area.width, area.height);
         let Some(cur) = self.current().cloned() else {
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -305,8 +301,10 @@ impl ImagePreviewOverlay {
         let cache_key = AppState::preview_image_cache_key(
             cur.owner_id(),
             cur.att_id(),
-            cols,
-            rows,
+            view_cols,
+            view_rows,
+            self.zoom_pct,
+            ui.graphics_caps.cell_px,
             proto,
         );
         let cached = app.image_cache.get(&cache_key);
@@ -562,11 +560,14 @@ mod tests {
 
         overlay.handle(&Action::Input('+'));
         assert_eq!(overlay.zoom_pct, 125);
-        let (cols_125, rows_125) = overlay.target_dimensions(120, 40);
+        let fit_125 = overlay.fit_box(120, 40);
         overlay.handle(&Action::Input('-'));
-        let (cols_100, rows_100) = overlay.target_dimensions(120, 40);
-        assert!(cols_125 > cols_100);
-        assert!(rows_125 > rows_100);
+        let fit_100 = overlay.fit_box(120, 40);
+        assert_eq!(fit_125.view_cols, fit_100.view_cols);
+        assert_eq!(fit_125.view_rows, fit_100.view_rows);
+        assert_eq!(fit_125.zoom_pct, 125);
+        assert_eq!(fit_100.zoom_pct, 100);
+        assert!(fit_125.scrollable);
         overlay.handle(&Action::Input('-'));
         assert_eq!(overlay.zoom_pct, 75);
 
@@ -704,7 +705,7 @@ mod tests {
         assert_eq!(overlay.current().unwrap().att_id(), "cid:screenshot.png@outlook");
 
         let area = Rect::new(0, 0, 100, 30);
-        let (cols, rows) = overlay.target_dimensions(area.width, area.height);
+        let fit = overlay.fit_box(area.width, area.height);
 
         for (proto, badge) in [
             (img_preview::TerminalImageProtocol::Sixel, "[Sixel]"),
@@ -739,13 +740,19 @@ mod tests {
             cell_px_exact: true,
         };
         let cur = overlay.current().unwrap();
-        let cache_key =
-            AppState::preview_image_cache_key(cur.owner_id(), cur.att_id(), cols, rows, proto);
+        let cache_key = AppState::preview_image_cache_key(
+            cur.owner_id(),
+            cur.att_id(),
+            fit.view_cols,
+            fit.view_rows,
+            fit.zoom_pct,
+            ui.graphics_caps.cell_px,
+            proto,
+        );
         let sample_png = make_tall_png(320, 200);
         let rendered = img_preview::decode_and_render_for_protocol(
             &sample_png,
-            cols,
-            rows,
+            fit,
             (28, 32, 46),
             ui.graphics_caps,
         )
@@ -812,11 +819,10 @@ mod tests {
 
             let msg = mail_with_attachments();
             let mut overlay = ImagePreviewOverlay::from_mail_message(&msg, Some(1)).unwrap();
-            let (cols, rows) = overlay.target_dimensions(area.width, area.height);
+            let fit = overlay.fit_box(area.width, area.height);
             let rendered = img_preview::decode_and_render_for_protocol(
                 &png,
-                cols,
-                rows,
+                fit,
                 (25, 25, 25),
                 ui.graphics_caps,
             )
@@ -835,8 +841,15 @@ mod tests {
             );
 
             let cur = overlay.current().unwrap();
-            let base_key =
-                AppState::preview_image_cache_key(cur.owner_id(), cur.att_id(), cols, rows, proto);
+            let base_key = AppState::preview_image_cache_key(
+                cur.owner_id(),
+                cur.att_id(),
+                fit.view_cols,
+                fit.view_rows,
+                fit.zoom_pct,
+                ui.graphics_caps.cell_px,
+                proto,
+            );
             app.insert_image_cache(base_key.clone(), rendered);
 
             let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
@@ -918,5 +931,41 @@ mod tests {
 
             app.sync_ctrl.request(crate::sync::SyncCommand::Shutdown);
         }
+    }
+
+    #[test]
+    fn test_preview_cache_key_includes_cell_px() {
+        let k1 = AppState::preview_image_cache_key(
+            "msg-1",
+            "att-1",
+            100,
+            30,
+            100,
+            (10, 20),
+            TerminalImageProtocol::Sixel,
+        );
+        let k2 = AppState::preview_image_cache_key(
+            "msg-1",
+            "att-1",
+            100,
+            30,
+            100,
+            (16, 32),
+            TerminalImageProtocol::Sixel,
+        );
+        let k3 = AppState::preview_image_cache_key(
+            "msg-1",
+            "att-1",
+            100,
+            30,
+            150,
+            (10, 20),
+            TerminalImageProtocol::Sixel,
+        );
+        assert_ne!(k1, k2, "different cell_px must produce different cache keys");
+        assert_ne!(k1, k3, "different zoom_pct must produce different cache keys");
+        assert!(k1.contains("10x20"));
+        assert!(k2.contains("16x32"));
+        assert!(k3.contains("150%"));
     }
 }

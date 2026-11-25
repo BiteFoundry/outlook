@@ -912,11 +912,19 @@ fn handle_terminal_event(
             ui.term_width = w;
             ui.term_height = h;
             *dirty = true;
-            if matches!(
-                ui.overlays.last(),
-                Some(ui::overlays::Overlay::ImagePreview(_))
-            ) {
-                let _ = action::dispatch(Action::LoadPreviewImage, app, ui);
+            #[cfg(not(windows))]
+            {
+                let _ = img_preview::refresh_cell_pixel_size(&mut ui.graphics_caps);
+                if matches!(
+                    ui.overlays.last(),
+                    Some(ui::overlays::Overlay::ImagePreview(_))
+                ) {
+                    let _ = action::dispatch(Action::LoadPreviewImage, app, ui);
+                }
+            }
+            #[cfg(windows)]
+            {
+                ui.cell_px_refresh_pending = true;
             }
         }
         CrosstermEvent::FocusGained => {
@@ -1215,6 +1223,25 @@ pub async fn run_with_persona(
                 Err(err) => {
                     ui.error(format!("External editor error: {err}"));
                 }
+            }
+        }
+
+        #[cfg(windows)]
+        if ui.cell_px_refresh_pending {
+            ui.cell_px_refresh_pending = false;
+            drop(events);
+            let _ = img_preview::refresh_cell_pixel_size(&mut ui.graphics_caps);
+            win_console::enforce_windows_mouse_capture();
+            let mut stdout = io::stdout();
+            let _ = write_vt_mouse_enable(&mut stdout);
+            let _ = write_vt_focus_enable(&mut stdout);
+            events = EventStream::new();
+            dirty = true;
+            if matches!(
+                ui.overlays.last(),
+                Some(ui::overlays::Overlay::ImagePreview(_))
+            ) {
+                let _ = action::dispatch(Action::LoadPreviewImage, &mut app, &mut ui);
             }
         }
 

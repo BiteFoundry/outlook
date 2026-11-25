@@ -710,8 +710,13 @@ pub fn draw_reader(
     };
 
     let width = (body_area.width as usize).max(16);
-    let thumb_cols = width.saturating_sub(6).clamp(16, 40) as u16;
-    let thumb_rows = 10u16;
+    let thumb_cols = width.saturating_sub(4).clamp(24, 72) as u16;
+    let thumb_rows = 16u16;
+    let cell_px = ui.graphics_caps.cell_px;
+    let inline_bg = img_preview::color_to_rgb(
+        ui.theme.bg_canvas,
+        img_preview::color_to_rgb(ui.theme.bg_card, (20, 22, 26)),
+    );
 
     // Request inline image decode for visible/expanded messages in thread
     if ui.inline_images {
@@ -722,7 +727,14 @@ pub fn draw_reader(
             }
             for att in parser::effective_mail_attachments(msg).iter() {
                 if img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name)) {
-                    app.request_mail_image(msg.id.clone(), att.clone(), thumb_cols, thumb_rows);
+                    app.request_mail_image(
+                        msg.id.clone(),
+                        att.clone(),
+                        thumb_cols,
+                        thumb_rows,
+                        cell_px,
+                        inline_bg,
+                    );
                 }
             }
         }
@@ -736,6 +748,8 @@ pub fn draw_reader(
         ui.show_link_urls,
         app.image_cache_gen,
         width,
+        cell_px,
+        inline_bg,
         &ui.theme,
     );
 
@@ -761,6 +775,8 @@ pub fn draw_reader(
                 width,
                 thumbs,
                 (thumb_cols, thumb_rows),
+                cell_px,
+                inline_bg,
                 ui.show_link_urls,
                 selected_blocks,
             ));
@@ -864,6 +880,8 @@ fn compute_reader_sig(
     show_link_urls: bool,
     image_cache_gen: u64,
     width: usize,
+    cell_px: (u16, u16),
+    inline_bg: (u8, u8, u8),
     theme: &Theme,
 ) -> (u64, u64) {
     let mut h = DualHasher::new(0x4d41_494c_5245_4144);
@@ -889,6 +907,8 @@ fn compute_reader_sig(
     h.write_hash(&show_link_urls);
     h.write_hash(&image_cache_gen);
     h.write_hash(&width);
+    h.write_hash(&cell_px);
+    h.write_hash(&inline_bg);
     hash_theme_sig(&mut h, theme);
     h.finish()
 }
@@ -925,6 +945,11 @@ pub fn build_reader_lines_with_opts(
     thumb_dims: (u16, u16),
     show_link_urls: bool,
 ) -> Vec<RenderedLine> {
+    let default_cell_px = img_preview::TerminalGraphicsCaps::default().cell_px;
+    let inline_bg = img_preview::color_to_rgb(
+        theme.bg_canvas,
+        img_preview::color_to_rgb(theme.bg_card, (20, 22, 26)),
+    );
     build_reader_lines_with_selected(
         thread_msgs,
         expanded_threads,
@@ -933,6 +958,8 @@ pub fn build_reader_lines_with_opts(
         width,
         image_cache,
         thumb_dims,
+        default_cell_px,
+        inline_bg,
         show_link_urls,
         None,
     )
@@ -947,6 +974,8 @@ fn build_reader_lines_with_selected(
     width: usize,
     image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
     thumb_dims: (u16, u16),
+    cell_px: (u16, u16),
+    inline_bg: (u8, u8, u8),
     show_link_urls: bool,
     selected_blocks: Option<(&str, &[RichBlock])>,
 ) -> Vec<RenderedLine> {
@@ -1163,6 +1192,8 @@ fn build_reader_lines_with_selected(
                 theme,
                 image_cache,
                 thumb_dims,
+                cell_px,
+                inline_bg,
                 show_link_urls,
             );
             let has_visible_body = !blocks.is_empty()
@@ -1303,6 +1334,8 @@ fn render_email_blocks(
     theme: &Theme,
     image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
     thumb_dims: (u16, u16),
+    cell_px: (u16, u16),
+    inline_bg: (u8, u8, u8),
     show_link_urls: bool,
 ) {
     let indent_w = UnicodeWidthStr::width(indent);
@@ -1505,8 +1538,14 @@ fn render_email_blocks(
                 ));
 
                 if let (Some(cache), Some(att)) = (image_cache, eff_attachments.get(att_idx)) {
-                    let key =
-                        AppState::image_cache_key(&msg.id, &att.id, thumb_dims.0, thumb_dims.1);
+                    let key = AppState::image_cache_key(
+                        &msg.id,
+                        &att.id,
+                        thumb_dims.0,
+                        thumb_dims.1,
+                        cell_px,
+                        inline_bg,
+                    );
                     if let Some(rendered) = cache.get(&key) {
                         for thumb_line in &rendered.lines {
                             let mut full = vec![Span::raw(indent.to_string())];
@@ -1558,6 +1597,8 @@ fn render_email_blocks(
                         theme,
                         None,
                         thumb_dims,
+                        cell_px,
+                        inline_bg,
                         show_link_urls,
                     );
                 }

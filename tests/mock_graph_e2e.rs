@@ -1323,12 +1323,17 @@ async fn e2e_mock_graph_auth_shared_m365_mail_delta_and_cid_sixel_preview() {
             ui_app.handle_ui_msg(&mut ui_state, msg);
             if let Some(Overlay::ImagePreview(ref ov)) = ui_state.overlays.last() {
                 if let Some(cur) = ov.current() {
-                    let (cols, rows) = ov.target_dimensions(ui_state.term_width, ui_state.term_height);
+                    let (view_cols, view_rows) = ImagePreviewOverlay::viewport_dimensions(
+                        ui_state.term_width,
+                        ui_state.term_height,
+                    );
                     let key = UiAppState::preview_image_cache_key(
                         cur.owner_id(),
                         cur.att_id(),
-                        cols,
-                        rows,
+                        view_cols,
+                        view_rows,
+                        ov.zoom_pct,
+                        ui_state.graphics_caps.cell_px,
                         ui_state.graphics_caps.protocol,
                     );
                     if ui_app.image_cache.contains_key(&key) {

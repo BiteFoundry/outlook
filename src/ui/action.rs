@@ -299,6 +299,10 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             ui.theme = super::theme::Theme::detect(ui.theme_preset);
             app.config.theme = ui.theme_preset;
             let _ = app.config.save();
+            app.clear_rendered_image_cache();
+            if matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_))) {
+                load_current_preview_image(app, ui);
+            }
             ui.info(format!("Theme: {}", ui.theme_preset.label()));
         }
         Action::ShowDownloadDir => {
@@ -1670,9 +1674,10 @@ pub fn load_current_preview_image(app: &mut AppState, ui: &mut UiState) {
     let Some(target) = preview.current().cloned() else {
         return;
     };
-    let (cols, rows) = preview.target_dimensions(ui.term_width, ui.term_height);
+    let fit = preview.fit_box(ui.term_width, ui.term_height);
     let caps = ui.graphics_caps;
-    app.request_preview_image(&target, cols, rows, caps, (28, 32, 46));
+    let bg_rgb = img_preview::color_to_rgb(ui.theme.bg_elevated, (28, 32, 46));
+    app.request_preview_image(&target, fit, caps, bg_rgb);
 }
 
 fn paste_clipboard(app: &mut AppState, ui: &mut UiState) {
@@ -1692,15 +1697,17 @@ fn paste_clipboard(app: &mut AppState, ui: &mut UiState) {
             if tokio::runtime::Handle::try_current().is_ok() {
                 let tx = app.ui_tx.clone();
                 let temp_dir = std::env::temp_dir();
+                let bg_rgb = img_preview::color_to_rgb(ui.theme.bg_elevated, (28, 32, 46));
+                let cell_px = ui.graphics_caps.cell_px;
                 tokio::task::spawn_blocking(move || {
                     if let Ok((path, png_bytes)) = composer::save_clipboard_rgba_to_temp_png(
                         &temp_dir, unix_ms, width, height, rgba,
                     ) {
-                        let preview = img_preview::decode_and_render_halfblocks(
+                        let preview = img_preview::decode_and_render_halfblocks_with_cell_px(
                             &png_bytes,
-                            24,
-                            4,
-                            (28, 32, 46),
+                            img_preview::FitBox::fixed(24, 4),
+                            bg_rgb,
+                            cell_px,
                         )
                         .ok();
                         let _ = tx.send(UiMsg::ClipboardImageEncoded {

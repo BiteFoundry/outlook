@@ -21,7 +21,7 @@ use crate::config::{
 use crate::graph::client::MailActionUnconfirmed;
 use crate::graph::mail::{rewrite_inline_image_cids, DraftSaveChange};
 use crate::graph::GraphClient;
-use crate::img_preview::{self, RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol};
+use crate::img_preview::{self, FitBox, RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol};
 use crate::models::{
     CalendarEvent, ContactItem, CoreEvent, DownloadedFile, EventRsvpAction, MailAttachment,
     MailFolder, MailMessage, MailSearchHit, NotificationCandidate, OutgoingEvent, OutgoingMail,
@@ -331,6 +331,7 @@ pub struct UiState {
     pub poll_retrying: bool,
     pub spinner_tick: u8,
     pub graphics_caps: TerminalGraphicsCaps,
+    pub cell_px_refresh_pending: bool,
     pub pending_pixel_graphic: Option<PendingPixelGraphic>,
     pub active_pixel_graphic: Option<(String, Rect, TerminalImageProtocol)>,
 }
@@ -384,6 +385,7 @@ impl UiState {
             poll_retrying: false,
             spinner_tick: 0,
             graphics_caps: TerminalGraphicsCaps::default(),
+            cell_px_refresh_pending: false,
             pending_pixel_graphic: None,
             active_pixel_graphic: None,
         }
@@ -2902,18 +2904,35 @@ impl AppState {
     // Image Cache & Async Decode (inline halfblock + HD pixel preview)
     // ------------------------------------------------------------------
 
-    pub fn image_cache_key(owner_id: &str, att_id: &str, cols: u16, rows: u16) -> String {
-        format!("{owner_id}:{att_id}:{cols}x{rows}")
+    pub fn image_cache_key(
+        owner_id: &str,
+        att_id: &str,
+        cols: u16,
+        rows: u16,
+        cell_px: (u16, u16),
+        bg_rgb: (u8, u8, u8),
+    ) -> String {
+        format!(
+            "{owner_id}:{att_id}:{cols}x{rows}:{}x{}:{:02x}{:02x}{:02x}",
+            cell_px.0, cell_px.1, bg_rgb.0, bg_rgb.1, bg_rgb.2
+        )
     }
 
     pub fn preview_image_cache_key(
         owner_id: &str,
         att_id: &str,
-        cols: u16,
-        rows: u16,
+        view_cols: u16,
+        view_rows: u16,
+        zoom_pct: u16,
+        cell_px: (u16, u16),
         protocol: TerminalImageProtocol,
     ) -> String {
-        format!("{owner_id}:{att_id}:{cols}x{rows}:{}", protocol.as_str())
+        format!(
+            "{owner_id}:{att_id}:{view_cols}x{view_rows}:{zoom_pct}%:{}x{}:{}",
+            cell_px.0,
+            cell_px.1,
+            protocol.as_str()
+        )
     }
 
     pub fn raw_image_cache_key(owner_id: &str, att_id: &str) -> String {
@@ -3023,16 +3042,21 @@ impl AppState {
         }
     }
 
-    pub fn clear_image_caches(&mut self) {
+    /// Clears rendered terminal image caches (keeping fetched raw bytes intact, e.g. on theme change).
+    pub fn clear_rendered_image_cache(&mut self) {
         self.image_cache.clear();
         self.image_cache_order.clear();
         self.image_cache_bytes = 0;
         self.image_errors.clear();
         self.image_errors_order.clear();
+        self.image_cache_gen = self.image_cache_gen.wrapping_add(1);
+    }
+
+    pub fn clear_image_caches(&mut self) {
+        self.clear_rendered_image_cache();
         self.image_raw_cache.clear();
         self.image_raw_order.clear();
         self.image_raw_bytes = 0;
-        self.image_cache_gen = self.image_cache_gen.wrapping_add(1);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3041,9 +3065,9 @@ impl AppState {
         key: String,
         msg_id: String,
         att: MailAttachment,
-        cols: u16,
-        rows: u16,
+        fit: FitBox,
         bg: (u8, u8, u8),
+        cell_px: (u16, u16),
         caps: Option<TerminalGraphicsCaps>,
     ) {
         if self.image_cache.contains_key(&key)
@@ -3174,8 +3198,10 @@ impl AppState {
                         });
                     }
                     let decode_res = tokio::task::spawn_blocking(move || match caps {
-                        Some(c) => img_preview::decode_and_render_for_protocol(&bytes, cols, rows, bg, c),
-                        None => img_preview::decode_and_render_halfblocks(&bytes, cols, rows, bg),
+                        Some(c) => img_preview::decode_and_render_for_protocol(&bytes, fit, bg, c),
+                        None => img_preview::decode_and_render_halfblocks_with_cell_px(
+                            &bytes, fit, bg, cell_px,
+                        ),
                     })
                     .await;
                     match decode_res {
@@ -3221,16 +3247,25 @@ impl AppState {
         att: MailAttachment,
         cols: u16,
         rows: u16,
+        cell_px: (u16, u16),
+        bg_rgb: (u8, u8, u8),
     ) {
-        let key = Self::image_cache_key(&msg_id, &att.id, cols, rows);
-        self.spawn_mail_image_decode(key, msg_id, att, cols, rows, (20, 22, 26), None);
+        let key = Self::image_cache_key(&msg_id, &att.id, cols, rows, cell_px, bg_rgb);
+        self.spawn_mail_image_decode(
+            key,
+            msg_id,
+            att,
+            FitBox::fixed(cols, rows),
+            bg_rgb,
+            cell_px,
+            None,
+        );
     }
 
     pub fn request_preview_image(
         &mut self,
         target: &PreviewTarget,
-        cols: u16,
-        rows: u16,
+        fit: FitBox,
         caps: TerminalGraphicsCaps,
         bg_rgb: (u8, u8, u8),
     ) {
@@ -3239,17 +3274,19 @@ impl AppState {
                 let key = Self::preview_image_cache_key(
                     msg_id,
                     &attachment.id,
-                    cols,
-                    rows,
+                    fit.view_cols,
+                    fit.view_rows,
+                    fit.zoom_pct,
+                    caps.cell_px,
                     caps.protocol,
                 );
                 self.spawn_mail_image_decode(
                     key,
                     msg_id.clone(),
                     attachment.clone(),
-                    cols,
-                    rows,
+                    fit,
                     bg_rgb,
+                    caps.cell_px,
                     Some(caps),
                 );
             }
