@@ -1,6 +1,6 @@
 [package]
 name = "outlook-cli"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "Microsoft Outlook terminal client & AI agent toolkit — Mail, Calendar, Tasks & Contacts (CLI, TUI, HTTP API, MCP)"
 repository = "https://github.com/BiteFoundry/outlook"
