@@ -117,12 +117,25 @@ impl SettingsState {
         }
 
         let rows = SettingsState::rows(app, ui);
-        for (index, (label, value)) in rows.iter().enumerate() {
-            if index as u16 >= inner.height.saturating_sub(1) {
-                break;
-            }
-            let y = inner.y + index as u16;
-            let selected = index == self.selected;
+        let visible = inner.height.saturating_sub(1) as usize;
+        let total = rows.len();
+        let selected_idx = self.selected.min(total.saturating_sub(1));
+        let start = if visible == 0 {
+            0
+        } else if selected_idx >= visible {
+            (selected_idx + 1 - visible).min(total.saturating_sub(visible))
+        } else {
+            0
+        };
+        for (slot, (index, (label, value))) in rows
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .enumerate()
+        {
+            let y = inner.y + slot as u16;
+            let selected = index == selected_idx;
             let style = if selected {
                 theme.selection()
             } else {

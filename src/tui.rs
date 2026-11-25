@@ -503,6 +503,35 @@ enum LoopStep {
     Quit,
 }
 
+fn should_flush_frame_after_event(
+    ev: &CrosstermEvent,
+    prev_overlay_depth: usize,
+    prev_tab: usize,
+    prev_fullscreen: bool,
+    prev_narrow: ui::app::NarrowPane,
+    ui: &UiState,
+) -> bool {
+    if matches!(ev, CrosstermEvent::Resize(_, _)) {
+        return true;
+    }
+    if matches!(
+        ev,
+        CrosstermEvent::Mouse(m)
+            if matches!(
+                m.kind,
+                MouseEventKind::Down(_)
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+            )
+    ) {
+        return true;
+    }
+    ui.overlays.len() != prev_overlay_depth
+        || ui.active_nav_tab != prev_tab
+        || ui.medium_reader_fullscreen != prev_fullscreen
+        || ui.narrow_pane != prev_narrow
+}
+
 async fn process_terminal_event_with_burst(
     first_ev: CrosstermEvent,
     events: &mut EventStream,
@@ -1195,6 +1224,7 @@ pub async fn run_with_persona(
         }
 
         let mut should_quit = false;
+        let mut flush_frame = false;
         tokio::select! {
             _ = tick.tick() => {
                 let before = ui.toasts.len();
@@ -1225,6 +1255,21 @@ pub async fn run_with_persona(
             maybe_ev = events.next() => {
                 match maybe_ev {
                     Some(Ok(ev)) => {
+                        let prev_overlays = ui.overlays.len();
+                        let prev_tab = ui.active_nav_tab;
+                        let prev_fullscreen = ui.medium_reader_fullscreen;
+                        let prev_narrow = ui.narrow_pane;
+                        let ev_needs_flush = matches!(ev, CrosstermEvent::Resize(_, _))
+                            || matches!(
+                                &ev,
+                                CrosstermEvent::Mouse(m)
+                                    if matches!(
+                                        m.kind,
+                                        MouseEventKind::Down(_)
+                                            | MouseEventKind::ScrollUp
+                                            | MouseEventKind::ScrollDown
+                                    )
+                            );
                         if matches!(
                             process_terminal_event_with_burst(
                                 ev,
@@ -1240,6 +1285,14 @@ pub async fn run_with_persona(
                         ) {
                             should_quit = true;
                         }
+                        if ev_needs_flush
+                            || ui.overlays.len() != prev_overlays
+                            || ui.active_nav_tab != prev_tab
+                            || ui.medium_reader_fullscreen != prev_fullscreen
+                            || ui.narrow_pane != prev_narrow
+                        {
+                            flush_frame = true;
+                        }
                     }
                     Some(Err(_)) | None => should_quit = true,
                 }
@@ -1249,9 +1302,11 @@ pub async fn run_with_persona(
             break;
         }
 
-        // Coalesce burst events (scroll wheel, fast typing, sync batches) before redrawing.
+        // Coalesce burst events (fast typing, sync batches) before redrawing,
+        // but flush immediately on clicks, scrolls, resizes, or overlay/layout changes
+        // so hitmaps and viewport rects are never stale for the next event.
         let mut drained = 0usize;
-        while drained < MAX_COALESCED_EVENTS && !ui.editor_requested {
+        while drained < MAX_COALESCED_EVENTS && !ui.editor_requested && !flush_frame {
             let mut progressed = false;
             while drained < MAX_COALESCED_EVENTS {
                 match core_rx.try_recv() {
@@ -1282,11 +1337,23 @@ pub async fn run_with_persona(
                     Err(_) => break,
                 }
             }
-            while drained < MAX_COALESCED_EVENTS && !ui.editor_requested {
+            while drained < MAX_COALESCED_EVENTS && !ui.editor_requested && !flush_frame {
                 match events.next().now_or_never() {
                     Some(Some(Ok(ev))) => {
                         drained += 1;
                         progressed = true;
+                        let prev_overlays = ui.overlays.len();
+                        let prev_tab = ui.active_nav_tab;
+                        let prev_fullscreen = ui.medium_reader_fullscreen;
+                        let prev_narrow = ui.narrow_pane;
+                        let ev_clone_flush = should_flush_frame_after_event(
+                            &ev,
+                            prev_overlays,
+                            prev_tab,
+                            prev_fullscreen,
+                            prev_narrow,
+                            &ui,
+                        );
                         if matches!(
                             process_terminal_event_with_burst(
                                 ev,
@@ -1303,6 +1370,15 @@ pub async fn run_with_persona(
                             should_quit = true;
                             break;
                         }
+                        if ev_clone_flush
+                            || ui.overlays.len() != prev_overlays
+                            || ui.active_nav_tab != prev_tab
+                            || ui.medium_reader_fullscreen != prev_fullscreen
+                            || ui.narrow_pane != prev_narrow
+                        {
+                            flush_frame = true;
+                            break;
+                        }
                     }
                     Some(Some(Err(_)) | None) => {
                         should_quit = true;
@@ -1311,7 +1387,7 @@ pub async fn run_with_persona(
                     None => break,
                 }
             }
-            if should_quit || !progressed {
+            if should_quit || !progressed || flush_frame {
                 break;
             }
         }
@@ -1628,6 +1704,73 @@ mod tests {
         assert!(!pixel_graphics_allowed_for_overlays(
             &stacked,
             "m1:att1:80x24:sixel"
+        ));
+    }
+
+    #[test]
+    fn test_coalesce_loop_flushes_on_mouse_down_scroll_resize_and_overlay_change() {
+        use crossterm::event::{MouseButton, MouseEvent};
+
+        let mut ui = UiState::new();
+        let plain_key = CrosstermEvent::Key(press(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(!should_flush_frame_after_event(
+            &plain_key,
+            0,
+            ui.active_nav_tab,
+            ui.medium_reader_fullscreen,
+            ui.narrow_pane,
+            &ui,
+        ));
+
+        let click = CrosstermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(should_flush_frame_after_event(
+            &click,
+            0,
+            ui.active_nav_tab,
+            ui.medium_reader_fullscreen,
+            ui.narrow_pane,
+            &ui,
+        ));
+
+        let scroll = CrosstermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(should_flush_frame_after_event(
+            &scroll,
+            0,
+            ui.active_nav_tab,
+            ui.medium_reader_fullscreen,
+            ui.narrow_pane,
+            &ui,
+        ));
+
+        let resize = CrosstermEvent::Resize(100, 30);
+        assert!(should_flush_frame_after_event(
+            &resize,
+            0,
+            ui.active_nav_tab,
+            ui.medium_reader_fullscreen,
+            ui.narrow_pane,
+            &ui,
+        ));
+
+        // Overlay opened during key dispatch also forces flush
+        ui.push_overlay(Overlay::settings());
+        assert!(should_flush_frame_after_event(
+            &plain_key,
+            0,
+            ui.active_nav_tab,
+            ui.medium_reader_fullscreen,
+            ui.narrow_pane,
+            &ui,
         ));
     }
 }

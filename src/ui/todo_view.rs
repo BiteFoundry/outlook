@@ -51,13 +51,18 @@ pub fn draw_list(
         return;
     }
 
-    let tasks = &app.todo_tasks;
+    let tasks = app.visible_todo_tasks(ui);
     let theme = &ui.theme;
     if tasks.is_empty() {
         ui.todo_list_scroll.total_lines = 0;
+        let msg = if ui.todo_hide_completed && !app.todo_tasks.is_empty() {
+            " All tasks completed ([Open] filter active)"
+        } else {
+            " No tasks in this list (n to add task)"
+        };
         frame.render_widget(
             Paragraph::new(Span::styled(
-                truncate(" No tasks in this list (n to add task)", list_area.width as usize),
+                truncate(msg, list_area.width as usize),
                 theme.muted_style(),
             )),
             list_area,

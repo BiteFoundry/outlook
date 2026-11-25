@@ -499,6 +499,35 @@ impl MailComposeOverlay {
                 self.suggestion_dismissed = false;
                 OverlayOutcome::Handled
             }
+            Action::MouseScroll { delta, .. } => {
+                if has_suggestions {
+                    if *delta < 0 {
+                        self.suggestion_idx =
+                            (self.suggestion_idx + suggestions_len - 1) % suggestions_len;
+                    } else if *delta > 0 {
+                        self.suggestion_idx = (self.suggestion_idx + 1) % suggestions_len;
+                    }
+                } else if *delta < 0 {
+                    self.body.scroll_up((-*delta) as usize);
+                } else if *delta > 0 {
+                    self.body.scroll_down(*delta as usize);
+                }
+                OverlayOutcome::Handled
+            }
+            Action::ScrollPageUp if self.field == 4 => {
+                let step = (self.body.last_viewport_height / 2).max(4);
+                for _ in 0..step {
+                    self.body.move_up(false);
+                }
+                OverlayOutcome::Handled
+            }
+            Action::ScrollPageDown if self.field == 4 => {
+                let step = (self.body.last_viewport_height / 2).max(4);
+                for _ in 0..step {
+                    self.body.move_down(false);
+                }
+                OverlayOutcome::Handled
+            }
             Action::MoveDown | Action::CursorDown => {
                 if has_suggestions {
                     self.suggestion_idx = (self.suggestion_idx + 1) % suggestions_len;

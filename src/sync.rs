@@ -355,7 +355,12 @@ pub enum SyncCommand {
     Bootstrap,
     RefreshAll,
     SyncFolder { folder_id: String },
-    LoadOlderMail { folder_id: String, explicit: bool },
+    LoadOlderMail {
+        folder_id: String,
+        explicit: bool,
+        #[serde(default)]
+        seq: u64,
+    },
     HydrateMessage { message_id: String },
     SyncCalendar,
     SyncTodo { list_id: Option<String> },
@@ -654,7 +659,11 @@ pub fn spawn_sync_engine(
                             }
                             active_tick.reset();
                         }
-                        Some(SyncCommand::LoadOlderMail { folder_id, explicit }) => {
+                        Some(SyncCommand::LoadOlderMail {
+                            folder_id,
+                            explicit,
+                            seq,
+                        }) => {
                             fast_shared.record_activity(Instant::now());
                             fast_shared.clear_auth_pause();
                             let has_more = if restricted_folders.contains(&folder_id) {
@@ -678,7 +687,11 @@ pub fn spawn_sync_engine(
                                     }
                                 }
                             };
-                            let _ = fast_event_tx.send(CoreEvent::MailHistoryPageFinished { folder_id, has_more });
+                            let _ = fast_event_tx.send(CoreEvent::MailHistoryPageFinished {
+                                folder_id,
+                                has_more,
+                                seq,
+                            });
                         }
                         Some(SyncCommand::NotifyUserActivity) => {
                             fast_shared.record_activity(Instant::now());
@@ -2115,7 +2128,7 @@ async fn poll_calendar_with_flag(
                     &sync_cursor,
                 )?;
                 if has_changes {
-                    let list = st.list_calendar_events(Some(&s_iso), Some(&e_iso), 200)?;
+                    let list = st.list_calendar_events(Some(&s_iso), None, 200)?;
                     Ok(Some(list))
                 } else {
                     Ok(None)
@@ -2140,7 +2153,7 @@ async fn poll_calendar_with_flag(
                     let to_store = events.clone();
                     let s_iso = start_iso.clone();
                     let e_iso = end_iso.clone();
-                    let _ = run_storage(storage, move |st| {
+                    let list = run_storage(storage, move |st| {
                         st.upsert_sync_cursor(&SyncCursor {
                             scope_key: "calendar_delta".to_string(),
                             delta_link: None,
@@ -2149,13 +2162,14 @@ async fn poll_calendar_with_flag(
                         })?;
                         if reached_end {
                             st.replace_calendar_events_in_window(&s_iso, &e_iso, &to_store)?;
-                            Ok(())
                         } else {
-                            st.upsert_calendar_events(&to_store)
+                            st.upsert_calendar_events(&to_store)?;
                         }
+                        st.list_calendar_events(Some(&s_iso), None, 200)
                     })
-                    .await;
-                    let _ = event_tx.send(CoreEvent::CalendarEventsUpdated(events));
+                    .await
+                    .unwrap_or(events);
+                    let _ = event_tx.send(CoreEvent::CalendarEventsUpdated(list));
                     Ok(())
                 }
                 Err(fallback_err) => Err(fallback_err),
@@ -2265,17 +2279,19 @@ async fn poll_todo_with_flag(
             Ok((tasks, reached_end)) => {
                 let tasks_for_db = tasks.clone();
                 let lid_for_db = lid.clone();
-                let _ = run_storage(storage, move |st| {
+                let sorted_tasks = run_storage(storage, move |st| {
                     if reached_end {
-                        st.replace_todo_tasks_for_list(&lid_for_db, true, &tasks_for_db)
+                        st.replace_todo_tasks_for_list(&lid_for_db, true, &tasks_for_db)?;
                     } else {
-                        st.upsert_todo_tasks(&tasks_for_db)
+                        st.upsert_todo_tasks(&tasks_for_db)?;
                     }
+                    st.list_todo_tasks(Some(&lid_for_db), true)
                 })
-                .await;
+                .await
+                .unwrap_or(tasks);
                 let _ = event_tx.send(CoreEvent::TodoTasksUpdated {
                     list_id: lid,
-                    tasks,
+                    tasks: sorted_tasks,
                 });
                 emit_recovered_if_needed(err_backoff, event_tx);
             }
@@ -2369,7 +2385,7 @@ async fn poll_contacts_with_flag(
     }
 }
 
-async fn run_bootstrap_and_emit(
+async fn run_bootstrap_core(
     graph: &GraphClient,
     storage: &Storage,
     event_tx: &mpsc::UnboundedSender<CoreEvent>,
@@ -2377,7 +2393,7 @@ async fn run_bootstrap_and_emit(
     mail_err_backoff: &mut ErrorBackoffState,
     breakers: &mut CapabilityCircuitBreakers,
     last_folders: &mut Option<Vec<MailFolder>>,
-) {
+) -> bool {
     let _ = event_tx.send(CoreEvent::SyncStateChanged {
         busy: true,
         summary: "Syncing Outlook...".to_string(),
@@ -2455,6 +2471,29 @@ async fn run_bootstrap_and_emit(
     breakers.todo_disabled = todo_disabled;
     breakers.contacts_disabled = contacts_disabled;
 
+    mail_ok
+}
+
+async fn run_bootstrap_and_emit(
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    shared: &SyncSharedState,
+    mail_err_backoff: &mut ErrorBackoffState,
+    breakers: &mut CapabilityCircuitBreakers,
+    last_folders: &mut Option<Vec<MailFolder>>,
+) {
+    let mail_ok = run_bootstrap_core(
+        graph,
+        storage,
+        event_tx,
+        shared,
+        mail_err_backoff,
+        breakers,
+        last_folders,
+    )
+    .await;
+
     let _ = event_tx.send(CoreEvent::SyncStateChanged {
         busy: false,
         summary: if mail_ok {
@@ -2477,7 +2516,7 @@ async fn run_refresh_all_and_emit(
     breakers: &mut CapabilityCircuitBreakers,
     last_folders: &mut Option<Vec<MailFolder>>,
 ) {
-    run_bootstrap_and_emit(
+    let mail_ok = run_bootstrap_core(
         graph,
         storage,
         event_tx,
@@ -2516,13 +2555,14 @@ async fn run_refresh_all_and_emit(
         .filter(|s| !s.is_empty())
     {
         let token_fp = current_token_fingerprint(graph).await;
+        let mut local_todo_backoff = ErrorBackoffState::new(60_000);
         poll_todo_quiet(
             Some(active_lid),
             graph,
             storage,
             event_tx,
             shared,
-            slow_err_backoff,
+            &mut local_todo_backoff,
             breakers,
             &token_fp,
         )
@@ -2530,6 +2570,15 @@ async fn run_refresh_all_and_emit(
     }
 
     slow_err_backoff.record_success();
+
+    let _ = event_tx.send(CoreEvent::SyncStateChanged {
+        busy: false,
+        summary: if mail_ok {
+            "Synced".to_string()
+        } else {
+            POLL_RETRY_SUMMARY.to_string()
+        },
+    });
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -4867,5 +4916,343 @@ mod tests {
         );
 
         ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn test_todo_poll_preserves_sqlite_sort_order_and_calendar_poll_preserves_future_events() {
+        use axum::{http::StatusCode, routing::get, Json, Router};
+
+        let now = chrono::Utc::now();
+        let in_window_start = (now + chrono::Duration::days(2)).to_rfc3339();
+        let in_window_end = (now + chrono::Duration::days(2) + chrono::Duration::hours(1)).to_rfc3339();
+        let future_start = (now + chrono::Duration::days(45)).to_rfc3339();
+        let future_end = (now + chrono::Duration::days(45) + chrono::Duration::hours(1)).to_rfc3339();
+
+        let in_window_start_c = in_window_start.clone();
+        let in_window_end_c = in_window_end.clone();
+
+        let router = Router::new()
+            .route(
+                "/v1.0/me/todo/lists",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "value": [
+                                { "id": "list-1", "displayName": "Tasks", "wellknownListName": "defaultList", "isOwner": true, "isShared": false }
+                            ]
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/todo/lists/list-1/tasks",
+                get(|| async {
+                    // Intentionally unsorted Graph order: completed first, then normal, then due earlier!
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "value": [
+                                { "id": "t-done", "title": "Completed task", "status": "completed", "importance": "high" },
+                                { "id": "t-nodue", "title": "No due date", "status": "notStarted", "importance": "normal" },
+                                { "id": "t-due-soon", "title": "Due tomorrow", "status": "notStarted", "importance": "normal", "dueDateTime": { "dateTime": "2026-11-26T00:00:00", "timeZone": "UTC" } }
+                            ]
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/calendarView/delta",
+                get(move || {
+                    let s = in_window_start_c.clone();
+                    let e = in_window_end_c.clone();
+                    async move {
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/calendarView/delta?$deltatoken=tok1",
+                                "value": [
+                                    {
+                                        "id": "ev-near",
+                                        "subject": "Near Meeting",
+                                        "start": { "dateTime": s, "timeZone": "UTC" },
+                                        "end": { "dateTime": e, "timeZone": "UTC" }
+                                    }
+                                ]
+                            })),
+                        )
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tok = crate::auth::StoredTokens {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("u".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = crate::auth::AuthManager::from_tokens(cfg.clone(), tok);
+        let graph = GraphClient::new(cfg, auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+
+        // Pre-seed a locally created event 45 days in the future (> 30d window!)
+        storage
+            .upsert_calendar_events(&[crate::models::CalendarEvent {
+                id: "ev-far-45d".into(),
+                subject: "Far Future Conference".into(),
+                start_iso: future_start,
+                end_iso: future_end,
+                time_zone: "UTC".into(),
+                ..Default::default()
+            }])
+            .unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let shared = SyncSharedState::new();
+        let mut backoff = ErrorBackoffState::new(1000);
+        let mut breakers = CapabilityCircuitBreakers::default();
+
+        poll_todo_quiet(
+            Some("list-1"),
+            &graph,
+            &storage,
+            &tx,
+            &shared,
+            &mut backoff,
+            &mut breakers,
+            "fp",
+        )
+        .await;
+
+        let mut todo_order = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let CoreEvent::TodoTasksUpdated { tasks, .. } = ev {
+                todo_order = tasks.into_iter().map(|t| t.id).collect();
+            }
+        }
+        assert_eq!(
+            todo_order,
+            vec!["t-due-soon", "t-nodue", "t-done"],
+            "poll_todo_quiet must emit SQLite sorted order instead of raw unsorted Graph order"
+        );
+
+        poll_calendar_quiet(&graph, &storage, &tx, &shared, &mut backoff, &mut breakers, "fp")
+            .await;
+
+        let mut cal_ids = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let CoreEvent::CalendarEventsUpdated(events) = ev {
+                cal_ids = events.into_iter().map(|e| e.id).collect();
+            }
+        }
+        assert!(
+            cal_ids.contains(&"ev-near".to_string()) && cal_ids.contains(&"ev-far-45d".to_string()),
+            "calendar poll must preserve locally stored >30d future events, got {cal_ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_all_keeps_busy_true_until_active_folder_and_todo_complete() {
+        use axum::{http::StatusCode, routing::get, Json, Router};
+
+        let router = Router::new()
+            .route(
+                "/v1.0/me",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "id": "u1", "displayName": "User", "mail": "u@example.com" })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "value": [
+                                { "id": "f-inbox", "displayName": "Inbox", "wellKnownName": "inbox", "unreadItemCount": 0, "totalItemCount": 0 },
+                                { "id": "f-sent", "displayName": "Sent", "wellKnownName": "sentitems", "unreadItemCount": 0, "totalItemCount": 1 }
+                            ]
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/f-inbox/messages/delta",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "@odata.deltaLink": "d1", "value": [] })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/f-sent/messages/delta",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "@odata.deltaLink": "d2",
+                            "value": [
+                                {
+                                    "id": "m-sent-1",
+                                    "parentFolderId": "f-sent",
+                                    "subject": "Sent item",
+                                    "receivedDateTime": "2026-11-25T08:00:00Z",
+                                    "isRead": true
+                                }
+                            ]
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/f-sent/messages",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "value": [] })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/mailFolders/f-inbox/messages",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "value": [] })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/calendarView/delta",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "@odata.deltaLink": "dc1", "value": [] })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/contacts",
+                get(|| async {
+                    (StatusCode::OK, Json(serde_json::json!({ "value": [] })))
+                }),
+            )
+            .route(
+                "/v1.0/me/todo/lists",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "value": [
+                                { "id": "l-def", "displayName": "Tasks", "wellknownListName": "defaultList", "isOwner": true, "isShared": false },
+                                { "id": "l-work", "displayName": "Work", "isOwner": true, "isShared": false }
+                            ]
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/me/todo/lists/l-def/tasks",
+                get(|| async { (StatusCode::OK, Json(serde_json::json!({ "value": [] }))) }),
+            )
+            .route(
+                "/v1.0/me/todo/lists/l-work/tasks",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "value": [{ "id": "tw-1", "title": "Work task", "status": "notStarted", "importance": "normal" }]
+                        })),
+                    )
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tok = crate::auth::StoredTokens {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("u".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = crate::auth::AuthManager::from_tokens(cfg.clone(), tok);
+        let graph = GraphClient::new(cfg, auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let shared = SyncSharedState::new();
+        let mut mail_backoff = ErrorBackoffState::new(1000);
+        let mut slow_backoff = ErrorBackoffState::new(1000);
+        let mut breakers = CapabilityCircuitBreakers::default();
+        let mut last_folders = None;
+
+        let focus = FocusTarget {
+            active_view: ActiveView::Mail,
+            active_folder_id: Some("f-sent".into()),
+            active_message_id: None,
+            active_todo_list_id: Some("l-work".into()),
+        };
+        run_refresh_all_and_emit(
+            &focus,
+            &graph,
+            &storage,
+            &tx,
+            &shared,
+            &mut mail_backoff,
+            &mut slow_backoff,
+            &mut breakers,
+            &mut last_folders,
+        )
+        .await;
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        let sent_pos = events
+            .iter()
+            .position(|e| matches!(e, CoreEvent::MailMessagesUpdated { folder_id, .. } if folder_id == "f-sent"))
+            .expect("active Sent folder synced");
+        let work_todo_pos = events
+            .iter()
+            .position(|e| matches!(e, CoreEvent::TodoTasksUpdated { list_id, .. } if list_id == "l-work"))
+            .expect("active Work todo list synced");
+        let busy_false_positions: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| matches!(e, CoreEvent::SyncStateChanged { busy: false, .. }).then_some(i))
+            .collect();
+        assert_eq!(busy_false_positions.len(), 1);
+        assert!(
+            busy_false_positions[0] > sent_pos && busy_false_positions[0] > work_todo_pos,
+            "SyncStateChanged(busy=false) must only fire after active folder & active todo list finish"
+        );
     }
 }

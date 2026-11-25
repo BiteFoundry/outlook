@@ -35,6 +35,10 @@ pub struct ComposerState {
     pub pending_images: Vec<InlineImageUpload>,
     pub pending_preview: Option<RenderedTerminalImage>,
     pub last_inner_width: u16,
+    pub scroll_offset: usize,
+    pub last_viewport_height: usize,
+    pub last_visual_lines: usize,
+    scroll_pinned: bool,
     anchor: Option<usize>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
@@ -58,6 +62,10 @@ impl Default for ComposerState {
             pending_images: Vec::new(),
             pending_preview: None,
             last_inner_width: 72,
+            scroll_offset: 0,
+            last_viewport_height: 8,
+            last_visual_lines: 1,
+            scroll_pinned: false,
             anchor: None,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -107,6 +115,7 @@ impl ComposerState {
     }
 
     fn insert_replacing_selection(&mut self, value: &str) {
+        self.scroll_pinned = false;
         if let Some((start, end)) = self.selection_range() {
             self.record();
             self.text.replace_range(start..end, value);
@@ -185,6 +194,8 @@ impl ComposerState {
         self.record();
         self.text.clear();
         self.cursor = 0;
+        self.scroll_offset = 0;
+        self.scroll_pinned = false;
         self.anchor = None;
         self.pending_images.clear();
         self.pending_preview = None;
@@ -230,6 +241,7 @@ impl ComposerState {
     pub fn load_text(&mut self, value: &str) {
         self.text = normalize(value);
         self.cursor = self.text.len();
+        self.scroll_pinned = false;
         self.anchor = None;
         self.undo.clear();
         self.redo.clear();
@@ -238,6 +250,8 @@ impl ComposerState {
     pub fn load_text_cursor_start(&mut self, value: &str) {
         self.text = normalize(value);
         self.cursor = 0;
+        self.scroll_offset = 0;
+        self.scroll_pinned = false;
         self.anchor = None;
         self.undo.clear();
         self.redo.clear();
@@ -247,6 +261,7 @@ impl ComposerState {
         if value.is_empty() || pos > self.text.len() || !self.text.is_char_boundary(pos) {
             return;
         }
+        self.scroll_pinned = false;
         self.record();
         self.text.insert_str(pos, value);
         self.cursor = pos + value.len();
@@ -257,6 +272,7 @@ impl ComposerState {
         if range.start >= range.end {
             return;
         }
+        self.scroll_pinned = false;
         self.record();
         self.text.replace_range(range.clone(), "");
         self.cursor = range.start;
@@ -378,6 +394,7 @@ impl ComposerState {
     }
 
     fn move_to(&mut self, pos: usize, extend: bool) {
+        self.scroll_pinned = false;
         let pos = pos.min(self.text.len());
         if extend {
             if self.anchor.is_none() {
@@ -387,6 +404,19 @@ impl ComposerState {
             self.anchor = None;
         }
         self.cursor = pos;
+    }
+
+    pub fn scroll_up(&mut self, lines: usize) {
+        self.scroll_pinned = true;
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
+    pub fn scroll_down(&mut self, lines: usize) {
+        self.scroll_pinned = true;
+        let max_off = self
+            .last_visual_lines
+            .saturating_sub(self.last_viewport_height.max(1));
+        self.scroll_offset = self.scroll_offset.saturating_add(lines).min(max_off);
     }
 
     // ------------------------------------------------------------------
@@ -427,6 +457,7 @@ impl ComposerState {
     }
 
     fn restore(&mut self, snapshot: Snapshot) {
+        self.scroll_pinned = false;
         self.text = snapshot.text;
         self.cursor = snapshot.cursor.min(self.text.len());
         while !self.text.is_char_boundary(self.cursor) {
@@ -465,12 +496,18 @@ impl ComposerState {
         let (visual, cursor_row, cursor_col) = text_layout(&self.text, body_width, self.cursor);
 
         let height = area.height as usize;
-        let mut offset = if cursor_row >= height {
-            cursor_row + 1 - height
-        } else {
-            0
-        };
-        offset = offset.min(visual.len().saturating_sub(height));
+        self.last_viewport_height = height;
+        self.last_visual_lines = visual.len();
+        let max_off = visual.len().saturating_sub(height);
+        if !self.scroll_pinned {
+            if cursor_row < self.scroll_offset {
+                self.scroll_offset = cursor_row;
+            } else if cursor_row >= self.scroll_offset + height {
+                self.scroll_offset = cursor_row + 1 - height;
+            }
+        }
+        self.scroll_offset = self.scroll_offset.min(max_off);
+        let offset = self.scroll_offset;
 
         let mut lines: Vec<Line> = Vec::with_capacity(height);
         if self.text.is_empty() {
@@ -493,7 +530,7 @@ impl ComposerState {
 
         frame.render_widget(Paragraph::new(lines).style(surface_style), area);
 
-        if !focused {
+        if !focused || cursor_row < offset || cursor_row >= offset + height {
             return None;
         }
         let cursor_y = area

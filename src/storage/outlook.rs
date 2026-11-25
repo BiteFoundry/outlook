@@ -898,6 +898,59 @@ pub fn list_smart_folder_summaries(
     }
 }
 
+/// Counts cached mail messages matching smart folder criteria (`Unread`, `Flagged`),
+/// excluding Deleted Items via well-known folder mapping and an optional explicit excluded folder ID.
+pub fn count_smart_folder_messages(
+    conn: &Connection,
+    unread_only: bool,
+    flagged_only: bool,
+    excluded_folder_id: Option<&str>,
+) -> Result<i32> {
+    let mut extra_clauses = String::new();
+    if unread_only {
+        extra_clauses.push_str(" AND m.is_read = 0");
+    }
+    if flagged_only {
+        extra_clauses.push_str(" AND m.flagged = 1");
+    }
+    extra_clauses.push_str(
+        " AND (m.folder_id IS NULL OR (
+            LOWER(m.folder_id) NOT IN ('deleteditems', 'trash', 'deleted')
+            AND m.folder_id NOT IN (
+                SELECT id FROM mail_folders
+                WHERE LOWER(COALESCE(well_known_name, '')) = 'deleteditems'
+            )
+        ))",
+    );
+
+    let count: i64 = if let Some(ex_fid) = excluded_folder_id.map(str::trim).filter(|s| !s.is_empty())
+    {
+        let sql = format!(
+            "
+            SELECT COUNT(*)
+            FROM mail_messages m
+            WHERE 1 = 1
+              {extra_clauses}
+              AND COALESCE(m.folder_id, '') != ?1
+            "
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        stmt.query_row(params![ex_fid], |row| row.get(0))?
+    } else {
+        let sql = format!(
+            "
+            SELECT COUNT(*)
+            FROM mail_messages m
+            WHERE 1 = 1
+              {extra_clauses}
+            "
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        stmt.query_row([], |row| row.get(0))?
+    };
+    Ok(count.max(0) as i32)
+}
+
 /// Reload a folder through the last exposed row, including newer arrivals above it.
 pub(super) fn list_mail_summaries_through(
     conn: &Connection,

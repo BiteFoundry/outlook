@@ -308,6 +308,16 @@ impl Storage {
         )
     }
 
+    pub fn count_smart_folder_messages(
+        &self,
+        unread_only: bool,
+        flagged_only: bool,
+        excluded_folder_id: Option<&str>,
+    ) -> Result<i32> {
+        let conn = self.read_conn()?;
+        outlook::count_smart_folder_messages(&conn, unread_only, flagged_only, excluded_folder_id)
+    }
+
     pub(crate) fn list_mail_summaries_through(
         &self,
         folder_id: &str,

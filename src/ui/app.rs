@@ -183,21 +183,34 @@ pub enum UiMsg {
     AttachmentDownloaded(DownloadedFile),
     SearchResults {
         query: String,
+        generation: u64,
         hits: Vec<MailSearchHit>,
     },
     RemoteSearchResults {
         query: String,
+        generation: u64,
         messages: Vec<MailMessage>,
     },
     RemoteSearchFailed {
         query: String,
+        generation: u64,
         error: String,
     },
     CalendarEventCreated(CalendarEvent),
     CalendarEventDeleted(String),
+    CalendarEventDeleteFailed {
+        original_event: Option<CalendarEvent>,
+        error: String,
+    },
     CalendarRsvpDone {
         event_id: String,
         response_status: String,
+    },
+    CalendarRsvpFailed {
+        event_id: String,
+        prev_status: Option<String>,
+        prev_mail_statuses: Vec<(String, Option<String>)>,
+        error: String,
     },
     TodoListCreated(TodoList),
     TodoTasksLoaded {
@@ -206,7 +219,15 @@ pub enum UiMsg {
     },
     TodoTaskCreated(TodoTask),
     TodoTaskUpdated(TodoTask),
+    TodoTaskToggleFailed {
+        original_task: TodoTask,
+        error: String,
+    },
     TodoTaskDeleted(String),
+    TodoTaskDeleteFailed {
+        original_task: Option<TodoTask>,
+        error: String,
+    },
     ClipboardImageEncoded {
         unix_ms: u128,
         path: PathBuf,
@@ -292,6 +313,7 @@ pub struct UiState {
     pub group_threads: bool,
     pub focused_only: bool,
     pub mail_unread_only: bool,
+    pub todo_hide_completed: bool,
     pub inline_images: bool,
     pub show_link_urls: bool,
     pub medium_reader_fullscreen: bool,
@@ -344,6 +366,7 @@ impl UiState {
             group_threads: true,
             focused_only: false,
             mail_unread_only: false,
+            todo_hide_completed: false,
             inline_images: true,
             show_link_urls: false,
             medium_reader_fullscreen: false,
@@ -460,6 +483,7 @@ pub struct AppState {
     pub loading_mail: bool,
     pub loading_older_mail: bool,
     pub mail_oldest_reached: bool,
+    pub mail_history_seq: u64,
     mail_history_boundary: Option<(String, String)>,
     pub syncing: bool,
     pub sync_summary: String,
@@ -540,6 +564,7 @@ impl AppState {
             loading_mail: false,
             loading_older_mail: false,
             mail_oldest_reached: false,
+            mail_history_seq: 0,
             mail_history_boundary: None,
             syncing: false,
             sync_summary: "Synced".to_string(),
@@ -646,6 +671,68 @@ impl AppState {
                     .filter(|m| !m.is_read)
                     .count() as i32
             })
+    }
+
+    /// Mailbox-wide unread count across all non-Deleted-Items folders (never limited to the loaded slice).
+    pub fn smart_unread_count(&self) -> i32 {
+        if !self.mail_folders.is_empty() {
+            let folder_sum: i32 = self
+                .mail_folders
+                .iter()
+                .filter(|f| {
+                    !self.is_deleted_items_folder(&f.id)
+                        && !f
+                            .well_known_name
+                            .as_deref()
+                            .is_some_and(|w| w.eq_ignore_ascii_case("deleteditems"))
+                })
+                .map(|f| f.unread_item_count.max(0))
+                .sum();
+            if folder_sum > 0 {
+                return folder_sum;
+            }
+        }
+        let trash_id = self.find_trash_folder_id();
+        let db_count = self
+            .storage
+            .count_smart_folder_messages(true, false, trash_id.as_deref())
+            .unwrap_or(0);
+        if db_count > 0 {
+            return db_count;
+        }
+        if self.mail_folders.is_empty()
+            && self
+                .storage
+                .list_mail_summaries(None, 1)
+                .map(|v| v.is_empty())
+                .unwrap_or(false)
+        {
+            self.mail_messages.iter().filter(|m| !m.is_read).count() as i32
+        } else {
+            0
+        }
+    }
+
+    /// Mailbox-wide flagged count from SQLite (excluding Deleted Items).
+    pub fn smart_flagged_count(&self) -> i32 {
+        let trash_id = self.find_trash_folder_id();
+        let db_count = self
+            .storage
+            .count_smart_folder_messages(false, true, trash_id.as_deref())
+            .unwrap_or(0);
+        if db_count > 0 {
+            return db_count;
+        }
+        if self
+            .storage
+            .list_mail_summaries(None, 1)
+            .map(|v| v.is_empty())
+            .unwrap_or(false)
+        {
+            self.mail_messages.iter().filter(|m| m.flagged).count() as i32
+        } else {
+            0
+        }
     }
 
     pub fn active_folder_display_name(&self) -> String {
@@ -1010,11 +1097,31 @@ impl AppState {
         self.sync_displayed_mail_details(group_threads, true);
     }
 
+    fn refresh_mail_folders_from_storage(&mut self) {
+        if let Ok(folders) = self.storage.list_mail_folders() {
+            if !folders.is_empty() {
+                self.mail_folders = folders;
+            }
+        }
+    }
+
+    fn active_mail_is_visible(&self, ui: &UiState) -> bool {
+        let Some(ref active_id) = self.active_mail_id else {
+            return false;
+        };
+        let rows = self.visible_mail_rows(ui);
+        rows.iter().any(|r| {
+            r.thread_msg_indices
+                .iter()
+                .any(|&i| self.mail_messages[i].id == *active_id)
+        })
+    }
+
     fn replace_mail_list(&mut self, ui: &mut UiState, messages: Vec<MailMessage>) {
         self.mail_messages = messages;
         self.clear_mail_detail_cache();
         self.preserve_pinned_mail_in_list();
-        if self.active_mail().is_none() {
+        if self.active_mail().is_none() || !self.active_mail_is_visible(ui) {
             self.select_first_visible_mail(ui);
         } else {
             self.hydrate_active_mail_if_needed(ui.group_threads);
@@ -1070,6 +1177,41 @@ impl AppState {
     pub fn active_todo_task(&self) -> Option<&TodoTask> {
         let id = self.active_todo_task_id.as_deref()?;
         self.todo_tasks.iter().find(|t| t.id == id)
+    }
+
+    pub fn visible_todo_tasks(&self, ui: &UiState) -> Vec<TodoTask> {
+        if !ui.todo_hide_completed {
+            return self.todo_tasks.clone();
+        }
+        self.todo_tasks
+            .iter()
+            .filter(|t| !t.is_completed())
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn reconcile_calendar_selection(&mut self, ui: &mut UiState) {
+        let vis = self.visible_calendar_events(ui);
+        if let Some(ref active_id) = self.active_event_id {
+            if let Some(pos) = vis.iter().position(|e| e.id == *active_id) {
+                ui.cal_list_scroll.selected_idx = Some(pos);
+                return;
+            }
+        }
+        self.active_event_id = vis.first().map(|e| e.id.clone());
+        ui.cal_list_scroll.selected_idx = (!vis.is_empty()).then_some(0);
+    }
+
+    pub(crate) fn reconcile_todo_selection(&mut self, ui: &mut UiState) {
+        let vis = self.visible_todo_tasks(ui);
+        if let Some(ref active_id) = self.active_todo_task_id {
+            if let Some(pos) = vis.iter().position(|t| t.id == *active_id) {
+                ui.todo_list_scroll.selected_idx = Some(pos);
+                return;
+            }
+        }
+        self.active_todo_task_id = vis.first().map(|t| t.id.clone());
+        ui.todo_list_scroll.selected_idx = (!vis.is_empty()).then_some(0);
     }
 
     pub fn spawn_bootstrap(&mut self, ui: &mut UiState) {
@@ -1242,6 +1384,7 @@ impl AppState {
         self.clear_mail_detail_cache();
         self.mail_oldest_reached = false;
         self.loading_older_mail = false;
+        self.mail_history_seq = self.mail_history_seq.wrapping_add(1);
         self.mail_history_boundary = None;
         ui.mail_list_scroll = ScrollState::default();
         ui.mail_read_scroll = ScrollState::default();
@@ -1323,10 +1466,13 @@ impl AppState {
         {
             return;
         }
+        self.mail_history_seq = self.mail_history_seq.wrapping_add(1);
+        let seq = self.mail_history_seq;
         self.loading_older_mail = true;
         self.sync_ctrl.request(SyncCommand::LoadOlderMail {
             folder_id: self.active_folder_id.clone(),
             explicit: false,
+            seq,
         });
     }
 
@@ -1334,6 +1480,7 @@ impl AppState {
         let Some((id, new_read)) = self.active_mail().map(|m| (m.id.clone(), !m.is_read)) else {
             return;
         };
+        let prev_sel = ui.mail_list_scroll.selected_idx.unwrap_or(0);
         if let Some(m) = self.mail_messages.iter_mut().find(|m| m.id == id) {
             m.is_read = new_read;
         }
@@ -1346,6 +1493,10 @@ impl AppState {
             }
         }
         let _ = self.storage.set_mail_read_local(&id, new_read);
+        self.refresh_mail_folders_from_storage();
+        if !self.active_mail_is_visible(ui) {
+            self.reselect_after_removal(ui, prev_sel);
+        }
 
         if tokio::runtime::Handle::try_current().is_err() {
             return;
@@ -1369,13 +1520,13 @@ impl AppState {
                 });
             }
         });
-        let _ = ui;
     }
 
     pub fn toggle_mail_flag(&mut self, ui: &mut UiState) {
         let Some((id, new_flag)) = self.active_mail().map(|m| (m.id.clone(), !m.flagged)) else {
             return;
         };
+        let prev_sel = ui.mail_list_scroll.selected_idx.unwrap_or(0);
         if let Some(m) = self.mail_messages.iter_mut().find(|m| m.id == id) {
             m.flagged = new_flag;
         }
@@ -1388,6 +1539,9 @@ impl AppState {
             }
         }
         let _ = self.storage.set_mail_flagged_local(&id, new_flag);
+        if !self.active_mail_is_visible(ui) {
+            self.reselect_after_removal(ui, prev_sel);
+        }
         ui.info(if new_flag { "Flagged" } else { "Unflagged" });
 
         if tokio::runtime::Handle::try_current().is_err() {
@@ -1434,6 +1588,7 @@ impl AppState {
             }
         }
         let _ = self.storage.move_mail_folder_local(&id, &archive_id);
+        self.refresh_mail_folders_from_storage();
         self.reselect_after_removal(ui, prev_sel);
         ui.success("Archived");
 
@@ -1621,6 +1776,7 @@ impl AppState {
                 .storage
                 .move_mail_folder_local(id, &destination_folder_id);
         }
+        self.refresh_mail_folders_from_storage();
         self.reselect_after_removal(ui, prev_sel);
         ui.success(format!("Moved to {destination_name}"));
 
@@ -2169,6 +2325,7 @@ impl AppState {
         self.search_remote_inflight = trimmed_len >= 2;
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
+        let local_gen_atomic = Arc::clone(&self.search_gen_atomic);
         let local_query = query.clone();
         let task_label = "Search mail".to_string();
         ui.tasks.begin(task_label.clone());
@@ -2179,10 +2336,13 @@ impl AppState {
             })
             .await
             .unwrap_or_default();
-            let _ = tx.send(UiMsg::SearchResults {
-                query: local_query,
-                hits,
-            });
+            if local_gen_atomic.load(Ordering::SeqCst) == generation {
+                let _ = tx.send(UiMsg::SearchResults {
+                    query: local_query,
+                    generation,
+                    hits,
+                });
+            }
             let _ = tx.send(UiMsg::TaskDone {
                 label: task_label,
                 error: None,
@@ -2219,6 +2379,7 @@ impl AppState {
                         if gen_atomic.load(Ordering::SeqCst) == generation {
                             let _ = tx.send(UiMsg::RemoteSearchResults {
                                 query: remote_query,
+                                generation,
                                 messages,
                             });
                         }
@@ -2233,6 +2394,7 @@ impl AppState {
                         if gen_atomic.load(Ordering::SeqCst) == generation {
                             let _ = tx.send(UiMsg::RemoteSearchFailed {
                                 query: remote_query,
+                                generation,
                                 error: err_msg.clone(),
                             });
                         }
@@ -2278,7 +2440,11 @@ impl AppState {
                     })
                     .await;
                     if gen_atomic.load(Ordering::SeqCst) == generation {
-                        let _ = tx.send(UiMsg::RemoteSearchResults { query, messages });
+                        let _ = tx.send(UiMsg::RemoteSearchResults {
+                            query,
+                            generation,
+                            messages,
+                        });
                     }
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
@@ -2291,6 +2457,7 @@ impl AppState {
                     if gen_atomic.load(Ordering::SeqCst) == generation {
                         let _ = tx.send(UiMsg::RemoteSearchFailed {
                             query,
+                            generation,
                             error: err_msg.clone(),
                         });
                     }
@@ -2315,6 +2482,38 @@ impl AppState {
             EventRsvpAction::TentativelyAccept => "tentativelyAccepted",
             EventRsvpAction::Decline => "declined",
         };
+        let prev_status = self
+            .calendar_events
+            .iter()
+            .find(|e| e.id == event_id)
+            .map(|e| e.response_status.clone())
+            .or_else(|| {
+                self.storage
+                    .get_calendar_event(&event_id)
+                    .ok()
+                    .flatten()
+                    .map(|e| e.response_status)
+            });
+        let mut prev_mail_statuses: Vec<(String, Option<String>)> = Vec::new();
+        let mut record_mail_prev = |m: &MailMessage| {
+            if let Some(ref mr) = m.meeting_request {
+                if mr.event_id.as_deref() == Some(event_id.as_str())
+                    && !prev_mail_statuses.iter().any(|(mid, _)| mid == &m.id)
+                {
+                    prev_mail_statuses.push((m.id.clone(), mr.response_status.clone()));
+                }
+            }
+        };
+        for m in &self.mail_messages {
+            record_mail_prev(m);
+        }
+        for m in self.mail_detail_cache.values() {
+            record_mail_prev(m);
+        }
+        if let Some(ref m) = self.pinned_mail {
+            record_mail_prev(m);
+        }
+
         if let Some(ev) = self.calendar_events.iter_mut().find(|e| e.id == event_id) {
             ev.response_status = status_str.to_string();
         }
@@ -2348,6 +2547,7 @@ impl AppState {
             return;
         }
         let graph = self.graph.clone();
+        let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         let task_label = "Calendar RSVP".to_string();
         ui.tasks.begin(task_label.clone());
@@ -2365,10 +2565,20 @@ impl AppState {
                     });
                 }
                 Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: task_label,
-                        error: Some(err.to_string()),
-                        toast: Some((format!("RSVP failed: {err}"), ToastKind::Error)),
+                    if let Some(ref old_status) = prev_status {
+                        let st = storage.clone();
+                        let eid = event_id.clone();
+                        let old = old_status.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            st.update_event_response_local(&eid, &old)
+                        })
+                        .await;
+                    }
+                    let _ = tx.send(UiMsg::CalendarRsvpFailed {
+                        event_id,
+                        prev_status,
+                        prev_mail_statuses,
+                        error: err.to_string(),
                     });
                 }
             }
@@ -2415,17 +2625,32 @@ impl AppState {
         let Some(id) = self.active_event_id.clone() else {
             return;
         };
+        let prev_event = self
+            .storage
+            .get_calendar_event(&id)
+            .ok()
+            .flatten()
+            .or_else(|| self.calendar_events.iter().find(|e| e.id == id).cloned());
+        let prev_sel = ui.cal_list_scroll.selected_idx.unwrap_or(0);
         self.calendar_events.retain(|e| e.id != id);
         let _ = self.storage.delete_calendar_event(&id);
         let visible = self.visible_calendar_events(ui);
-        self.active_event_id = visible.first().map(|e| e.id.clone());
-        ui.cal_list_scroll.selected_idx = (!visible.is_empty()).then_some(0);
+        if visible.is_empty() {
+            self.active_event_id = None;
+            ui.cal_list_scroll.selected_idx = None;
+        } else {
+            let next_idx = prev_sel.min(visible.len() - 1);
+            self.active_event_id = Some(visible[next_idx].id.clone());
+            ui.cal_list_scroll.selected_idx = Some(next_idx);
+        }
+        ui.cal_detail_scroll.offset = 0;
         ui.info("Event deleted");
 
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
         let graph = self.graph.clone();
+        let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
             match graph.delete_calendar_event(&id).await {
@@ -2433,10 +2658,17 @@ impl AppState {
                     let _ = tx.send(UiMsg::CalendarEventDeleted(id));
                 }
                 Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: "Delete event".to_string(),
-                        error: Some(err.to_string()),
-                        toast: Some((format!("Delete failed: {err}"), ToastKind::Error)),
+                    if let Some(ref ev) = prev_event {
+                        let st = storage.clone();
+                        let restore = ev.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            st.upsert_calendar_events(std::slice::from_ref(&restore))
+                        })
+                        .await;
+                    }
+                    let _ = tx.send(UiMsg::CalendarEventDeleteFailed {
+                        original_event: prev_event,
+                        error: err.to_string(),
                     });
                 }
             }
@@ -2452,10 +2684,7 @@ impl AppState {
             .storage
             .list_todo_tasks(Some(&list_id), true)
             .unwrap_or_default();
-        self.active_todo_task_id = self.todo_tasks.first().map(|t| t.id.clone());
-        if !self.todo_tasks.is_empty() {
-            ui.todo_list_scroll.selected_idx = Some(0);
-        }
+        self.reconcile_todo_selection(ui);
         self.push_focus_to_sync();
         self.sync_ctrl.request(SyncCommand::SyncTodo {
             list_id: Some(list_id),
@@ -2466,9 +2695,11 @@ impl AppState {
         let Some(task_id) = self.active_todo_task_id.clone() else {
             return;
         };
+        let prev_sel = ui.todo_list_scroll.selected_idx.unwrap_or(0);
         let Some(task) = self.todo_tasks.iter_mut().find(|t| t.id == task_id) else {
             return;
         };
+        let prev_task = task.clone();
         let completed = !task.is_completed();
         task.status = if completed {
             "completed".to_string()
@@ -2477,6 +2708,18 @@ impl AppState {
         };
         let list_id = task.list_id.clone();
         let _ = self.storage.set_todo_task_completed_local(&task_id, completed);
+        if ui.todo_hide_completed && completed {
+            let vis = self.visible_todo_tasks(ui);
+            if vis.is_empty() {
+                self.active_todo_task_id = None;
+                ui.todo_list_scroll.selected_idx = None;
+            } else {
+                let next_idx = prev_sel.min(vis.len() - 1);
+                self.active_todo_task_id = Some(vis[next_idx].id.clone());
+                ui.todo_list_scroll.selected_idx = Some(next_idx);
+            }
+            ui.todo_detail_scroll.offset = 0;
+        }
 
         if tokio::runtime::Handle::try_current().is_err() {
             return;
@@ -2498,15 +2741,19 @@ impl AppState {
                     let _ = tx.send(UiMsg::TodoTaskUpdated(updated));
                 }
                 Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: "Update task".to_string(),
-                        error: Some(err.to_string()),
-                        toast: Some((format!("Task update failed: {err}"), ToastKind::Error)),
+                    let st = storage.clone();
+                    let restore = prev_task.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        st.upsert_todo_tasks(std::slice::from_ref(&restore))
+                    })
+                    .await;
+                    let _ = tx.send(UiMsg::TodoTaskToggleFailed {
+                        original_task: prev_task,
+                        error: err.to_string(),
                     });
                 }
             }
         });
-        let _ = ui;
     }
 
     pub fn create_todo_task(&mut self, ui: &mut UiState, list_id: String, title: String) {
@@ -2596,24 +2843,37 @@ impl AppState {
         let Some(task_id) = self.active_todo_task_id.clone() else {
             return;
         };
-        let list_id = self
+        let prev_task = self
             .todo_tasks
             .iter()
             .find(|t| t.id == task_id)
+            .cloned();
+        let list_id = prev_task
+            .as_ref()
             .map(|t| t.list_id.clone())
             .or_else(|| self.active_todo_list_id.clone())
             .unwrap_or_default();
+        let prev_sel = ui.todo_list_scroll.selected_idx.unwrap_or(0);
 
         self.todo_tasks.retain(|t| t.id != task_id);
         let _ = self.storage.delete_todo_task(&task_id);
-        self.active_todo_task_id = self.todo_tasks.first().map(|t| t.id.clone());
-        ui.todo_list_scroll.selected_idx = (!self.todo_tasks.is_empty()).then_some(0);
+        let vis = self.visible_todo_tasks(ui);
+        if vis.is_empty() {
+            self.active_todo_task_id = None;
+            ui.todo_list_scroll.selected_idx = None;
+        } else {
+            let next_idx = prev_sel.min(vis.len() - 1);
+            self.active_todo_task_id = Some(vis[next_idx].id.clone());
+            ui.todo_list_scroll.selected_idx = Some(next_idx);
+        }
+        ui.todo_detail_scroll.offset = 0;
         ui.info("Task deleted");
 
         if tokio::runtime::Handle::try_current().is_err() || list_id.is_empty() {
             return;
         }
         let graph = self.graph.clone();
+        let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
             match graph.delete_todo_task(&list_id, &task_id).await {
@@ -2621,10 +2881,17 @@ impl AppState {
                     let _ = tx.send(UiMsg::TodoTaskDeleted(task_id));
                 }
                 Err(err) => {
-                    let _ = tx.send(UiMsg::TaskDone {
-                        label: "Delete task".to_string(),
-                        error: Some(err.to_string()),
-                        toast: Some((format!("Delete failed: {err}"), ToastKind::Error)),
+                    if let Some(ref task) = prev_task {
+                        let st = storage.clone();
+                        let restore = task.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            st.upsert_todo_tasks(std::slice::from_ref(&restore))
+                        })
+                        .await;
+                    }
+                    let _ = tx.send(UiMsg::TodoTaskDeleteFailed {
+                        original_task: prev_task,
+                        error: err.to_string(),
                     });
                 }
             }
@@ -3289,8 +3556,15 @@ impl AppState {
                     self.maybe_notify(ui, &candidate);
                 }
             }
-            CoreEvent::MailHistoryPageFinished { folder_id, has_more } => {
-                if !self.loading_older_mail || !self.folder_matches_active(&folder_id) {
+            CoreEvent::MailHistoryPageFinished {
+                folder_id,
+                has_more,
+                seq,
+            } => {
+                if !self.loading_older_mail
+                    || seq != self.mail_history_seq
+                    || !self.folder_matches_active(&folder_id)
+                {
                     return;
                 }
                 self.loading_older_mail = false;
@@ -3343,13 +3617,7 @@ impl AppState {
             CoreEvent::CalendarEventsUpdated(events) => {
                 ui.poll_retrying = false;
                 self.calendar_events = events;
-                let vis = self.visible_calendar_events(ui);
-                if self.active_event().is_none() {
-                    self.active_event_id = vis.first().map(|e| e.id.clone());
-                    ui.cal_list_scroll.selected_idx = (!vis.is_empty()).then_some(0);
-                } else if let Some(ref active_id) = self.active_event_id {
-                    ui.cal_list_scroll.selected_idx = vis.iter().position(|e| e.id == *active_id);
-                }
+                self.reconcile_calendar_selection(ui);
             }
             CoreEvent::ContactsUpdated(contacts) => {
                 self.contacts = contacts;
@@ -3371,14 +3639,7 @@ impl AppState {
                 }
                 if self.active_todo_list_id.as_deref() == Some(list_id.as_str()) {
                     self.todo_tasks = tasks;
-                    if self.active_todo_task().is_none() {
-                        self.active_todo_task_id = self.todo_tasks.first().map(|t| t.id.clone());
-                        ui.todo_list_scroll.selected_idx =
-                            (!self.todo_tasks.is_empty()).then_some(0);
-                    } else if let Some(ref active_id) = self.active_todo_task_id {
-                        ui.todo_list_scroll.selected_idx =
-                            self.todo_tasks.iter().position(|t| t.id == *active_id);
-                    }
+                    self.reconcile_todo_selection(ui);
                 }
             }
         }
@@ -3422,14 +3683,25 @@ impl AppState {
                         }
                     }
                 }
-                // The bootstrap payload is the Inbox: it may only replace the list while the Inbox is
-                // the folder on screen, not after the user has already switched elsewhere.
+                // The bootstrap payload is the Inbox: it may only replace the list while the real
+                // Inbox is on screen, never virtual smart folders (`Unread` / `Flagged`) or another folder.
+                let is_virtual_folder = self.active_folder_id == VIRTUAL_UNREAD_FOLDER
+                    || self.active_folder_id == VIRTUAL_FLAGGED_FOLDER;
                 if !mail_messages.is_empty()
                     && self.mail_history_boundary.is_none()
+                    && !is_virtual_folder
                     && self.folder_matches_active("inbox")
                 {
                     self.mail_messages = mail_messages;
                     self.clear_mail_detail_cache();
+                } else if is_virtual_folder {
+                    let limit = self.mail_messages.len().max(150);
+                    if let Ok(loaded) = self.load_folder_summaries(&self.active_folder_id, limit) {
+                        if !loaded.is_empty() {
+                            self.mail_messages = loaded;
+                            self.clear_mail_detail_cache();
+                        }
+                    }
                 } else if self.mail_messages.is_empty()
                     && !self.active_folder_id.eq_ignore_ascii_case("inbox")
                 {
@@ -3449,10 +3721,8 @@ impl AppState {
                 self.preserve_pinned_mail_in_list();
                 if !calendar_events.is_empty() {
                     self.calendar_events = calendar_events;
-                    if self.active_event_id.is_none() {
-                        self.active_event_id = self.calendar_events.first().map(|e| e.id.clone());
-                    }
                 }
+                self.reconcile_calendar_selection(ui);
                 if !contacts.is_empty() {
                     self.contacts = contacts;
                 }
@@ -3468,15 +3738,25 @@ impl AppState {
                     }
                 }
                 if !todo_tasks.is_empty() {
-                    self.todo_tasks = todo_tasks;
-                    if self.active_todo_task_id.is_none() {
-                        self.active_todo_task_id = self.todo_tasks.first().map(|t| t.id.clone());
+                    let payload_list_id = todo_tasks.first().map(|t| t.list_id.as_str());
+                    let matches_active = match (self.active_todo_list_id.as_deref(), payload_list_id)
+                    {
+                        (Some(active), Some(payload)) => active == payload,
+                        (None, Some(payload)) => {
+                            self.active_todo_list_id = Some(payload.to_string());
+                            true
+                        }
+                        _ => false,
+                    };
+                    if matches_active {
+                        self.todo_tasks = todo_tasks;
                     }
                 }
+                self.reconcile_todo_selection(ui);
                 self.syncing = false;
                 self.sync_summary = "Synced".to_string();
                 self.emit_scope_warning_once(ui, scope_warning);
-                if self.active_mail().is_none() {
+                if self.active_mail().is_none() || !self.active_mail_is_visible(ui) {
                     self.select_first_visible_mail(ui);
                 } else {
                     self.hydrate_active_mail_if_needed(ui.group_threads);
@@ -3731,14 +4011,16 @@ impl AppState {
                     self.mail_folders = folders;
                 }
                 if let Some(msg) = original_message {
-                    if self.message_matches_active_folder(&msg)
-                        && !self.mail_messages.iter().any(|m| m.id == msg.id)
-                    {
-                        self.mail_messages.push(Self::mail_summary_from(&msg));
+                    if self.message_matches_active_folder(&msg) {
+                        if !self.mail_messages.iter().any(|m| m.id == msg.id) {
+                            self.mail_messages.push(Self::mail_summary_from(&msg));
+                            self.mail_messages
+                                .sort_by(|a, b| b.received_at.cmp(&a.received_at));
+                        }
+                        self.active_mail_id = Some(original_id);
+                        self.sync_displayed_mail_details(ui.group_threads, false);
+                        self.sync_mail_list_selection_to_active(ui);
                     }
-                    self.active_mail_id = Some(original_id);
-                    self.sync_displayed_mail_details(ui.group_threads, false);
-                    self.sync_mail_list_selection_to_active(ui);
                 }
                 ui.tasks.finish("Delete email", Some(error.clone()));
                 ui.toasts.error(format!("Delete failed: {error}"));
@@ -3799,12 +4081,24 @@ impl AppState {
                 if let Some(m) = self.pinned_mail.as_mut().filter(|m| m.id == id) {
                     revert(m);
                 }
+                self.refresh_mail_folders_from_storage();
+                if self.active_mail().is_none() || !self.active_mail_is_visible(ui) {
+                    self.select_first_visible_mail(ui);
+                } else {
+                    self.sync_mail_list_selection_to_active(ui);
+                }
                 ui.toasts.error(error.clone());
                 ui.tasks.finish(&label, Some(error));
             }
             UiMsg::MailDeleted { .. } | UiMsg::AttachmentDownloaded(_) => {}
-            UiMsg::SearchResults { query, hits } => {
-                if self.search_query.trim() == query.trim() {
+            UiMsg::SearchResults {
+                query,
+                generation,
+                hits,
+            } => {
+                if generation == self.search_generation
+                    && self.search_query.trim() == query.trim()
+                {
                     if !self.search_remote_inflight {
                         self.searching = false;
                     }
@@ -3826,8 +4120,14 @@ impl AppState {
                     }
                 }
             }
-            UiMsg::RemoteSearchResults { query, messages } => {
-                if self.search_query.trim() == query.trim() {
+            UiMsg::RemoteSearchResults {
+                query,
+                generation,
+                messages,
+            } => {
+                if generation == self.search_generation
+                    && self.search_query.trim() == query.trim()
+                {
                     self.searching = false;
                     self.search_remote_inflight = false;
                     self.search_remote_done = true;
@@ -3861,8 +4161,14 @@ impl AppState {
                     });
                 }
             }
-            UiMsg::RemoteSearchFailed { query, error } => {
-                if self.search_query.trim() == query.trim() {
+            UiMsg::RemoteSearchFailed {
+                query,
+                generation,
+                error,
+            } => {
+                if generation == self.search_generation
+                    && self.search_query.trim() == query.trim()
+                {
                     self.searching = false;
                     self.search_remote_inflight = false;
                     self.search_remote_done = false;
@@ -3870,19 +4176,43 @@ impl AppState {
                 }
             }
             UiMsg::CalendarEventCreated(created) => {
-                self.active_event_id = Some(created.id.clone());
+                let created_id = created.id.clone();
                 self.calendar_events.push(created);
                 self.calendar_events
                     .sort_by(|a, b| a.start_iso.cmp(&b.start_iso));
+                self.active_event_id = Some(created_id.clone());
+                let vis = self.visible_calendar_events(ui);
+                ui.cal_list_scroll.selected_idx = vis.iter().position(|e| e.id == created_id);
+                ui.cal_detail_scroll.offset = 0;
                 if self.daemon_attached {
                     self.sync_ctrl.request(SyncCommand::SyncCalendar);
                 }
             }
             UiMsg::CalendarEventDeleted(id) => {
                 self.calendar_events.retain(|e| e.id != id);
+                self.reconcile_calendar_selection(ui);
                 if self.daemon_attached {
                     self.sync_ctrl.request(SyncCommand::SyncCalendar);
                 }
+            }
+            UiMsg::CalendarEventDeleteFailed {
+                original_event,
+                error,
+            } => {
+                if let Some(ev) = original_event {
+                    let ev_id = ev.id.clone();
+                    if !self.calendar_events.iter().any(|e| e.id == ev_id) {
+                        self.calendar_events.push(ev);
+                        self.calendar_events
+                            .sort_by(|a, b| a.start_iso.cmp(&b.start_iso));
+                    }
+                    if self.active_event_id.is_none() {
+                        self.active_event_id = Some(ev_id);
+                    }
+                    self.reconcile_calendar_selection(ui);
+                }
+                ui.tasks.finish("Delete event", Some(error.clone()));
+                ui.toasts.error(format!("Delete failed: {error}"));
             }
             UiMsg::CalendarRsvpDone {
                 event_id,
@@ -3895,6 +4225,37 @@ impl AppState {
                     self.sync_ctrl.request(SyncCommand::SyncCalendar);
                 }
             }
+            UiMsg::CalendarRsvpFailed {
+                event_id,
+                prev_status,
+                prev_mail_statuses,
+                error,
+            } => {
+                if let Some(old_status) = prev_status {
+                    if let Some(ev) = self.calendar_events.iter_mut().find(|e| e.id == event_id) {
+                        ev.response_status = old_status;
+                    }
+                }
+                for (msg_id, old_mail_status) in prev_mail_statuses {
+                    if let Some(m) = self.mail_messages.iter_mut().find(|m| m.id == msg_id) {
+                        if let Some(ref mut mr) = m.meeting_request {
+                            mr.response_status = old_mail_status.clone();
+                        }
+                    }
+                    if let Some(m) = self.mail_detail_cache.get_mut(&msg_id) {
+                        if let Some(ref mut mr) = m.meeting_request {
+                            mr.response_status = old_mail_status.clone();
+                        }
+                    }
+                    if let Some(m) = self.pinned_mail.as_mut().filter(|m| m.id == msg_id) {
+                        if let Some(ref mut mr) = m.meeting_request {
+                            mr.response_status = old_mail_status;
+                        }
+                    }
+                }
+                ui.tasks.finish("Calendar RSVP", Some(error.clone()));
+                ui.toasts.error(format!("RSVP failed: {error}"));
+            }
             UiMsg::TodoListCreated(list) => {
                 let lid = list.id.clone();
                 self.todo_lists.push(list);
@@ -3903,22 +4264,67 @@ impl AppState {
             UiMsg::TodoTasksLoaded { list_id, tasks } => {
                 if self.active_todo_list_id.as_deref() == Some(list_id.as_str()) {
                     self.todo_tasks = tasks;
+                    self.reconcile_todo_selection(ui);
                 }
             }
             UiMsg::TodoTaskCreated(task) => {
                 if self.active_todo_list_id.as_deref() == Some(task.list_id.as_str()) {
                     self.active_todo_task_id = Some(task.id.clone());
                     self.todo_tasks.insert(0, task);
-                    ui.todo_list_scroll.selected_idx = Some(0);
+                    self.reconcile_todo_selection(ui);
                 }
             }
             UiMsg::TodoTaskUpdated(task) => {
                 if let Some(existing) = self.todo_tasks.iter_mut().find(|t| t.id == task.id) {
                     *existing = task;
                 }
+                self.reconcile_todo_selection(ui);
+            }
+            UiMsg::TodoTaskToggleFailed {
+                original_task,
+                error,
+            } => {
+                if let Some(existing) = self
+                    .todo_tasks
+                    .iter_mut()
+                    .find(|t| t.id == original_task.id)
+                {
+                    *existing = original_task;
+                }
+                self.reconcile_todo_selection(ui);
+                ui.tasks.finish("Update task", Some(error.clone()));
+                ui.toasts.error(format!("Task update failed: {error}"));
             }
             UiMsg::TodoTaskDeleted(task_id) => {
                 self.todo_tasks.retain(|t| t.id != task_id);
+                self.reconcile_todo_selection(ui);
+            }
+            UiMsg::TodoTaskDeleteFailed {
+                original_task,
+                error,
+            } => {
+                if let Some(task) = original_task {
+                    if self.active_todo_list_id.as_deref() == Some(task.list_id.as_str()) {
+                        if let Ok(sorted) = self
+                            .storage
+                            .list_todo_tasks(Some(&task.list_id), true)
+                        {
+                            if !sorted.is_empty() {
+                                self.todo_tasks = sorted;
+                            } else if !self.todo_tasks.iter().any(|t| t.id == task.id) {
+                                self.todo_tasks.push(task.clone());
+                            }
+                        } else if !self.todo_tasks.iter().any(|t| t.id == task.id) {
+                            self.todo_tasks.push(task.clone());
+                        }
+                        if self.active_todo_task_id.is_none() {
+                            self.active_todo_task_id = Some(task.id);
+                        }
+                        self.reconcile_todo_selection(ui);
+                    }
+                }
+                ui.tasks.finish("Delete task", Some(error.clone()));
+                ui.toasts.error(format!("Delete failed: {error}"));
             }
             UiMsg::ClipboardImageEncoded {
                 unix_ms,
@@ -4208,8 +4614,9 @@ mod tests {
             assert!(app.loading_older_mail);
 
             app.storage.upsert_mail_messages(&rows.map(mail).collect::<Vec<_>>()).unwrap();
+            let seq = app.mail_history_seq;
             app.handle_core_event(&mut ui, CoreEvent::MailHistoryPageFinished {
-                folder_id: "inbox".into(), has_more: Some(has_more),
+                folder_id: "inbox".into(), has_more: Some(has_more), seq,
             });
             assert!(!app.loading_older_mail);
             assert_eq!(ui.mail_list_scroll.selected_idx, Some(last_row));
@@ -4228,8 +4635,9 @@ mod tests {
         assert_eq!(ui.mail_list_scroll.selected_idx, Some(550));
 
         // An exhausted Graph cursor still allows paging through the remaining local rows.
+        let seq = app.mail_history_seq;
         app.handle_core_event(&mut ui, CoreEvent::MailHistoryPageFinished {
-            folder_id: "inbox".into(), has_more: Some(false),
+            folder_id: "inbox".into(), has_more: Some(false), seq,
         });
         assert_eq!(app.mail_messages.len(), 600);
         assert!(app.mail_oldest_reached);
@@ -4513,6 +4921,7 @@ mod tests {
             &mut ui,
             UiMsg::RemoteSearchResults {
                 query: "invoice".into(),
+                generation: app.search_generation,
                 messages: vec![dup_local, newer_remote],
             },
         );
@@ -4528,6 +4937,7 @@ mod tests {
             &mut ui,
             UiMsg::RemoteSearchFailed {
                 query: "invoice".into(),
+                generation: app.search_generation,
                 error: "timeout".into(),
             },
         );
@@ -5984,5 +6394,457 @@ mod tests {
             trash_ids.contains(&"m-unread-del-moved") && trash_ids.contains(&"m-flagged-del-moved"),
             "Trash folder must show moved messages, got {trash_ids:?}"
         );
+    }
+
+    #[test]
+    fn bootstrap_done_preserves_virtual_mail_folders_and_non_default_todo_list_and_reclamps() {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _) = tokio::sync::watch::channel(FocusTarget::default());
+        let (nudge_tx, _) = mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+        let (ui_tx, _) = mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+
+        // User already switched to VIRTUAL_FLAGGED_FOLDER and a non-default To Do list ("list-work")
+        let mut flagged_in_archive =
+            make_mail("m-flag-arch", "c-fa", "2026-11-21T10:00:00Z", true, true);
+        flagged_in_archive.folder_id = Some("f-archive".into());
+        let mut inbox_unflagged =
+            make_mail("m-inbox-only", "c-in", "2026-11-22T10:00:00Z", true, false);
+        inbox_unflagged.folder_id = Some("f-inbox".into());
+        app.storage
+            .upsert_mail_messages(&[flagged_in_archive.clone(), inbox_unflagged.clone()])
+            .unwrap();
+        app.select_mail_folder(&mut ui, VIRTUAL_FLAGGED_FOLDER.into());
+        assert_eq!(listed_ids(&app), ["m-flag-arch"]);
+
+        let work_task = TodoTask {
+            id: "work-1".into(),
+            list_id: "list-work".into(),
+            title: "Work task".into(),
+            status: "notStarted".into(),
+            importance: "high".into(),
+            body_plain: None,
+            due_date_iso: None,
+            reminder_iso: None,
+            completed_at: None,
+            created_at: None,
+            updated_at: None,
+        };
+        let default_task = TodoTask {
+            id: "def-1".into(),
+            list_id: "list-default".into(),
+            title: "Default task".into(),
+            status: "notStarted".into(),
+            importance: "normal".into(),
+            body_plain: None,
+            due_date_iso: None,
+            reminder_iso: None,
+            completed_at: None,
+            created_at: None,
+            updated_at: None,
+        };
+        app.active_todo_list_id = Some("list-work".into());
+        app.todo_tasks = vec![work_task.clone()];
+        app.active_todo_task_id = Some("stale-task-id".into());
+        app.active_event_id = Some("stale-event-id".into());
+
+        let ev = CalendarEvent {
+            id: "ev-real".into(),
+            subject: "Real Meeting".into(),
+            start_iso: "2026-11-25T10:00:00Z".into(),
+            end_iso: "2026-11-25T11:00:00Z".into(),
+            ..Default::default()
+        };
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::BootstrapDone {
+                me: None,
+                mail_folders: vec![MailFolder {
+                    id: "f-inbox".into(),
+                    display_name: "Inbox".into(),
+                    well_known_name: Some("inbox".into()),
+                    parent_folder_id: None,
+                    child_folder_count: 0,
+                    unread_item_count: 0,
+                    total_item_count: 1,
+                }],
+                mail_messages: vec![inbox_unflagged],
+                calendar_events: vec![ev],
+                contacts: vec![],
+                todo_lists: vec![
+                    TodoList {
+                        id: "list-default".into(),
+                        display_name: "Tasks".into(),
+                        wellknown_list_name: Some("defaultList".into()),
+                        is_owner: true,
+                        is_shared: false,
+                    },
+                    TodoList {
+                        id: "list-work".into(),
+                        display_name: "Work".into(),
+                        wellknown_list_name: None,
+                        is_owner: true,
+                        is_shared: false,
+                    },
+                ],
+                todo_tasks: vec![default_task],
+                scope_warning: None,
+            },
+        );
+
+        // Virtual Flagged folder must NOT be overwritten by Inbox-only summaries
+        assert_eq!(listed_ids(&app), ["m-flag-arch"]);
+        // Non-default To Do list must NOT be clobbered by defaultList tasks
+        assert_eq!(app.todo_tasks.len(), 1);
+        assert_eq!(app.todo_tasks[0].id, "work-1");
+        // Stale event & task selections must be re-clamped
+        assert_eq!(app.active_event_id.as_deref(), Some("ev-real"));
+        assert_eq!(ui.cal_list_scroll.selected_idx, Some(0));
+        assert_eq!(app.active_todo_task_id.as_deref(), Some("work-1"));
+        assert_eq!(ui.todo_list_scroll.selected_idx, Some(0));
+    }
+
+    #[test]
+    fn mail_folder_unread_counts_reconcile_and_delete_failed_no_hijack() {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _) = tokio::sync::watch::channel(FocusTarget::default());
+        let (nudge_tx, _) = mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+        let (ui_tx, _) = mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+        ui.group_threads = false;
+
+        let folders = vec![
+            MailFolder {
+                id: "f-inbox".into(),
+                display_name: "Inbox".into(),
+                well_known_name: Some("inbox".into()),
+                parent_folder_id: None,
+                child_folder_count: 0,
+                unread_item_count: 2,
+                total_item_count: 2,
+            },
+            MailFolder {
+                id: "f-archive".into(),
+                display_name: "Archive".into(),
+                well_known_name: Some("archive".into()),
+                parent_folder_id: None,
+                child_folder_count: 0,
+                unread_item_count: 1,
+                total_item_count: 1,
+            },
+            MailFolder {
+                id: "f-sent".into(),
+                display_name: "Sent Items".into(),
+                well_known_name: Some("sentitems".into()),
+                parent_folder_id: None,
+                child_folder_count: 0,
+                unread_item_count: 0,
+                total_item_count: 1,
+            },
+        ];
+        app.storage.upsert_mail_folders(&folders).unwrap();
+        app.mail_folders = folders;
+
+        let mut m1 = make_mail("m1", "c1", "2026-11-25T10:00:00Z", false, true);
+        m1.folder_id = Some("f-inbox".into());
+        let mut m2 = make_mail("m2", "c2", "2026-11-25T09:00:00Z", false, false);
+        m2.folder_id = Some("f-inbox".into());
+        let mut arch = make_mail("m-arch", "c-a", "2026-11-24T09:00:00Z", false, true);
+        arch.folder_id = Some("f-archive".into());
+        let mut sent = make_mail("m-sent", "c-s", "2026-11-24T08:00:00Z", true, false);
+        sent.folder_id = Some("f-sent".into());
+        app.storage
+            .upsert_mail_messages(&[m1.clone(), m2, arch, sent])
+            .unwrap();
+
+        // Smart badges report mailbox-wide counts even while viewing Sent
+        app.select_mail_folder(&mut ui, "f-sent".into());
+        assert_eq!(app.smart_unread_count(), 3);
+        assert_eq!(app.smart_flagged_count(), 2);
+
+        // MailDeleteFailed for an Inbox message must NOT hijack selection while user is in Sent
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::MailDeleteFailed {
+                original_id: "m1".into(),
+                original_message: Some(m1.clone()),
+                error: "network".into(),
+            },
+        );
+        assert_eq!(app.active_mail_id.as_deref(), Some("m-sent"));
+
+        // Under mail_unread_only, toggle_mail_read updates Inbox unread count AND reselects next unread email
+        app.select_mail_folder(&mut ui, "f-inbox".into());
+        ui.mail_unread_only = true;
+        assert_eq!(app.active_mail_id.as_deref(), Some("m1"));
+        app.toggle_mail_read(&mut ui);
+        assert_eq!(app.unread_inbox_count(), 1);
+        assert_eq!(
+            app.active_mail_id.as_deref(),
+            Some("m2"),
+            "marking read under mail_unread_only must advance active_mail_id to next visible unread"
+        );
+
+        // MailFlagReverted reloads mail_folders unread count after local SQLite revert
+        app.storage.set_mail_read_local("m1", false).unwrap();
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::MailFlagReverted {
+                id: "m1".into(),
+                is_read: Some(false),
+                flagged: None,
+                label: "Mark read".into(),
+                error: "500".into(),
+            },
+        );
+        assert_eq!(app.unread_inbox_count(), 2);
+
+        // Archive immediately updates Inbox and Archive folder unread counts
+        app.active_mail_id = Some("m1".into());
+        app.archive_selected_mail(&mut ui);
+        assert_eq!(app.unread_inbox_count(), 1);
+        let archive_unread = app
+            .mail_folders
+            .iter()
+            .find(|f| f.id == "f-archive")
+            .unwrap()
+            .unread_item_count;
+        assert_eq!(archive_unread, 2);
+    }
+
+    #[test]
+    fn search_generation_and_mail_history_seq_guards_drop_stale_messages() {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _) = tokio::sync::watch::channel(FocusTarget::default());
+        let (nudge_tx, _) = mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+        let (ui_tx, _) = mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+
+        // Simulate search generation = 2 for query "budget"
+        app.search_query = "budget".into();
+        app.search_generation = 2;
+        app.searching = true;
+
+        // Stale generation 1 (even with identical query string!) must be dropped
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::SearchResults {
+                query: "budget".into(),
+                generation: 1,
+                hits: vec![MailSearchHit {
+                    id: "stale-hit".into(),
+                    conversation_id: None,
+                    folder_id: Some("inbox".into()),
+                    subject: "Stale".into(),
+                    from_display: "A".into(),
+                    received_at: "2026-11-20T00:00:00Z".into(),
+                    snippet: "stale".into(),
+                    has_attachments: false,
+                    is_read: true,
+                    flagged: false,
+                }],
+            },
+        );
+        assert!(app.search_results.is_empty());
+        assert!(app.searching);
+
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::RemoteSearchFailed {
+                query: "budget".into(),
+                generation: 1,
+                error: "stale failure".into(),
+            },
+        );
+        assert!(app.search_error.is_none());
+        assert!(app.searching);
+
+        // Current generation 2 applies cleanly
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::SearchResults {
+                query: "budget".into(),
+                generation: 2,
+                hits: vec![MailSearchHit {
+                    id: "fresh-hit".into(),
+                    conversation_id: None,
+                    folder_id: Some("inbox".into()),
+                    subject: "Fresh".into(),
+                    from_display: "B".into(),
+                    received_at: "2026-11-25T00:00:00Z".into(),
+                    snippet: "fresh".into(),
+                    has_attachments: false,
+                    is_read: false,
+                    flagged: false,
+                }],
+            },
+        );
+        assert_eq!(app.search_results.len(), 1);
+        assert_eq!(app.search_results[0].id, "fresh-hit");
+
+        // MailHistoryPageFinished sequence guard drops stale seq
+        app.active_folder_id = "f-inbox".into();
+        app.maybe_autoload_older_mail();
+        let seq = app.mail_history_seq;
+        assert!(app.loading_older_mail);
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::MailHistoryPageFinished {
+                folder_id: "f-inbox".into(),
+                has_more: Some(false),
+                seq: seq.wrapping_sub(1),
+            },
+        );
+        assert!(
+            app.loading_older_mail,
+            "stale MailHistoryPageFinished must be ignored"
+        );
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::MailHistoryPageFinished {
+                folder_id: "f-inbox".into(),
+                has_more: Some(false),
+                seq,
+            },
+        );
+        assert!(!app.loading_older_mail);
+    }
+
+    #[test]
+    fn calendar_and_todo_optimistic_rollback_and_delete_selection_clamp() {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _) = tokio::sync::watch::channel(FocusTarget::default());
+        let (nudge_tx, _) = mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+        let (ui_tx, _) = mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+
+        // CalendarEventCreated sets cal_list_scroll.selected_idx
+        let ev1 = CalendarEvent {
+            id: "ev1".into(),
+            subject: "First".into(),
+            start_iso: "2026-11-25T09:00:00Z".into(),
+            end_iso: "2026-11-25T10:00:00Z".into(),
+            response_status: "notResponded".into(),
+            ..Default::default()
+        };
+        let ev2 = CalendarEvent {
+            id: "ev2".into(),
+            subject: "Second".into(),
+            start_iso: "2026-11-25T11:00:00Z".into(),
+            end_iso: "2026-11-25T12:00:00Z".into(),
+            response_status: "notResponded".into(),
+            ..Default::default()
+        };
+        let ev3 = CalendarEvent {
+            id: "ev3".into(),
+            subject: "Third".into(),
+            start_iso: "2026-11-25T13:00:00Z".into(),
+            end_iso: "2026-11-25T14:00:00Z".into(),
+            response_status: "notResponded".into(),
+            ..Default::default()
+        };
+        app.calendar_events = vec![ev1.clone(), ev2.clone()];
+        app.handle_ui_msg(&mut ui, UiMsg::CalendarEventCreated(ev3.clone()));
+        assert_eq!(app.active_event_id.as_deref(), Some("ev3"));
+        assert_eq!(ui.cal_list_scroll.selected_idx, Some(2));
+
+        // Deleting index 1 clamps selection to index 1 (ev3) instead of jumping to 0 and resets detail scroll
+        app.active_event_id = Some("ev2".into());
+        ui.cal_list_scroll.selected_idx = Some(1);
+        ui.cal_detail_scroll.offset = 7;
+        app.delete_selected_calendar_event(&mut ui);
+        assert_eq!(app.active_event_id.as_deref(), Some("ev3"));
+        assert_eq!(ui.cal_list_scroll.selected_idx, Some(1));
+        assert_eq!(ui.cal_detail_scroll.offset, 0);
+
+        // CalendarEventDeleteFailed restores deleted event
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::CalendarEventDeleteFailed {
+                original_event: Some(ev2.clone()),
+                error: "500".into(),
+            },
+        );
+        assert!(app.calendar_events.iter().any(|e| e.id == "ev2"));
+
+        // CalendarRsvpFailed reverts optimistic RSVP
+        app.respond_calendar_event(&mut ui, "ev1".into(), EventRsvpAction::Accept);
+        assert_eq!(app.calendar_events[0].response_status, "accepted");
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::CalendarRsvpFailed {
+                event_id: "ev1".into(),
+                prev_status: Some("notResponded".into()),
+                prev_mail_statuses: vec![],
+                error: "500".into(),
+            },
+        );
+        assert_eq!(app.calendar_events[0].response_status, "notResponded");
+
+        // TodoTask delete clamps near prev_sel, resets detail scroll, and TodoTaskToggleFailed/DeleteFailed roll back
+        let mk_task = |id: &str| TodoTask {
+            id: id.into(),
+            list_id: "l1".into(),
+            title: id.into(),
+            status: "notStarted".into(),
+            importance: "normal".into(),
+            body_plain: None,
+            due_date_iso: None,
+            reminder_iso: None,
+            completed_at: None,
+            created_at: None,
+            updated_at: None,
+        };
+        let (t1, t2, t3) = (mk_task("t1"), mk_task("t2"), mk_task("t3"));
+        app.active_todo_list_id = Some("l1".into());
+        app.todo_tasks = vec![t1.clone(), t2.clone(), t3.clone()];
+        app.active_todo_task_id = Some("t2".into());
+        ui.todo_list_scroll.selected_idx = Some(1);
+        ui.todo_detail_scroll.offset = 5;
+        app.delete_selected_todo_task(&mut ui);
+        assert_eq!(app.active_todo_task_id.as_deref(), Some("t3"));
+        assert_eq!(ui.todo_list_scroll.selected_idx, Some(1));
+        assert_eq!(ui.todo_detail_scroll.offset, 0);
+
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::TodoTaskDeleteFailed {
+                original_task: Some(t2),
+                error: "500".into(),
+            },
+        );
+        assert!(app.todo_tasks.iter().any(|t| t.id == "t2"));
+
+        app.active_todo_task_id = Some("t1".into());
+        app.toggle_todo_completed(&mut ui);
+        assert!(app.todo_tasks.iter().find(|t| t.id == "t1").unwrap().is_completed());
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::TodoTaskToggleFailed {
+                original_task: t1,
+                error: "500".into(),
+            },
+        );
+        assert!(!app.todo_tasks.iter().find(|t| t.id == "t1").unwrap().is_completed());
     }
 }

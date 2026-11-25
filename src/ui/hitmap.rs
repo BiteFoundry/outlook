@@ -5,6 +5,7 @@
 use ratatui::layout::{Position, Rect};
 
 use crate::models::EventRsvpAction;
+use crate::ui::app::Focus;
 
 /// Toolbar, header, and modal button identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +38,7 @@ pub enum ButtonId {
     HtmlOpenBrowser,
     // Calendar toolbar actions
     NewEvent,
+    CalendarToday,
     JoinMeeting,
     RsvpAccept,
     RsvpTentative,
@@ -45,6 +47,7 @@ pub enum ButtonId {
     // Tasks toolbar actions
     NewTodoList,
     NewTodoTask,
+    TodoFilterToggle,
     DeleteTodoTask,
     // Narrow responsive bar pills
     NarrowFolders,
@@ -55,6 +58,9 @@ pub enum ButtonId {
     ComposeAttach,
     ComposeSaveDraft,
     ComposeCancel,
+    // Event form overlay buttons
+    EventFormSubmit,
+    EventFormCancel,
     // Confirm dialog
     ConfirmOk,
     ConfirmCancel,
@@ -63,6 +69,8 @@ pub enum ButtonId {
 /// Clickable targets on the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitTarget {
+    /// Background pane click target (focuses the clicked pane without activating any item).
+    Pane(Focus),
     /// Primary navigation tab (`0` = Mail, `1` = Calendar, `2` = Tasks).
     NavTab(usize),
     /// A row in the left sidebar (`nav_pane`).

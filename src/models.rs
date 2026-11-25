@@ -421,6 +421,8 @@ pub enum CoreEvent {
         folder_id: String,
         /// Graph cursor availability, or `None` if the request failed.
         has_more: Option<bool>,
+        #[serde(default)]
+        seq: u64,
     },
     MailMessageHydrated(Box<MailMessage>),
     CalendarEventsUpdated(Vec<CalendarEvent>),

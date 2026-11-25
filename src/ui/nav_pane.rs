@@ -214,12 +214,8 @@ fn build_mail_nav_rows(app: &AppState) -> Vec<NavRow> {
         });
     }
 
-    // 2. Virtual smart views
-    let unread_total = app
-        .mail_messages
-        .iter()
-        .filter(|m| !m.is_read)
-        .count() as i32;
+    // 2. Virtual smart views (mailbox-wide counts from folders/SQLite, never just loaded slice)
+    let unread_total = app.smart_unread_count();
     rows.push(NavRow::MailFolder {
         folder_id: VIRTUAL_UNREAD_FOLDER.to_string(),
         display_name: "Unread".to_string(),
@@ -227,11 +223,7 @@ fn build_mail_nav_rows(app: &AppState) -> Vec<NavRow> {
         is_virtual: true,
         depth: 0,
     });
-    let flagged_total = app
-        .mail_messages
-        .iter()
-        .filter(|m| m.flagged)
-        .count() as i32;
+    let flagged_total = app.smart_flagged_count();
     rows.push(NavRow::MailFolder {
         folder_id: VIRTUAL_FLAGGED_FOLDER.to_string(),
         display_name: "Flagged".to_string(),
@@ -567,7 +559,7 @@ fn draw_filter_strip(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut H
         Rect::new(area.x, y, area.width, 1),
     );
 
-    let (filter_label, new_label, new_btn) = match ui.active_nav_tab {
+    let (filter_label, filter_btn, filter_active, new_label, new_btn) = match ui.active_nav_tab {
         TAB_MAIL => (
             if ui.mail_unread_only {
                 "[Unread]"
@@ -576,11 +568,29 @@ fn draw_filter_strip(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut H
             } else {
                 "[All]"
             },
+            ButtonId::FilterToggle,
+            ui.mail_unread_only || ui.focused_only,
             "[+New]",
             ButtonId::NewMail,
         ),
-        TAB_CALENDAR => ("[Today]", "[+Event]", ButtonId::NewEvent),
-        _ => ("[Tasks]", "[+Task]", ButtonId::NewTodoTask),
+        TAB_CALENDAR => (
+            "[Today]",
+            ButtonId::CalendarToday,
+            ui.cal_range == CalendarRangeFilter::Today,
+            "[+Event]",
+            ButtonId::NewEvent,
+        ),
+        _ => (
+            if ui.todo_hide_completed {
+                "[Open]"
+            } else {
+                "[Tasks]"
+            },
+            ButtonId::TodoFilterToggle,
+            ui.todo_hide_completed,
+            "[+Task]",
+            ButtonId::NewTodoTask,
+        ),
     };
 
     let filter_w = UnicodeWidthStr::width(filter_label) as u16;
@@ -614,8 +624,6 @@ fn draw_filter_strip(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut H
         let filter_x = area.right().saturating_sub(right_w);
         let new_x = area.right().saturating_sub(new_w);
 
-        let filter_active =
-            ui.active_nav_tab == TAB_MAIL && (ui.mail_unread_only || ui.focused_only);
         let filter_style = if filter_active {
             if theme.no_color {
                 Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
@@ -648,7 +656,7 @@ fn draw_filter_strip(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut H
             filter_x,
             y,
             filter_w,
-            HitTarget::Button(ButtonId::FilterToggle),
+            HitTarget::Button(filter_btn),
         );
 
         frame.render_widget(

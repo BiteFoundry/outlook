@@ -406,6 +406,7 @@ mod tests {
             &mut ui,
             crate::ui::app::UiMsg::RemoteSearchFailed {
                 query: "archive".to_string(),
+                generation: app.search_generation,
                 error: "HTTP 503".to_string(),
             },
         );

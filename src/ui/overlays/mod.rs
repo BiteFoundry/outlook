@@ -177,7 +177,7 @@ impl Overlay {
     }
 
     pub fn help() -> Self {
-        Overlay::Help(HelpOverlay)
+        Overlay::Help(HelpOverlay::default())
     }
 
     pub fn confirm(message: impl Into<String>, on_confirm: Option<Action>) -> Self {
@@ -221,16 +221,51 @@ impl Overlay {
             Overlay::FilePicker(picker) => picker.handle(wheel_step.as_ref().unwrap_or(action)),
             Overlay::Links(links) => links.handle(wheel_step.as_ref().unwrap_or(action)),
             Overlay::MailCompose(compose) => compose.handle(action, app),
-            Overlay::EventForm(form) => form.handle(action),
+            Overlay::EventForm(form) => form.handle(wheel_step.as_ref().unwrap_or(action)),
             Overlay::FolderPicker(picker) => {
                 picker.handle(wheel_step.as_ref().unwrap_or(action), app)
             }
             Overlay::QuickInput(input) => input.handle(action),
             Overlay::ImagePreview(preview) => preview.handle(action),
             Overlay::HtmlPreview(preview) => preview.handle(action),
-            Overlay::Help(_) => match action {
+            Overlay::Help(help) => match action {
                 Action::CloseOverlay | Action::Activate | Action::Input('q') => {
                     OverlayOutcome::Close
+                }
+                Action::MoveUp => {
+                    help.scroll = help.scroll.saturating_sub(1);
+                    OverlayOutcome::Handled
+                }
+                Action::MoveDown => {
+                    help.scroll = help.scroll.saturating_add(1).min(help.max_scroll);
+                    OverlayOutcome::Handled
+                }
+                Action::ScrollPageUp => {
+                    help.scroll = help.scroll.saturating_sub(6);
+                    OverlayOutcome::Handled
+                }
+                Action::ScrollPageDown => {
+                    help.scroll = help.scroll.saturating_add(6).min(help.max_scroll);
+                    OverlayOutcome::Handled
+                }
+                Action::ScrollTop => {
+                    help.scroll = 0;
+                    OverlayOutcome::Handled
+                }
+                Action::ScrollBottom => {
+                    help.scroll = help.max_scroll;
+                    OverlayOutcome::Handled
+                }
+                Action::MouseScroll { delta, .. } => {
+                    if *delta < 0 {
+                        help.scroll = help.scroll.saturating_sub((-*delta) as usize);
+                    } else if *delta > 0 {
+                        help.scroll = help
+                            .scroll
+                            .saturating_add(*delta as usize)
+                            .min(help.max_scroll);
+                    }
+                    OverlayOutcome::Handled
                 }
                 Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
                 _ => OverlayOutcome::Handled,
@@ -322,8 +357,8 @@ impl Overlay {
                 preview.draw(frame, area, ui, hitmap);
                 None
             }
-            Overlay::Help(_) => {
-                draw_help(frame, area, ui, hitmap);
+            Overlay::Help(help) => {
+                draw_help(help, frame, area, ui, hitmap);
                 None
             }
             Overlay::Confirm(dialog) => {
@@ -339,7 +374,10 @@ impl Overlay {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct HelpOverlay;
+pub struct HelpOverlay {
+    pub scroll: usize,
+    pub max_scroll: usize,
+}
 
 const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
     (
@@ -395,7 +433,13 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
     ),
 ];
 
-fn draw_help(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
+fn draw_help(
+    help: &mut HelpOverlay,
+    frame: &mut Frame,
+    area: Rect,
+    ui: &UiState,
+    hitmap: &mut HitMap,
+) {
     let theme = &ui.theme;
     let rect = centered_rect(
         area,
@@ -410,42 +454,85 @@ fn draw_help(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
         .border_type(BorderType::Rounded)
         .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
         .title(Line::from(Span::styled(
-            " Microsoft Outlook TUI Help · Esc Close ",
+            " Microsoft Outlook TUI Help · ↑↓/Wheel Scroll · Esc Close ",
             theme.title(true),
         )))
         .border_style(theme.border_style(true));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        help.max_scroll = 0;
+        help.scroll = 0;
+        return;
+    }
+
+    let build_section = |title: &str, entries: &[(&str, &str)]| -> Vec<Line<'static>> {
+        let mut lines = Vec::with_capacity(entries.len() + 1);
+        lines.push(Line::from(Span::styled(
+            format!(" {title}"),
+            theme.title(true),
+        )));
+        for (key, desc) in entries {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {key:<23}"), theme.accent_style()),
+                Span::raw((*desc).to_string()),
+            ]));
+        }
+        lines
+    };
+
+    if inner.width < 60 {
+        let mut all_lines = Vec::new();
+        for (idx, (title, entries)) in HELP_SECTIONS.iter().enumerate() {
+            if idx > 0 {
+                all_lines.push(Line::raw(""));
+            }
+            all_lines.extend(build_section(title, entries));
+        }
+        help.max_scroll = all_lines.len().saturating_sub(inner.height as usize);
+        help.scroll = help.scroll.min(help.max_scroll);
+        frame.render_widget(
+            Paragraph::new(all_lines)
+                .wrap(Wrap { trim: false })
+                .scroll((help.scroll.min(u16::MAX as usize) as u16, 0)),
+            inner,
+        );
+        return;
+    }
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(inner);
 
-    for (index, (title, entries)) in HELP_SECTIONS.iter().enumerate() {
-        let target = columns[index % 2];
-        if target.width == 0 {
-            continue;
-        }
-        let y_offset = if index < 2 { 0 } else { target.height / 2 };
-        let mut lines = Vec::with_capacity(entries.len() + 1);
-        lines.push(Line::from(Span::styled(
-            format!(" {title}"),
-            theme.title(true),
-        )));
-        for (key, desc) in entries.iter() {
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {key:<23}"), theme.accent_style()),
-                Span::raw(desc.to_string()),
-            ]));
-        }
-        let sub = Rect::new(
-            target.x,
-            target.y + y_offset,
-            target.width,
-            target.height.saturating_sub(y_offset),
+    let mut left_lines = build_section(HELP_SECTIONS[0].0, HELP_SECTIONS[0].1);
+    left_lines.push(Line::raw(""));
+    left_lines.extend(build_section(HELP_SECTIONS[2].0, HELP_SECTIONS[2].1));
+
+    let mut right_lines = build_section(HELP_SECTIONS[1].0, HELP_SECTIONS[1].1);
+    right_lines.push(Line::raw(""));
+    right_lines.extend(build_section(HELP_SECTIONS[3].0, HELP_SECTIONS[3].1));
+
+    let total_rows = left_lines.len().max(right_lines.len());
+    help.max_scroll = total_rows.saturating_sub(inner.height as usize);
+    help.scroll = help.scroll.min(help.max_scroll);
+    let scroll_y = help.scroll.min(u16::MAX as usize) as u16;
+
+    if columns[0].width > 0 {
+        frame.render_widget(
+            Paragraph::new(left_lines)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll_y, 0)),
+            columns[0],
         );
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), sub);
+    }
+    if columns[1].width > 0 {
+        frame.render_widget(
+            Paragraph::new(right_lines)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll_y, 0)),
+            columns[1],
+        );
     }
 }
 

@@ -15,7 +15,7 @@ use crate::{
     ui::{
         action::Action,
         app::UiState,
-        hitmap::{HitMap, HitTarget},
+        hitmap::{ButtonId, HitMap, HitTarget},
         overlays::{centered_rect, OverlayOutcome},
     },
 };
@@ -173,7 +173,7 @@ impl EventFormOverlay {
                 }
                 OverlayOutcome::Handled
             }
-            Action::OverlaySubmit => self.submit(),
+            Action::OverlaySubmit | Action::SaveDraft => self.submit(),
             Action::Tab | Action::MoveDown => {
                 self.field = (self.field + 1) % 8;
                 OverlayOutcome::Handled
@@ -227,7 +227,7 @@ impl EventFormOverlay {
             .border_style(theme.border_style(true));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
-        if inner.width == 0 || inner.height < 6 {
+        if inner.width == 0 || inner.height < 2 {
             return;
         }
 
@@ -258,11 +258,23 @@ impl EventFormOverlay {
             (6, "Notes:         ", self.notes.clone()),
         ];
 
+        let footer_rows: u16 = if self.error.is_some() && inner.height >= 3 {
+            2
+        } else {
+            1
+        };
+        let field_viewport_h = inner.height.saturating_sub(footer_rows) as usize;
+        let focused_field = self.field.min(rows.len().saturating_sub(1));
+        let start = if field_viewport_h == 0 {
+            0
+        } else if focused_field >= field_viewport_h {
+            (focused_field + 1 - field_viewport_h).min(rows.len().saturating_sub(field_viewport_h))
+        } else {
+            0
+        };
+
         let mut y = inner.y;
-        for (idx, label, value) in rows {
-            if y >= inner.y + inner.height.saturating_sub(2) {
-                break;
-            }
+        for (idx, label, value) in rows.into_iter().skip(start).take(field_viewport_h) {
             let max_v = (inner.width as usize).saturating_sub(UnicodeWidthStr::width(label) + 3);
             let shown = crate::ui::truncate_width(&value, max_v);
             let line = Line::from(vec![
@@ -276,39 +288,50 @@ impl EventFormOverlay {
         }
 
         if let Some(err) = &self.error {
-            if y < inner.y + inner.height.saturating_sub(1) {
+            if inner.height >= 3 {
+                let err_y = inner.bottom().saturating_sub(2);
                 frame.render_widget(
                     Paragraph::new(Span::styled(
                         crate::ui::truncate_width(&format!(" Error: {err}"), inner.width as usize),
                         Style::default().fg(theme.error),
                     )),
-                    Rect::new(inner.x, y, inner.width, 1),
+                    Rect::new(inner.x, err_y, inner.width, 1),
                 );
-                y = y.saturating_add(1);
             }
         }
 
-        if y < inner.y + inner.height {
-            let save_st = if self.field == 7 && self.button_idx == 0 {
-                theme.selection()
-            } else {
-                theme.accent_style()
-            };
-            let cancel_st = if self.field == 7 && self.button_idx == 1 {
-                theme.selection()
-            } else {
-                theme.muted_style()
-            };
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled(" [Create Event (Ctrl+S)] ", save_st),
-                    Span::raw("  "),
-                    Span::styled(" [Cancel (Esc)] ", cancel_st),
-                ])),
-                Rect::new(inner.x, y, inner.width, 1),
-            );
-            hitmap.add_line(inner.x, y, inner.width, HitTarget::OverlayItem { index: 7 });
+        let btn_y = inner.bottom().saturating_sub(1);
+        let save_st = if self.field == 7 && self.button_idx == 0 {
+            theme.selection()
+        } else {
+            theme.accent_style()
+        };
+        let cancel_st = if self.field == 7 && self.button_idx == 1 {
+            theme.selection()
+        } else {
+            theme.muted_style()
+        };
+        let save_label = " [Create Event (Ctrl+S)] ";
+        let cancel_label = " [Cancel (Esc)] ";
+        let save_w = UnicodeWidthStr::width(save_label) as u16;
+        let cancel_w = UnicodeWidthStr::width(cancel_label) as u16;
+        let bx = inner.x.saturating_add(1);
+        let save_rect = Rect::new(bx, btn_y, save_w.min(inner.right().saturating_sub(bx)), 1);
+        if save_rect.width > 0 {
+            frame.render_widget(Paragraph::new(Span::styled(save_label, save_st)), save_rect);
+            hitmap.add(save_rect, HitTarget::Button(ButtonId::EventFormSubmit));
+        }
+        let cx = bx.saturating_add(save_w).saturating_add(2);
+        if cx < inner.right() {
+            let cancel_rect =
+                Rect::new(cx, btn_y, cancel_w.min(inner.right().saturating_sub(cx)), 1);
+            if cancel_rect.width > 0 {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(cancel_label, cancel_st)),
+                    cancel_rect,
+                );
+                hitmap.add(cancel_rect, HitTarget::Button(ButtonId::EventFormCancel));
+            }
         }
     }
 }

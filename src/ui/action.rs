@@ -127,6 +127,7 @@ pub enum Action {
 
     // Calendar actions
     OpenEventForm,
+    SelectCalendarToday,
     CreateCalendarEvent(OutgoingEvent),
     DeleteCalendarEvent,
     CalendarRsvp(EventRsvpAction),
@@ -135,6 +136,7 @@ pub enum Action {
     // Todo actions
     OpenNewTodoList,
     OpenNewTodoTask,
+    ToggleTodoHideCompleted,
     CreateTodoList {
         display_name: String,
     },
@@ -199,7 +201,14 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
     }
 
     if let Action::OpenContextMenuAt { column, row } = action {
-        open_context_menu_at(column, row, app, ui);
+        if ui.overlays.is_empty() {
+            open_context_menu_at(column, row, app, ui);
+        } else if ui.overlays.len() == 1
+            && matches!(ui.overlays.last(), Some(Overlay::ContextMenu(_)))
+        {
+            ui.overlays.pop();
+            open_context_menu_at(column, row, app, ui);
+        }
         return false;
     }
 
@@ -314,8 +323,9 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     ui.cal_list_scroll.selected_idx = Some(0);
                 }
             } else if ui.active_nav_tab == TAB_TASKS && app.active_todo_task_id.is_none() {
-                app.active_todo_task_id = app.todo_tasks.first().map(|t| t.id.clone());
-                if !app.todo_tasks.is_empty() {
+                let vis = app.visible_todo_tasks(ui);
+                app.active_todo_task_id = vis.first().map(|t| t.id.clone());
+                if !vis.is_empty() {
                     ui.todo_list_scroll.selected_idx = Some(0);
                 }
             }
@@ -647,6 +657,14 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             ui.close_overlays_of(OverlayKind::EventForm);
             ui.push_overlay(Overlay::event_form());
         }
+        Action::SelectCalendarToday => {
+            ui.cal_range = CalendarRangeFilter::Today;
+            ui.cal_month_cursor = chrono::Local::now().date_naive();
+            app.reconcile_calendar_selection(ui);
+            ui.cal_list_scroll.offset = 0;
+            ui.cal_detail_scroll.offset = 0;
+            ui.set_focus(Focus::List);
+        }
         Action::CreateCalendarEvent(ev) => {
             app.create_calendar_event(ui, ev);
         }
@@ -695,6 +713,17 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             ui.push_overlay(Overlay::quick_input(QuickInputOverlay::new_todo_task(
                 list_id,
             )));
+        }
+        Action::ToggleTodoHideCompleted => {
+            ui.todo_hide_completed = !ui.todo_hide_completed;
+            app.reconcile_todo_selection(ui);
+            ui.todo_list_scroll.offset = 0;
+            ui.todo_detail_scroll.offset = 0;
+            ui.info(if ui.todo_hide_completed {
+                "Tasks: Open only"
+            } else {
+                "Tasks: All tasks"
+            });
         }
         Action::CreateTodoList { display_name } => {
             app.create_todo_list(ui, display_name);
@@ -919,7 +948,9 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::CheckForUpdates => app.check_for_updates(ui, true, false),
         Action::ApplySelfUpdate => app.check_for_updates(ui, false, false),
         Action::OpenContextMenuAt { column, row } => {
-            open_context_menu_at(column, row, app, ui);
+            if ui.overlays.is_empty() {
+                open_context_menu_at(column, row, app, ui);
+            }
         }
         Action::Click { column, row } => {
             return handle_click(column, row, app, ui);
@@ -1095,17 +1126,18 @@ fn move_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
                 ui.cal_detail_scroll.offset = 0;
             }
             TAB_TASKS => {
-                if app.todo_tasks.is_empty() {
+                let vis = app.visible_todo_tasks(ui);
+                if vis.is_empty() {
                     return;
                 }
                 let cur = ui.todo_list_scroll.selected_idx.unwrap_or(0);
                 let next = if delta < 0 {
                     cur.saturating_sub((-delta) as usize)
                 } else {
-                    (cur + delta as usize).min(app.todo_tasks.len() - 1)
+                    (cur + delta as usize).min(vis.len() - 1)
                 };
                 ui.todo_list_scroll.selected_idx = Some(next);
-                app.active_todo_task_id = Some(app.todo_tasks[next].id.clone());
+                app.active_todo_task_id = Some(vis[next].id.clone());
                 ui.todo_detail_scroll.offset = 0;
             }
             _ => {}
@@ -1134,10 +1166,11 @@ fn move_list_edge(app: &mut AppState, ui: &mut UiState, top: bool) {
             }
         }
         TAB_TASKS => {
-            if !app.todo_tasks.is_empty() {
-                let idx = if top { 0 } else { app.todo_tasks.len() - 1 };
+            let vis = app.visible_todo_tasks(ui);
+            if !vis.is_empty() {
+                let idx = if top { 0 } else { vis.len() - 1 };
                 ui.todo_list_scroll.selected_idx = Some(idx);
-                app.active_todo_task_id = Some(app.todo_tasks[idx].id.clone());
+                app.active_todo_task_id = Some(vis[idx].id.clone());
             }
         }
         _ => {}
@@ -1267,6 +1300,12 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
                 };
             }
             Some(HitTarget::OverlayItem { index }) => {
+                if let Some(Overlay::EventForm(ref mut form)) = ui.overlays.last_mut() {
+                    if index <= 6 {
+                        form.select(index);
+                        return false;
+                    }
+                }
                 if let Some(top) = ui.overlays.last_mut() {
                     top.select(index);
                 }
@@ -1291,18 +1330,39 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
             }
             Some(HitTarget::Button(btn)) => return handle_button(btn, app, ui),
             None => {
-                let _ = ui.close_top_overlay();
-                return false;
+                return dispatch(Action::CloseOverlay, app, ui);
             }
             _ => return false,
         }
     }
 
     let Some(target) = hit else {
+        let pos = ratatui::layout::Position::new(column, row);
+        let list_area = match ui.active_nav_tab {
+            TAB_CALENDAR => ui.cal_list_scroll.area,
+            TAB_TASKS => ui.todo_list_scroll.area,
+            _ => ui.mail_list_scroll.area,
+        };
+        let detail_area = match ui.active_nav_tab {
+            TAB_CALENDAR => ui.cal_detail_scroll.area,
+            TAB_TASKS => ui.todo_detail_scroll.area,
+            _ => ui.mail_read_scroll.area,
+        };
+        if detail_area.contains(pos) {
+            ui.set_focus(Focus::Reader);
+        } else if list_area.contains(pos) {
+            ui.set_focus(Focus::List);
+        } else if ui.nav_area.contains(pos) {
+            ui.set_focus(Focus::Nav);
+        }
         return false;
     };
 
     match target {
+        HitTarget::Pane(focus) => {
+            ui.set_focus(focus);
+            false
+        }
         HitTarget::NavTab(idx) => dispatch(Action::SelectNavTab(idx), app, ui),
         HitTarget::NavRow(idx) => {
             ui.set_focus(Focus::Nav);
@@ -1333,7 +1393,8 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
                     }
                 }
                 TAB_TASKS => {
-                    if let Some(task) = app.todo_tasks.get(idx) {
+                    let vis = app.visible_todo_tasks(ui);
+                    if let Some(task) = vis.get(idx) {
                         ui.todo_list_scroll.selected_idx = Some(idx);
                         app.active_todo_task_id = Some(task.id.clone());
                         ui.todo_detail_scroll.offset = 0;
@@ -1344,7 +1405,9 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
             false
         }
         HitTarget::TodoCheckbox(idx) => {
-            if let Some(task) = app.todo_tasks.get(idx) {
+            ui.set_focus(Focus::List);
+            let vis = app.visible_todo_tasks(ui);
+            if let Some(task) = vis.get(idx) {
                 ui.todo_list_scroll.selected_idx = Some(idx);
                 app.active_todo_task_id = Some(task.id.clone());
                 app.toggle_todo_completed(ui);
@@ -1352,6 +1415,7 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
             false
         }
         HitTarget::ThreadItem(thread_pos) => {
+            ui.set_focus(Focus::Reader);
             let toggle_id = app.active_mail().and_then(|selected| {
                 let cid = selected.conversation_id.as_deref()?;
                 let mut msgs: Vec<_> = app
@@ -1470,7 +1534,15 @@ fn handle_button(btn: ButtonId, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         ButtonId::DensityToggle => dispatch(Action::ToggleDensity, app, ui),
         ButtonId::Help => dispatch(Action::OpenOverlay(OverlayKind::Help), app, ui),
-        ButtonId::FilterToggle => dispatch(Action::ToggleUnreadFilter, app, ui),
+        ButtonId::FilterToggle => {
+            if ui.active_nav_tab == TAB_MAIL {
+                dispatch(Action::ToggleUnreadFilter, app, ui)
+            } else {
+                false
+            }
+        }
+        ButtonId::CalendarToday => dispatch(Action::SelectCalendarToday, app, ui),
+        ButtonId::TodoFilterToggle => dispatch(Action::ToggleTodoHideCompleted, app, ui),
         ButtonId::FocusedToggle => dispatch(Action::ToggleFocusedOnly, app, ui),
         ButtonId::ThreadGroupToggle => dispatch(Action::ToggleGroupThreads, app, ui),
         ButtonId::Settings => dispatch(Action::OpenOverlay(OverlayKind::Settings), app, ui),
@@ -1514,19 +1586,76 @@ fn handle_button(btn: ButtonId, app: &mut AppState, ui: &mut UiState) -> bool {
         Button::ComposeAttach => dispatch(Action::OpenAttachPicker, app, ui),
         Button::ComposeSaveDraft => dispatch(Action::SaveDraft, app, ui),
         Button::ComposeCancel => dispatch(Action::CloseOverlay, app, ui),
+        ButtonId::EventFormSubmit => {
+            if let Some(Overlay::EventForm(ref mut form)) = ui.overlays.last_mut() {
+                form.field = 7;
+                form.button_idx = 0;
+            }
+            dispatch(Action::OverlaySubmit, app, ui)
+        }
+        ButtonId::EventFormCancel => {
+            if let Some(Overlay::EventForm(ref mut form)) = ui.overlays.last_mut() {
+                form.field = 7;
+                form.button_idx = 1;
+            }
+            dispatch(Action::CloseOverlay, app, ui)
+        }
         ButtonId::ConfirmOk => dispatch(Action::Activate, app, ui),
         ButtonId::ConfirmCancel => dispatch(Action::CloseOverlay, app, ui),
     }
 }
 use ButtonId as Button;
 
-fn open_context_menu_at(column: u16, row: u16, app: &AppState, ui: &mut UiState) {
+fn open_context_menu_at(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) {
     let target = match ui.hitmap.hit(row, column) {
         Some(HitTarget::ListItem(idx)) => match ui.active_nav_tab {
-            TAB_CALENDAR => ContextTarget::CalendarEvent(idx),
-            TAB_TASKS => ContextTarget::TodoTask(idx),
-            _ => ContextTarget::MailItem(idx),
+            TAB_CALENDAR => {
+                let vis = app.visible_calendar_events(ui);
+                if let Some(ev) = vis.get(idx) {
+                    ui.set_focus(Focus::List);
+                    ui.cal_list_scroll.selected_idx = Some(idx);
+                    app.active_event_id = Some(ev.id.clone());
+                    ui.cal_detail_scroll.offset = 0;
+                    ContextTarget::CalendarEvent(idx)
+                } else {
+                    ContextTarget::Global
+                }
+            }
+            TAB_TASKS => {
+                let vis = app.visible_todo_tasks(ui);
+                if let Some(task) = vis.get(idx) {
+                    ui.set_focus(Focus::List);
+                    ui.todo_list_scroll.selected_idx = Some(idx);
+                    app.active_todo_task_id = Some(task.id.clone());
+                    ui.todo_detail_scroll.offset = 0;
+                    ContextTarget::TodoTask(idx)
+                } else {
+                    ContextTarget::Global
+                }
+            }
+            _ => {
+                let rows = app.visible_mail_rows(ui);
+                if idx < rows.len() {
+                    ui.set_focus(Focus::List);
+                    app.select_mail_row(ui, idx);
+                    ContextTarget::MailItem(idx)
+                } else {
+                    ContextTarget::Global
+                }
+            }
         },
+        Some(HitTarget::TodoCheckbox(idx)) => {
+            let vis = app.visible_todo_tasks(ui);
+            if let Some(task) = vis.get(idx) {
+                ui.set_focus(Focus::List);
+                ui.todo_list_scroll.selected_idx = Some(idx);
+                app.active_todo_task_id = Some(task.id.clone());
+                ui.todo_detail_scroll.offset = 0;
+                ContextTarget::TodoTask(idx)
+            } else {
+                ContextTarget::Global
+            }
+        }
         _ => ContextTarget::Global,
     };
     let menu = ContextMenu::build(target, (column, row), app, ui);

@@ -226,6 +226,12 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
         ui.narrow_pane,
     );
     ui.nav_area = plan.nav.unwrap_or_default();
+    ui.mail_list_scroll.area = Rect::default();
+    ui.mail_read_scroll.area = Rect::default();
+    ui.cal_list_scroll.area = Rect::default();
+    ui.cal_detail_scroll.area = Rect::default();
+    ui.todo_list_scroll.area = Rect::default();
+    ui.todo_detail_scroll.area = Rect::default();
 
     let mut hitmap = HitMap::default();
     let mut cursor_pos = None;
@@ -235,7 +241,15 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
     }
 
     if let Some(nav_area) = plan.nav {
+        hitmap.add(nav_area, HitTarget::Pane(Focus::Nav));
         nav_pane::draw(frame, nav_area, app, ui, &mut hitmap);
+    }
+
+    if let Some(list_area) = plan.list {
+        hitmap.add(list_area, HitTarget::Pane(Focus::List));
+    }
+    if let Some(reader_area) = plan.reader {
+        hitmap.add(reader_area, HitTarget::Pane(Focus::Reader));
     }
 
     match ui.active_nav_tab {
@@ -1057,5 +1071,568 @@ mod tests {
         assert!(ui.overlays.is_empty());
 
         app.sync_ctrl.request(crate::sync::SyncCommand::Shutdown);
+    }
+
+    fn make_ui_test_harness() -> (AppState, UiState) {
+        use crate::{
+            auth::AuthManager,
+            config::AppConfig,
+            graph::GraphClient,
+            storage::Storage,
+            sync::{FocusTarget, SyncController},
+        };
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _) = tokio::sync::watch::channel(FocusTarget::default());
+        let (nudge_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+        let (ui_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let ui = UiState::from_config(&cfg);
+        (app, ui)
+    }
+
+    fn sample_mail_msg(id: &str, subj: &str, received_at: &str) -> crate::models::MailMessage {
+        crate::models::MailMessage {
+            id: id.into(),
+            conversation_id: Some(format!("conv-{id}")),
+            folder_id: Some("inbox".into()),
+            subject: subj.into(),
+            received_at: received_at.into(),
+            is_read: false,
+            body_loaded: true,
+            body_plain: format!("Body of {id}\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nline 12"),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn right_click_selects_clicked_item_and_blocks_over_modals() {
+        use crate::models::{CalendarEvent, TodoTask};
+        use crate::ui::action::Action;
+        use crate::ui::overlays::context_menu::ContextTarget;
+        use crate::ui::overlays::{Overlay, OverlayKind};
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let (mut app, mut ui) = make_ui_test_harness();
+        ui.group_threads = false;
+        app.mail_messages = vec![
+            sample_mail_msg("m1", "First", "2026-11-25T10:00:00Z"),
+            sample_mail_msg("m2", "Second", "2026-11-25T09:00:00Z"),
+        ];
+        app.active_mail_id = Some("m1".into());
+        ui.mail_list_scroll.selected_idx = Some(0);
+
+        let mut term = Terminal::new(TestBackend::new(140, 32)).unwrap();
+        term.draw(|f| {
+            let _ = draw(f, &mut app, &mut ui);
+        })
+        .unwrap();
+
+        // Right-click second mail item -> selects m2 BEFORE building ContextMenu
+        let r_m2 = ui.hitmap.region_of(HitTarget::ListItem(1)).unwrap();
+        action::dispatch(
+            Action::OpenContextMenuAt {
+                column: r_m2.x,
+                row: r_m2.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(app.active_mail_id.as_deref(), Some("m2"));
+        assert_eq!(ui.mail_list_scroll.selected_idx, Some(1));
+        assert!(matches!(
+            ui.overlays.last(),
+            Some(Overlay::ContextMenu(m)) if m.context == ContextTarget::MailItem(1)
+        ));
+
+        // Right-click while ContextMenu is open replaces it instead of stacking
+        action::dispatch(
+            Action::OpenContextMenuAt { column: 5, row: 5 },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(ui.overlays.len(), 1);
+        assert_eq!(ui.overlays.last().map(Overlay::kind), Some(OverlayKind::ContextMenu));
+        ui.close_top_overlay();
+
+        // Right-click while a modal (Settings) is open is blocked (no stacking)
+        ui.push_overlay(Overlay::settings());
+        action::dispatch(
+            Action::OpenContextMenuAt {
+                column: r_m2.x,
+                row: r_m2.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(ui.overlays.len(), 1);
+        assert_eq!(ui.overlays.last().map(Overlay::kind), Some(OverlayKind::Settings));
+        ui.close_top_overlay();
+
+        // Calendar right-click selects clicked event
+        ui.active_nav_tab = TAB_CALENDAR;
+        app.calendar_events = vec![
+            CalendarEvent {
+                id: "ev1".into(),
+                subject: "Standup".into(),
+                start_iso: "2026-11-25T09:00:00Z".into(),
+                end_iso: "2026-11-25T09:30:00Z".into(),
+                ..Default::default()
+            },
+            CalendarEvent {
+                id: "ev2".into(),
+                subject: "Design".into(),
+                start_iso: "2026-11-25T11:00:00Z".into(),
+                end_iso: "2026-11-25T12:00:00Z".into(),
+                ..Default::default()
+            },
+        ];
+        app.active_event_id = Some("ev1".into());
+        ui.cal_list_scroll.selected_idx = Some(0);
+        term.draw(|f| {
+            let _ = draw(f, &mut app, &mut ui);
+        })
+        .unwrap();
+        let r_ev2 = ui.hitmap.region_of(HitTarget::ListItem(1)).unwrap();
+        action::dispatch(
+            Action::OpenContextMenuAt {
+                column: r_ev2.x,
+                row: r_ev2.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(app.active_event_id.as_deref(), Some("ev2"));
+        assert_eq!(ui.cal_list_scroll.selected_idx, Some(1));
+        assert!(matches!(
+            ui.overlays.last(),
+            Some(Overlay::ContextMenu(m)) if m.context == ContextTarget::CalendarEvent(1)
+        ));
+        ui.close_top_overlay();
+
+        // Tasks right-click on TodoCheckbox selects clicked task and opens Task Menu (not Global)
+        ui.active_nav_tab = TAB_TASKS;
+        app.todo_tasks = vec![
+            TodoTask {
+                id: "t1".into(),
+                list_id: "l1".into(),
+                title: "Task 1".into(),
+                status: "notStarted".into(),
+                importance: "normal".into(),
+                body_plain: None,
+                due_date_iso: None,
+                reminder_iso: None,
+                completed_at: None,
+                created_at: None,
+                updated_at: None,
+            },
+            TodoTask {
+                id: "t2".into(),
+                list_id: "l1".into(),
+                title: "Task 2".into(),
+                status: "notStarted".into(),
+                importance: "high".into(),
+                body_plain: None,
+                due_date_iso: None,
+                reminder_iso: None,
+                completed_at: None,
+                created_at: None,
+                updated_at: None,
+            },
+        ];
+        app.active_todo_task_id = Some("t1".into());
+        ui.todo_list_scroll.selected_idx = Some(0);
+        term.draw(|f| {
+            let _ = draw(f, &mut app, &mut ui);
+        })
+        .unwrap();
+        let r_cb2 = ui.hitmap.region_of(HitTarget::TodoCheckbox(1)).unwrap();
+        action::dispatch(
+            Action::OpenContextMenuAt {
+                column: r_cb2.x,
+                row: r_cb2.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(app.active_todo_task_id.as_deref(), Some("t2"));
+        assert_eq!(ui.todo_list_scroll.selected_idx, Some(1));
+        assert!(matches!(
+            ui.overlays.last(),
+            Some(Overlay::ContextMenu(m)) if m.context == ContextTarget::TodoTask(1)
+        ));
+    }
+
+    #[test]
+    fn backdrop_click_on_mail_compose_stashes_draft() {
+        use crate::ui::action::Action;
+        use crate::ui::overlays::mail_compose::MailComposeOverlay;
+        use crate::ui::overlays::Overlay;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let (mut app, mut ui) = make_ui_test_harness();
+        let mut compose = MailComposeOverlay::new();
+        compose.to = "alice@contoso.com".into();
+        compose.subject = "Important Draft".into();
+        compose.body.insert_str("Do not lose this body!");
+        let draft_key = compose.mode.draft_key();
+        ui.push_overlay(Overlay::mail_compose(compose));
+
+        let mut term = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        term.draw(|f| {
+            let _ = draw(f, &mut app, &mut ui);
+        })
+        .unwrap();
+
+        // Click at (0, 0) outside the centered compose modal
+        action::dispatch(Action::Click { column: 0, row: 0 }, &mut app, &mut ui);
+        assert!(ui.overlays.is_empty(), "backdrop click should close compose");
+        let saved = app
+            .draft_store
+            .get_mail(&draft_key)
+            .expect("unsent draft must be stashed on backdrop click");
+        assert_eq!(saved.subject, "Important Draft");
+        assert_eq!(saved.body, "Do not lose this body!");
+    }
+
+    #[test]
+    fn event_form_field_clicks_focus_without_advancing_and_cancel_does_not_create() {
+        use crate::ui::action::Action;
+        use crate::ui::overlays::event_form::EventFormOverlay;
+        use crate::ui::overlays::{Overlay, OverlayOutcome};
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let (mut app, mut ui) = make_ui_test_harness();
+        let mut form = EventFormOverlay::new();
+        form.subject = "Quarterly Sync".into();
+        form.start = "2026-11-26 10:00".into();
+        form.end = "2026-11-26 11:00".into();
+        form.field = 2;
+
+        // Ctrl+S (SaveDraft) submits the form cleanly
+        let save_outcome = form.clone().handle(&Action::SaveDraft);
+        assert!(matches!(
+            save_outcome,
+            OverlayOutcome::CloseAndDispatch(Action::CreateCalendarEvent(_))
+        ));
+
+        ui.push_overlay(Overlay::EventForm(form));
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| {
+            let _ = draw(f, &mut app, &mut ui);
+        })
+        .unwrap();
+
+        // Click field 0 (Subject) -> focuses field 0 and does NOT advance to 1
+        let f0 = ui.hitmap.region_of(HitTarget::OverlayItem { index: 0 }).unwrap();
+        action::dispatch(Action::Click { column: f0.x, row: f0.y }, &mut app, &mut ui);
+        if let Some(Overlay::EventForm(ref ef)) = ui.overlays.last() {
+            assert_eq!(ef.field, 0, "clicking Subject must keep focus on field 0");
+        } else {
+            panic!("EventForm should stay open");
+        }
+
+        // Click field 4 (Location) -> focuses field 4 and does NOT advance to 5
+        let f4 = ui.hitmap.region_of(HitTarget::OverlayItem { index: 4 }).unwrap();
+        action::dispatch(Action::Click { column: f4.x, row: f4.y }, &mut app, &mut ui);
+        if let Some(Overlay::EventForm(ref ef)) = ui.overlays.last() {
+            assert_eq!(ef.field, 4, "clicking Location must keep focus on field 4");
+        } else {
+            panic!("EventForm should stay open");
+        }
+
+        // Submit and Cancel must be two distinct buttons; Cancel closes without creating an event
+        let submit_r = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::EventFormSubmit))
+            .expect("EventFormSubmit button registered");
+        let cancel_r = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::EventFormCancel))
+            .expect("EventFormCancel button registered");
+        assert!(submit_r.x + submit_r.width <= cancel_r.x);
+
+        action::dispatch(
+            Action::Click {
+                column: cancel_r.x,
+                row: cancel_r.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(ui.overlays.is_empty(), "clicking Cancel must close EventForm");
+        assert!(
+            app.calendar_events.is_empty(),
+            "clicking Cancel must never create an event"
+        );
+    }
+
+    #[test]
+    fn sidebar_calendar_today_and_tasks_pills_never_toggle_mail_unread() {
+        use crate::ui::action::Action;
+        use crate::ui::app::CalendarRangeFilter;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let (mut app, mut ui) = make_ui_test_harness();
+        let mut term = Terminal::new(TestBackend::new(140, 32)).unwrap();
+
+        // Calendar tab: [Today] pill jumps to Today and does NOT touch mail_unread_only
+        ui.active_nav_tab = TAB_CALENDAR;
+        ui.cal_range = CalendarRangeFilter::AllUpcoming;
+        ui.mail_unread_only = false;
+        term.draw(|f| {
+            let _ = draw(f, &mut app, &mut ui);
+        })
+        .unwrap();
+        let today_r = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::CalendarToday))
+            .expect("[Today] pill registered as CalendarToday");
+        action::dispatch(
+            Action::Click {
+                column: today_r.x,
+                row: today_r.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(ui.cal_range, CalendarRangeFilter::Today);
+        assert!(!ui.mail_unread_only);
+
+        // Tasks tab: [Tasks] pill toggles todo_hide_completed and does NOT touch mail_unread_only
+        ui.active_nav_tab = TAB_TASKS;
+        ui.todo_hide_completed = false;
+        term.draw(|f| {
+            let _ = draw(f, &mut app, &mut ui);
+        })
+        .unwrap();
+        let tasks_r = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::TodoFilterToggle))
+            .expect("[Tasks] pill registered as TodoFilterToggle");
+        action::dispatch(
+            Action::Click {
+                column: tasks_r.x,
+                row: tasks_r.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(ui.todo_hide_completed);
+        assert!(!ui.mail_unread_only);
+    }
+
+    #[test]
+    fn fullscreen_reader_clears_stale_list_area_and_pane_clicks_focus_panes() {
+        use crate::ui::action::Action;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let (mut app, mut ui) = make_ui_test_harness();
+        app.mail_messages = vec![
+            sample_mail_msg("m1", "Long email", "2026-11-25T10:00:00Z"),
+            sample_mail_msg("m2", "Second email", "2026-11-25T09:00:00Z"),
+        ];
+        app.mail_messages[0].body_plain = (0..60)
+            .map(|i| format!("Paragraph line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.active_mail_id = Some("m1".into());
+        ui.mail_list_scroll.selected_idx = Some(0);
+
+        // First draw Wide (populates mail_list_scroll.area)
+        let mut wide = Terminal::new(TestBackend::new(140, 32)).unwrap();
+        wide.draw(|f| {
+            let _ = draw(f, &mut app, &mut ui);
+        })
+        .unwrap();
+        assert!(ui.mail_list_scroll.area.height > 0);
+        let reader_area = ui.mail_read_scroll.area;
+        let list_area = ui.mail_list_scroll.area;
+        let nav_area = ui.nav_area;
+
+        // Clicking inside Reading pane focuses Focus::Reader; empty List/Nav focus List/Nav
+        ui.set_focus(Focus::List);
+        action::dispatch(
+            Action::Click {
+                column: reader_area.x + 2,
+                row: reader_area.bottom().saturating_sub(1),
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(ui.focus(), Focus::Reader);
+
+        action::dispatch(
+            Action::Click {
+                column: nav_area.x + 1,
+                row: nav_area.bottom().saturating_sub(1),
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(ui.focus(), Focus::Nav);
+
+        action::dispatch(
+            Action::Click {
+                column: list_area.x + 1,
+                row: list_area.bottom().saturating_sub(1),
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(ui.focus(), Focus::List);
+
+        // Switch to Medium fullscreen -> plan.list is None -> stale mail_list_scroll.area MUST be cleared!
+        ui.medium_reader_fullscreen = true;
+        let mut medium = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        medium
+            .draw(|f| {
+                let _ = draw(f, &mut app, &mut ui);
+            })
+            .unwrap();
+        assert_eq!(ui.mail_list_scroll.area, Rect::default());
+        assert!(ui.mail_read_scroll.area.height > 0);
+
+        // Wheel scroll over upper reader area scrolls mail_read_scroll instead of changing mail list selection
+        let rx = ui.mail_read_scroll.area.x + 2;
+        let ry = ui.mail_read_scroll.area.y + 1;
+        action::dispatch(
+            Action::MouseScroll {
+                delta: 3,
+                column: rx,
+                row: ry,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(app.active_mail_id.as_deref(), Some("m1"));
+        assert!(ui.mail_read_scroll.offset > 0);
+    }
+
+    #[test]
+    fn overlay_scroll_windowing_for_settings_context_menu_event_form_help_and_compose() {
+        use crate::ui::action::Action;
+        use crate::ui::overlays::context_menu::{ContextMenu, ContextTarget};
+        use crate::ui::overlays::event_form::EventFormOverlay;
+        use crate::ui::overlays::mail_compose::MailComposeOverlay;
+        use crate::ui::overlays::settings::SettingsState;
+        use crate::ui::overlays::Overlay;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let (mut app, mut ui) = make_ui_test_harness();
+        let mut short = Terminal::new(TestBackend::new(80, 9)).unwrap();
+
+        // Settings scroll window keeps item 11 visible & clickable in short terminal
+        let mut settings = SettingsState::default();
+        settings.selected = 11;
+        ui.push_overlay(Overlay::Settings(settings));
+        short
+            .draw(|f| {
+                let _ = draw(f, &mut app, &mut ui);
+            })
+            .unwrap();
+        assert!(ui
+            .hitmap
+            .region_of(HitTarget::OverlayItem { index: 11 })
+            .is_some());
+        ui.close_top_overlay();
+
+        // ContextMenu scroll window keeps last item visible & clickable in short terminal
+        let mut menu = ContextMenu::build(ContextTarget::Global, (0, 0), &app, &ui);
+        let last_idx = menu.items.len() - 1;
+        menu.selected = last_idx;
+        ui.push_overlay(Overlay::ContextMenu(menu));
+        short
+            .draw(|f| {
+                let _ = draw(f, &mut app, &mut ui);
+            })
+            .unwrap();
+        assert!(ui
+            .hitmap
+            .region_of(HitTarget::OverlayItem { index: last_idx })
+            .is_some());
+        ui.close_top_overlay();
+
+        // EventForm scroll window keeps field 6 visible + buttons pinned at bottom in short terminal
+        let mut form = EventFormOverlay::new();
+        form.field = 6;
+        ui.push_overlay(Overlay::EventForm(form));
+        short
+            .draw(|f| {
+                let _ = draw(f, &mut app, &mut ui);
+            })
+            .unwrap();
+        assert!(ui
+            .hitmap
+            .region_of(HitTarget::OverlayItem { index: 6 })
+            .is_some());
+        assert!(ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::EventFormCancel))
+            .is_some());
+        ui.close_top_overlay();
+
+        // HelpOverlay scrolls down with MouseScroll in short terminal
+        ui.push_overlay(Overlay::help());
+        short
+            .draw(|f| {
+                let _ = draw(f, &mut app, &mut ui);
+            })
+            .unwrap();
+        action::dispatch(
+            Action::MouseScroll {
+                delta: 3,
+                column: 10,
+                row: 4,
+            },
+            &mut app,
+            &mut ui,
+        );
+        if let Some(Overlay::Help(h)) = ui.overlays.last() {
+            assert!(h.max_scroll > 0);
+            assert!(h.scroll > 0);
+        } else {
+            panic!("expected Help overlay");
+        }
+        ui.close_top_overlay();
+
+        // MailComposeOverlay body scrolls up with MouseScroll
+        let mut compose = MailComposeOverlay::new();
+        compose.field = 4;
+        compose.body.load_text(
+            &(0..30)
+                .map(|i| format!("Compose line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        ui.push_overlay(Overlay::mail_compose(compose));
+        let mut medium = Terminal::new(TestBackend::new(80, 18)).unwrap();
+        medium
+            .draw(|f| {
+                let _ = draw(f, &mut app, &mut ui);
+            })
+            .unwrap();
+        let before_off = match ui.overlays.last() {
+            Some(Overlay::MailCompose(c)) => c.body.scroll_offset,
+            _ => unreachable!(),
+        };
+        assert!(before_off > 0);
+        action::dispatch(
+            Action::MouseScroll {
+                delta: -3,
+                column: 20,
+                row: 10,
+            },
+            &mut app,
+            &mut ui,
+        );
+        let after_off = match ui.overlays.last() {
+            Some(Overlay::MailCompose(c)) => c.body.scroll_offset,
+            _ => unreachable!(),
+        };
+        assert!(after_off < before_off, "compose body wheel-up must scroll offset up");
     }
 }
