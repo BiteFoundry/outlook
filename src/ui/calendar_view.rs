@@ -4,12 +4,13 @@
 //! - Right pane: Full event time/timezone, location, organizer, attendee RSVP list, description,
 //!   and 1-key actions (`n` New Event, `a` Accept, `y` Tentative, `x` Decline, `o` Join, `Delete`).
 
+use bitefoundry_html::layout::{wrap_styled_spans, WrapPrefix};
 use chrono::{DateTime, Duration, Local, NaiveDate};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph},
+    widgets::{Block, Paragraph, Wrap},
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
@@ -59,10 +60,9 @@ pub fn draw_list(
     if events.is_empty() {
         ui.cal_list_scroll.total_lines = 0;
         frame.render_widget(
-            Paragraph::new(Span::styled(
-                truncate(" No events in selected range (n to create)", list_area.width as usize),
-                theme.muted_style(),
-            )),
+            Paragraph::new(" No events in selected range (n to create)")
+                .style(theme.muted_style())
+                .wrap(Wrap { trim: false }),
             list_area,
         );
         return;
@@ -112,48 +112,14 @@ pub fn draw_list(
             Style::default()
         };
 
-        let gutter = if is_selected && list_focused { "▎" } else { " " };
-        let (rsvp_glyph, rsvp_color) = rsvp_badge(&ev.response_status, theme);
-        let time_str = if ev.is_all_day {
-            "All Day".to_string()
-        } else {
-            format!(
-                "{}–{}",
-                format_hhmm(&ev.start_iso),
-                format_hhmm(&ev.end_iso)
-            )
-        };
-        let mut suffix = String::new();
-        if conflicts[idx] {
-            suffix.push_str(" ⚠");
-        }
-        if ev.is_online_meeting {
-            suffix.push_str(" 🎥");
-        }
-        let suffix_w = UnicodeWidthStr::width(suffix.as_str());
-        let prefix_w = 2 + 2 + time_str.len() + 1;
-        let title_max = width.saturating_sub(prefix_w + suffix_w + 1);
-        let title = if ev.is_cancelled {
-            truncate(&format!("[Cancelled] {}", ev.subject), title_max)
-        } else {
-            truncate(&ev.subject, title_max)
-        };
-        let used = prefix_w + UnicodeWidthStr::width(title.as_str()) + suffix_w;
-        let pad = width.saturating_sub(used + 1);
-
-        let title_style = if ev.is_cancelled {
-            bg.fg(theme.fg_muted).add_modifier(Modifier::CROSSED_OUT)
-        } else {
-            bg.fg(theme.fg_primary)
-        };
-        let line = Line::from(vec![
-            Span::styled(gutter, bg.fg(theme.accent)),
-            Span::styled(format!("{rsvp_glyph} "), bg.fg(rsvp_color)),
-            Span::styled(format!("{time_str} "), bg.fg(theme.fg_muted)),
-            Span::styled(title, title_style),
-            Span::styled(" ".repeat(pad), bg),
-            Span::styled(format!("{suffix} "), bg.fg(if conflicts[idx] { theme.warning } else { theme.accent_soft })),
-        ]);
+        let line = format_event_list_row(
+            ev,
+            conflicts[idx],
+            is_selected && list_focused,
+            width,
+            theme,
+            bg,
+        );
         lines.push(RenderedLine::clickable(line, HitTarget::ListItem(idx)));
     }
 
@@ -269,7 +235,8 @@ pub fn draw_detail(
         ui.cal_detail_scroll.total_lines = 0;
         frame.render_widget(
             Paragraph::new(" Select a calendar event (n: new event · a/y/x: RSVP)")
-                .style(ui.theme.muted_style()),
+                .style(ui.theme.muted_style())
+                .wrap(Wrap { trim: false }),
             body_area,
         );
         return;
@@ -343,47 +310,129 @@ fn draw_detail_toolbar(
     }
 }
 
+fn format_event_list_row(
+    ev: &CalendarEvent,
+    has_conflict: bool,
+    is_sel_focused: bool,
+    width: usize,
+    theme: &crate::ui::theme::Theme,
+    bg: Style,
+) -> Line<'static> {
+    let gutter = if is_sel_focused { "▎" } else { " " };
+    let (rsvp_glyph, rsvp_color) = rsvp_badge(&ev.response_status, theme);
+    let time_str = if ev.is_all_day {
+        "All Day".to_string()
+    } else {
+        format!(
+            "{}–{}",
+            format_hhmm(&ev.start_iso),
+            format_hhmm(&ev.end_iso)
+        )
+    };
+    let mut suffix = String::new();
+    if has_conflict {
+        suffix.push_str(" ⚠");
+    }
+    if ev.is_online_meeting {
+        suffix.push_str(" 🎥");
+    }
+    let suffix_w = UnicodeWidthStr::width(suffix.as_str());
+    let gutter_w = UnicodeWidthStr::width(gutter);
+    let rsvp_w = UnicodeWidthStr::width(rsvp_glyph) + 1;
+    let time_w = UnicodeWidthStr::width(time_str.as_str()) + 1;
+    let prefix_w = gutter_w + rsvp_w + time_w;
+    let title_max = width.saturating_sub(prefix_w + suffix_w + 1);
+    let title = if ev.is_cancelled {
+        truncate(&format!("[Cancelled] {}", ev.subject), title_max)
+    } else {
+        truncate(&ev.subject, title_max)
+    };
+    let used = prefix_w + UnicodeWidthStr::width(title.as_str()) + suffix_w;
+    let pad = width.saturating_sub(used + 1);
+
+    let title_style = if ev.is_cancelled {
+        bg.fg(theme.fg_muted).add_modifier(Modifier::CROSSED_OUT)
+    } else {
+        bg.fg(theme.fg_primary)
+    };
+    Line::from(vec![
+        Span::styled(gutter, bg.fg(theme.accent)),
+        Span::styled(format!("{rsvp_glyph} "), bg.fg(rsvp_color)),
+        Span::styled(format!("{time_str} "), bg.fg(theme.fg_muted)),
+        Span::styled(title, title_style),
+        Span::styled(" ".repeat(pad), bg),
+        Span::styled(
+            format!("{suffix} "),
+            bg.fg(if has_conflict {
+                theme.warning
+            } else {
+                theme.accent_soft
+            }),
+        ),
+    ])
+}
+
 pub fn build_event_detail_lines(
     ev: &CalendarEvent,
     theme: &crate::ui::theme::Theme,
     width: usize,
 ) -> Vec<RenderedLine> {
     let mut out = Vec::new();
+    let p2 = [Span::raw("  ")];
+    let p4 = [Span::raw("    ")];
+    let hanging = WrapPrefix {
+        first: &p2,
+        cont: &p4,
+    };
+    let plain_indent = WrapPrefix {
+        first: &p2,
+        cont: &p2,
+    };
+
     let subj = if ev.is_cancelled {
         format!("[Cancelled] {}", ev.subject)
     } else {
         ev.subject.clone()
     };
-    out.push(RenderedLine::plain(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            truncate(&subj, width.saturating_sub(4)),
+    for line in wrap_styled_spans(
+        &[Span::styled(
+            subj,
             theme.subject_style().add_modifier(Modifier::BOLD),
-        ),
-    ])));
+        )],
+        width,
+        hanging,
+    ) {
+        out.push(RenderedLine::plain(line));
+    }
 
     let when = if ev.is_all_day {
-        format!("  When:      {} (All Day · {})", format_date_only(ev), ev.time_zone)
+        format!("When:      {} (All Day · {})", format_date_only(ev), ev.time_zone)
     } else {
         // Hours are shown in the machine's zone, so label them with its offset, not the event's storage zone.
         format!(
-            "  When:      {} {} – {} ({})",
+            "When:      {} {} – {} ({})",
             format_date_only(ev),
             format_hhmm(&ev.start_iso),
             format_hhmm(&ev.end_iso),
             Local::now().format("%:z")
         )
     };
-    out.push(RenderedLine::plain(Line::from(Span::styled(
-        truncate(&when, width),
-        Style::default().fg(theme.fg_primary),
-    ))));
+    for line in wrap_styled_spans(
+        &[Span::styled(when, Style::default().fg(theme.fg_primary))],
+        width,
+        hanging,
+    ) {
+        out.push(RenderedLine::plain(line));
+    }
 
     if let Some(ref loc) = ev.location.as_deref().filter(|s| !s.trim().is_empty()) {
-        out.push(RenderedLine::plain(Line::from(Span::styled(
-            truncate(&format!("  Location:  {loc}"), width),
-            theme.muted_style(),
-        ))));
+        for line in wrap_styled_spans(
+            &[Span::styled(format!("Location:  {loc}"), theme.muted_style())],
+            width,
+            hanging,
+        ) {
+            out.push(RenderedLine::plain(line));
+        }
     }
 
     if let Some(org) = ev
@@ -395,38 +444,60 @@ pub fn build_event_detail_lines(
             (Some(n), Some(e)) if !n.eq_ignore_ascii_case(e) => format!("{n} <{e}>"),
             _ => org.to_string(),
         };
-        out.push(RenderedLine::plain(Line::from(Span::styled(
-            truncate(&format!("  Organizer: {org_full}"), width),
-            theme.muted_style(),
-        ))));
+        for line in wrap_styled_spans(
+            &[Span::styled(
+                format!("Organizer: {org_full}"),
+                theme.muted_style(),
+            )],
+            width,
+            hanging,
+        ) {
+            out.push(RenderedLine::plain(line));
+        }
     }
 
     let (glyph, color) = rsvp_badge(&ev.response_status, theme);
-    out.push(RenderedLine::plain(Line::from(vec![
-        Span::styled("  Your RSVP: ", theme.muted_style()),
-        Span::styled(
-            format!("{glyph} {}", ev.response_status),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-    ])));
+    for line in wrap_styled_spans(
+        &[
+            Span::styled("Your RSVP: ", theme.muted_style()),
+            Span::styled(
+                format!("{glyph} {}", ev.response_status),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ],
+        width,
+        hanging,
+    ) {
+        out.push(RenderedLine::plain(line));
+    }
 
     if let Some(ref join_url) = ev.online_meeting_url {
-        let label = format!("  🎥 Join Online Meeting (o): {join_url}");
-        out.push(RenderedLine::clickable(
-            Line::from(Span::styled(
-                truncate(&label, width),
+        let label = format!("🎥 Join Online Meeting (o): {join_url}");
+        for line in wrap_styled_spans(
+            &[Span::styled(
+                label,
                 theme.accent_style().add_modifier(Modifier::UNDERLINED),
-            )),
-            HitTarget::JoinMeetingUrl,
-        ));
+            )],
+            width,
+            hanging,
+        ) {
+            out.push(RenderedLine::clickable(line, HitTarget::JoinMeetingUrl));
+        }
     }
 
     if !ev.attendees.is_empty() {
         out.push(RenderedLine::plain(Line::raw("")));
-        out.push(RenderedLine::plain(Line::from(Span::styled(
-            format!("  Attendees ({}):", ev.attendees.len()),
-            theme.muted_style().add_modifier(Modifier::BOLD),
-        ))));
+        for line in wrap_styled_spans(
+            &[Span::styled(
+                format!("Attendees ({}):", ev.attendees.len()),
+                theme.muted_style().add_modifier(Modifier::BOLD),
+            )],
+            width,
+            plain_indent,
+        ) {
+            out.push(RenderedLine::plain(line));
+        }
+        let att_cont = [Span::raw("      ")];
         for att in &ev.attendees {
             let (ag, ac) = rsvp_badge(&att.response_status, theme);
             let name = att.name.as_deref().unwrap_or(&att.address);
@@ -435,16 +506,27 @@ pub fn build_event_detail_lines(
             } else {
                 format!("{name} <{}> ({})", att.address, att.attendee_type)
             };
-            out.push(RenderedLine::plain(Line::from(vec![
-                Span::raw("    "),
-                Span::styled(format!("{ag} "), Style::default().fg(ac)),
-                Span::styled(truncate(&text, width.saturating_sub(8)), Style::default().fg(theme.fg_secondary)),
-            ])));
+            let att_first = [Span::raw("    "), Span::styled(format!("{ag} "), Style::default().fg(ac))];
+            for line in wrap_styled_spans(
+                &[Span::styled(text, Style::default().fg(theme.fg_secondary))],
+                width,
+                WrapPrefix {
+                    first: &att_first,
+                    cont: &att_cont,
+                },
+            ) {
+                out.push(RenderedLine::plain(line));
+            }
         }
     }
 
+    let rule = if width > 4 {
+        format!("  {}", "─".repeat(width - 4))
+    } else {
+        "─".repeat(width)
+    };
     out.push(RenderedLine::plain(Line::from(Span::styled(
-        format!("  {}", "─".repeat(width.saturating_sub(4).max(4))),
+        rule,
         theme.subtle_style(),
     ))));
 
@@ -456,16 +538,17 @@ pub fn build_event_detail_lines(
         String::new()
     };
     if plain.trim().is_empty() {
-        out.push(RenderedLine::plain(Line::from(Span::styled(
-            "  (No description)",
-            theme.muted_style(),
-        ))));
+        for line in wrap_styled_spans(
+            &[Span::styled("(No description)", theme.muted_style())],
+            width,
+            plain_indent,
+        ) {
+            out.push(RenderedLine::plain(line));
+        }
     } else {
-        for line_str in plain.lines() {
-            out.push(RenderedLine::plain(Line::from(vec![
-                Span::raw("  "),
-                Span::raw(truncate(line_str, width.saturating_sub(4))),
-            ])));
+        let body = plain.trim_end_matches(['\r', '\n']).to_string();
+        for line in wrap_styled_spans(&[Span::raw(body)], width, plain_indent) {
+            out.push(RenderedLine::plain(line));
         }
     }
 
@@ -619,5 +702,105 @@ mod tests {
         let mut negative_offset = floating;
         negative_offset.start_iso = "2026-11-23T00:00:00-08:00".into();
         assert_eq!(event_local_date(&negative_offset), Some(day));
+    }
+
+    #[test]
+    fn event_detail_wraps_200_char_korean_description_and_metadata_within_42_cols() {
+        let mut ev = event(
+            "ev-wrap",
+            "2026-11-23T09:00:00+09:00",
+            "2026-11-23T10:00:00+09:00",
+            "Asia/Seoul",
+            false,
+        );
+        ev.subject = "분기별 제품 로드맵 및 아키텍처 심층 리뷰 미팅 (Q4 2026)".into();
+        ev.location = Some("서울 본사 14층 대회의실 컨퍼런스룸 A동 북쪽 출입구".into());
+        ev.organizer_name = Some("김민수 팀장".into());
+        ev.organizer_email = Some("minsu.kim@contoso.example.com".into());
+        ev.response_status = "accepted".into();
+        ev.is_online_meeting = true;
+        ev.online_meeting_url = Some(
+            "https://teams.microsoft.com/l/meetup-join/19%3ameeting_long_token_abcdef1234567890/0"
+                .into(),
+        );
+        ev.attendees = vec![crate::models::EventAttendee {
+            name: Some("이서연 수석엔지니어".into()),
+            address: "seoyeon.lee@contoso.example.com".into(),
+            attendee_type: "required".into(),
+            response_status: "accepted".into(),
+        }];
+        let desc_ko = "이번 회의에서는 차세대 터미널 클라이언트 텍스트 래핑 불변식을 점검합니다. \
+한글과 영문 및 URL이 혼합된 긴 일정 설명이 42컬럼의 좁은 상세 패널에서도 단 한 글자도 잘리지 않고 \
+여러 줄로 안전하게 표시되어야 합니다. 특히 회의 안건과 사전 준비 자료, 배포 일정, 검증 체크리스트를 \
+모두 포함해 총 이백 글자 이상의 설명이 온전히 보존되는지 확인합니다! 끝.";
+        assert!(desc_ko.chars().count() >= 200);
+        ev.body_plain = desc_ko.to_string();
+
+        let theme = crate::ui::theme::Theme::default();
+        let width = 42usize;
+        let lines = build_event_detail_lines(&ev, &theme, width);
+
+        for (idx, rl) in lines.iter().enumerate() {
+            assert!(
+                rl.line.width() <= width,
+                "calendar detail line {idx} exceeded width {width}: width={} text={:?}",
+                rl.line.width(),
+                rl.line.to_string()
+            );
+        }
+
+        let join_rows: Vec<&RenderedLine> = lines
+            .iter()
+            .filter(|rl| rl.target == Some(HitTarget::JoinMeetingUrl))
+            .collect();
+        assert!(
+            join_rows.len() >= 2,
+            "expected wrapped join URL across multiple clickable rows, got {}",
+            join_rows.len()
+        );
+        let join_combined: String = join_rows
+            .iter()
+            .map(|rl| rl.line.to_string().trim().to_string())
+            .collect();
+        assert!(join_combined.contains("meetup-join"));
+        assert!(join_combined.contains("abcdef1234567890/0"));
+
+        let body_after_rule: String = lines
+            .iter()
+            .skip_while(|rl| !rl.line.to_string().contains('─'))
+            .skip(1)
+            .map(|rl| rl.line.to_string().trim().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let norm = |s: &str| s.split_whitespace().collect::<String>();
+        assert_eq!(norm(&body_after_rule), norm(desc_ko));
+    }
+
+    #[test]
+    fn event_list_row_en_dash_width_is_exact() {
+        let mut ev = event(
+            "ev-dash",
+            "2026-11-23T09:00:00+09:00",
+            "2026-11-23T10:00:00+09:00",
+            "Asia/Seoul",
+            false,
+        );
+        ev.subject = "Design Sync with Platform Team".into();
+        ev.is_online_meeting = true;
+        let theme = crate::ui::theme::Theme::default();
+
+        for width in [36usize, 42, 60] {
+            let row = format_event_list_row(&ev, false, true, width, &theme, Style::default());
+            let rendered = row.to_string();
+            assert!(
+                rendered.contains('–'),
+                "expected en-dash in timed event list row: {rendered:?}"
+            );
+            assert_eq!(
+                row.width(),
+                width,
+                "en-dash row width mismatch for width={width}: rendered={rendered:?}"
+            );
+        }
     }
 }

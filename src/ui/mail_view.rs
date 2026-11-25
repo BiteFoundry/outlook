@@ -8,12 +8,15 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use bitefoundry_html::layout::{
+    render_wrapped_table, wrap_styled_spans, TableAlign, TableBorder, TableSpec, WrapPrefix,
+};
 use chrono::{DateTime, Local};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph},
+    widgets::{Block, Paragraph, Wrap},
     Frame,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -302,10 +305,9 @@ pub fn draw_list(
             " Folder is empty (c to compose)"
         };
         frame.render_widget(
-            Paragraph::new(Span::styled(
-                truncate(msg, list_area.width as usize),
-                theme.muted_style(),
-            )),
+            Paragraph::new(msg)
+                .style(theme.muted_style())
+                .wrap(Wrap { trim: false }),
             list_area,
         );
         return;
@@ -665,7 +667,8 @@ pub fn draw_reader(
         ui.mail_read_scroll.total_lines = 0;
         frame.render_widget(
             Paragraph::new(" Select an email to read (c: compose · Ctrl+K: jump)")
-                .style(ui.theme.muted_style()),
+                .style(ui.theme.muted_style())
+                .wrap(Wrap { trim: false }),
             body_area,
         );
         return;
@@ -984,13 +987,10 @@ fn build_reader_lines_with_selected(
     let latest = &thread_msgs[total - 1];
 
     // Subject header
-    let mut subj_spans = vec![
-        Span::raw("  "),
-        Span::styled(
-            truncate(latest.effective_subject(), width.saturating_sub(6)),
-            theme.subject_style().add_modifier(Modifier::BOLD),
-        ),
-    ];
+    let mut subj_spans = vec![Span::styled(
+        latest.effective_subject().to_string(),
+        theme.subject_style().add_modifier(Modifier::BOLD),
+    )];
     if latest.flagged {
         subj_spans.push(Span::styled("  ⚑", Style::default().fg(theme.warning)));
     }
@@ -1006,7 +1006,25 @@ fn build_reader_lines_with_selected(
             theme.muted_style(),
         ));
     }
-    out.push(RenderedLine::plain(Line::from(subj_spans)));
+    let p2 = [Span::raw("  ")];
+    for line in wrap_styled_spans(
+        &subj_spans,
+        width,
+        WrapPrefix {
+            first: &p2,
+            cont: &p2,
+        },
+    ) {
+        out.push(RenderedLine::plain(line));
+    }
+
+    let hairline = |w: usize| -> String {
+        if w > 4 {
+            format!("  {}", "─".repeat(w - 4))
+        } else {
+            "─".repeat(w)
+        }
+    };
 
     for (t_pos, msg) in thread_msgs.iter().enumerate() {
         let is_last = t_pos + 1 == total;
@@ -1014,7 +1032,7 @@ fn build_reader_lines_with_selected(
 
         if t_pos > 0 {
             out.push(RenderedLine::plain(Line::from(Span::styled(
-                format!("  {}", "─".repeat(width.saturating_sub(4).max(4))),
+                hairline(width),
                 theme.subtle_style(),
             ))));
         }
@@ -1033,14 +1051,15 @@ fn build_reader_lines_with_selected(
         // Expanded message header block
         let from_line = format!("  From: {}", msg.from_display());
         let date_str = format_full_time(&msg.received_at);
+        let date_w = UnicodeWidthStr::width(date_str.as_str());
         let mut from_spans = vec![Span::styled(
-            truncate(&from_line, width.saturating_sub(date_str.len() + 3)),
+            truncate(&from_line, width.saturating_sub(date_w + 3)),
             Style::default()
                 .fg(theme.fg_primary)
                 .add_modifier(Modifier::BOLD),
         )];
         let used = UnicodeWidthStr::width(from_spans[0].content.as_ref());
-        let pad = width.saturating_sub(used + date_str.len() + 2);
+        let pad = width.saturating_sub(used + date_w + 2);
         from_spans.push(Span::raw(" ".repeat(pad)));
         from_spans.push(Span::styled(date_str, theme.muted_style()));
         let from_target = if total > 1 && !is_last {
@@ -1061,10 +1080,18 @@ fn build_reader_lines_with_selected(
                 .map(|r| r.display())
                 .collect::<Vec<_>>()
                 .join(", ");
-            out.push(RenderedLine::plain(Line::from(Span::styled(
-                truncate(&format!("  To:   {to_str}"), width),
-                theme.muted_style(),
-            ))));
+            let to_first = [Span::styled("  To:   ", theme.muted_style())];
+            let to_cont = [Span::raw("        ")];
+            for line in wrap_styled_spans(
+                &[Span::styled(to_str, theme.muted_style())],
+                width,
+                WrapPrefix {
+                    first: &to_first,
+                    cont: &to_cont,
+                },
+            ) {
+                out.push(RenderedLine::plain(line));
+            }
         }
 
         if !msg.cc_recipients.is_empty() {
@@ -1074,10 +1101,18 @@ fn build_reader_lines_with_selected(
                 .map(|r| r.display())
                 .collect::<Vec<_>>()
                 .join(", ");
-            out.push(RenderedLine::plain(Line::from(Span::styled(
-                truncate(&format!("  Cc:   {cc_str}"), width),
-                theme.muted_style(),
-            ))));
+            let cc_first = [Span::styled("  Cc:   ", theme.muted_style())];
+            let cc_cont = [Span::raw("        ")];
+            for line in wrap_styled_spans(
+                &[Span::styled(cc_str, theme.muted_style())],
+                width,
+                WrapPrefix {
+                    first: &cc_first,
+                    cont: &cc_cont,
+                },
+            ) {
+                out.push(RenderedLine::plain(line));
+            }
         }
 
         // Meeting Request Invite Banner
@@ -1085,7 +1120,7 @@ fn build_reader_lines_with_selected(
             render_meeting_invite_banner(&mut out, mr, width, theme);
         }
 
-        // Attachment chips bar
+        // Attachment chips bar (multi-line flow wrap + per-row hit targets)
         let cached_blocks = selected_blocks
             .filter(|(id, _)| *id == msg.id)
             .map(|(_, blocks)| blocks);
@@ -1095,14 +1130,12 @@ fn build_reader_lines_with_selected(
             parser::effective_mail_attachments(msg)
         };
         if !eff_attachments.is_empty() {
+            let chip_style = theme.accent_style().add_modifier(Modifier::BOLD);
             let mut spans = vec![Span::raw("  ")];
             let mut inline_targets = Vec::new();
-            let mut col = 2u16;
+            let mut col = 2usize;
+            let mut row_has_chip = false;
             for (att_idx, att) in eff_attachments.iter().enumerate() {
-                if att_idx > 0 {
-                    spans.push(Span::raw(" "));
-                    col += 1;
-                }
                 let is_img =
                     img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name));
                 let is_html = !is_img
@@ -1131,34 +1164,62 @@ fn build_reader_lines_with_selected(
                     att.name.as_str()
                 };
                 let chip = format!("[{tag} {name}]");
-                let cw = UnicodeWidthStr::width(chip.as_str()) as u16;
-                if (col as usize) + (cw as usize) > width {
-                    break;
+                let cw = UnicodeWidthStr::width(chip.as_str());
+                let target = HitTarget::Attachment {
+                    thread_pos: t_pos,
+                    attach_index: att_idx,
+                };
+                let sep_w = if row_has_chip { 1 } else { 0 };
+                if row_has_chip && col + sep_w + cw > width {
+                    out.push(RenderedLine::with_inline(
+                        Line::from(std::mem::replace(&mut spans, vec![Span::raw("  ")])),
+                        None,
+                        std::mem::take(&mut inline_targets),
+                    ));
+                    col = 2;
+                    row_has_chip = false;
                 }
-                spans.push(Span::styled(
-                    chip,
-                    theme.accent_style().add_modifier(Modifier::BOLD),
-                ));
-                inline_targets.push((
-                    col,
-                    cw,
-                    HitTarget::Attachment {
-                        thread_pos: t_pos,
-                        attach_index: att_idx,
-                    },
-                ));
+                if !row_has_chip && 2 + cw > width {
+                    let wrapped = wrap_styled_spans(
+                        &[Span::styled(chip, chip_style)],
+                        width,
+                        WrapPrefix {
+                            first: &p2,
+                            cont: &p2,
+                        },
+                    );
+                    let max_content = width.saturating_sub(2);
+                    for line in wrapped {
+                        let content_w = line.width().saturating_sub(2).min(max_content) as u16;
+                        out.push(RenderedLine::with_inline(
+                            line,
+                            None,
+                            vec![(2, content_w, target)],
+                        ));
+                    }
+                    continue;
+                }
+                if row_has_chip {
+                    spans.push(Span::raw(" "));
+                    col += 1;
+                }
+                spans.push(Span::styled(chip, chip_style));
+                inline_targets.push((col as u16, cw as u16, target));
                 col += cw;
+                row_has_chip = true;
             }
-            out.push(RenderedLine::with_inline(
-                Line::from(spans),
-                None,
-                inline_targets,
-            ));
+            if row_has_chip {
+                out.push(RenderedLine::with_inline(
+                    Line::from(spans),
+                    None,
+                    inline_targets,
+                ));
+            }
         }
 
         // Thin hairline below header
         out.push(RenderedLine::plain(Line::from(Span::styled(
-            format!("  {}", "─".repeat(width.saturating_sub(4).max(4))),
+            hairline(width),
             theme.subtle_style(),
         ))));
 
@@ -1253,37 +1314,77 @@ fn render_meeting_invite_banner(
         .map(|l| format!(" · {l}"))
         .unwrap_or_default();
 
-    let mut line1_spans = vec![
-        Span::raw("  "),
-        Span::styled(
-            truncate(
-                &format!("📅 Meeting Invite · {time_range}{loc}"),
-                width.saturating_sub(18),
-            ),
+    let p2 = [Span::raw("  ")];
+    let p4 = [Span::raw("    ")];
+    let mut header_lines = wrap_styled_spans(
+        &[Span::styled(
+            format!("📅 Meeting Invite · {time_range}{loc}"),
             Style::default()
                 .fg(theme.accent_soft)
                 .add_modifier(Modifier::BOLD),
-        ),
-    ];
-    let mut line1_targets = Vec::new();
-    if mr.online_meeting_url.is_some() {
-        let col = line_display_width(&Line::from(line1_spans.clone())) as u16 + 2;
-        let pill = "[Join Online]";
-        let pw = UnicodeWidthStr::width(pill) as u16;
-        line1_spans.push(Span::raw("  "));
-        line1_spans.push(Span::styled(
-            pill,
-            theme.accent_style().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        ));
-        line1_targets.push((col, pw, HitTarget::JoinMeetingUrl));
-    }
-    out.push(RenderedLine::with_inline(
-        Line::from(line1_spans),
-        None,
-        line1_targets,
-    ));
+        )],
+        width,
+        WrapPrefix {
+            first: &p2,
+            cont: &p4,
+        },
+    );
 
-    // RSVP action chips
+    if mr.online_meeting_url.is_some() {
+        let pill = "[Join Online]";
+        let pw = UnicodeWidthStr::width(pill);
+        let pill_style = theme
+            .accent_style()
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+        let fits_inline = header_lines
+            .last()
+            .is_some_and(|last| last.width() + 2 + pw <= width);
+        if fits_inline {
+            let last_idx = header_lines.len() - 1;
+            for (idx, mut line) in header_lines.into_iter().enumerate() {
+                if idx == last_idx {
+                    let col = line.width() + 2;
+                    line.spans.push(Span::raw("  "));
+                    line.spans.push(Span::styled(pill, pill_style));
+                    out.push(RenderedLine::with_inline(
+                        line,
+                        None,
+                        vec![(col as u16, pw as u16, HitTarget::JoinMeetingUrl)],
+                    ));
+                } else {
+                    out.push(RenderedLine::plain(line));
+                }
+            }
+        } else {
+            for line in header_lines {
+                out.push(RenderedLine::plain(line));
+            }
+            for line in wrap_styled_spans(
+                &[Span::styled(pill, pill_style)],
+                width,
+                WrapPrefix {
+                    first: &p2,
+                    cont: &p2,
+                },
+            ) {
+                let content_w = line
+                    .width()
+                    .saturating_sub(2)
+                    .min(width.saturating_sub(2)) as u16;
+                out.push(RenderedLine::with_inline(
+                    line,
+                    Some(HitTarget::JoinMeetingUrl),
+                    vec![(2, content_w, HitTarget::JoinMeetingUrl)],
+                ));
+            }
+        }
+    } else {
+        for line in header_lines.drain(..) {
+            out.push(RenderedLine::plain(line));
+        }
+    }
+
+    // RSVP action chips (multi-line flow wrap so `[Decline (x)]` never clips)
     let resp = mr
         .response_status
         .as_deref()
@@ -1308,25 +1409,61 @@ fn render_meeting_invite_banner(
     ];
     let mut spans = vec![Span::raw("  ")];
     let mut targets = Vec::new();
-    let mut col = 2u16;
-    for (idx, (label, action, active)) in rsvp_btns.iter().enumerate() {
-        if idx > 0 {
-            spans.push(Span::raw("  "));
-            col += 2;
-        }
-        let w = UnicodeWidthStr::width(*label) as u16;
-        let st = if *active {
+    let mut col = 2usize;
+    let mut row_has_chip = false;
+    for (label, action, active) in rsvp_btns {
+        let w = UnicodeWidthStr::width(label);
+        let st = if active {
             Style::default()
                 .fg(theme.success)
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED)
         } else {
             theme.accent_style().add_modifier(Modifier::BOLD)
         };
-        spans.push(Span::styled(*label, st));
-        targets.push((col, w, HitTarget::MeetingRsvp(*action)));
+        let target = HitTarget::MeetingRsvp(action);
+        let sep_w = if row_has_chip { 2 } else { 0 };
+        if row_has_chip && col + sep_w + w > width {
+            out.push(RenderedLine::with_inline(
+                Line::from(std::mem::replace(&mut spans, vec![Span::raw("  ")])),
+                None,
+                std::mem::take(&mut targets),
+            ));
+            col = 2;
+            row_has_chip = false;
+        }
+        if !row_has_chip && 2 + w > width {
+            for line in wrap_styled_spans(
+                &[Span::styled(label, st)],
+                width,
+                WrapPrefix {
+                    first: &p2,
+                    cont: &p2,
+                },
+            ) {
+                let content_w = line
+                    .width()
+                    .saturating_sub(2)
+                    .min(width.saturating_sub(2)) as u16;
+                out.push(RenderedLine::with_inline(
+                    line,
+                    Some(target),
+                    vec![(2, content_w, target)],
+                ));
+            }
+            continue;
+        }
+        if row_has_chip {
+            spans.push(Span::raw("  "));
+            col += 2;
+        }
+        spans.push(Span::styled(label, st));
+        targets.push((col as u16, w as u16, target));
         col += w;
+        row_has_chip = true;
     }
-    out.push(RenderedLine::with_inline(Line::from(spans), None, targets));
+    if row_has_chip {
+        out.push(RenderedLine::with_inline(Line::from(spans), None, targets));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1347,7 +1484,8 @@ fn render_email_blocks(
     show_link_urls: bool,
 ) {
     let indent_w = UnicodeWidthStr::width(indent);
-    let body_w = width.saturating_sub(indent_w + 1).max(8);
+    let body_w = width.saturating_sub(indent_w + 1).max(1);
+    let total_w = indent_w + body_w;
 
     for block in blocks {
         match block {
@@ -1449,25 +1587,32 @@ fn render_email_blocks(
                 }
                 out.push(RenderedLine::plain(Line::from(top)));
 
-                for raw_line in code.lines() {
-                    let expanded = raw_line.replace('\t', "    ");
-                    let content = truncate(&expanded, body_w.saturating_sub(2));
-                    let content_w = UnicodeWidthStr::width(content.as_str());
-                    let mut spans = vec![
-                        Span::raw(indent.to_string()),
-                        Span::styled("│ ", header_style),
-                        Span::styled(content, theme.code_style()),
-                    ];
-                    if let Some(bg) = code_bg {
-                        let used = 2 + content_w;
-                        if used < body_w {
-                            spans.push(Span::styled(
-                                " ".repeat(body_w - used),
-                                Style::default().bg(bg),
-                            ));
+                let code_prefix = [
+                    Span::raw(indent.to_string()),
+                    Span::styled("│ ", header_style),
+                ];
+                let trimmed_code = code.trim_end_matches(['\r', '\n']);
+                if !trimmed_code.is_empty() {
+                    let wrapped = wrap_styled_spans(
+                        &[Span::styled(trimmed_code.to_string(), theme.code_style())],
+                        total_w,
+                        WrapPrefix {
+                            first: &code_prefix,
+                            cont: &code_prefix,
+                        },
+                    );
+                    for mut line in wrapped {
+                        if let Some(bg) = code_bg {
+                            let used = line.width();
+                            if used < total_w {
+                                line.spans.push(Span::styled(
+                                    " ".repeat(total_w - used),
+                                    Style::default().bg(bg),
+                                ));
+                            }
                         }
+                        out.push(RenderedLine::plain(line));
                     }
-                    out.push(RenderedLine::plain(Line::from(spans)));
                 }
 
                 let mut bot = vec![
@@ -1497,22 +1642,29 @@ fn render_email_blocks(
                     .unwrap_or(0);
                 let label = name.as_deref().unwrap_or(id.as_str());
                 let chip = format!("[FILE {label}]");
-                let w = UnicodeWidthStr::width(chip.as_str()) as u16;
-                out.push(RenderedLine::with_inline(
-                    Line::from(vec![
-                        Span::raw(indent.to_string()),
-                        Span::styled(chip, theme.accent_style().add_modifier(Modifier::BOLD)),
-                    ]),
-                    None,
-                    vec![(
-                        indent_w as u16,
-                        w,
-                        HitTarget::Attachment {
-                            thread_pos,
-                            attach_index: att_idx,
-                        },
+                let target = HitTarget::Attachment {
+                    thread_pos,
+                    attach_index: att_idx,
+                };
+                let prefix_spans = [Span::raw(indent.to_string())];
+                for line in wrap_styled_spans(
+                    &[Span::styled(
+                        chip,
+                        theme.accent_style().add_modifier(Modifier::BOLD),
                     )],
-                ));
+                    total_w,
+                    WrapPrefix {
+                        first: &prefix_spans,
+                        cont: &prefix_spans,
+                    },
+                ) {
+                    let content_w = line.width().saturating_sub(indent_w).min(body_w) as u16;
+                    out.push(RenderedLine::with_inline(
+                        line,
+                        None,
+                        vec![(indent_w as u16, content_w, target)],
+                    ));
+                }
             }
             RichBlock::InlineImageChip {
                 src,
@@ -1531,19 +1683,29 @@ fn render_email_blocks(
                     .filter(|s| !s.is_empty())
                     .unwrap_or("inline-image");
                 let chip = format!("[IMG {att_name}]");
-                let cw = UnicodeWidthStr::width(chip.as_str()) as u16;
                 let target = HitTarget::Attachment {
                     thread_pos,
                     attach_index: att_idx,
                 };
-                out.push(RenderedLine::with_inline(
-                    Line::from(vec![
-                        Span::raw(indent.to_string()),
-                        Span::styled(chip, theme.accent_style().add_modifier(Modifier::BOLD)),
-                    ]),
-                    Some(target),
-                    vec![(indent_w as u16, cw, target)],
-                ));
+                let prefix_spans = [Span::raw(indent.to_string())];
+                for line in wrap_styled_spans(
+                    &[Span::styled(
+                        chip,
+                        theme.accent_style().add_modifier(Modifier::BOLD),
+                    )],
+                    total_w,
+                    WrapPrefix {
+                        first: &prefix_spans,
+                        cont: &prefix_spans,
+                    },
+                ) {
+                    let content_w = line.width().saturating_sub(indent_w).min(body_w) as u16;
+                    out.push(RenderedLine::with_inline(
+                        line,
+                        Some(target),
+                        vec![(indent_w as u16, content_w, target)],
+                    ));
+                }
 
                 if let (Some(cache), Some(att)) = (image_cache, eff_attachments.get(att_idx)) {
                     let key = AppState::image_cache_key(
@@ -1564,13 +1726,16 @@ fn render_email_blocks(
                             "↳ {}x{} ({}) · click or Alt+v for HD preview",
                             rendered.width_px, rendered.height_px, rendered.format_label
                         );
-                        out.push(RenderedLine::clickable(
-                            Line::from(vec![
-                                Span::raw(indent.to_string()),
-                                Span::styled(truncate(&meta, body_w), theme.muted_style()),
-                            ]),
-                            target,
-                        ));
+                        for line in wrap_styled_spans(
+                            &[Span::styled(meta, theme.muted_style())],
+                            total_w,
+                            WrapPrefix {
+                                first: &prefix_spans,
+                                cont: &prefix_spans,
+                            },
+                        ) {
+                            out.push(RenderedLine::clickable(line, target));
+                        }
                     }
                 }
             }
@@ -1581,16 +1746,20 @@ fn render_email_blocks(
                 } else {
                     format!("▸ Quoted reply ({line_count} lines) — press z to expand")
                 };
-                out.push(RenderedLine::clickable(
-                    Line::from(vec![
-                        Span::raw(indent.to_string()),
-                        Span::styled(
-                            truncate(&toggle_label, body_w),
-                            theme.accent_style().add_modifier(Modifier::ITALIC),
-                        ),
-                    ]),
-                    target,
-                ));
+                let prefix_spans = [Span::raw(indent.to_string())];
+                for line in wrap_styled_spans(
+                    &[Span::styled(
+                        toggle_label,
+                        theme.accent_style().add_modifier(Modifier::ITALIC),
+                    )],
+                    total_w,
+                    WrapPrefix {
+                        first: &prefix_spans,
+                        cont: &prefix_spans,
+                    },
+                ) {
+                    out.push(RenderedLine::clickable(line, target));
+                }
                 if quote_expanded {
                     let nested_indent = format!("{indent}│ ");
                     render_email_blocks(
@@ -1632,104 +1801,36 @@ fn render_table_block(
         return;
     }
 
-    let cell_text = |spans: &[RichSpan]| -> String {
-        let mut s = String::new();
-        for (i, sp) in spans.iter().enumerate() {
-            s.push_str(&sp.text);
-            if show_link_urls {
-                if let Some(ref url) = sp.style.link_url {
-                    let next_same = spans
-                        .get(i + 1)
-                        .and_then(|n| n.style.link_url.as_deref())
-                        == Some(url.as_str());
-                    if !next_same && should_append_inline_href(&sp.text, url) {
-                        s.push_str(&format!(" ({url})"));
-                    }
-                }
-            }
-        }
-        s.replace(['\n', '\r'], " ").trim().to_string()
+    let styled_headers: Vec<Vec<Span<'static>>> = headers
+        .iter()
+        .map(|cell| rich_spans_to_styled_spans(cell, theme, show_link_urls))
+        .collect();
+    let styled_rows: Vec<Vec<Vec<Span<'static>>>> = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|cell| rich_spans_to_styled_spans(cell, theme, show_link_urls))
+                .collect()
+        })
+        .collect();
+    let alignments = vec![TableAlign::Left; cols];
+    let prefix = [Span::raw(indent.to_string())];
+    let indent_w = UnicodeWidthStr::width(indent);
+    let spec = TableSpec {
+        headers: &styled_headers,
+        rows: &styled_rows,
+        alignments: &alignments,
+        border: TableBorder::Box,
+        prefix: &prefix,
+        border_style: theme.subtle_style(),
+        header_style: Style::default()
+            .fg(theme.fg_primary)
+            .add_modifier(Modifier::BOLD),
+        cell_style: Style::default().fg(theme.fg_secondary),
     };
-
-    let mut col_widths = vec![3usize; cols];
-    for (ci, h) in headers.iter().enumerate() {
-        col_widths[ci] = col_widths[ci].max(UnicodeWidthStr::width(cell_text(h).as_str()));
+    for line in render_wrapped_table(&spec, indent_w + body_w) {
+        out.push(RenderedLine::plain(line));
     }
-    for row in rows {
-        for (ci, cell) in row.iter().enumerate() {
-            if ci < cols {
-                col_widths[ci] =
-                    col_widths[ci].max(UnicodeWidthStr::width(cell_text(cell).as_str()));
-            }
-        }
-    }
-
-    // Clamp column widths to fit inside `body_w`
-    let border_overhead = cols + 1 + cols * 2;
-    let avail_content = body_w.saturating_sub(border_overhead).max(cols * 3);
-    let total_content: usize = col_widths.iter().sum();
-    if total_content > avail_content {
-        for w in &mut col_widths {
-            *w = ((*w * avail_content) / total_content.max(1)).max(3);
-        }
-    }
-
-    let border_line = |left: &str, mid: &str, right: &str| -> String {
-        let mut s = String::from(left);
-        for (ci, w) in col_widths.iter().enumerate() {
-            if ci > 0 {
-                s.push_str(mid);
-            }
-            s.push_str(&"─".repeat(w + 2));
-        }
-        s.push_str(right);
-        s
-    };
-
-    let format_row = |cells: &[Vec<RichSpan>], is_header: bool| -> Line<'static> {
-        let mut spans = vec![
-            Span::raw(indent.to_string()),
-            Span::styled("│", theme.subtle_style()),
-        ];
-        for (ci, cw) in col_widths.iter().enumerate() {
-            let text = cells.get(ci).map(|c| cell_text(c)).unwrap_or_default();
-            let trunc = truncate(&text, *cw);
-            let used = UnicodeWidthStr::width(trunc.as_str());
-            let pad = cw.saturating_sub(used);
-            let style = if is_header {
-                Style::default()
-                    .fg(theme.fg_primary)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.fg_secondary)
-            };
-            spans.push(Span::styled(format!(" {trunc}{} ", " ".repeat(pad)), style));
-            spans.push(Span::styled("│", theme.subtle_style()));
-        }
-        Line::from(spans)
-    };
-
-    out.push(RenderedLine::plain(Line::from(vec![
-        Span::raw(indent.to_string()),
-        Span::styled(border_line("┌", "┬", "┐"), theme.subtle_style()),
-    ])));
-
-    if !headers.is_empty() {
-        out.push(RenderedLine::plain(format_row(headers, true)));
-        out.push(RenderedLine::plain(Line::from(vec![
-            Span::raw(indent.to_string()),
-            Span::styled(border_line("├", "┼", "┤"), theme.subtle_style()),
-        ])));
-    }
-
-    for row in rows {
-        out.push(RenderedLine::plain(format_row(row, false)));
-    }
-
-    out.push(RenderedLine::plain(Line::from(vec![
-        Span::raw(indent.to_string()),
-        Span::styled(border_line("└", "┴", "┘"), theme.subtle_style()),
-    ])));
 }
 
 fn resolve_mail_attachment_index(
@@ -1777,64 +1878,12 @@ fn should_append_inline_href(label: &str, url: &str) -> bool {
         || lower_t.contains(&lower_u))
 }
 
-fn push_wrapped_text(
-    text: &str,
-    style: Style,
-    limit: usize,
-    lines: &mut Vec<Vec<Span<'static>>>,
-    current: &mut Vec<Span<'static>>,
-    used: &mut usize,
-) {
-    let mut buf = String::new();
-    for ch in text.chars() {
-        if ch == '\n' {
-            if !buf.is_empty() {
-                current.push(Span::styled(std::mem::take(&mut buf), style));
-            }
-            lines.push(std::mem::take(current));
-            *used = 0;
-            continue;
-        }
-        if ch == '\t' {
-            for _ in 0..4 {
-                if *used + 1 > limit && (*used > 0 || !buf.is_empty()) {
-                    if !buf.is_empty() {
-                        current.push(Span::styled(std::mem::take(&mut buf), style));
-                    }
-                    lines.push(std::mem::take(current));
-                    *used = 0;
-                }
-                buf.push(' ');
-                *used += 1;
-            }
-            continue;
-        }
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if *used + cw > limit && (*used > 0 || !buf.is_empty()) {
-            if !buf.is_empty() {
-                current.push(Span::styled(std::mem::take(&mut buf), style));
-            }
-            lines.push(std::mem::take(current));
-            *used = 0;
-        }
-        buf.push(ch);
-        *used += cw;
-    }
-    if !buf.is_empty() {
-        current.push(Span::styled(buf, style));
-    }
-}
-
-fn wrap_rich_spans(
+fn rich_spans_to_styled_spans(
     rich: &[RichSpan],
-    width: usize,
     theme: &Theme,
     show_link_urls: bool,
-) -> Vec<Vec<Span<'static>>> {
-    let limit = width.max(1);
-    let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
-    let mut current: Vec<Span<'static>> = Vec::new();
-    let mut used = 0usize;
+) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
     let mut active_link_label = String::new();
 
     for (idx, piece) in rich.iter().enumerate() {
@@ -1863,14 +1912,9 @@ fn wrap_rich_spans(
             active_link_label.clear();
         }
 
-        push_wrapped_text(
-            &piece.text,
-            style,
-            limit,
-            &mut lines,
-            &mut current,
-            &mut used,
-        );
+        if !piece.text.is_empty() {
+            out.push(Span::styled(piece.text.clone(), style));
+        }
 
         if show_link_urls {
             if let Some(ref url) = piece.style.link_url {
@@ -1880,15 +1924,10 @@ fn wrap_rich_spans(
                     == Some(url.as_str());
                 if !next_same {
                     if should_append_inline_href(&active_link_label, url) {
-                        let suffix = format!(" ({})", url.trim());
-                        push_wrapped_text(
-                            &suffix,
+                        out.push(Span::styled(
+                            format!(" ({})", url.trim()),
                             theme.muted_style(),
-                            limit,
-                            &mut lines,
-                            &mut current,
-                            &mut used,
-                        );
+                        ));
                     }
                     active_link_label.clear();
                 }
@@ -1896,15 +1935,21 @@ fn wrap_rich_spans(
         }
     }
 
-    lines.push(current);
-    lines
+    out
 }
 
-fn line_display_width(line: &Line<'_>) -> usize {
-    line.spans
-        .iter()
-        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-        .sum()
+fn wrap_rich_spans(
+    rich: &[RichSpan],
+    width: usize,
+    theme: &Theme,
+    show_link_urls: bool,
+) -> Vec<Vec<Span<'static>>> {
+    let limit = width.max(1);
+    let styled = rich_spans_to_styled_spans(rich, theme, show_link_urls);
+    wrap_styled_spans(&styled, limit, WrapPrefix::empty())
+        .into_iter()
+        .map(|line| line.spans)
+        .collect()
 }
 
 pub fn format_short_time(iso: &str) -> String {
@@ -2507,5 +2552,304 @@ mod tests {
         assert!(removed.contains("Edited again"));
         assert!(!removed.contains("OLDER_QUOTED_TEXT"));
         assert_eq!(DOM_PARSE_COUNT.with(|count| count.get()), warm + 2);
+    }
+
+    #[test]
+    fn plain_text_content_type_three_line_email_renders_three_distinct_lines() {
+        let graph_body = crate::graph::mail::GraphOutlookBody {
+            content_type: Some("text".into()),
+            content: Some("Alpha line & details\nBeta line < 2\nGamma line end".into()),
+        };
+        let (body_html, body_plain) =
+            crate::graph::mail::normalize_outlook_body(Some(&graph_body), "Alpha");
+        assert!(body_html.is_empty());
+        assert_eq!(
+            body_plain,
+            "Alpha line & details\nBeta line < 2\nGamma line end"
+        );
+
+        let mut msg = sample_mail("m-text-3l", "c-text-3l", &body_html);
+        msg.meeting_request = None;
+        msg.body_plain = body_plain;
+
+        let theme = Theme::default();
+        let expanded = std::collections::HashSet::new();
+        let lines = build_reader_lines(&[msg], &expanded, &expanded, &theme, 60, None, (24, 8));
+        let body_lines: Vec<String> = lines
+            .iter()
+            .skip_while(|l| !l.line.to_string().contains('─'))
+            .skip(1)
+            .map(|l| l.line.to_string())
+            .collect();
+        assert_eq!(
+            body_lines,
+            vec![
+                "  Alpha line & details",
+                "  Beta line < 2",
+                "  Gamma line end",
+            ]
+        );
+
+        // Direct plain-text path through `html_in::parse_message_blocks` also keeps 3 lines.
+        let mut direct_msg = sample_mail("m-direct-3l", "c-direct-3l", "Line 1\nLine 2\nLine 3");
+        direct_msg.meeting_request = None;
+        let direct_lines =
+            build_reader_lines(&[direct_msg], &expanded, &expanded, &theme, 60, None, (24, 8));
+        let direct_body: Vec<String> = direct_lines
+            .iter()
+            .skip_while(|l| !l.line.to_string().contains('─'))
+            .skip(1)
+            .map(|l| l.line.to_string())
+            .collect();
+        assert_eq!(direct_body, vec!["  Line 1", "  Line 2", "  Line 3"]);
+    }
+
+    #[test]
+    fn six_column_html_table_at_width_60_respects_width_and_preserves_all_cells() {
+        let html = r#"
+            <table>
+                <thead>
+                    <tr>
+                        <th>Service</th>
+                        <th>Region</th>
+                        <th>Owner</th>
+                        <th>Latency</th>
+                        <th>Status</th>
+                        <th>Notes</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>MailSync</td>
+                        <td>SeoulKR</td>
+                        <td>김서연</td>
+                        <td>142ms</td>
+                        <td>Healthy</td>
+                        <td>Zero packet loss observed</td>
+                    </tr>
+                    <tr>
+                        <td>CalendarAPI</td>
+                        <td>TokyoJP</td>
+                        <td>박지훈</td>
+                        <td>289ms</td>
+                        <td>Degraded</td>
+                        <td>Retry queue draining smoothly</td>
+                    </tr>
+                </tbody>
+            </table>
+        "#;
+        let mut msg = sample_mail("m-table6", "c-table6", html);
+        msg.meeting_request = None;
+
+        let theme = Theme::default();
+        let expanded = std::collections::HashSet::new();
+        let width = 60usize;
+        let lines = build_reader_lines(&[msg], &expanded, &expanded, &theme, width, None, (24, 8));
+
+        for (idx, rl) in lines.iter().enumerate() {
+            assert!(
+                rl.line.width() <= width,
+                "table mail line {idx} exceeded width {width}: width={} text={:?}",
+                rl.line.width(),
+                rl.line.to_string()
+            );
+        }
+
+        // Reconstruct each column's vertical text from `│`-delimited box rows so wrapped
+        // cells like `"Servic"` + `"e"` or `"김"` + `"서"` + `"연"` verify lossless preservation.
+        let mut cols_combined = vec![String::new(); 6];
+        for rl in &lines {
+            let text = rl.line.to_string();
+            let trimmed = text.trim();
+            if trimmed.starts_with('│') && trimmed.ends_with('│') {
+                let inner = &trimmed['│'.len_utf8()..trimmed.len() - '│'.len_utf8()];
+                let cells: Vec<&str> = inner.split('│').collect();
+                assert_eq!(
+                    cells.len(),
+                    6,
+                    "expected 6 columns per table row, got {cells:?}"
+                );
+                for (ci, cell) in cells.iter().enumerate() {
+                    cols_combined[ci].push_str(cell.trim());
+                }
+            }
+        }
+        let all_cols = cols_combined.join("\n");
+        for (ci, expected_tokens) in [
+            (0, vec!["Service", "MailSync", "CalendarAPI"]),
+            (1, vec!["Region", "SeoulKR", "TokyoJP"]),
+            (2, vec!["Owner", "김서연", "박지훈"]),
+            (3, vec!["Latency", "142ms", "289ms"]),
+            (4, vec!["Status", "Healthy", "Degraded"]),
+            (
+                5,
+                vec!["Notes", "Zero", "packet", "loss", "observed", "Retry", "queue", "draining", "smoothly"],
+            ),
+        ] {
+            for token in expected_tokens {
+                assert!(
+                    cols_combined[ci].contains(token),
+                    "missing table cell token {token:?} in col {ci}:\n{all_cols}\nfull:\n{}",
+                    lines_to_text(&lines)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rsvp_banner_at_42_cols_preserves_decline_text_and_hit_target() {
+        let msg = sample_mail("m-rsvp42", "c-rsvp42", "<p>Join us for review.</p>");
+        let theme = Theme::default();
+        let expanded = std::collections::HashSet::new();
+        let width = 42usize;
+        let lines = build_reader_lines(&[msg], &expanded, &expanded, &theme, width, None, (24, 8));
+
+        for (idx, rl) in lines.iter().enumerate() {
+            assert!(
+                rl.line.width() <= width,
+                "rsvp mail line {idx} exceeded width {width}: width={} text={:?}",
+                rl.line.width(),
+                rl.line.to_string()
+            );
+        }
+
+        let rendered = lines_to_text(&lines);
+        assert!(rendered.contains("[Accept (a)]"), "got:\n{rendered}");
+        assert!(rendered.contains("[Tentative (y)]"), "got:\n{rendered}");
+        assert!(rendered.contains("[Decline (x)]"), "got:\n{rendered}");
+
+        let decline_hit = lines.iter().find_map(|rl| {
+            rl.inline_targets.iter().find(|&&(col, w, t)| {
+                t == HitTarget::MeetingRsvp(EventRsvpAction::Decline)
+                    && (col as usize) + (w as usize) <= width
+            })
+        });
+        assert!(
+            decline_hit.is_some(),
+            "expected HitTarget::MeetingRsvp(Decline) within {width} cols"
+        );
+    }
+
+    #[test]
+    fn headers_attachments_and_code_block_wrap_losslessly_within_width() {
+        let mut msg = sample_mail(
+            "m-wrap-all",
+            "c-wrap-all",
+            "<pre><code>let very_long_identifier_for_wrapping_check = compute_lossless_layout(first_arg, second_arg, third_arg);\n\tindented_second_line();</code></pre>",
+        );
+        msg.meeting_request = None;
+        msg.to_recipients = vec![
+            EmailRecipient {
+                name: Some("Alice Johnson".into()),
+                address: "alice.johnson@contoso.com".into(),
+            },
+            EmailRecipient {
+                name: Some("Bob Martinez".into()),
+                address: "bob.martinez@contoso.com".into(),
+            },
+            EmailRecipient {
+                name: Some("Carol Kim".into()),
+                address: "carol.kim@contoso.com".into(),
+            },
+        ];
+        msg.cc_recipients = vec![
+            EmailRecipient {
+                name: Some("Dave Park".into()),
+                address: "dave.park@contoso.com".into(),
+            },
+            EmailRecipient {
+                name: Some("Eve Choi".into()),
+                address: "eve.choi@contoso.com".into(),
+            },
+        ];
+        msg.attachments = vec![
+            MailAttachment {
+                id: "a1".into(),
+                name: "architecture-overview-2026.pdf".into(),
+                content_type: "application/pdf".into(),
+                size: 1024,
+                is_inline: false,
+                content_id: None,
+                content_bytes_b64: None,
+            },
+            MailAttachment {
+                id: "a2".into(),
+                name: "release-notes.md".into(),
+                content_type: "text/markdown".into(),
+                size: 512,
+                is_inline: false,
+                content_id: None,
+                content_bytes_b64: None,
+            },
+            MailAttachment {
+                id: "a3".into(),
+                name: "screenshot-final.png".into(),
+                content_type: "image/png".into(),
+                size: 2048,
+                is_inline: false,
+                content_id: None,
+                content_bytes_b64: None,
+            },
+        ];
+
+        let theme = Theme::default();
+        let expanded = std::collections::HashSet::new();
+        let width = 44usize;
+        let lines = build_reader_lines(&[msg], &expanded, &expanded, &theme, width, None, (24, 8));
+
+        for (idx, rl) in lines.iter().enumerate() {
+            assert!(
+                rl.line.width() <= width,
+                "wrapped mail line {idx} exceeded width {width}: width={} text={:?}",
+                rl.line.width(),
+                rl.line.to_string()
+            );
+            for &(col, w, _) in &rl.inline_targets {
+                assert!(
+                    (col as usize) + (w as usize) <= width,
+                    "inline target ({col}, {w}) exceeded width {width} on line {idx}"
+                );
+            }
+        }
+
+        let rendered = lines_to_text(&lines);
+        assert!(rendered.contains("carol.kim@contoso.com"));
+        assert!(rendered.contains("eve.choi@contoso.com"));
+        assert!(rendered.contains("[FILE architecture-overview-2026.pdf]"));
+        assert!(rendered.contains("[MD release-notes.md]"));
+        assert!(rendered.contains("[IMG screenshot-final.png]"));
+
+        // Verify all 3 attachment chip hit targets exist in the attachment bar.
+        for expected_idx in 0..3 {
+            assert!(
+                lines.iter().any(|rl| {
+                    rl.inline_targets.iter().any(|&(_, _, t)| {
+                        t == HitTarget::Attachment {
+                            thread_pos: 0,
+                            attach_index: expected_idx,
+                        }
+                    })
+                }),
+                "missing HitTarget::Attachment for index {expected_idx}"
+            );
+        }
+
+        // Verify code block wraps with `│ ` continuation prefix and loses zero text.
+        let code_lines: Vec<String> = lines
+            .iter()
+            .map(|rl| rl.line.to_string())
+            .filter(|s| s.contains("│ "))
+            .collect();
+        assert!(
+            code_lines.len() >= 3,
+            "expected wrapped code block lines with │ prefix, got: {code_lines:?}"
+        );
+        let code_joined: String = code_lines
+            .iter()
+            .map(|l| l.split_once("│ ").map(|(_, r)| r.trim()).unwrap_or(""))
+            .collect();
+        assert!(code_joined.contains("very_long_identifier_for_wrapping_check"));
+        assert!(code_joined.contains("third_arg);"));
+        assert!(code_joined.contains("indented_second_line();"));
     }
 }

@@ -283,8 +283,7 @@ pub(crate) fn normalize_outlook_body(
     }
 
     if content_type.eq_ignore_ascii_case("text") {
-        let escaped = escape_html_text(raw_content);
-        return (escaped, raw_content.to_string());
+        return (String::new(), raw_content.to_string());
     }
 
     let body_html = raw_content.to_string();
@@ -1473,7 +1472,14 @@ impl GraphClient {
                     anyhow!("Graph returned an empty draft ID").context(MailActionUnconfirmed)
                 );
             }
-            let (quoted_html, _) = normalize_outlook_body(raw.body.as_ref(), "");
+            let (quoted_html, quoted_plain) = normalize_outlook_body(raw.body.as_ref(), "");
+            let quoted_html = if quoted_html.is_empty() && !quoted_plain.trim().is_empty() {
+                escape_html_text(&quoted_plain)
+                    .replace("\r\n", "\n")
+                    .replace('\n', "<br>")
+            } else {
+                quoted_html
+            };
             created_thread = (raw.id, quoted_html);
             progress(DraftSaveChange::ThreadCreated {
                 id: created_thread.0.clone(),
@@ -2699,7 +2705,7 @@ pub(crate) mod tests {
         assert!(page1[0].body_plain.contains("Hello World"));
         assert!(!page1[1].is_focused());
         assert_eq!(page1[1].body_plain, "a < b & c");
-        assert_eq!(page1[1].body_html, "a &lt; b &amp; c");
+        assert!(page1[1].body_html.is_empty());
         assert!(next1.is_some());
 
         let all_sent = client.list_mail_messages("sent", 10, true).await.unwrap();
