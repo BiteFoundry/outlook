@@ -2286,7 +2286,7 @@ dependencies = [
 
 [[package]]
 name = "outlook-cli"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "arboard",
