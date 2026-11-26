@@ -2197,9 +2197,15 @@ async fn poll_mail_folders_quiet(
 ) -> Result<()> {
     let (folders, complete) = graph.list_mail_folders_complete().await?;
     if !complete {
-        // A partial tree is merged into the cache but never becomes the baseline: nothing is deleted,
-        // the UI keeps its current list, and the next poll retries the full listing.
-        run_storage(storage, move |st| st.upsert_mail_folders(&folders)).await?;
+        // A partial tree (depth cap hit, throttled or failed child listing) is merged into the cache
+        // but never becomes the baseline: nothing is pruned and the next poll retries the full listing.
+        // The merged cache still goes to the UI so live unread counts and new folders keep updating.
+        let merged = run_storage(storage, move |st| {
+            st.upsert_mail_folders(&folders)?;
+            st.list_mail_folders()
+        })
+        .await?;
+        let _ = event_tx.send(CoreEvent::MailFoldersUpdated(merged));
         return Ok(());
     }
     let changed = last_folders.as_ref() != Some(&folders);
@@ -4106,7 +4112,14 @@ mod tests {
             .unwrap();
         assert_eq!(cached_ids(&storage), ["f-alpha", "f-inbox", "f-proj"]);
         assert!(last_folders.is_none(), "a partial tree must not become the poll baseline");
-        assert!(rx.try_recv().is_err(), "a partial tree must not be pushed to the UI");
+        // The merged cache (not the partial listing) still reaches the UI, so Alpha stays visible.
+        let Ok(CoreEvent::MailFoldersUpdated(pushed)) = rx.try_recv() else {
+            panic!("a partial tree must still push the merged folder cache to the UI");
+        };
+        let mut pushed_ids: Vec<String> = pushed.into_iter().map(|f| f.id).collect();
+        pushed_ids.sort();
+        assert_eq!(pushed_ids, ["f-alpha", "f-inbox", "f-proj"]);
+        assert!(rx.try_recv().is_err());
 
         // The resolver's live refresh takes the same path.
         let err = crate::resolver::resolve_mail_folder(&client, &storage, "No Such Folder", false).await;
@@ -4119,6 +4132,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cached_ids(&storage), ["f-inbox", "f-proj"]);
+        assert!(matches!(rx.try_recv(), Ok(CoreEvent::MailFoldersUpdated(_))));
+    }
+
+    #[tokio::test]
+    async fn test_depth_capped_folder_poll_still_pushes_live_unread_counts() {
+        use axum::{
+            routing::{get, post},
+            Json, Router,
+        };
+
+        // An endless chain f-d0 > f-d1 > ... always reports one more child, so the listing stops at
+        // the depth cap and comes back partial on every poll.
+        let app = Router::new()
+            .route(
+                "/v1.0/me/mailFolders",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [
+                            { "id": "f-d0", "displayName": "Inbox", "childFolderCount": 1, "unreadItemCount": 7, "totalItemCount": 9 }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/$batch",
+                post(|Json(payload): Json<serde_json::Value>| async move {
+                    let responses: Vec<serde_json::Value> = payload["requests"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|r| {
+                            let id = r["id"].as_str().unwrap_or_default().to_string();
+                            let url = r["url"].as_str().unwrap_or_default().to_string();
+                            let parent = url
+                                .strip_prefix("/me/mailFolders/")
+                                .and_then(|rest| rest.split_once("/childFolders"))
+                                .map(|(parent, _)| parent.to_string());
+                            match parent.as_deref().and_then(|p| p.strip_prefix("f-d")) {
+                                Some(level) => {
+                                    let next = level.parse::<u32>().unwrap() + 1;
+                                    serde_json::json!({ "id": id, "status": 200, "body": { "value": [
+                                        { "id": format!("f-d{next}"), "displayName": format!("Level {next}"), "parentFolderId": parent, "childFolderCount": 1, "unreadItemCount": next, "totalItemCount": next }
+                                    ] } })
+                                }
+                                None => serde_json::json!({ "id": id, "status": 404, "body": {} }),
+                            }
+                        })
+                        .collect();
+                    Json(serde_json::json!({ "responses": responses }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = mock_client(format!("http://{addr}/v1.0"));
+        let (_, complete) = client.list_mail_folders_complete().await.unwrap();
+        assert!(!complete, "the endless chain must hit MAX_FOLDER_DEPTH");
+
+        let storage = Storage::open_in_memory().unwrap();
+        // A folder cached below the depth cap must survive (the partial tree never prunes).
+        let mut deep = test_folder("f-deep", "Deep", Some("f-d6"), 0);
+        deep.unread_item_count = 2;
+        let mut stale_inbox = test_folder("f-d0", "Inbox", None, 1);
+        stale_inbox.unread_item_count = 1;
+        storage.replace_mail_folders(&[stale_inbox, deep]).unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut last_folders = None;
+        poll_mail_folders_quiet(&client, &storage, &tx, &mut last_folders)
+            .await
+            .unwrap();
+
+        assert!(last_folders.is_none(), "a depth-capped tree must not become the poll baseline");
+        let Ok(CoreEvent::MailFoldersUpdated(pushed)) = rx.try_recv() else {
+            panic!("a depth-capped poll must still push MailFoldersUpdated to the UI");
+        };
+        let unread = |id: &str| pushed.iter().find(|f| f.id == id).map(|f| f.unread_item_count);
+        assert_eq!(unread("f-d0"), Some(7), "live Inbox unread count must reach the UI");
+        assert_eq!(unread("f-d3"), Some(3), "newly listed subfolders must reach the UI");
+        assert_eq!(unread("f-deep"), Some(2), "cached folders below the cap must not be dropped");
+        assert!(storage.list_mail_folders().unwrap().iter().any(|f| f.id == "f-deep"));
+
+        // Every partial poll keeps the TUI current.
+        poll_mail_folders_quiet(&client, &storage, &tx, &mut last_folders)
+            .await
+            .unwrap();
         assert!(matches!(rx.try_recv(), Ok(CoreEvent::MailFoldersUpdated(_))));
     }
 

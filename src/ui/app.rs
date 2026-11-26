@@ -306,6 +306,8 @@ pub struct UiState {
     pub active_nav_tab: usize,
     pub nav_selected: usize,
     pub nav_area: Rect,
+    /// Mail folders whose subfolders are hidden in the folder pane (empty = fully expanded).
+    pub collapsed_folder_ids: HashSet<String>,
     pub mail_list_scroll: ScrollState,
     pub mail_read_scroll: ScrollState,
     pub(crate) mail_reader_content: Option<super::mail_view::ReaderMailContent>,
@@ -360,6 +362,7 @@ impl UiState {
             active_nav_tab: TAB_MAIL,
             nav_selected: 1,
             nav_area: Rect::default(),
+            collapsed_folder_ids: HashSet::new(),
             mail_list_scroll: ScrollState::default(),
             mail_read_scroll: ScrollState::default(),
             mail_reader_content: None,

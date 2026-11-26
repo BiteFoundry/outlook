@@ -43,6 +43,11 @@ fn palette_commands() -> Vec<PaletteItem> {
         ("New To Do Task", "", Action::OpenNewTodoTask),
         ("Search Mail", "/ / Ctrl+F", Action::OpenSearch),
         ("Toggle Thread Grouping", "t", Action::ToggleGroupThreads),
+        (
+            "Expand / Collapse Older Thread Messages",
+            "E",
+            Action::ToggleThreadMessages,
+        ),
         ("Toggle Focused / All Mail", "F", Action::ToggleFocusedOnly),
         ("Toggle Unread Filter", "U", Action::ToggleUnreadFilter),
         (

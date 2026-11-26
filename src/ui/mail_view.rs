@@ -689,8 +689,11 @@ pub fn draw_reader(
                 .collect();
             list.sort_by(|a, b| a.received_at.cmp(&b.received_at));
             let total = list.len();
+            let active_id = app.active_mail_id.as_deref();
             for (pos, msg) in list.iter_mut().enumerate() {
-                let is_expanded = pos + 1 == total || app.expanded_thread_ids.contains(&msg.id);
+                let is_expanded = pos + 1 == total
+                    || active_id == Some(msg.id.as_str())
+                    || app.expanded_thread_ids.contains(&msg.id);
                 if is_expanded {
                     if let Some(full) = app.mail_detail_cache.get(&msg.id) {
                         *msg = full.clone();
@@ -725,7 +728,8 @@ pub fn draw_reader(
     if ui.inline_images {
         for (t_pos, msg) in thread_msgs.iter().enumerate() {
             let is_last = t_pos + 1 == thread_msgs.len();
-            if !is_last && !app.expanded_thread_ids.contains(&msg.id) {
+            let is_active = app.active_mail_id.as_deref() == Some(msg.id.as_str());
+            if !is_last && !is_active && !app.expanded_thread_ids.contains(&msg.id) {
                 continue;
             }
             for att in parser::effective_mail_attachments(msg).iter() {
@@ -745,6 +749,7 @@ pub fn draw_reader(
 
     let sig = compute_reader_sig(
         &thread_msgs,
+        app.active_mail_id.as_deref(),
         &app.expanded_thread_ids,
         &app.expanded_quoted_ids,
         ui.inline_images,
@@ -772,6 +777,7 @@ pub fn draw_reader(
             );
             let built: Arc<[RenderedLine]> = Arc::from(build_reader_lines_with_selected(
                 &thread_msgs,
+                app.active_mail_id.as_deref(),
                 &app.expanded_thread_ids,
                 &app.expanded_quoted_ids,
                 &ui.theme,
@@ -877,6 +883,7 @@ fn draw_reader_toolbar(
 #[allow(clippy::too_many_arguments)]
 fn compute_reader_sig(
     thread_msgs: &[MailMessage],
+    active_id: Option<&str>,
     expanded_threads: &std::collections::HashSet<String>,
     expanded_quoted: &std::collections::HashSet<String>,
     inline_images: bool,
@@ -900,6 +907,7 @@ fn compute_reader_sig(
         h.write_str(&m.preview);
         h.write_hash(&m.attachments.len());
         h.write_hash(&expanded_threads.contains(&m.id));
+        h.write_hash(&(active_id == Some(m.id.as_str())));
         h.write_hash(&expanded_quoted.contains(&m.id));
         if let Some(ref mr) = m.meeting_request {
             h.write_hash(&1u8);
@@ -955,6 +963,7 @@ pub fn build_reader_lines_with_opts(
     );
     build_reader_lines_with_selected(
         thread_msgs,
+        None,
         expanded_threads,
         expanded_quoted,
         theme,
@@ -971,6 +980,7 @@ pub fn build_reader_lines_with_opts(
 #[allow(clippy::too_many_arguments)]
 fn build_reader_lines_with_selected(
     thread_msgs: &[MailMessage],
+    active_id: Option<&str>,
     expanded_threads: &std::collections::HashSet<String>,
     expanded_quoted: &std::collections::HashSet<String>,
     theme: &Theme,
@@ -1028,7 +1038,11 @@ fn build_reader_lines_with_selected(
 
     for (t_pos, msg) in thread_msgs.iter().enumerate() {
         let is_last = t_pos + 1 == total;
-        let is_expanded = is_last || expanded_threads.contains(&msg.id);
+        // The selected message (a search jump or an Unread/Flagged pick may land on an older one)
+        // is always open, like the newest; other older items open on click / `E`.
+        let is_active = active_id == Some(msg.id.as_str());
+        let is_expanded = is_last || is_active || expanded_threads.contains(&msg.id);
+        let collapsible = !is_last && !is_active;
 
         if t_pos > 0 {
             out.push(RenderedLine::plain(Line::from(Span::styled(
@@ -1048,8 +1062,12 @@ fn build_reader_lines_with_selected(
             continue;
         }
 
-        // Expanded message header block
-        let from_line = format!("  From: {}", msg.from_display());
+        // Expanded message header block (`▾` marks an older item that folds back on click / `E`)
+        let from_line = if collapsible {
+            format!("  ▾ From: {}", msg.from_display())
+        } else {
+            format!("  From: {}", msg.from_display())
+        };
         let date_str = format_full_time(&msg.received_at);
         let date_w = UnicodeWidthStr::width(date_str.as_str());
         let mut from_spans = vec![Span::styled(
@@ -1062,11 +1080,7 @@ fn build_reader_lines_with_selected(
         let pad = width.saturating_sub(used + date_w + 2);
         from_spans.push(Span::raw(" ".repeat(pad)));
         from_spans.push(Span::styled(date_str, theme.muted_style()));
-        let from_target = if total > 1 && !is_last {
-            Some(HitTarget::ThreadItem(t_pos))
-        } else {
-            None
-        };
+        let from_target = collapsible.then_some(HitTarget::ThreadItem(t_pos));
         out.push(RenderedLine {
             line: Line::from(from_spans),
             target: from_target,
@@ -2468,6 +2482,92 @@ mod tests {
         let (expanded, _) = render_reader_text(&mut app, &mut ui);
         assert!(expanded.contains("NEWER_LAZY_BODY_TOKEN"));
         assert!(expanded.contains("OLDER_LAZY_BODY_TOKEN"));
+    }
+
+    #[test]
+    fn search_jump_to_older_thread_message_opens_it_and_e_toggles_older_items() {
+        use crate::models::MailSearchHit;
+        use crate::ui::action::{dispatch, Action};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (mut app, mut ui) = make_reader_test_app();
+        ui.group_threads = true;
+        ui.inline_images = false;
+        app.storage
+            .upsert_mail_folders(&[crate::models::MailFolder {
+                id: "f-inbox".into(),
+                display_name: "Inbox".into(),
+                well_known_name: Some("inbox".into()),
+                parent_folder_id: None,
+                child_folder_count: 0,
+                unread_item_count: 0,
+                total_item_count: 3,
+            }])
+            .unwrap();
+        let mail = |id: &str, hour: u32, token: &str| {
+            let mut m = sample_mail(id, "conv-jump", &format!("<p>{token}</p>"));
+            m.folder_id = Some("f-inbox".into());
+            m.received_at = format!("2026-11-19T{hour:02}:00:00Z");
+            m.preview = format!("{id} preview");
+            m.meeting_request = None;
+            m
+        };
+        app.storage
+            .upsert_mail_messages(&[
+                mail("m-a", 8, "ALPHA_BODY_TOKEN"),
+                mail("m-b", 9, "BRAVO_BODY_TOKEN"),
+                mail("m-c", 10, "CHARLIE_BODY_TOKEN"),
+            ])
+            .unwrap();
+        app.search_results = vec![MailSearchHit {
+            id: "m-a".into(),
+            conversation_id: Some("conv-jump".into()),
+            folder_id: Some("f-inbox".into()),
+            subject: "Quarterly Review".into(),
+            from_display: "Alice".into(),
+            received_at: "2026-11-19T08:00:00Z".into(),
+            snippet: "ALPHA".into(),
+            has_attachments: false,
+            is_read: false,
+            flagged: false,
+        }];
+
+        // Jumping to the oldest message of the thread opens it even though it is not the newest.
+        dispatch(Action::JumpToSearchHit(0), &mut app, &mut ui);
+        assert_eq!(app.active_mail_id.as_deref(), Some("m-a"));
+        assert_eq!(ui.focus(), Focus::Reader);
+        let (jumped, _) = render_reader_text(&mut app, &mut ui);
+        assert!(jumped.contains("ALPHA_BODY_TOKEN"), "search hit must render expanded:\n{jumped}");
+        assert!(jumped.contains("CHARLIE_BODY_TOKEN"));
+        assert!(!jumped.contains("BRAVO_BODY_TOKEN"));
+        assert!(jumped.contains("▸ Alice"), "other older item stays a collapsed header");
+
+        // `E` in the reader expands every collapsed older item; open ones show a `▾` fold marker.
+        let press_e = |app: &mut AppState, ui: &mut UiState| {
+            let action = ui
+                .keymap
+                .resolve_for_tab(
+                    Focus::Reader,
+                    ui.active_nav_tab,
+                    KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT),
+                )
+                .expect("E is bound in the reader");
+            assert_eq!(action, Action::ToggleThreadMessages);
+            dispatch(action, app, ui);
+        };
+        press_e(&mut app, &mut ui);
+        let (expanded, _) = render_reader_text(&mut app, &mut ui);
+        assert!(expanded.contains("ALPHA_BODY_TOKEN"));
+        assert!(expanded.contains("BRAVO_BODY_TOKEN"), "E must expand collapsed items:\n{expanded}");
+        assert!(expanded.contains("CHARLIE_BODY_TOKEN"));
+        assert!(expanded.contains("▾ From: Alice"));
+
+        // `E` again folds the older items back, but the selected message stays open.
+        press_e(&mut app, &mut ui);
+        let (folded, _) = render_reader_text(&mut app, &mut ui);
+        assert!(folded.contains("ALPHA_BODY_TOKEN"));
+        assert!(!folded.contains("BRAVO_BODY_TOKEN"));
+        assert!(folded.contains("CHARLIE_BODY_TOKEN"));
     }
 
     #[test]

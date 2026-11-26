@@ -398,6 +398,7 @@ fn main() {
             }],
             meeting_request: None,
             web_link: None,
+            ..Default::default()
         },
         MailMessage {
             id: "mail-2".into(),
@@ -435,6 +436,7 @@ fn main() {
             attachments: vec![],
             meeting_request: None,
             web_link: None,
+            ..Default::default()
         },
         MailMessage {
             id: "mail-3".into(),
@@ -471,6 +473,7 @@ fn main() {
             }],
             meeting_request: None,
             web_link: None,
+            ..Default::default()
         },
         MailMessage {
             id: "mail-4".into(),
@@ -499,6 +502,7 @@ fn main() {
             attachments: vec![],
             meeting_request: None,
             web_link: None,
+            ..Default::default()
         },
         MailMessage {
             id: "mail-5".into(),
@@ -527,6 +531,7 @@ fn main() {
             attachments: vec![],
             meeting_request: None,
             web_link: None,
+            ..Default::default()
         },
     ];
     app.active_mail_id = Some("mail-1".to_string());
@@ -569,6 +574,7 @@ fn main() {
             body_plain: "Quick sync on v2.4 canary rollout and blockers.".into(),
             is_cancelled: false,
             web_link: None,
+            ..Default::default()
         },
         CalendarEvent {
             id: "ev-2".into(),
@@ -614,6 +620,7 @@ fn main() {
             body_plain: "Final telemetry review before promoting to 100% traffic.".into(),
             is_cancelled: false,
             web_link: None,
+            ..Default::default()
         },
         CalendarEvent {
             id: "ev-3".into(),
@@ -646,6 +653,7 @@ fn main() {
             body_plain: "Review MCP tool schemas across the @bitefoundry terminal suite.".into(),
             is_cancelled: false,
             web_link: None,
+            ..Default::default()
         },
         CalendarEvent {
             id: "ev-4".into(),
@@ -665,6 +673,7 @@ fn main() {
             body_plain: "Live demo of TUI features and sprint retrospective.".into(),
             is_cancelled: false,
             web_link: None,
+            ..Default::default()
         },
     ];
     app.active_event_id = Some("ev-2".to_string());

@@ -45,6 +45,12 @@ pub enum Action {
     SelectNavTab(usize),
     SelectNavRow(usize),
     SelectCalendarDate(NaiveDate),
+    /// `←`/`h` in the folder pane: collapse the selected folder, else select its parent.
+    NavCollapseFolder,
+    /// `→`/`l` in the folder pane: expand the selected collapsed folder, else open the row.
+    NavExpandFolder,
+    /// `Space` in the folder pane: toggle the selected folder's subfolders.
+    NavToggleFolder,
 
     // Movement, scrolling & context
     MoveUp,
@@ -82,6 +88,8 @@ pub enum Action {
         destination_name: String,
     },
     ToggleGroupThreads,
+    /// Expand (or, when all are open, collapse) the older messages of the active grouped thread.
+    ToggleThreadMessages,
     ToggleFocusedOnly,
     ToggleUnreadFilter,
     ToggleQuotedHistory,
@@ -338,6 +346,9 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::SelectNavRow(idx) => {
             activate_nav_row(app, ui, idx);
         }
+        Action::NavCollapseFolder => nav_collapse_or_select_parent(app, ui),
+        Action::NavExpandFolder => nav_expand_or_activate(app, ui),
+        Action::NavToggleFolder => nav_toggle_folder(app, ui),
         Action::SelectCalendarDate(date) => {
             ui.cal_range = CalendarRangeFilter::SpecificDate(date);
             ui.cal_month_cursor = date;
@@ -502,6 +513,7 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 "Thread grouping: Off"
             });
         }
+        Action::ToggleThreadMessages => toggle_thread_messages(app, ui),
         Action::ToggleFocusedOnly => {
             ui.focused_only = !ui.focused_only;
             app.config.focused_only = ui.focused_only;
@@ -1077,6 +1089,129 @@ fn activate_nav_row(app: &mut AppState, ui: &mut UiState, idx: usize) {
                 let _ = dispatch(Action::OpenNewTodoList, app, ui);
             }
         }
+    }
+}
+
+/// The folder-pane rows and the index of the selected one (clamped), when there are rows.
+fn selected_nav_row(app: &AppState, ui: &UiState) -> Option<(Vec<NavRow>, usize)> {
+    let rows = super::nav_pane::build_nav_rows(app, ui);
+    let idx = ui.nav_selected.min(rows.len().checked_sub(1)?);
+    Some((rows, idx))
+}
+
+fn nav_collapse_or_select_parent(app: &mut AppState, ui: &mut UiState) {
+    let Some((rows, idx)) = selected_nav_row(app, ui) else {
+        return;
+    };
+    let NavRow::MailFolder {
+        folder_id,
+        depth,
+        expanded,
+        ..
+    } = &rows[idx]
+    else {
+        return;
+    };
+    if *expanded {
+        ui.collapsed_folder_ids.insert(folder_id.clone());
+        ui.nav_selected = idx;
+    } else if *depth > 0 {
+        // Rows are a pre-order listing, so the nearest row one level up is the parent.
+        if let Some(parent) = rows[..idx].iter().rposition(
+            |r| matches!(r, NavRow::MailFolder { depth: d, .. } if d.saturating_add(1) == *depth),
+        ) {
+            ui.nav_selected = parent;
+        }
+    }
+}
+
+fn nav_expand_or_activate(app: &mut AppState, ui: &mut UiState) {
+    if let Some((rows, idx)) = selected_nav_row(app, ui) {
+        if let NavRow::MailFolder {
+            folder_id,
+            has_children: true,
+            expanded: false,
+            ..
+        } = &rows[idx]
+        {
+            ui.collapsed_folder_ids.remove(folder_id);
+            ui.nav_selected = idx;
+            return;
+        }
+    }
+    handle_activate(app, ui);
+}
+
+fn nav_toggle_folder(app: &mut AppState, ui: &mut UiState) {
+    let Some((rows, idx)) = selected_nav_row(app, ui) else {
+        return;
+    };
+    if let NavRow::MailFolder {
+        folder_id,
+        has_children: true,
+        expanded,
+        ..
+    } = &rows[idx]
+    {
+        if *expanded {
+            ui.collapsed_folder_ids.insert(folder_id.clone());
+        } else {
+            ui.collapsed_folder_ids.remove(folder_id);
+        }
+        ui.nav_selected = idx;
+    }
+}
+
+/// Ids of the messages above the newest one in the active grouped conversation, oldest first,
+/// in the same order the reader lists them.
+fn active_thread_older_ids(app: &AppState, ui: &UiState) -> Vec<String> {
+    if !ui.group_threads {
+        return Vec::new();
+    }
+    let Some(cid) = app
+        .active_mail()
+        .and_then(|m| m.conversation_id.as_deref())
+        .filter(|s| !s.is_empty())
+    else {
+        return Vec::new();
+    };
+    let mut thread: Vec<&crate::models::MailMessage> = app
+        .mail_messages
+        .iter()
+        .filter(|m| m.conversation_id.as_deref() == Some(cid))
+        .collect();
+    thread.sort_by(|a, b| a.received_at.cmp(&b.received_at));
+    thread.pop();
+    thread.into_iter().map(|m| m.id.clone()).collect()
+}
+
+fn toggle_thread_messages(app: &mut AppState, ui: &mut UiState) {
+    if ui.active_nav_tab != TAB_MAIL {
+        return;
+    }
+    let older = active_thread_older_ids(app, ui);
+    if older.is_empty() {
+        ui.info("No older messages in this thread");
+        return;
+    }
+    let active = app.active_mail_id.as_deref();
+    let any_collapsed = older
+        .iter()
+        .any(|id| !app.expanded_thread_ids.contains(id) && active != Some(id.as_str()));
+    if any_collapsed {
+        let count = older.len();
+        app.expanded_thread_ids.extend(older);
+        app.sync_displayed_mail_details(ui.group_threads, true);
+        ui.info(format!(
+            "Thread: expanded {count} older message{}",
+            if count == 1 { "" } else { "s" }
+        ));
+    } else {
+        for id in &older {
+            app.expanded_thread_ids.remove(id);
+        }
+        app.sync_displayed_mail_details(ui.group_threads, false);
+        ui.info("Thread: collapsed older messages");
     }
 }
 

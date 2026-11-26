@@ -163,8 +163,20 @@ impl Keymap {
             M::SHIFT,
             Action::StartNewMailCompose,
         );
-        map.bind(Some(Focus::Nav), Char('l'), M::NONE, Action::Activate);
-        map.bind(Some(Focus::Nav), Right, M::NONE, Action::Activate);
+        // Folder tree: ←/h collapse (or jump to parent), →/l expand (or open), Space toggles
+        map.bind(Some(Focus::Nav), Char('l'), M::NONE, Action::NavExpandFolder);
+        map.bind(Some(Focus::Nav), Right, M::NONE, Action::NavExpandFolder);
+        map.bind(Some(Focus::Nav), Char('h'), M::NONE, Action::NavCollapseFolder);
+        map.bind(Some(Focus::Nav), Left, M::NONE, Action::NavCollapseFolder);
+        map.bind(Some(Focus::Nav), Char(' '), M::NONE, Action::NavToggleFolder);
+
+        // Reader: expand / collapse every older message of a grouped thread
+        map.bind(
+            Some(Focus::Reader),
+            Char('E'),
+            M::SHIFT,
+            Action::ToggleThreadMessages,
+        );
 
         // --- Global shortcuts ---
         map.bind(any, Char('c'), M::CONTROL, Action::Quit);
@@ -396,6 +408,32 @@ mod tests {
         assert_eq!(
             map.resolve(Focus::Overlay, key(KeyCode::Char('f'), KeyModifiers::CONTROL)),
             Some(Action::OpenFilePicker)
+        );
+    }
+
+    #[test]
+    fn folder_tree_and_thread_toggle_keys_map_correctly() {
+        let map = Keymap::default_outlook();
+        for (code, action) in [
+            (KeyCode::Left, Action::NavCollapseFolder),
+            (KeyCode::Char('h'), Action::NavCollapseFolder),
+            (KeyCode::Right, Action::NavExpandFolder),
+            (KeyCode::Char('l'), Action::NavExpandFolder),
+            (KeyCode::Char(' '), Action::NavToggleFolder),
+        ] {
+            assert_eq!(
+                map.resolve(Focus::Nav, key(code, KeyModifiers::NONE)),
+                Some(action)
+            );
+        }
+        assert_eq!(
+            map.resolve(Focus::Reader, key(KeyCode::Char('E'), KeyModifiers::SHIFT)),
+            Some(Action::ToggleThreadMessages)
+        );
+        // `h` outside the folder pane keeps toggling inline hrefs.
+        assert_eq!(
+            map.resolve(Focus::Reader, key(KeyCode::Char('h'), KeyModifiers::NONE)),
+            Some(Action::ToggleShowLinkUrls)
         );
     }
 }
