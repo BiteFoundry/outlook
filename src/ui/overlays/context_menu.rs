@@ -12,7 +12,7 @@ use crate::{
     models::EventRsvpAction,
     ui::{
         action::Action,
-        app::{AppState, UiState},
+        app::UiState,
         hitmap::{HitMap, HitTarget},
         overlays::{OverlayKind, OverlayOutcome},
     },
@@ -52,7 +52,12 @@ pub struct ContextMenu {
 }
 
 impl ContextMenu {
-    pub fn build(target: ContextTarget, anchor: (u16, u16), app: &AppState, _ui: &UiState) -> Self {
+    pub fn build(
+        target: ContextTarget,
+        anchor: (u16, u16),
+        has_attachments: bool,
+        has_online_meeting: bool,
+    ) -> Self {
         let items = match target {
             ContextTarget::MailItem(_) => {
                 let mut list = vec![
@@ -66,10 +71,7 @@ impl ContextMenu {
                     MenuItem::new("Interactive HTML Preview", Some("H"), Action::OpenHtmlPreview),
                     MenuItem::new("Delete", Some("Del"), Action::DeleteItem),
                 ];
-                if app
-                    .active_mail()
-                    .is_some_and(|m| m.has_attachments || !m.attachments.is_empty())
-                {
+                if has_attachments {
                     list.push(MenuItem::new(
                         "Attachments",
                         Some("A"),
@@ -93,11 +95,7 @@ impl ContextMenu {
                     ),
                     MenuItem::new("Decline", Some("x"), Action::CalendarRsvp(EventRsvpAction::Decline)),
                 ];
-                if app
-                    .active_event()
-                    .and_then(|e| e.online_meeting_url.as_ref())
-                    .is_some()
-                {
+                if has_online_meeting {
                     list.push(MenuItem::new(
                         "Join Online Meeting",
                         Some("o"),

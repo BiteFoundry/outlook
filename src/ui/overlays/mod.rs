@@ -220,7 +220,7 @@ impl Overlay {
             Overlay::PathInput(input) => input.handle(action),
             Overlay::FilePicker(picker) => picker.handle(wheel_step.as_ref().unwrap_or(action)),
             Overlay::Links(links) => links.handle(wheel_step.as_ref().unwrap_or(action)),
-            Overlay::MailCompose(compose) => compose.handle(action, app),
+            Overlay::MailCompose(compose) => compose.handle(action, &app.contacts),
             Overlay::EventForm(form) => form.handle(wheel_step.as_ref().unwrap_or(action)),
             Overlay::FolderPicker(picker) => {
                 picker.handle(wheel_step.as_ref().unwrap_or(action), app)
@@ -336,7 +336,7 @@ impl Overlay {
                 links.draw(frame, area, ui, hitmap);
                 None
             }
-            Overlay::MailCompose(compose) => compose.draw(frame, area, app, ui, hitmap),
+            Overlay::MailCompose(compose) => compose.draw(frame, area, &app.contacts, ui, hitmap),
             Overlay::EventForm(form) => {
                 form.draw(frame, area, ui, hitmap);
                 None

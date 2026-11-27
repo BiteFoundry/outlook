@@ -1523,7 +1523,7 @@ mod tests {
     #[test]
     fn overlay_scroll_windowing_for_settings_context_menu_event_form_help_and_compose() {
         use crate::ui::action::Action;
-        use crate::ui::overlays::context_menu::{ContextMenu, ContextTarget};
+        use crate::ui::overlays::context_menu::ContextTarget;
         use crate::ui::overlays::event_form::EventFormOverlay;
         use crate::ui::overlays::mail_compose::MailComposeOverlay;
         use crate::ui::overlays::settings::SettingsState;
@@ -1548,7 +1548,7 @@ mod tests {
         ui.close_top_overlay();
 
         // ContextMenu scroll window keeps last item visible & clickable in short terminal
-        let mut menu = ContextMenu::build(ContextTarget::Global, (0, 0), &app, &ui);
+        let mut menu = app.build_context_menu(ContextTarget::Global, (0, 0));
         let last_idx = menu.items.len() - 1;
         menu.selected = last_idx;
         ui.push_overlay(Overlay::ContextMenu(menu));

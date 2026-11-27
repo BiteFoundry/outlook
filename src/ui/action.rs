@@ -15,7 +15,7 @@ use super::composer;
 use super::hitmap::{ButtonId, HitTarget};
 use super::mail_view::retain_latest_reader_layout;
 use super::nav_pane::{NavRow, TAB_CALENDAR, TAB_COUNT, TAB_MAIL, TAB_TASKS};
-use super::overlays::context_menu::{ContextMenu, ContextTarget};
+use super::overlays::context_menu::ContextTarget;
 use super::overlays::html_preview::{self, HtmlPreviewOverlay};
 use super::overlays::image_preview::ImagePreviewOverlay;
 use super::overlays::links::LinkExtractorOverlay;
@@ -223,6 +223,11 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
     // Top overlay handles actions first.
     if let Some(mut top) = ui.overlays.pop() {
         let outcome = top.handle(&action, app, ui);
+        if let Overlay::MailCompose(ref mut compose) = top {
+            if matches!(outcome, OverlayOutcome::Handled) {
+                app.sync_compose_contacts_if_needed(compose);
+            }
+        }
         match outcome {
             OverlayOutcome::Handled => {
                 ui.overlays.push(top);
@@ -425,7 +430,7 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 Some(entry) => MailComposeOverlay::from_draft_entry(mode, entry),
                 None => MailComposeOverlay::new(),
             };
-            compose.maybe_request_contacts_sync(app);
+            app.sync_compose_contacts_if_needed(&mut compose);
             ui.close_overlays_of(OverlayKind::MailCompose);
             ui.push_overlay(Overlay::mail_compose(compose));
         }
@@ -435,7 +440,7 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 return false;
             }
             let mut compose = MailComposeOverlay::new();
-            compose.maybe_request_contacts_sync(app);
+            app.sync_compose_contacts_if_needed(&mut compose);
             ui.close_overlays_of(OverlayKind::MailCompose);
             ui.push_overlay(Overlay::mail_compose(compose));
         }
@@ -450,7 +455,7 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 if let Some(saved) = app.draft_store.get_mail(&compose.mode.draft_key()) {
                     compose = compose.resume_thread_draft(saved);
                 }
-                compose.maybe_request_contacts_sync(app);
+                app.sync_compose_contacts_if_needed(&mut compose);
                 ui.close_overlays_of(OverlayKind::MailCompose);
                 ui.push_overlay(Overlay::mail_compose(compose));
             }
@@ -461,7 +466,7 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 if let Some(saved) = app.draft_store.get_mail(&compose.mode.draft_key()) {
                     compose = compose.resume_thread_draft(saved);
                 }
-                compose.maybe_request_contacts_sync(app);
+                app.sync_compose_contacts_if_needed(&mut compose);
                 ui.close_overlays_of(OverlayKind::MailCompose);
                 ui.push_overlay(Overlay::mail_compose(compose));
             }
@@ -1455,7 +1460,7 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
             Some(HitTarget::ComposeField(idx)) => {
                 if let Some(Overlay::MailCompose(ref mut compose)) = ui.overlays.last_mut() {
                     compose.select_field(idx);
-                    compose.maybe_request_contacts_sync(app);
+                    app.sync_compose_contacts_if_needed(compose);
                 }
                 return false;
             }
@@ -1799,7 +1804,7 @@ fn open_context_menu_at(column: u16, row: u16, app: &mut AppState, ui: &mut UiSt
         }
         _ => ContextTarget::Global,
     };
-    let menu = ContextMenu::build(target, (column, row), app, ui);
+    let menu = app.build_context_menu(target, (column, row));
     ui.close_overlays_of(OverlayKind::ContextMenu);
     ui.push_overlay(Overlay::context_menu(menu));
 }

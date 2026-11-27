@@ -20,7 +20,7 @@ use crate::{
     models::{ContactItem, MailMessage},
     ui::{
         action::Action,
-        app::{AppState, UiState},
+        app::UiState,
         composer::{slice_display_window, truncate_display, ComposerState},
         hitmap::{ButtonId, HitMap, HitTarget},
         overlays::{centered_rect, OverlayKind, OverlayOutcome},
@@ -392,19 +392,21 @@ impl MailComposeOverlay {
         OverlayOutcome::Dispatch(Action::SubmitMailCompose)
     }
 
-    pub fn maybe_request_contacts_sync(&mut self, app: &AppState) {
+    pub fn claim_contacts_sync(&mut self) -> bool {
         if self.field <= 2 && !self.contacts_sync_requested {
             self.contacts_sync_requested = true;
-            app.request_contacts_sync();
+            true
+        } else {
+            false
         }
     }
 
-    pub fn handle(&mut self, action: &Action, app: &AppState) -> OverlayOutcome {
-        let suggestions = self.matching_contacts(&app.contacts);
+    pub fn handle(&mut self, action: &Action, contacts: &[ContactItem]) -> OverlayOutcome {
+        let suggestions = self.matching_contacts(contacts);
         let suggestions_len = suggestions.len();
         let has_suggestions = self.field <= 2 && suggestions_len > 0;
 
-        let outcome = match action {
+        match action {
             Action::OverlaySubmit => self.submit(),
             Action::SaveDraft => OverlayOutcome::Dispatch(Action::SaveMailDraft),
             Action::OpenAttachPicker | Action::OpenFilePicker => {
@@ -433,9 +435,6 @@ impl MailComposeOverlay {
                     buf.push(*ch);
                     self.suggestion_idx = 0;
                 }
-                if self.field <= 2 {
-                    self.maybe_request_contacts_sync(app);
-                }
                 OverlayOutcome::Handled
             }
             Action::Paste(text) => {
@@ -445,9 +444,6 @@ impl MailComposeOverlay {
                 } else if let Some(buf) = self.active_header_mut() {
                     buf.push_str(&text.replace(['\r', '\n'], " "));
                     self.suggestion_dismissed = false;
-                    if self.field <= 2 {
-                        self.maybe_request_contacts_sync(app);
-                    }
                 }
                 OverlayOutcome::Handled
             }
@@ -459,9 +455,6 @@ impl MailComposeOverlay {
                     buf.pop();
                     self.suggestion_idx = 0;
                     self.suggestion_dismissed = false;
-                    if self.field <= 2 {
-                        self.maybe_request_contacts_sync(app);
-                    }
                 }
                 OverlayOutcome::Handled
             }
@@ -611,11 +604,7 @@ impl MailComposeOverlay {
             }
             Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
             _ => OverlayOutcome::Handled,
-        };
-        if self.field <= 2 && matches!(outcome, OverlayOutcome::Handled) {
-            self.maybe_request_contacts_sync(app);
         }
-        outcome
     }
 
     fn activate_button(&mut self) -> OverlayOutcome {
@@ -631,7 +620,7 @@ impl MailComposeOverlay {
         &mut self,
         frame: &mut Frame,
         area: Rect,
-        app: &AppState,
+        contacts: &[ContactItem],
         ui: &UiState,
         hitmap: &mut HitMap,
     ) -> Option<(u16, u16)> {
@@ -861,7 +850,7 @@ impl MailComposeOverlay {
         }
 
         // Render live Contacts/Directory autocomplete dropdown OVER the body when typing in To/Cc/Bcc
-        let suggestions = self.matching_contacts(&app.contacts);
+        let suggestions = self.matching_contacts(contacts);
         if self.field <= 2 && !suggestions.is_empty() {
             let anchor_y = inner.y + (self.field as u16) + 1;
             let drop_h = (suggestions.len() as u16 + 2).min(inner.bottom().saturating_sub(anchor_y));
@@ -932,15 +921,7 @@ pub fn split_emails(raw: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        auth::AuthManager,
-        config::{AppConfig, DraftStore},
-        graph::GraphClient,
-        models::EmailRecipient,
-        storage::Storage,
-        sync::{self, SyncCommand},
-    };
-    use tokio::sync::mpsc;
+    use crate::{config::DraftStore, models::EmailRecipient};
 
     fn sample_contacts() -> Vec<ContactItem> {
         vec![
@@ -1060,33 +1041,22 @@ mod tests {
 
     #[tokio::test]
     async fn handle_ctrl_enter_submits_mail_and_esc_stashes() {
-        let cfg = AppConfig::default();
-        let auth = AuthManager::new(cfg.clone()).unwrap();
-        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
-        let storage = Storage::open_in_memory().unwrap();
-        let (tx, _) = mpsc::unbounded_channel();
-        let sync_ctrl = sync::spawn_sync_engine(cfg.clone(), graph.clone(), storage.clone(), tx);
-        let (ui_tx, _) = mpsc::unbounded_channel();
-        let app = AppState::new(cfg, auth, graph, storage, sync_ctrl, ui_tx);
-
         let mut compose = MailComposeOverlay::new();
         compose.to = "alice@contoso.com".into();
         compose.subject = "Hello".into();
         compose.field = 4;
         compose.body.insert_str("Body text");
 
-        let esc_outcome = compose.handle(&Action::CloseOverlay, &app);
+        let esc_outcome = compose.handle(&Action::CloseOverlay, &[]);
         assert!(matches!(
             esc_outcome,
             OverlayOutcome::CloseAndDispatch(Action::StashMailDraft(_))
         ));
 
-        let send_outcome = compose.handle(&Action::OverlaySubmit, &app);
+        let send_outcome = compose.handle(&Action::OverlaySubmit, &[]);
         assert!(matches!(
             send_outcome,
             OverlayOutcome::Dispatch(Action::SubmitMailCompose)
         ));
-
-        app.sync_ctrl.request(SyncCommand::Shutdown);
     }
 }
