@@ -2259,7 +2259,7 @@ dependencies = [
 
 [[package]]
 name = "outlook-cli"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "anyhow",
  "arboard",

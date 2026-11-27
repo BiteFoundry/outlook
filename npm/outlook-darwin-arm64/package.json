@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/outlook-darwin-arm64",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "description": "Prebuilt outlook binary for macOS arm64",
   "repository": {
     "type": "git",
