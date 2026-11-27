@@ -6,6 +6,17 @@ description = "Microsoft Outlook terminal client & AI agent toolkit — Mail, Ca
 repository = "https://github.com/BiteFoundry/outlook"
 license = "MIT"
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/outlook-{ version }-{ target }.{ archive-format }"
+pkg-fmt = "tgz"
+bin-dir = "outlook{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-fmt = "zip"
+
 [lib]
 name = "outlook_cli"
 path = "src/lib.rs"

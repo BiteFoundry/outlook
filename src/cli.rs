@@ -24,6 +24,7 @@ use crate::{
         OutgoingEvent, OutgoingMail, OutgoingTodoTask, SyncCursor, TodoList, TodoTask,
     },
     resolver,
+    safe_text::{sanitize_terminal_inline, sanitize_terminal_text},
     serve::{self, ServeOptions},
     storage::Storage,
     tui, updater,
@@ -2725,11 +2726,15 @@ fn format_mail_folders_lines(folders: &[MailFolder]) -> Vec<String> {
             let wk = f
                 .well_known_name
                 .as_deref()
-                .map(|w| format!(" [{w}]"))
+                .map(|w| format!(" [{}]", sanitize_terminal_inline(w)))
                 .unwrap_or_default();
             format!(
-                "{path}{wk}  unread={}/{}  ({})",
-                f.unread_item_count, f.total_item_count, f.id
+                "{}{}  unread={}/{}  ({})",
+                sanitize_terminal_inline(&path),
+                wk,
+                f.unread_item_count,
+                f.total_item_count,
+                sanitize_terminal_inline(&f.id)
             )
         })
         .collect()
@@ -3046,7 +3051,7 @@ fn print_mail_list_output(
             ))?
         );
     } else if page.messages.is_empty() {
-        println!("No messages found in '{folder}'.");
+        println!("No messages found in '{}'.", sanitize_terminal_inline(folder));
     } else {
         for m in &page.messages {
             let unread_mark = if m.is_read { " " } else { "*" };
@@ -3054,10 +3059,10 @@ fn print_mail_list_output(
             let att_mark = if m.has_attachments { "@" } else { " " };
             println!(
                 "{unread_mark}{flag_mark}{att_mark} [{}] {} | {} ({})",
-                m.received_at,
-                m.from_display(),
+                sanitize_terminal_inline(&m.received_at),
+                sanitize_terminal_inline(&m.from_display()),
                 truncate_single_line(m.effective_subject(), 60),
-                m.id
+                sanitize_terminal_inline(&m.id)
             );
         }
     }
@@ -3400,36 +3405,54 @@ async fn cmd_mail_list(
 }
 
 fn print_mail_read_text(msg: &MailMessage, raw_html: bool) {
-    println!("Subject: {}", msg.effective_subject());
-    println!("From: {}", msg.from_display());
+    println!("Subject: {}", sanitize_terminal_inline(msg.effective_subject()));
+    println!("From: {}", sanitize_terminal_inline(&msg.from_display()));
     if !msg.to_recipients.is_empty() {
-        let to_list: Vec<String> = msg.to_recipients.iter().map(|r| r.display()).collect();
+        let to_list: Vec<String> = msg
+            .to_recipients
+            .iter()
+            .map(|r| sanitize_terminal_inline(&r.display()).into_owned())
+            .collect();
         println!("To: {}", to_list.join(", "));
     }
     if !msg.cc_recipients.is_empty() {
-        let cc_list: Vec<String> = msg.cc_recipients.iter().map(|r| r.display()).collect();
+        let cc_list: Vec<String> = msg
+            .cc_recipients
+            .iter()
+            .map(|r| sanitize_terminal_inline(&r.display()).into_owned())
+            .collect();
         println!("Cc: {}", cc_list.join(", "));
     }
     if !msg.bcc_recipients.is_empty() {
-        let bcc_list: Vec<String> = msg.bcc_recipients.iter().map(|r| r.display()).collect();
+        let bcc_list: Vec<String> = msg
+            .bcc_recipients
+            .iter()
+            .map(|r| sanitize_terminal_inline(&r.display()).into_owned())
+            .collect();
         println!("Bcc: {}", bcc_list.join(", "));
     }
     println!(
         "Date: {} | read={} | flagged={} | importance={}",
-        msg.received_at, msg.is_read, msg.flagged, msg.importance
+        sanitize_terminal_inline(&msg.received_at),
+        msg.is_read,
+        msg.flagged,
+        sanitize_terminal_inline(&msg.importance)
     );
     if !msg.attachments.is_empty() {
         println!("Attachments ({}):", msg.attachments.len());
         for (idx, att) in msg.attachments.iter().enumerate() {
             println!(
                 "  [{idx}] {} ({}, {} bytes, id={})",
-                att.name, att.content_type, att.size, att.id
+                sanitize_terminal_inline(&att.name),
+                sanitize_terminal_inline(&att.content_type),
+                att.size,
+                sanitize_terminal_inline(&att.id)
             );
         }
     }
     println!("---");
     if raw_html {
-        println!("{}", msg.body_html);
+        println!("{}", sanitize_terminal_text(&msg.body_html));
     } else {
         let body = if !msg.body_plain.trim().is_empty() {
             msg.body_plain.trim().to_string()
@@ -3437,12 +3460,12 @@ fn print_mail_read_text(msg: &MailMessage, raw_html: bool) {
             let blocks = crate::parser::parse_message_blocks(&msg.body_html, &msg.attachments);
             crate::parser::blocks_to_plain(&blocks)
         };
-        println!("{body}");
+        println!("{}", sanitize_terminal_text(&body));
     }
     if !msg.body_loaded {
         eprintln!(
             "note: body not loaded; showing preview only. Run 'outlook read {} --json --full' online to fetch it.",
-            msg.id
+            sanitize_terminal_inline(&msg.id)
         );
     }
 }
@@ -3555,15 +3578,21 @@ async fn cmd_mail_read(
                             cfg.image_protocol,
                         ) {
                             Ok(rendered) => {
-                                println!("\n[Image preview: {}]", att.name);
+                                println!("\n[Image preview: {}]", sanitize_terminal_inline(&att.name));
                                 print_rendered_preview(&rendered)?;
                             }
                             Err(err) => {
-                                eprintln!("Image render failed ({}): {err:#}", att.name);
+                                eprintln!(
+                                    "Image render failed ({}): {err:#}",
+                                    sanitize_terminal_inline(&att.name)
+                                );
                             }
                         }
                     }
-                    Err(err) => eprintln!("Attachment fetch failed ({}): {err:#}", att.name),
+                    Err(err) => eprintln!(
+                        "Attachment fetch failed ({}): {err:#}",
+                        sanitize_terminal_inline(&att.name)
+                    ),
                 }
             }
         }
@@ -4082,21 +4111,28 @@ async fn cmd_mail_search(
         };
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else if hits.is_empty() && remote_messages.is_empty() {
-        println!("No mail messages matching '{query}'.");
+        println!(
+            "No mail messages matching '{}'.",
+            sanitize_terminal_inline(query)
+        );
     } else {
         for hit in &hits {
             println!(
                 "[local][{}] {} | {}: {} ({})",
-                hit.received_at, hit.from_display, hit.subject, hit.snippet, hit.id
+                sanitize_terminal_inline(&hit.received_at),
+                sanitize_terminal_inline(&hit.from_display),
+                sanitize_terminal_inline(&hit.subject),
+                sanitize_terminal_inline(&hit.snippet),
+                sanitize_terminal_inline(&hit.id)
             );
         }
         for msg in &remote_messages {
             println!(
                 "[remote][{}] {} | {} ({})",
-                msg.received_at,
-                msg.from_display(),
-                msg.effective_subject(),
-                msg.id
+                sanitize_terminal_inline(&msg.received_at),
+                sanitize_terminal_inline(&msg.from_display()),
+                sanitize_terminal_inline(msg.effective_subject()),
+                sanitize_terminal_inline(&msg.id)
             );
         }
     }
@@ -4148,12 +4184,17 @@ fn print_cal_events_output(
                 .location
                 .as_deref()
                 .filter(|s| !s.trim().is_empty())
-                .map(|s| format!(" @ {s}"))
+                .map(|s| format!(" @ {}", sanitize_terminal_inline(s)))
                 .unwrap_or_default();
             let meet = if ev.is_online_meeting { " [Online]" } else { "" };
             println!(
                 "[{} ~ {}] {}{}{} ({})",
-                ev.start_iso, ev.end_iso, ev.subject, loc, meet, ev.id
+                sanitize_terminal_inline(&ev.start_iso),
+                sanitize_terminal_inline(&ev.end_iso),
+                sanitize_terminal_inline(&ev.subject),
+                loc,
+                meet,
+                sanitize_terminal_inline(&ev.id)
             );
         }
     }
@@ -4256,32 +4297,37 @@ fn print_event_show_output(ev: &CalendarEvent, json_out: bool, compact: bool) ->
         let payload = json!({ "event": val });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
-        println!("Subject: {}", ev.subject);
-        println!("Time: {} ~ {} ({})", ev.start_iso, ev.end_iso, ev.time_zone);
+        println!("Subject: {}", sanitize_terminal_inline(&ev.subject));
+        println!(
+            "Time: {} ~ {} ({})",
+            sanitize_terminal_inline(&ev.start_iso),
+            sanitize_terminal_inline(&ev.end_iso),
+            sanitize_terminal_inline(&ev.time_zone)
+        );
         if let Some(ref loc) = ev.location {
-            println!("Location: {loc}");
+            println!("Location: {}", sanitize_terminal_inline(loc));
         }
         if let Some(org) = ev.organizer_name.as_deref().or(ev.organizer_email.as_deref()) {
-            println!("Organizer: {org}");
+            println!("Organizer: {}", sanitize_terminal_inline(org));
         }
-        println!("Response: {}", ev.response_status);
+        println!("Response: {}", sanitize_terminal_inline(&ev.response_status));
         if let Some(ref url) = ev.online_meeting_url {
-            println!("Online Meeting: {url}");
+            println!("Online Meeting: {}", sanitize_terminal_inline(url));
         }
         if !ev.attendees.is_empty() {
             println!("Attendees ({}):", ev.attendees.len());
             for a in &ev.attendees {
                 println!(
                     "  - {} <{}> [{} / {}]",
-                    a.name.as_deref().unwrap_or(&a.address),
-                    a.address,
-                    a.attendee_type,
-                    a.response_status
+                    sanitize_terminal_inline(a.name.as_deref().unwrap_or(&a.address)),
+                    sanitize_terminal_inline(&a.address),
+                    sanitize_terminal_inline(&a.attendee_type),
+                    sanitize_terminal_inline(&a.response_status)
                 );
             }
         }
         if !ev.body_plain.trim().is_empty() {
-            println!("---\n{}", ev.body_plain.trim());
+            println!("---\n{}", sanitize_terminal_text(ev.body_plain.trim()));
         }
     }
     Ok(())
@@ -4379,10 +4425,13 @@ async fn cmd_event_create(
     } else {
         println!(
             "Created event: {} ({} ~ {}) id={}",
-            created.subject, created.start_iso, created.end_iso, created.id
+            sanitize_terminal_inline(&created.subject),
+            sanitize_terminal_inline(&created.start_iso),
+            sanitize_terminal_inline(&created.end_iso),
+            sanitize_terminal_inline(&created.id)
         );
         if let Some(ref url) = created.online_meeting_url {
-            println!("Online meeting link: {url}");
+            println!("Online meeting link: {}", sanitize_terminal_inline(url));
         }
     }
     Ok(())
@@ -4413,7 +4462,11 @@ async fn cmd_update_event(
             serde_json::to_string_pretty(&json!({ "ok": true, "event": event }))?
         );
     } else {
-        println!("Updated event {} ({}).", event.subject, event.id);
+        println!(
+            "Updated event {} ({}).",
+            sanitize_terminal_inline(&event.subject),
+            sanitize_terminal_inline(&event.id)
+        );
     }
     Ok(())
 }
@@ -4519,9 +4572,14 @@ fn print_todo_lists_output(
             let wk = l
                 .wellknown_list_name
                 .as_deref()
-                .map(|w| format!(" [{w}]"))
+                .map(|w| format!(" [{}]", sanitize_terminal_inline(w)))
                 .unwrap_or_default();
-            println!("{}{} ({})", l.display_name, wk, l.id);
+            println!(
+                "{}{} ({})",
+                sanitize_terminal_inline(&l.display_name),
+                wk,
+                sanitize_terminal_inline(&l.id)
+            );
         }
     }
     Ok(())
@@ -4556,9 +4614,14 @@ fn print_todo_tasks_output(
             let due = t
                 .due_date_iso
                 .as_deref()
-                .map(|d| format!(" (due {d})"))
+                .map(|d| format!(" (due {})", sanitize_terminal_inline(d)))
                 .unwrap_or_default();
-            println!("[{check}]{imp} {}{}  ({})", t.title, due, t.id);
+            println!(
+                "[{check}]{imp} {}{}  ({})",
+                sanitize_terminal_inline(&t.title),
+                due,
+                sanitize_terminal_inline(&t.id)
+            );
         }
     }
     Ok(())
@@ -4736,7 +4799,11 @@ async fn cmd_todo_add(
             }))?
         );
     } else {
-        println!("Task added: {} ({})", created.title, created.id);
+        println!(
+            "Task added: {} ({})",
+            sanitize_terminal_inline(&created.title),
+            sanitize_terminal_inline(&created.id)
+        );
     }
     Ok(())
 }
@@ -4777,7 +4844,11 @@ async fn cmd_update_task(
             serde_json::to_string_pretty(&json!({ "ok": true, "task": task }))?
         );
     } else {
-        println!("Updated task {} ({}).", task.title, task.id);
+        println!(
+            "Updated task {} ({}).",
+            sanitize_terminal_inline(&task.title),
+            sanitize_terminal_inline(&task.id)
+        );
     }
     Ok(())
 }
@@ -4866,17 +4937,22 @@ fn print_contact_line(c: &ContactItem) {
         .company_name
         .as_deref()
         .filter(|s| !s.trim().is_empty())
-        .map(|s| format!(" · {s}"))
+        .map(|s| format!(" · {}", sanitize_terminal_inline(s)))
         .unwrap_or_default();
     let phone = c
         .mobile_phone
         .as_deref()
         .filter(|s| !s.trim().is_empty())
-        .map(|s| format!(" · {s}"))
+        .map(|s| format!(" · {}", sanitize_terminal_inline(s)))
         .unwrap_or_default();
     println!(
         "[{}] {} <{}>{}{} ({})",
-        c.source, c.display_name, email, org, phone, c.id
+        sanitize_terminal_inline(&c.source),
+        sanitize_terminal_inline(&c.display_name),
+        sanitize_terminal_inline(email),
+        org,
+        phone,
+        sanitize_terminal_inline(&c.id)
     );
 }
 
@@ -5703,8 +5779,8 @@ fn format_unix_ts(ts: i64) -> String {
 }
 
 fn truncate_single_line(input: &str, max_chars: usize) -> String {
-    let single = input.replace(['\r', '\n'], " ");
-    let trimmed = single.trim();
+    let sanitized = sanitize_terminal_inline(input);
+    let trimmed = sanitized.trim();
     if trimmed.chars().count() <= max_chars {
         trimmed.to_string()
     } else {
