@@ -3197,8 +3197,8 @@ impl AppState {
                     } else if att.id.trim().len() >= 11
                         && att.id.trim()[..11].eq_ignore_ascii_case("data:image/")
                     {
-                        match bitefoundry_html::graphics::decode_data_image_uri(att.id.trim()) {
-                            Ok(decoded) => Ok((Arc::from(decoded.bytes), Some(decoded.mime), true)),
+                        match img_preview::decode_data_image_uri(att.id.trim()) {
+                            Ok((bytes, mime)) => Ok((Arc::from(bytes), Some(mime), true)),
                             Err(e) => Err(e),
                         }
                     } else if att.id.starts_with("https://") || att.id.starts_with("http://") {

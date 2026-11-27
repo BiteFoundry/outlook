@@ -14,7 +14,7 @@
 
 <br />
 
-![outlook TUI Demo](https://raw.githubusercontent.com/BiteFoundry/outlook/master/assets/demo.gif)
+![outlook TUI Demo](https://bitefoundry.dev/assets/demos/outlook.gif)
 
 </div>
 

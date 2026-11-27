@@ -1322,6 +1322,99 @@ fn validate_raster_image_bytes(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "svg-graphics")]
+fn rasterize_svg_image(bytes: &[u8], fit: FitBox, cell_px: (u16, u16)) -> Result<Vec<u8>> {
+    let zoom = if fit.scrollable {
+        fit.zoom_pct.clamp(25, 300) as u32
+    } else {
+        100
+    };
+    let max_px_w = ((fit.view_cols.max(1) as u32)
+        .saturating_mul(cell_px.0.max(1) as u32)
+        .saturating_mul(zoom)
+        / 100)
+        .clamp(256, bitefoundry_html::graphics::MAX_RASTER_DIM_PX);
+    let max_px_h = if fit.scrollable {
+        bitefoundry_html::graphics::MAX_RASTER_DIM_PX
+    } else {
+        ((fit.view_rows.max(1) as u32)
+            .saturating_mul(cell_px.1.max(1) as u32)
+            .saturating_mul(zoom)
+            / 100)
+            .clamp(256, bitefoundry_html::graphics::MAX_RASTER_DIM_PX)
+    };
+    let svg_input = trim_bom_and_ascii_ws(bytes);
+    let raster = bitefoundry_html::graphics::rasterize_svg_to_png(
+        svg_input, max_px_w, max_px_h, None,
+    )
+    .context("Failed to rasterize SVG image")?;
+    Ok(raster.png_bytes.to_vec())
+}
+
+#[cfg(not(feature = "svg-graphics"))]
+fn rasterize_svg_image(_bytes: &[u8], _fit: FitBox, _cell_px: (u16, u16)) -> Result<Vec<u8>> {
+    bail!("SVG image preview is disabled in this build (rebuild with `--features svg-graphics`)")
+}
+
+/// Decodes a `data:image/*` URI into `(bytes, mime)`.
+///
+/// With `svg-graphics` enabled this delegates to `bitefoundry_html::graphics::decode_data_image_uri`
+/// (supporting both raster images and inline SVG). Without `svg-graphics`, base64-encoded raster
+/// `data:image/*` URIs are still decoded cleanly while SVG URIs return a descriptive error.
+#[cfg(feature = "svg-graphics")]
+pub fn decode_data_image_uri(uri: &str) -> Result<(Vec<u8>, String)> {
+    let decoded = bitefoundry_html::graphics::decode_data_image_uri(uri)?;
+    Ok((decoded.bytes, decoded.mime))
+}
+
+#[cfg(not(feature = "svg-graphics"))]
+pub fn decode_data_image_uri(uri: &str) -> Result<(Vec<u8>, String)> {
+    const MAX_DATA_URI_BYTES: usize = 8 * 1024 * 1024;
+
+    let trimmed = uri.trim();
+    if trimmed.len() < 5 || !trimmed[..5].eq_ignore_ascii_case("data:") {
+        bail!("malformed data: URI");
+    }
+    let Some((meta, payload)) = trimmed[5..].split_once(',') else {
+        bail!("malformed data: URI (missing comma separator)");
+    };
+    let mut parts = meta.split(';');
+    let mime = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+    if mime == "image/svg+xml" {
+        bail!("SVG image preview is disabled in this build (rebuild with `--features svg-graphics`)");
+    }
+    if !matches!(
+        mime.as_str(),
+        "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp"
+    ) {
+        bail!("unsupported data URI MIME type: {mime}");
+    }
+    let is_base64 = parts.any(|p| p.trim().eq_ignore_ascii_case("base64"));
+    if !is_base64 {
+        bail!("non-base64 data:image URI requires the `svg-graphics` feature");
+    }
+    let compact: String = payload.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    if compact.len() > (MAX_DATA_URI_BYTES * 4) / 3 + 16 {
+        bail!("base64 data URI payload exceeds 8 MiB limit");
+    }
+    let bytes = B64_STANDARD
+        .decode(compact.as_bytes())
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(compact.as_bytes()))
+        .context("invalid base64 payload in data URI")?;
+    if bytes.is_empty() {
+        bail!("empty data:image payload");
+    }
+    if bytes.len() > MAX_DATA_URI_BYTES {
+        bail!("decoded data:image payload exceeds 8 MiB limit");
+    }
+    if bitefoundry_html::sniff_content_kind(Some(&mime), None, Some(&bytes))
+        != bitefoundry_html::ContentKind::RasterImage
+    {
+        bail!("data:{mime} payload failed raster magic verification");
+    }
+    Ok((bytes, mime))
+}
+
 /// Validates input bytes against HTML spoofing and rasterizes SVG bytes into PNG via `bitefoundry_html`.
 fn prepare_image_bytes(
     bytes: &[u8],
@@ -1330,31 +1423,8 @@ fn prepare_image_bytes(
 ) -> Result<(std::borrow::Cow<'_, [u8]>, bool)> {
     validate_raster_image_bytes(bytes)?;
     if looks_like_svg_bytes(bytes) {
-        let zoom = if fit.scrollable {
-            fit.zoom_pct.clamp(25, 300) as u32
-        } else {
-            100
-        };
-        let max_px_w = ((fit.view_cols.max(1) as u32)
-            .saturating_mul(cell_px.0.max(1) as u32)
-            .saturating_mul(zoom)
-            / 100)
-            .clamp(256, bitefoundry_html::graphics::MAX_RASTER_DIM_PX);
-        let max_px_h = if fit.scrollable {
-            bitefoundry_html::graphics::MAX_RASTER_DIM_PX
-        } else {
-            ((fit.view_rows.max(1) as u32)
-                .saturating_mul(cell_px.1.max(1) as u32)
-                .saturating_mul(zoom)
-                / 100)
-                .clamp(256, bitefoundry_html::graphics::MAX_RASTER_DIM_PX)
-        };
-        let svg_input = trim_bom_and_ascii_ws(bytes);
-        let raster = bitefoundry_html::graphics::rasterize_svg_to_png(
-            svg_input, max_px_w, max_px_h, None,
-        )
-        .context("Failed to rasterize SVG image")?;
-        Ok((std::borrow::Cow::Owned(raster.png_bytes.to_vec()), true))
+        let png_bytes = rasterize_svg_image(bytes, fit, cell_px)?;
+        Ok((std::borrow::Cow::Owned(png_bytes), true))
     } else {
         Ok((std::borrow::Cow::Borrowed(bytes), false))
     }
