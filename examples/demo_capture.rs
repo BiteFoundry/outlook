@@ -266,12 +266,14 @@ fn recipient(name: &str, address: &str) -> EmailRecipient {
 fn main() {
     std::env::set_var("OUTLOOK_CONFIG_DIR", "~/.config/outlook-cli");
 
-    let mut cfg = AppConfig::default();
-    cfg.theme = ThemePreset::Dark;
-    cfg.density = DensityMode::Cozy;
-    cfg.show_nav_rail = true;
-    cfg.group_threads = true;
-    cfg.inline_images = true;
+    let cfg = AppConfig {
+        theme: ThemePreset::Dark,
+        density: DensityMode::Cozy,
+        show_nav_rail: true,
+        group_threads: true,
+        inline_images: true,
+        ..AppConfig::default()
+    };
 
     let auth = AuthManager::new(cfg.clone()).expect("auth init");
     let graph = GraphClient::new(cfg.clone(), auth.clone()).expect("graph init");

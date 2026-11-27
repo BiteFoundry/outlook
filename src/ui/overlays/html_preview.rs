@@ -101,6 +101,8 @@ pub fn html_theme_from_ui(theme: &Theme) -> HtmlTheme {
     }
 }
 
+type GraphicCacheEnv = ((u16, u16), (u8, u8, u8));
+
 /// Interactive HTML Preview overlay backed by `bitefoundry_html::HtmlViewSession`.
 pub struct HtmlPreviewOverlay {
     pub session: HtmlViewSession,
@@ -110,7 +112,7 @@ pub struct HtmlPreviewOverlay {
     /// Terminal-rendered inline graphics cached by `(node_id, width, protocol)` and cleared on `Drop`.
     graphic_cache: HashMap<(usize, u16, TerminalImageProtocol), RenderedTerminalImage>,
     /// Last `(cell_px, bg_rgb)` used to render cached graphics; changes invalidate `graphic_cache`.
-    graphic_cache_env: Option<((u16, u16), (u8, u8, u8))>,
+    graphic_cache_env: Option<GraphicCacheEnv>,
 }
 
 impl Drop for HtmlPreviewOverlay {
@@ -562,26 +564,29 @@ impl HtmlPreviewOverlay {
                 }
 
                 let cache_key = (g.node_id.0, content_area.width, caps.protocol);
-                if !self.graphic_cache.contains_key(&cache_key) {
-                    let slot_rows = g.line_count.min(u16::MAX as usize).max(1) as u16;
-                    let fit = FitBox::fixed(content_area.width.max(1), slot_rows);
-                    if let Ok(rendered_img) =
-                        img_preview::decode_and_render_for_protocol(&g.image_bytes, fit, bg_rgb, caps)
-                    {
-                        self.graphic_cache.insert(cache_key, rendered_img);
+                let rendered_img = match self.graphic_cache.entry(cache_key) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let slot_rows = g.line_count.clamp(1, u16::MAX as usize) as u16;
+                        let fit = FitBox::fixed(content_area.width.max(1), slot_rows);
+                        let Ok(rendered) = img_preview::decode_and_render_for_protocol(
+                            &g.image_bytes,
+                            fit,
+                            bg_rgb,
+                            caps,
+                        ) else {
+                            continue;
+                        };
+                        entry.insert(rendered)
                     }
-                }
-
-                let Some(rendered_img) = self.graphic_cache.get(&cache_key) else {
-                    continue;
                 };
 
                 if caps.protocol == TerminalImageProtocol::Halfblock {
                     // Replace reserved placeholder lines in place so total line count and
                     // click coordinates for controls below never shift.
                     let clear_end = g_bottom.min(lines.len());
-                    for row in g_top..clear_end {
-                        lines[row] = Line::default();
+                    for line in lines.iter_mut().take(clear_end).skip(g_top) {
+                        *line = Line::default();
                     }
                     for (offset, img_line) in rendered_img.lines.iter().take(g.line_count).enumerate() {
                         let dst = g_top + offset;
@@ -592,8 +597,8 @@ impl HtmlPreviewOverlay {
                 } else if rendered_img.protocol.is_pixel() {
                     // Clear placeholder text in reserved slot so terminal pixels sit on clean background.
                     let clear_end = g_bottom.min(lines.len());
-                    for row in g_top..clear_end {
-                        lines[row] = Line::default();
+                    for line in lines.iter_mut().take(clear_end).skip(g_top) {
+                        *line = Line::default();
                     }
 
                     let vis_top = g_top.max(viewport_top);

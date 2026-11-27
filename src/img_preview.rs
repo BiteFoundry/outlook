@@ -1451,9 +1451,11 @@ pub fn decode_and_render_halfblocks_with_cell_px(
     let resized = image::imageops::resize(&rgba, target_w, target_h, FilterType::Lanczos3);
     let mut lines = Vec::with_capacity((target_h / 2) as usize);
 
+    type HalfblockColorPair = ((u8, u8, u8), (u8, u8, u8));
+
     for y in (0..target_h).step_by(2) {
         let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut current_pair: Option<((u8, u8, u8), (u8, u8, u8))> = None;
+        let mut current_pair: Option<HalfblockColorPair> = None;
         let mut run = String::new();
 
         for x in 0..target_w {
@@ -1838,12 +1840,12 @@ fn compute_pixel_fit_for_protocol(
     }
 
     let max_w_bound = if !fit.scrollable || (!tall_scroll && zoom_pct <= 100) {
-        (vp_w as u32).min(MAX_RENDER_PX_W).max(1)
+        (vp_w as u32).clamp(1, MAX_RENDER_PX_W)
     } else {
         MAX_RENDER_PX_W
     };
     let max_h_bound = if !fit.scrollable || (!tall_scroll && zoom_pct <= 100) {
-        (eff_vp_h as u32).min(MAX_RENDER_PX_H).max(1)
+        (eff_vp_h as u32).clamp(1, MAX_RENDER_PX_H)
     } else {
         MAX_RENDER_PX_H
     };
@@ -2047,7 +2049,7 @@ fn quantize_rgba_to_256_with_stats(
     let mut indexed = Vec::with_capacity(pixel_count);
     let mut overflow = false;
 
-    for px in flat_rgba.chunks_exact(4).take(pixel_count) {
+    for px in flat_rgba.as_chunks::<4>().0.iter().take(pixel_count) {
         let key = ((px[0] as u32) << 16) | ((px[1] as u32) << 8) | (px[2] as u32);
         if let Some(&idx) = exact_map.get(&key) {
             indexed.push(idx);
@@ -2068,7 +2070,7 @@ fn quantize_rgba_to_256_with_stats(
 
     // Perceptually-weighted median-cut over 5-bit-per-channel RGB buckets for > 256 distinct colors.
     let mut hist: HashMap<u16, (u32, u64, u64, u64)> = HashMap::new();
-    for px in flat_rgba.chunks_exact(4).take(pixel_count) {
+    for px in flat_rgba.as_chunks::<4>().0.iter().take(pixel_count) {
         let qkey = (((px[0] as u16) >> 3) << 10)
             | (((px[1] as u16) >> 3) << 5)
             | ((px[2] as u16) >> 3);
@@ -2182,11 +2184,8 @@ fn quantize_rgba_to_256_with_stats(
                 sg += b.sum_g;
                 sb += b.sum_b;
             }
-            if cnt == 0 {
-                (0, 0, 0)
-            } else {
-                ((sr / cnt) as u8, (sg / cnt) as u8, (sb / cnt) as u8)
-            }
+            sr.checked_div(cnt)
+                .map_or((0, 0, 0), |r| (r as u8, (sg / cnt) as u8, (sb / cnt) as u8))
         })
         .collect();
 
@@ -2861,7 +2860,7 @@ mod tests {
                 big_grad.extend_from_slice(&[
                     ((x * 255) / gw) as u8,
                     ((y * 255) / gh) as u8,
-                    (((x * 7 + y * 13) % 256)) as u8,
+                    ((x * 7 + y * 13) % 256) as u8,
                     255,
                 ]);
             }

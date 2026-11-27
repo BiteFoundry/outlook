@@ -2742,7 +2742,7 @@ mod tests {
             ]
         );
         // Contacts stay read-only: nothing in the CLI, MCP or HTTP surface writes contacts.
-        assert!(!DEFAULT_SCOPES.iter().any(|scope| *scope == "Contacts.ReadWrite"));
+        assert!(!DEFAULT_SCOPES.contains(&"Contacts.ReadWrite"));
     }
 
     #[test]
@@ -2849,9 +2849,11 @@ mod tests {
     async fn test_direct_access_token_login_and_valid_token() {
         let _env_lock = ENV_LOCK.lock().await;
         let _env_guard = EnvVarGuard::clear_auth_env();
-        let mut cfg = AppConfig::default();
-        cfg.client_id = "cid".into();
-        cfg.tenant_id = "tid".into();
+        let cfg = AppConfig {
+            client_id: "cid".into(),
+            tenant_id: "tid".into(),
+            ..AppConfig::default()
+        };
 
         let tok = StoredTokens {
             access_token: "direct-tok".into(),
@@ -2911,10 +2913,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let cred_path = dir.path().join("creds.json");
 
-        let mut cfg = AppConfig::default();
-        cfg.auth_base_url = format!("http://{addr}");
-        cfg.client_id = "cid".into();
-        cfg.tenant_id = "tenant-1".into();
+        let cfg = AppConfig {
+            auth_base_url: format!("http://{addr}"),
+            client_id: "cid".into(),
+            tenant_id: "tenant-1".into(),
+            ..AppConfig::default()
+        };
 
         let dummy = StoredTokens {
             access_token: "old".into(),
@@ -3205,18 +3209,17 @@ mod tests {
         );
         std::fs::write(&token_path, &soon_jwt).unwrap();
 
-        let mut cfg = AppConfig::default();
-        cfg.token_file = token_path.to_string_lossy().to_string();
-        cfg.token_refresh_mins = 5;
         #[cfg(windows)]
-        {
-            cfg.token_refresh_cmd = format!("echo {fresh_jwt}> \"{}\"", token_path.display());
-        }
+        let token_refresh_cmd = format!("echo {fresh_jwt}> \"{}\"", token_path.display());
         #[cfg(not(windows))]
-        {
-            cfg.token_refresh_cmd =
-                format!("printf '%s\\n' '{fresh_jwt}' > '{}'", token_path.display());
-        }
+        let token_refresh_cmd =
+            format!("printf '%s\\n' '{fresh_jwt}' > '{}'", token_path.display());
+        let cfg = AppConfig {
+            token_file: token_path.to_string_lossy().to_string(),
+            token_refresh_mins: 5,
+            token_refresh_cmd,
+            ..AppConfig::default()
+        };
 
         let mgr = AuthManager::new(cfg).unwrap();
         assert!(mgr.is_refreshable().await);
@@ -3234,10 +3237,12 @@ mod tests {
 
         let soon_jwt = make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 120 }), false);
         std::fs::write(&token_path, &soon_jwt).unwrap();
-        let mut cfg = AppConfig::default();
-        cfg.token_file = token_path.to_string_lossy().to_string();
-        cfg.token_refresh_mins = 5;
-        cfg.token_refresh_cmd = "exit 1".to_string();
+        let cfg = AppConfig {
+            token_file: token_path.to_string_lossy().to_string(),
+            token_refresh_mins: 5,
+            token_refresh_cmd: "exit 1".to_string(),
+            ..AppConfig::default()
+        };
 
         let mgr = AuthManager::new(cfg.clone()).unwrap();
         assert_eq!(mgr.valid_access_token().await.unwrap(), soon_jwt);
@@ -3260,8 +3265,10 @@ mod tests {
             make_test_jwt_with_encoder(&serde_json::json!({ "exp": now - 120 }), false);
         std::fs::write(&token_path, &expired_jwt).unwrap();
 
-        let mut cfg = AppConfig::default();
-        cfg.token_file = token_path.to_string_lossy().to_string();
+        let cfg = AppConfig {
+            token_file: token_path.to_string_lossy().to_string(),
+            ..AppConfig::default()
+        };
         let mgr_file = AuthManager::new(cfg.clone()).unwrap();
         assert!(!mgr_file.is_refreshable().await);
         let msg_file = mgr_file.valid_access_token().await.unwrap_err().to_string();
@@ -3286,8 +3293,10 @@ mod tests {
             make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 3600 }), false);
         std::fs::write(&token_path, &fresh_jwt).unwrap();
 
-        let mut cfg = AppConfig::default();
-        cfg.token_file = token_path.to_string_lossy().to_string();
+        let cfg = AppConfig {
+            token_file: token_path.to_string_lossy().to_string(),
+            ..AppConfig::default()
+        };
         assert!(should_skip_keyring_on_init(&cfg));
 
         let ext_tok = read_external_token_file(&token_path, &cfg).unwrap();
@@ -3439,8 +3448,10 @@ mod tests {
         std::fs::write(&teams_tok_path, &teams_only_jwt).unwrap();
 
         let outlook_cred_path = dir.path().join("outlook_creds.json");
-        let mut cfg = AppConfig::default();
-        cfg.share_m365_auth = true;
+        let cfg = AppConfig {
+            share_m365_auth: true,
+            ..AppConfig::default()
+        };
 
         // 1. Teams-only token in teams-cli token_file must NOT be reused
         let mgr_skip = AuthManager::empty_for_test(cfg.clone())
@@ -3544,9 +3555,11 @@ mod tests {
         std::fs::create_dir_all(&teams_dir).unwrap();
         let outlook_cred_path = dir.path().join("outlook-cli").join("credentials.json");
 
-        let mut cfg = AppConfig::default();
-        cfg.auth_base_url = format!("http://{addr}");
-        cfg.share_m365_auth = true;
+        let cfg = AppConfig {
+            auth_base_url: format!("http://{addr}"),
+            share_m365_auth: true,
+            ..AppConfig::default()
+        };
 
         // 1. Teams session already has Mail.ReadWrite -> reused directly without hitting token endpoint
         let teams_with_mail = StoredTokens {
@@ -3709,9 +3722,11 @@ mod tests {
         let expired = shared_session_tokens(Some("User.Read Chat.Read"), -600, Some("rt-teams"));
         save_tokens_to_path(&expired, &teams_dir.join("credentials.json")).unwrap();
 
-        let mut cfg = AppConfig::default();
-        cfg.auth_base_url = auth_base;
-        cfg.share_m365_auth = true;
+        let cfg = AppConfig {
+            auth_base_url: auth_base,
+            share_m365_auth: true,
+            ..AppConfig::default()
+        };
 
         // Flag off: the teams-cli session is never read and the token endpoint is never contacted.
         let mut disabled = cfg.clone();
@@ -3766,9 +3781,11 @@ mod tests {
         let token_file_str = token_file.to_string_lossy().to_string();
         let _teams_env = EnvVarGuard::set(&[("TEAMS_TOKEN_FILE", Some(token_file_str.as_str()))]);
 
-        let mut cfg = AppConfig::default();
-        cfg.auth_base_url = "http://127.0.0.1:9".into();
-        cfg.share_m365_auth = true;
+        let mut cfg = AppConfig {
+            auth_base_url: "http://127.0.0.1:9".into(),
+            share_m365_auth: true,
+            ..AppConfig::default()
+        };
         let mgr_on = AuthManager::empty_for_test(cfg.clone())
             .with_token_path(dir.path().join("on.json"))
             .with_legacy_teams_dir(teams_dir.clone());
@@ -3799,10 +3816,12 @@ mod tests {
         let _env_guard = EnvVarGuard::clear_auth_env();
         let (auth_base, requested) = spawn_scope_recording_token_endpoint(OUTLOOK_SCP, true).await;
         let dir = tempdir().unwrap();
-        let mut cfg = AppConfig::default();
-        cfg.auth_base_url = auth_base;
-        cfg.client_id = "cid".into();
-        cfg.tenant_id = "tid-shared".into();
+        let cfg = AppConfig {
+            auth_base_url: auth_base,
+            client_id: "cid".into(),
+            tenant_id: "tid-shared".into(),
+            ..AppConfig::default()
+        };
 
         // A session signed in before 0.3.1 has no directory scope: refresh asks only for what it holds.
         let legacy = shared_session_tokens(Some(OUTLOOK_SCP), -600, Some("rt-legacy"));
@@ -3845,10 +3864,12 @@ mod tests {
         let _env_guard = EnvVarGuard::clear_auth_env();
         let (auth_base, requested) = spawn_scope_recording_token_endpoint(OUTLOOK_SCP, false).await;
         let dir = tempdir().unwrap();
-        let mut cfg = AppConfig::default();
-        cfg.auth_base_url = auth_base;
-        cfg.client_id = "cid".into();
-        cfg.tenant_id = "tid-shared".into();
+        let cfg = AppConfig {
+            auth_base_url: auth_base,
+            client_id: "cid".into(),
+            tenant_id: "tid-shared".into(),
+            ..AppConfig::default()
+        };
 
         let granted = shared_session_tokens(
             Some("User.Read User.ReadBasic.All Mail.ReadWrite"),
@@ -3951,10 +3972,12 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.auth_base_url = format!("http://{addr}");
-        cfg.client_id = "cid-eph".into();
-        cfg.tenant_id = "tenant-ephemeral".into();
+        let cfg = AppConfig {
+            auth_base_url: format!("http://{addr}"),
+            client_id: "cid-eph".into(),
+            tenant_id: "tenant-ephemeral".into(),
+            ..AppConfig::default()
+        };
 
         let expired = StoredTokens {
             access_token: "ephemeral-old-tok".into(),

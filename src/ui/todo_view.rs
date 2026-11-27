@@ -190,7 +190,7 @@ fn draw_list_header(
         )),
         Rect::new(area.x, area.y, area.width.saturating_sub(bw + 1), 1),
     );
-    if area.width >= bw + 1 {
+    if area.width > bw {
         let r = Rect::new(area.right().saturating_sub(bw + 1), area.y, bw, 1);
         frame.render_widget(
             Paragraph::new(Span::styled(btn, bar_style.fg(theme.accent))),

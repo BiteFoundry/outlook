@@ -234,7 +234,7 @@ impl GraphClient {
         let mut seen_emails: HashSet<String> = HashSet::new();
         let mut seen_ids: HashSet<String> = HashSet::new();
 
-        for item in matching_personal.chain(directory_items.into_iter()) {
+        for item in matching_personal.chain(directory_items) {
             if let Some(primary) = item
                 .primary_email()
                 .map(|s| s.trim().to_lowercase())

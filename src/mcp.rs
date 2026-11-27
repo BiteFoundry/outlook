@@ -697,7 +697,9 @@ async fn call_tool(
                             sync_complete: true,
                         }
                     }
-                    cli::CursorPos::Offset(_) => unreachable!(),
+                    cli::CursorPos::Offset(_) => {
+                        return Err("invalid cursor: not valid for this command".to_string());
+                    }
                 };
 
                 return Ok(with_compact_mail_list_metadata(
@@ -1324,7 +1326,7 @@ async fn call_tool(
                 ]);
                 parsed.require_scope(&scope).map_err(format_error)?;
                 let cli::CursorPos::Graph { skip, url } = parsed.pos else {
-                    unreachable!();
+                    return Err("invalid cursor: not valid for this command".to_string());
                 };
                 if offline {
                     return Err("invalid cursor: this cursor needs online access".to_string());
@@ -3850,8 +3852,10 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
 
-        let mut online_cfg = AppConfig::default();
-        online_cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let online_cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tokens = StoredTokens {
             access_token: "test-token".to_string(),
             refresh_token: None,

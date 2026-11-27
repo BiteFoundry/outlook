@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use futures::stream::{self, StreamExt};
+use futures_util::stream::{self, StreamExt};
 use scraper::{Html, Node};
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
@@ -2458,8 +2458,10 @@ pub(crate) mod tests {
     use tempfile::tempdir;
 
     pub(crate) fn test_graph_client(graph_base_url: &str) -> GraphClient {
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = graph_base_url.to_string();
+        let cfg = AppConfig {
+            graph_base_url: graph_base_url.to_string(),
+            ..AppConfig::default()
+        };
         let auth = AuthManager::from_tokens(
             cfg.clone(),
             StoredTokens {
@@ -2976,15 +2978,18 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        assert_eq!(rec_check.send_mail_payloads.lock().unwrap().len(), 1);
-        let p0 = &rec_check.send_mail_payloads.lock().unwrap()[0];
-        assert_eq!(
-            p0["message"]["body"]["content"],
-            "<p>See <img src=\"cid:img-cid-1@outlook\"></p>"
-        );
-        assert_eq!(p0["message"]["attachments"][0]["isInline"], true);
-        assert_eq!(p0["message"]["attachments"][0]["contentId"], "img-cid-1@outlook");
-        assert_eq!(p0["message"]["attachments"][1]["contentType"], "text/plain");
+        {
+            let payloads = rec_check.send_mail_payloads.lock().unwrap();
+            assert_eq!(payloads.len(), 1);
+            let p0 = &payloads[0];
+            assert_eq!(
+                p0["message"]["body"]["content"],
+                "<p>See <img src=\"cid:img-cid-1@outlook\"></p>"
+            );
+            assert_eq!(p0["message"]["attachments"][0]["isInline"], true);
+            assert_eq!(p0["message"]["attachments"][0]["contentId"], "img-cid-1@outlook");
+            assert_eq!(p0["message"]["attachments"][1]["contentType"], "text/plain");
+        }
 
         // 2. Large attachment triggers draft + upload session
         let large_path = dir.path().join("big.bin");
@@ -3567,9 +3572,9 @@ pub(crate) mod tests {
             format!("<ul><li>First item</li><li>Second item</li></ul>{quoted}")
         );
 
-        let existing_b = format!(
+        let existing_b =
             "<html><body dir=\"ltr\"><p>Old reply</p><div id=\"divRplyFwdMsg\"><p>Original</p></div></body></html>"
-        );
+                .to_string();
         let (out_b, preserved_b) =
             splice_draft_body_preserving_quote(&existing_b, "<p>Updated reply</p>");
         assert!(preserved_b);

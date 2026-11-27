@@ -1926,8 +1926,10 @@ mod tests {
             axum::serve(graph_listener, graph_app).await.unwrap();
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = graph_base;
+        let cfg = AppConfig {
+            graph_base_url: graph_base,
+            ..AppConfig::default()
+        };
         let auth = AuthManager::from_tokens(
             cfg.clone(),
             crate::auth::StoredTokens {

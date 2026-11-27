@@ -1,5 +1,5 @@
 //! Tab 1 (`Mail`): Message List Pane (Cozy / Compact, thread grouping, Focused/Unread filters)
-//! + Rich HTML Email Reading Pane (`Table`, `CodeBlock`, `QuotedHistory` folding, Meeting Invite
+//! and Rich HTML Email Reading Pane (`Table`, `CodeBlock`, `QuotedHistory` folding, Meeting Invite
 //! RSVP banner, and viewport-driven Halfblock inline thumbnails clickable for HD Sixel preview).
 
 use std::cell::RefCell;
@@ -134,8 +134,11 @@ impl RenderedLine {
     }
 }
 
+type LineCacheKey = (u64, u64);
+type LineCacheEntry = (LineCacheKey, Arc<[RenderedLine]>);
+
 pub struct LineSliceCache {
-    entries: Vec<((u64, u64), Arc<[RenderedLine]>)>,
+    entries: Vec<LineCacheEntry>,
     capacity: usize,
 }
 
@@ -2153,7 +2156,7 @@ mod tests {
         let mut expanded_quoted = std::collections::HashSet::new();
 
         let folded_lines = build_reader_lines(
-            &[msg.clone()],
+            std::slice::from_ref(&msg),
             &expanded_threads,
             &expanded_quoted,
             &theme,

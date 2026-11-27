@@ -583,13 +583,15 @@ mod tests {
         id: &str,
         folder_id: &str,
         subject: &str,
-        from_name: &str,
-        from_addr: &str,
+        from: (&str, &str),
         received_at: &str,
-        body_loaded: bool,
-        body_html: &str,
-        body_plain: &str,
+        body: Option<(&str, &str)>,
     ) -> MailMessage {
+        let (from_name, from_addr) = from;
+        let (body_loaded, body_html, body_plain) = match body {
+            Some((html, plain)) => (true, html, plain),
+            None => (false, "", ""),
+        };
         MailMessage {
             id: id.to_string(),
             internet_message_id: Some(format!("<{id}@example.com>")),
@@ -666,12 +668,12 @@ mod tests {
             "m1",
             "fld-inbox",
             "Q4 Budget Review",
-            "Alice",
-            "alice@example.com",
+            ("Alice", "alice@example.com"),
             "2026-11-18T10:00:00Z",
-            true,
-            "<p>Full body with Kubernetes rollout details</p>",
-            "Full body with Kubernetes rollout details",
+            Some((
+                "<p>Full body with Kubernetes rollout details</p>",
+                "Full body with Kubernetes rollout details",
+            )),
         );
         full_msg.preview = "Full body with...".to_string();
         full_msg.has_attachments = true;
@@ -700,12 +702,9 @@ mod tests {
             "m1",
             "fld-inbox",
             "Q4 Budget Review",
-            "Alice",
-            "alice@example.com",
+            ("Alice", "alice@example.com"),
             "2026-11-18T10:00:00Z",
-            false,
-            "",
-            "",
+            None,
         );
         header_update.is_read = true;
         header_update.flagged = true;
@@ -751,12 +750,9 @@ mod tests {
             "m1",
             "fld-inbox",
             "Q4 Budget Review v2",
-            "Alice",
-            "alice@example.com",
+            ("Alice", "alice@example.com"),
             "2026-11-18T10:00:00Z",
-            false,
-            "",
-            "",
+            None,
         );
         content_update.is_read = true;
         content_update.flagged = true;
@@ -817,12 +813,12 @@ mod tests {
             "m-wal",
             "fld-inbox",
             "WAL Concurrent Read",
-            "Bob",
-            "bob@example.com",
+            ("Bob", "bob@example.com"),
             "2026-11-18T12:00:00Z",
-            true,
-            "<p>Concurrent WAL reader verification body</p>",
-            "Concurrent WAL reader verification body",
+            Some((
+                "<p>Concurrent WAL reader verification body</p>",
+                "Concurrent WAL reader verification body",
+            )),
         );
         storage.upsert_mail_messages(&[m1]).unwrap();
 
@@ -1083,16 +1079,15 @@ mod tests {
         }
 
         let make = |id: &str, folder: &str, ts: &str, read: bool, flagged: bool, focused: bool| {
+            let body_html = format!("<p>Large body for {id} {}</p>", "X".repeat(2048));
+            let body_plain = format!("Large plain for {id}");
             let mut m = sample_mail(
                 id,
                 folder,
                 &format!("Subject {id}"),
-                "Alice",
-                "alice@example.com",
+                ("Alice", "alice@example.com"),
                 ts,
-                true,
-                &format!("<p>Large body for {id} {}</p>", "X".repeat(2048)),
-                &format!("Large plain for {id}"),
+                Some((&body_html, &body_plain)),
             );
             m.is_read = read;
             m.flagged = flagged;
@@ -1207,23 +1202,17 @@ mod tests {
             "m1",
             "fld-inbox",
             "Unique Quantum Budget",
-            "Alice",
-            "alice@example.com",
+            ("Alice", "alice@example.com"),
             "2026-11-18T10:00:00Z",
-            true,
-            "<p>Quantum details</p>",
-            "Quantum details",
+            Some(("<p>Quantum details</p>", "Quantum details")),
         );
         let m2 = sample_mail(
             "m2",
             "fld-inbox",
             "Keep Same Id Move",
-            "Bob",
-            "bob@example.com",
+            ("Bob", "bob@example.com"),
             "2026-11-18T09:00:00Z",
-            true,
-            "<p>Preserved body</p>",
-            "Preserved body",
+            Some(("<p>Preserved body</p>", "Preserved body")),
         );
         storage.upsert_mail_messages(&[m1, m2]).unwrap();
 
@@ -1232,12 +1221,9 @@ mod tests {
             "m1-moved",
             "fld-archive",
             "Unique Quantum Budget",
-            "Alice",
-            "alice@example.com",
+            ("Alice", "alice@example.com"),
             "2026-11-18T10:00:00Z",
-            false,
-            "",
-            "",
+            None,
         );
         m1_moved.preview = "Quantum details".into();
         storage.replace_moved_mail_local("m1", &m1_moved).unwrap();
@@ -1293,12 +1279,9 @@ mod tests {
             "m-mod",
             "fld-inbox",
             "Draft Subject",
-            "Alice",
-            "alice@example.com",
+            ("Alice", "alice@example.com"),
             "2026-11-18T10:00:00Z",
-            true,
-            "<p>Long body v1</p>",
-            "Long body v1",
+            Some(("<p>Long body v1</p>", "Long body v1")),
         );
         msg.last_modified_at = Some("2026-11-18T10:00:00Z".into());
         storage.upsert_mail_messages(&[msg.clone()]).unwrap();

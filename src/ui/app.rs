@@ -2230,11 +2230,11 @@ impl AppState {
                     |change| {
                         match &change {
                             DraftSaveChange::ThreadCreated { id, .. }
-                            | DraftSaveChange::Fields { id, .. } => {
-                                if !id.trim().is_empty() {
-                                    *captured_for_cb.lock().unwrap_or_else(|e| e.into_inner()) =
-                                        Some(id.clone());
-                                }
+                            | DraftSaveChange::Fields { id, .. }
+                                if !id.trim().is_empty() =>
+                            {
+                                *captured_for_cb.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some(id.clone());
                             }
                             _ => {}
                         }
@@ -5440,8 +5440,10 @@ mod tests {
             )
             .with_state(Arc::clone(&writes));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{}/v1.0", listener.local_addr().unwrap());
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{}/v1.0", listener.local_addr().unwrap()),
+            ..AppConfig::default()
+        };
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
         let auth = AuthManager::from_tokens(
@@ -5539,8 +5541,10 @@ mod tests {
             let _ = axum::serve(listener, app_router).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "synthetic-tok".into(),
             refresh_token: None,
@@ -5625,8 +5629,10 @@ mod tests {
             let _ = axum::serve(listener, app_router).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "synthetic-tok".into(),
             refresh_token: None,
@@ -5760,8 +5766,10 @@ mod tests {
             let _ = axum::serve(listener, app_router).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "synthetic-tok".into(),
             refresh_token: None,
@@ -6179,8 +6187,10 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "synthetic-tok".into(),
             refresh_token: None,
@@ -6419,8 +6429,10 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "synthetic-tok".into(),
             refresh_token: None,

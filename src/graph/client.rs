@@ -4,7 +4,7 @@
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
-use futures::StreamExt;
+use futures_util::StreamExt;
 use rand::Rng;
 use reqwest::{Method, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -825,8 +825,10 @@ mod tests {
 
     #[test]
     fn test_resolve_url_relative_and_absolute() {
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = "https://graph.microsoft.com/v1.0/".to_string();
+        let cfg = AppConfig {
+            graph_base_url: "https://graph.microsoft.com/v1.0/".to_string(),
+            ..AppConfig::default()
+        };
         let auth = AuthManager::from_tokens(
             cfg.clone(),
             crate::auth::StoredTokens {
@@ -980,10 +982,12 @@ mod tests {
         });
 
         let dir = tempdir().unwrap();
-        let mut cfg = AppConfig::default();
-        cfg.auth_base_url = format!("http://{addr}");
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
-        cfg.tenant_id = "tid".into();
+        let cfg = AppConfig {
+            auth_base_url: format!("http://{addr}"),
+            graph_base_url: format!("http://{addr}/v1.0"),
+            tenant_id: "tid".into(),
+            ..AppConfig::default()
+        };
 
         let tok = crate::auth::StoredTokens {
             access_token: "stale-token".into(),
@@ -1097,8 +1101,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,
@@ -1141,8 +1147,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,

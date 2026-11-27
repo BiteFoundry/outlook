@@ -286,7 +286,7 @@ impl PeriodicBackoffTracker {
             return true;
         }
         self.tick_count = self.tick_count.saturating_add(1);
-        self.tick_count % mult == 0
+        self.tick_count.is_multiple_of(mult)
     }
 }
 
@@ -1998,9 +1998,7 @@ async fn sync_mail_folder_delta_impl(
             }
         }
 
-        let is_terminal = page.delta_link.is_some() || page.next_link.is_none();
-        if !is_terminal {
-            let next = page.next_link.expect("non-terminal page has next_link");
+        if let (None, Some(next)) = (&page.delta_link, page.next_link) {
             let next_key =
                 crate::graph::mail::canonical_delta_url_key(&real_folder_id, Some(&next));
             if !seen_urls.insert(next_key) {
@@ -2960,8 +2958,10 @@ mod tests {
     use crate::models::EmailRecipient;
 
     fn mock_client(base_url: String) -> GraphClient {
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = base_url;
+        let cfg = AppConfig {
+            graph_base_url: base_url,
+            ..AppConfig::default()
+        };
         let tok = StoredTokens {
             access_token: "test-access-token".into(),
             refresh_token: None,
@@ -4493,7 +4493,7 @@ mod tests {
             web_link: None,
             ..Default::default()
         };
-        storage.upsert_mail_messages(&[orig.clone()]).unwrap();
+        storage.upsert_mail_messages(std::slice::from_ref(&orig)).unwrap();
         storage
             .upsert_sync_cursor(&SyncCursor {
                 scope_key: "mail_delta:fld-inbox".into(),
@@ -4915,10 +4915,12 @@ mod tests {
             .unwrap();
 
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let mut cfg = AppConfig::default();
-        cfg.active_poll_ms = 5_000;
-        cfg.mail_poll_ms = 15_000;
-        cfg.calendar_poll_ms = 60_000;
+        let cfg = AppConfig {
+            active_poll_ms: 5_000,
+            mail_poll_ms: 15_000,
+            calendar_poll_ms: 60_000,
+            ..AppConfig::default()
+        };
         let ctrl = spawn_sync_engine(cfg, client, storage, event_tx);
 
         // Overlapping set_focus + SyncFolder + duplicate SyncFolder must run only 1 delta
@@ -5192,10 +5194,12 @@ mod tests {
             .unwrap();
 
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let mut cfg = AppConfig::default();
-        cfg.active_poll_ms = 250;
-        cfg.mail_poll_ms = 500;
-        cfg.calendar_poll_ms = 1_000;
+        let cfg = AppConfig {
+            active_poll_ms: 250,
+            mail_poll_ms: 500,
+            calendar_poll_ms: 1_000,
+            ..AppConfig::default()
+        };
         let ctrl = spawn_sync_engine(cfg, client, storage, event_tx);
 
         // 1. Visible Mail at >2 min (180 s) and >10 min (720 s) idle retains full 250 ms cadence
@@ -5396,8 +5400,10 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,
@@ -5595,8 +5601,10 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,
@@ -5776,8 +5784,10 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,
@@ -5945,8 +5955,10 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,
@@ -6046,11 +6058,13 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
-        cfg.active_poll_ms = 60_000;
-        cfg.mail_poll_ms = 60_000;
-        cfg.calendar_poll_ms = 60_000;
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            active_poll_ms: 60_000,
+            mail_poll_ms: 60_000,
+            calendar_poll_ms: 60_000,
+            ..AppConfig::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,
@@ -6154,11 +6168,13 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
-        cfg.active_poll_ms = 60_000;
-        cfg.mail_poll_ms = 60_000;
-        cfg.calendar_poll_ms = 60_000;
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            active_poll_ms: 60_000,
+            mail_poll_ms: 60_000,
+            calendar_poll_ms: 60_000,
+            ..AppConfig::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,

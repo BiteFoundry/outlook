@@ -279,10 +279,8 @@ fn render_markdown_to_html(
                 TagEnd::Strong => out.push_str("</strong>"),
                 TagEnd::Emphasis => out.push_str("</em>"),
                 TagEnd::Strikethrough => out.push_str("</s>"),
-                TagEnd::Link => {
-                    if link_open_stack.pop().unwrap_or(false) {
-                        out.push_str("</a>");
-                    }
+                TagEnd::Link if link_open_stack.pop().unwrap_or(false) => {
+                    out.push_str("</a>");
                 }
                 _ => {}
             },

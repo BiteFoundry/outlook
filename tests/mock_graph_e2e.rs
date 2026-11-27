@@ -109,24 +109,26 @@ struct MockGraphState {
     inline_png_bytes: RwLock<Vec<u8>>,
 }
 
-fn check_bearer(headers: &HeaderMap, expected: &str) -> Result<(), Response> {
+fn check_bearer(headers: &HeaderMap, expected: &str) -> Option<Response> {
     let actual = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     if actual == Some(expected) {
-        Ok(())
+        None
     } else {
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "error": {
-                    "code": "InvalidAuthenticationToken",
-                    "message": format!("Expected Bearer {expected}, got {actual:?}")
-                }
-            })),
+        Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": {
+                        "code": "InvalidAuthenticationToken",
+                        "message": format!("Expected Bearer {expected}, got {actual:?}")
+                    }
+                })),
+            )
+                .into_response(),
         )
-            .into_response())
     }
 }
 
@@ -161,7 +163,7 @@ async fn oauth_token_handler(
 
 async fn get_me_handler(State(st): State<Arc<MockGraphState>>, headers: HeaderMap) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     if let Some(auth) = headers
@@ -186,7 +188,7 @@ async fn list_mail_folders_handler(
     headers: HeaderMap,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     Json(json!({
@@ -256,7 +258,7 @@ async fn list_folder_messages_handler(
     headers: HeaderMap,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     let q = query.unwrap_or_default();
@@ -280,7 +282,7 @@ async fn list_all_messages_handler(
     headers: HeaderMap,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     let q = query.unwrap_or_default();
@@ -313,7 +315,7 @@ async fn delta_folder_messages_handler(
     headers: HeaderMap,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     let call_num = st.delta_calls.fetch_add(1, Ordering::SeqCst) + 1;
@@ -375,7 +377,7 @@ async fn get_message_handler(
     headers: HeaderMap,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
 
@@ -461,7 +463,7 @@ async fn patch_message_handler(
     Json(payload): Json<Value>,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     st.patched_messages
@@ -476,7 +478,7 @@ async fn list_message_attachments_handler(
     headers: HeaderMap,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     st.attachment_fetch_calls.fetch_add(1, Ordering::SeqCst);
@@ -505,7 +507,7 @@ async fn get_attachment_meta_handler(
     headers: HeaderMap,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     st.attachment_fetch_calls.fetch_add(1, Ordering::SeqCst);
@@ -527,7 +529,7 @@ async fn get_attachment_value_handler(
     headers: HeaderMap,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     st.attachment_fetch_calls.fetch_add(1, Ordering::SeqCst);
@@ -541,7 +543,7 @@ async fn send_mail_handler(
     Json(payload): Json<Value>,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     st.sent_mail_payloads.write().unwrap().push(payload);
@@ -555,7 +557,7 @@ async fn reply_mail_handler(
     Json(payload): Json<Value>,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     st.replied_ids.write().unwrap().push((msg_id, payload));
@@ -569,7 +571,7 @@ async fn forward_mail_handler(
     Json(payload): Json<Value>,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     st.forwarded_ids.write().unwrap().push((msg_id, payload));
@@ -583,7 +585,7 @@ async fn move_mail_handler(
     Json(payload): Json<Value>,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     let dest = payload["destinationId"]
@@ -604,7 +606,7 @@ async fn calendar_view_handler(
     headers: HeaderMap,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     Json(json!({
@@ -683,7 +685,7 @@ async fn create_event_handler(
     Json(payload): Json<Value>,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     if let Some(rejection) = graph_all_day_rejection(&payload) {
@@ -714,7 +716,7 @@ async fn delete_event_handler(
     headers: HeaderMap,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     st.deleted_event_ids.write().unwrap().push(event_id);
@@ -728,7 +730,7 @@ async fn rsvp_event_handler(
     Json(payload): Json<Value>,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     st.rsvp_calls
@@ -743,7 +745,7 @@ async fn list_contacts_handler(
     headers: HeaderMap,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     Json(json!({
@@ -770,7 +772,7 @@ async fn list_directory_users_handler(
     headers: HeaderMap,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     Json(json!({
@@ -801,7 +803,7 @@ async fn list_todo_lists_handler(
     headers: HeaderMap,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     Json(json!({
@@ -823,7 +825,7 @@ async fn list_todo_tasks_handler(
     headers: HeaderMap,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     Json(json!({
@@ -849,7 +851,7 @@ async fn create_todo_task_handler(
     Json(payload): Json<Value>,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     st.created_todo_tasks.write().unwrap().push(payload.clone());
@@ -873,7 +875,7 @@ async fn patch_todo_task_handler(
     Json(payload): Json<Value>,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     let status = payload["status"]
@@ -899,7 +901,7 @@ async fn delete_todo_task_handler(
     headers: HeaderMap,
 ) -> Response {
     let expected = st.expected_token.read().unwrap().clone();
-    if let Err(resp) = check_bearer(&headers, &expected) {
+    if let Some(resp) = check_bearer(&headers, &expected) {
         return resp;
     }
     st.deleted_todo_tasks
@@ -989,13 +991,14 @@ async fn spawn_mock_graph_server(
 }
 
 fn test_config_for_server(base_url: &str) -> AppConfig {
-    let mut cfg = AppConfig::default();
-    cfg.client_id = "e2e-client-id".to_string();
-    cfg.tenant_id = "tenant-e2e".to_string();
-    cfg.auth_base_url = base_url.to_string();
-    cfg.graph_base_url = format!("{base_url}/v1.0");
-    cfg.share_m365_auth = true;
-    cfg
+    AppConfig {
+        client_id: "e2e-client-id".to_string(),
+        tenant_id: "tenant-e2e".to_string(),
+        auth_base_url: base_url.to_string(),
+        graph_base_url: format!("{base_url}/v1.0"),
+        share_m365_auth: true,
+        ..AppConfig::default()
+    }
 }
 
 #[tokio::test]
@@ -1160,7 +1163,9 @@ async fn e2e_mock_graph_auth_shared_m365_mail_delta_and_cid_sixel_preview() {
         Some("chart01@contoso")
     );
     assert!(hydrated.attachments[0].content_bytes_b64.is_some());
-    storage.upsert_mail_messages(&[hydrated.clone()]).unwrap();
+    storage
+        .upsert_mail_messages(std::slice::from_ref(&hydrated))
+        .unwrap();
 
     let blocks = parser::html_in::parse_message_blocks(
         &hydrated.body_html,
@@ -1371,14 +1376,15 @@ async fn e2e_mock_graph_auth_shared_m365_mail_delta_and_cid_sixel_preview() {
         })
         .await
         .expect("send_mail with inline cid");
-    let sent = state.sent_mail_payloads.read().unwrap();
-    assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0]["message"]["attachments"][0]["isInline"], true);
-    assert_eq!(
-        sent[0]["message"]["attachments"][0]["contentId"],
-        "logo@contoso"
-    );
-    drop(sent);
+    {
+        let sent = state.sent_mail_payloads.read().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["message"]["attachments"][0]["isInline"], true);
+        assert_eq!(
+            sent[0]["message"]["attachments"][0]["contentId"],
+            "logo@contoso"
+        );
+    }
 
     graph
         .reply_mail("msg-html-cid", "<p>Thanks Bob!</p>", false)
@@ -1498,11 +1504,12 @@ async fn e2e_mock_graph_calendar_rsvp_contacts_and_todo() {
         .respond_calendar_event("evt-existing-1", EventRsvpAction::Decline, None)
         .await
         .unwrap();
-    let rsvps = state.rsvp_calls.read().unwrap();
-    assert_eq!(rsvps[0].1, "accept");
-    assert_eq!(rsvps[1].1, "tentativelyAccept");
-    assert_eq!(rsvps[2].1, "decline");
-    drop(rsvps);
+    {
+        let rsvps = state.rsvp_calls.read().unwrap();
+        assert_eq!(rsvps[0].1, "accept");
+        assert_eq!(rsvps[1].1, "tentativelyAccept");
+        assert_eq!(rsvps[2].1, "decline");
+    }
 
     graph
         .delete_calendar_event("evt-created-1")
@@ -1567,7 +1574,9 @@ async fn e2e_mock_graph_calendar_rsvp_contacts_and_todo() {
         .expect("create_todo_task");
     assert_eq!(created_task.id, "task-created-1");
     assert!(!created_task.is_completed());
-    storage.upsert_todo_tasks(&[created_task.clone()]).unwrap();
+    storage
+        .upsert_todo_tasks(std::slice::from_ref(&created_task))
+        .unwrap();
 
     let completed = graph
         .set_todo_task_completed("default", &created_task.id, true)

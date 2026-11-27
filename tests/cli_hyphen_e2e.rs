@@ -84,19 +84,21 @@ impl MockCliGraphState {
     }
 }
 
-fn check_bearer(headers: &HeaderMap, expected: &str) -> Result<(), Response> {
+fn check_bearer(headers: &HeaderMap, expected: &str) -> Option<Response> {
     let actual = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     if actual == Some(expected) {
-        Ok(())
+        None
     } else {
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": { "code": "InvalidAuthenticationToken", "message": "bad token" } })),
+        Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": { "code": "InvalidAuthenticationToken", "message": "bad token" } })),
+            )
+                .into_response(),
         )
-            .into_response())
     }
 }
 
@@ -125,7 +127,7 @@ async fn spawn_mock_server(token: String) -> (String, Arc<MockCliGraphState>, to
                 |State(st): State<Arc<MockCliGraphState>>,
                  headers: HeaderMap,
                  Json(payload): Json<Value>| async move {
-                    if let Err(resp) = check_bearer(&headers, &st.expected_token) {
+                    if let Some(resp) = check_bearer(&headers, &st.expected_token) {
                         return resp;
                     }
                     st.sent_mails.write().unwrap().push(payload);
@@ -140,7 +142,7 @@ async fn spawn_mock_server(token: String) -> (String, Arc<MockCliGraphState>, to
                  Path(id): Path<String>,
                  headers: HeaderMap,
                  Json(payload): Json<Value>| async move {
-                    if let Err(resp) = check_bearer(&headers, &st.expected_token) {
+                    if let Some(resp) = check_bearer(&headers, &st.expected_token) {
                         return resp;
                     }
                     st.replies.write().unwrap().push((id, false, payload));
@@ -155,7 +157,7 @@ async fn spawn_mock_server(token: String) -> (String, Arc<MockCliGraphState>, to
                  Path(id): Path<String>,
                  headers: HeaderMap,
                  Json(payload): Json<Value>| async move {
-                    if let Err(resp) = check_bearer(&headers, &st.expected_token) {
+                    if let Some(resp) = check_bearer(&headers, &st.expected_token) {
                         return resp;
                     }
                     st.replies.write().unwrap().push((id, true, payload));
@@ -170,7 +172,7 @@ async fn spawn_mock_server(token: String) -> (String, Arc<MockCliGraphState>, to
                  Path(id): Path<String>,
                  headers: HeaderMap,
                  Json(payload): Json<Value>| async move {
-                    if let Err(resp) = check_bearer(&headers, &st.expected_token) {
+                    if let Some(resp) = check_bearer(&headers, &st.expected_token) {
                         return resp;
                     }
                     st.forwards.write().unwrap().push((id, payload));
@@ -184,7 +186,7 @@ async fn spawn_mock_server(token: String) -> (String, Arc<MockCliGraphState>, to
                 |State(st): State<Arc<MockCliGraphState>>,
                  Path(id): Path<String>,
                  headers: HeaderMap| async move {
-                    if let Err(resp) = check_bearer(&headers, &st.expected_token) {
+                    if let Some(resp) = check_bearer(&headers, &st.expected_token) {
                         return resp;
                     }
                     let draft = st.draft.read().unwrap().clone();
@@ -234,7 +236,7 @@ async fn spawn_mock_server(token: String) -> (String, Arc<MockCliGraphState>, to
                  Path(id): Path<String>,
                  headers: HeaderMap,
                  Json(payload): Json<Value>| async move {
-                    if let Err(resp) = check_bearer(&headers, &st.expected_token) {
+                    if let Some(resp) = check_bearer(&headers, &st.expected_token) {
                         return resp;
                     }
                     st.draft_patches.write().unwrap().push((id, payload.clone()));
@@ -259,7 +261,7 @@ async fn spawn_mock_server(token: String) -> (String, Arc<MockCliGraphState>, to
                 |State(st): State<Arc<MockCliGraphState>>,
                  RawQuery(query): RawQuery,
                  headers: HeaderMap| async move {
-                    if let Err(resp) = check_bearer(&headers, &st.expected_token) {
+                    if let Some(resp) = check_bearer(&headers, &st.expected_token) {
                         return resp;
                     }
                     let q = query.unwrap_or_default();
@@ -289,7 +291,7 @@ async fn spawn_mock_server(token: String) -> (String, Arc<MockCliGraphState>, to
                 |State(st): State<Arc<MockCliGraphState>>,
                  headers: HeaderMap,
                  Json(payload): Json<Value>| async move {
-                    if let Err(resp) = check_bearer(&headers, &st.expected_token) {
+                    if let Some(resp) = check_bearer(&headers, &st.expected_token) {
                         return resp;
                     }
                     st.created_events.write().unwrap().push(payload.clone());
@@ -314,7 +316,7 @@ async fn spawn_mock_server(token: String) -> (String, Arc<MockCliGraphState>, to
                  Path((id, action)): Path<(String, String)>,
                  headers: HeaderMap,
                  Json(payload): Json<Value>| async move {
-                    if let Err(resp) = check_bearer(&headers, &st.expected_token) {
+                    if let Some(resp) = check_bearer(&headers, &st.expected_token) {
                         return resp;
                     }
                     st.rsvp_calls.write().unwrap().push((id, action, payload));
@@ -326,7 +328,7 @@ async fn spawn_mock_server(token: String) -> (String, Arc<MockCliGraphState>, to
             "/v1.0/me/todo/lists",
             get(
                 |State(st): State<Arc<MockCliGraphState>>, headers: HeaderMap| async move {
-                    if let Err(resp) = check_bearer(&headers, &st.expected_token) {
+                    if let Some(resp) = check_bearer(&headers, &st.expected_token) {
                         return resp;
                     }
                     Json(json!({
@@ -351,7 +353,7 @@ async fn spawn_mock_server(token: String) -> (String, Arc<MockCliGraphState>, to
                  Path(list_id): Path<String>,
                  headers: HeaderMap,
                  Json(payload): Json<Value>| async move {
-                    if let Err(resp) = check_bearer(&headers, &st.expected_token) {
+                    if let Some(resp) = check_bearer(&headers, &st.expected_token) {
                         return resp;
                     }
                     st.created_tasks
@@ -376,7 +378,7 @@ async fn spawn_mock_server(token: String) -> (String, Arc<MockCliGraphState>, to
                  Path((list_id, task_id)): Path<(String, String)>,
                  headers: HeaderMap,
                  Json(payload): Json<Value>| async move {
-                    if let Err(resp) = check_bearer(&headers, &st.expected_token) {
+                    if let Some(resp) = check_bearer(&headers, &st.expected_token) {
                         return resp;
                     }
                     st.patched_tasks

@@ -687,9 +687,9 @@ fn draw_status_bar(
     let mini_right_w = seg_width(&mini_segments);
 
     let chosen_right: &[(&str, Option<ButtonId>)] =
-        if full_left_w + 2 + full_right_w <= area.width {
-            &full_segments
-        } else if badge_w + 14 + full_right_w <= area.width {
+        if full_left_w + 2 + full_right_w <= area.width
+            || badge_w + 14 + full_right_w <= area.width
+        {
             &full_segments
         } else if badge_w + 10 + compact_right_w <= area.width {
             &compact_segments
@@ -1534,8 +1534,7 @@ mod tests {
         let mut short = Terminal::new(TestBackend::new(80, 9)).unwrap();
 
         // Settings scroll window keeps item 11 visible & clickable in short terminal
-        let mut settings = SettingsState::default();
-        settings.selected = 11;
+        let settings = SettingsState { selected: 11 };
         ui.push_overlay(Overlay::Settings(settings));
         short
             .draw(|f| {

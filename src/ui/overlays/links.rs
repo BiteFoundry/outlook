@@ -412,10 +412,7 @@ fn find_matching_paren(bytes: &[u8], start: usize) -> Option<usize> {
 
 fn trim_trailing_url_punct(raw: &str) -> &str {
     let mut s = raw;
-    loop {
-        let Some(last) = s.chars().last() else {
-            break;
-        };
+    while let Some(last) = s.chars().last() {
         let should_strip = match last {
             '.' | ',' | ';' | ':' | '!' | '?' => true,
             ')' => {

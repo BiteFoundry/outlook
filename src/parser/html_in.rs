@@ -36,8 +36,8 @@ impl HtmlParseCache {
     }
 
     fn insert(&mut self, key: HtmlCacheKey, value: Arc<[RichBlock]>) {
-        if self.entries.contains_key(&key) {
-            self.entries.insert(key, value);
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = self.entries.entry(key) {
+            entry.insert(value);
             if self.order.back() != Some(&key) {
                 if let Some(pos) = self.order.iter().rposition(|k| *k == key) {
                     self.order.remove(pos);
@@ -858,10 +858,10 @@ impl ParserContext {
                     | MdTagEnd::Emphasis
                     | MdTagEnd::Strikethrough
                     | MdTagEnd::Link
-                    | MdTagEnd::Image => {
-                        if style_stack.len() > 1 {
-                            style_stack.pop();
-                        }
+                    | MdTagEnd::Image
+                        if style_stack.len() > 1 =>
+                    {
+                        style_stack.pop();
                     }
                     _ => {}
                 },
@@ -916,11 +916,9 @@ impl ParserContext {
                         &TextStyleFlags::default(),
                     );
                 }
-                MdEvent::Rule => {
-                    if blockquote_depth == 0 && list_depth == 0 {
-                        flush_paragraph(self, &mut cur_spans);
-                        self.push_block(RichBlock::Divider);
-                    }
+                MdEvent::Rule if blockquote_depth == 0 && list_depth == 0 => {
+                    flush_paragraph(self, &mut cur_spans);
+                    self.push_block(RichBlock::Divider);
                 }
                 _ => {}
             }
@@ -1710,30 +1708,29 @@ fn row_has_th_or_block_td(row_el: ElementRef<'_>, has_th: &mut bool, has_block_t
     for cell in row_el.children().filter_map(ElementRef::wrap) {
         match cell.value().name() {
             "th" => *has_th = true,
-            "td" => {
-                if cell.descendants().skip(1).any(|desc| {
-                    ElementRef::wrap(desc).is_some_and(|el| {
-                        matches!(
-                            el.value().name(),
-                            "div"
-                                | "p"
-                                | "ul"
-                                | "ol"
-                                | "blockquote"
-                                | "pre"
-                                | "h1"
-                                | "h2"
-                                | "h3"
-                                | "h4"
-                                | "h5"
-                                | "h6"
-                                | "hr"
-                                | "table"
-                        )
-                    })
-                }) {
-                    *has_block_td = true;
-                }
+            "td" if cell.descendants().skip(1).any(|desc| {
+                ElementRef::wrap(desc).is_some_and(|el| {
+                    matches!(
+                        el.value().name(),
+                        "div"
+                            | "p"
+                            | "ul"
+                            | "ol"
+                            | "blockquote"
+                            | "pre"
+                            | "h1"
+                            | "h2"
+                            | "h3"
+                            | "h4"
+                            | "h5"
+                            | "h6"
+                            | "hr"
+                            | "table"
+                    )
+                })
+            }) =>
+            {
+                *has_block_td = true;
             }
             _ => {}
         }
@@ -2052,10 +2049,10 @@ fn parse_markdown_inline_spans_block(segment: &str) -> Vec<RichSpan> {
                 | MdTagEnd::Emphasis
                 | MdTagEnd::Strikethrough
                 | MdTagEnd::Link
-                | MdTagEnd::Image => {
-                    if style_stack.len() > 1 {
-                        style_stack.pop();
-                    }
+                | MdTagEnd::Image
+                    if style_stack.len() > 1 =>
+                {
+                    style_stack.pop();
                 }
                 _ => {}
             },

@@ -3157,7 +3157,7 @@ async fn cmd_mail_list(
                 };
                 return print_mail_list_output(folder, &resolved.id, page, json_out, compact);
             }
-            CursorPos::Offset(_) => unreachable!(),
+            CursorPos::Offset(_) => bail!("invalid cursor: not valid for this command"),
         }
     }
 
@@ -4014,7 +4014,7 @@ async fn cmd_mail_search(
         ]);
         parsed.require_scope(&scope)?;
         let CursorPos::Graph { skip, url } = parsed.pos else {
-            unreachable!();
+            bail!("invalid cursor: not valid for this command");
         };
         if !crate::graph::client::graph_base_owns_url(&cfg.graph_base_url, &url) {
             bail!("invalid cursor: url is not a Graph URL for this account");
@@ -5077,7 +5077,7 @@ async fn cmd_sync(cfg: &AppConfig, days: i64, limit: usize, json_out: bool) -> R
     let (inbox_res, todo_task_results) = tokio::join!(
         crate::sync::sync_mail_folder_delta("inbox", &graph, &storage, None, false),
         async {
-            use futures::stream::{self, StreamExt};
+            use futures_util::stream::{self, StreamExt};
             stream::iter(todo_lists_for_tasks.iter())
                 .map(|list| {
                     let g = &graph;

@@ -761,8 +761,10 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::OpenSearchWithQuery(query) => {
             ui.close_overlays_of(OverlayKind::Search);
-            let mut search = SearchOverlay::default();
-            search.query = query.clone();
+            let search = SearchOverlay {
+                query: query.clone(),
+                ..SearchOverlay::default()
+            };
             ui.push_overlay(Overlay::Search(search));
             if !query.trim().is_empty() {
                 app.search_local_mail(ui, query);

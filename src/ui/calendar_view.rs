@@ -167,7 +167,7 @@ fn draw_agenda_header(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut 
                 )),
                 Rect::new(area.x, area.y, area.width.saturating_sub(bw + 1), 1),
             );
-            if area.width >= bw + 1 {
+            if area.width > bw {
                 let r = Rect::new(area.right().saturating_sub(bw + 1), area.y, bw, 1);
                 frame.render_widget(
                     Paragraph::new(Span::styled(btn, bar_style.fg(theme.accent))),
@@ -191,7 +191,7 @@ fn draw_agenda_header(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut 
         )),
         Rect::new(area.x, area.y, area.width.saturating_sub(bw + 1), 1),
     );
-    if area.width >= bw + 1 {
+    if area.width > bw {
         let r = Rect::new(area.right().saturating_sub(bw + 1), area.y, bw, 1);
         frame.render_widget(
             Paragraph::new(Span::styled(btn, bar_style.fg(theme.accent))),
