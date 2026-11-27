@@ -438,7 +438,7 @@ async fn current_token_fingerprint(graph: &GraphClient) -> String {
         Some(tokens) => {
             let mut hasher = Sha256::new();
             hasher.update(tokens.access_token.as_bytes());
-            hex::encode(hasher.finalize())
+            crate::hex_encode(hasher.finalize())
         }
         None => String::new(),
     }

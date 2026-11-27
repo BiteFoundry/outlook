@@ -538,7 +538,7 @@ impl AppState {
         let mut draft_store = DraftStore::load_from(&draft_store_path).unwrap_or_default();
         for entry in draft_store.mail.values_mut() {
             if entry.compose_id.is_empty() {
-                entry.compose_id = uuid::Uuid::new_v4().to_string();
+                entry.compose_id = crate::new_uuid_v4();
             }
         }
         Self {
@@ -2032,7 +2032,7 @@ impl AppState {
         } else {
             if let Some(mut previous) = self.draft_store.remove_mail(&key) {
                 if previous.compose_id.is_empty() {
-                    previous.compose_id = uuid::Uuid::new_v4().to_string();
+                    previous.compose_id = crate::new_uuid_v4();
                 }
                 self.draft_store
                     .set_mail(format!("{key}:{}", previous.compose_id), previous);
@@ -2155,7 +2155,7 @@ impl AppState {
             .iter()
             .map(|img| (&img.temp_id, &img.content_id, &img.file_name))
             .collect();
-        let body_hash = hex::encode(Sha256::digest(
+        let body_hash = crate::hex_encode(Sha256::digest(
             serde_json::to_vec(&(&entry.body, image_refs)).expect("draft body consists of strings"),
         ));
         let fields = MailDraftFields {

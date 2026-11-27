@@ -537,7 +537,7 @@ fn generate_serve_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
-    hex::encode(bytes)
+    crate::hex_encode(bytes)
 }
 
 /// Host names accepted in keyless mode besides loopback: a specific non-loopback bind address and

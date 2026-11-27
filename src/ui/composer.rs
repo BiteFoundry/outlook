@@ -220,7 +220,7 @@ impl ComposerState {
     ) -> String {
         self.pending_preview = preview;
         let idx = self.pending_images.len() + 1;
-        let temp_id = uuid::Uuid::new_v4().to_string();
+        let temp_id = crate::new_uuid_v4();
         let content_id = format!("inline-img-{temp_id}@outlook-cli");
         let name = file_name.unwrap_or_else(|| format!("screenshot-{idx}.png"));
         self.pending_images.push(InlineImageUpload {

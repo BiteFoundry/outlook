@@ -479,7 +479,7 @@ pub(crate) fn verify_sha256_sums(
         bail!("Checksum entry for '{asset_name}' not found in SHA256SUMS.txt");
     };
 
-    let actual = hex::encode(Sha256::digest(asset_bytes));
+    let actual = crate::hex_encode(Sha256::digest(asset_bytes));
     if !actual.eq_ignore_ascii_case(&expected) {
         bail!(
             "SHA-256 verification failed ({asset_name}): expected {expected}, actual {actual}"
@@ -488,13 +488,58 @@ pub(crate) fn verify_sha256_sums(
     Ok(())
 }
 
+struct TempExtractDir {
+    path: PathBuf,
+}
+
+impl TempExtractDir {
+    fn new() -> std::io::Result<Self> {
+        use rand::RngCore;
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        for _ in 0..16 {
+            let mut nonce = [0u8; 16];
+            rand::rngs::OsRng.fill_bytes(&mut nonce);
+            let candidate = base.join(format!("outlook-update-{pid}-{}", crate::hex_encode(nonce)));
+            #[cfg(unix)]
+            let res = {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new().mode(0o700).create(&candidate)
+            };
+            #[cfg(not(unix))]
+            let res = std::fs::create_dir(&candidate);
+
+            match res {
+                Ok(()) => return Ok(Self { path: candidate }),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "exhausted temporary directory name collisions",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempExtractDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 fn extract_binary_from_asset(asset_name: &str, asset_bytes: &[u8]) -> Result<Vec<u8>> {
     let lower = asset_name.to_ascii_lowercase();
     if !lower.ends_with(".tar.gz") && !lower.ends_with(".tgz") && !lower.ends_with(".zip") {
         return Ok(asset_bytes.to_vec());
     }
 
-    let tmp = tempfile::tempdir().context("Failed to create temporary directory for update extraction")?;
+    let tmp = TempExtractDir::new()
+        .context("Failed to create temporary directory for update extraction")?;
     let archive_path = tmp.path().join(asset_name);
     std::fs::write(&archive_path, asset_bytes)
         .with_context(|| format!("Failed to save temporary archive: {}", archive_path.display()))?;
@@ -662,7 +707,7 @@ mod tests {
     #[test]
     fn test_sha256_verification_success_and_mismatch() {
         let payload = b"outlook-binary-content-v0.2.0";
-        let digest = hex::encode(Sha256::digest(payload));
+        let digest = crate::hex_encode(Sha256::digest(payload));
         let sums = format!("{digest}  outlook.exe\n0000000000000000000000000000000000000000000000000000000000000000  other.tar.gz\n");
         verify_sha256_sums(&sums, "outlook.exe", payload).unwrap();
 
@@ -798,7 +843,7 @@ mod tests {
             "outlook"
         }
         .to_string();
-        let digest = hex::encode(Sha256::digest(&new_binary));
+        let digest = crate::hex_encode(Sha256::digest(&new_binary));
         let sums_text = format!("{digest}  {asset_name}\n");
 
         let state = MockReleaseState {
@@ -1077,5 +1122,24 @@ mod tests {
         );
         assert_eq!(std::fs::read(&decoy).unwrap(), b"untouched");
         assert_eq!(std::fs::read(&real_bin).unwrap(), b"v1");
+    }
+
+    #[test]
+    fn test_temp_extract_dir_creates_and_cleans_up_on_drop() {
+        let dir_path = {
+            let tmp = TempExtractDir::new().unwrap();
+            assert!(tmp.path().is_dir());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(tmp.path()).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o700);
+            }
+            let nested = tmp.path().join("extracted");
+            std::fs::create_dir(&nested).unwrap();
+            std::fs::write(nested.join("outlook"), b"bin").unwrap();
+            tmp.path().to_path_buf()
+        };
+        assert!(!dir_path.exists());
     }
 }

@@ -2281,7 +2281,6 @@ dependencies = [
  "crossterm",
  "dirs",
  "futures-util",
- "hex",
  "iana-time-zone",
  "image",
  "keyring",
@@ -2304,7 +2303,6 @@ dependencies = [
  "unicode-width 0.2.3",
  "url",
  "urlencoding",
- "uuid",
 ]
 
 [[package]]

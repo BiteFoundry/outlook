@@ -78,7 +78,7 @@ impl MailComposeOverlay {
     pub fn new() -> Self {
         Self {
             mode: MailComposeMode::New,
-            compose_id: uuid::Uuid::new_v4().to_string(),
+            compose_id: crate::new_uuid_v4(),
             draft_id: None,
             thread_headers: None,
             to: String::new(),

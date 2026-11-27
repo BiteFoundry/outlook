@@ -414,7 +414,7 @@ impl AsyncWrite for IpcStream {
 fn generate_secret() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
+    crate::hex_encode(bytes)
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -546,7 +546,7 @@ fn config_dir_short_hash(config_dir: &Path) -> String {
     {
         hasher.update(canonical.to_string_lossy().as_bytes());
     }
-    let digest = hex::encode(hasher.finalize());
+    let digest = crate::hex_encode(hasher.finalize());
     digest[..12].to_string()
 }
 

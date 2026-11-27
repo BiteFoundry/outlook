@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use tokio::io::AsyncReadExt;
-use uuid::Uuid;
 
 use super::GraphClient;
 use crate::models::{DownloadedFile, MailAttachment};
@@ -136,7 +135,7 @@ pub fn deduplicate_dest_path(dest_dir: &Path, safe_name: &str) -> PathBuf {
             return next_path;
         }
     }
-    dest_dir.join(format!("{stem}_{}", Uuid::new_v4()))
+    dest_dir.join(format!("{stem}_{}", crate::new_uuid_v4()))
 }
 
 pub fn guess_mime_type(path: &Path) -> &'static str {

@@ -1891,7 +1891,7 @@ async fn e2e_agent_surfaces_http_openapi_mcp_and_self_updater() {
         _ => raw_bin_asset.clone(),
     };
     let new_binary = b"NEW-OUTLOOK-VERIFIED-BINARY".to_vec();
-    let valid_digest = hex::encode(Sha256::digest(&new_binary));
+    let valid_digest = outlook_cli::hex_encode(Sha256::digest(&new_binary));
 
     // 4a. Check the versioned release archive.
     let gh_listener_check = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4468,8 +4468,8 @@ async fn regression_outlook_outlook_12_mcp_offline_attachment_download() {
     assert_eq!(total_graph_calls.load(Ordering::SeqCst), 0);
     let saved_cached = std::fs::read(val3["path"].as_str().unwrap()).unwrap();
     assert_eq!(
-        hex::encode(Sha256::digest(&saved_cached)),
-        hex::encode(Sha256::digest(&cached_bytes))
+        outlook_cli::hex_encode(Sha256::digest(&saved_cached)),
+        outlook_cli::hex_encode(Sha256::digest(&cached_bytes))
     );
 
     // 4. Control: online miss (offline=false) downloads via /$value path
