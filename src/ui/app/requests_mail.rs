@@ -35,6 +35,7 @@ impl AppState {
                 m.is_read = new_read;
             }
         }
+        self.bump_mail_gen();
         let _ = self.storage.set_mail_read_local(&id, new_read);
         self.refresh_mail_folders_from_storage();
         if !self.active_mail_is_visible(ui) {
@@ -81,6 +82,7 @@ impl AppState {
                 m.flagged = new_flag;
             }
         }
+        self.bump_mail_gen();
         let _ = self.storage.set_mail_flagged_local(&id, new_flag);
         if !self.active_mail_is_visible(ui) {
             self.reselect_after_removal(ui, prev_sel);
@@ -129,6 +131,7 @@ impl AppState {
             if self.pinned_mail.as_ref().is_some_and(|p| p.id == id) {
                 self.pinned_mail = None;
             }
+            self.bump_mail_gen();
         }
         let _ = self.storage.move_mail_folder_local(&id, &archive_id);
         self.refresh_mail_folders_from_storage();
@@ -210,6 +213,7 @@ impl AppState {
         if self.pinned_mail.as_ref().is_some_and(|p| p.id == id) {
             self.pinned_mail = None;
         }
+        self.bump_mail_gen();
         if in_trash {
             let _ = self.storage.delete_mail_messages_by_ids(std::slice::from_ref(&id));
         } else {
@@ -217,6 +221,7 @@ impl AppState {
         }
         if let Ok(folders) = self.storage.list_mail_folders() {
             self.mail_folders = folders;
+            self.bump_folders_gen();
         }
         self.reselect_after_removal(ui, prev_sel);
         ui.info(if in_trash { "Deleted permanently" } else { "Moved to Trash" });
@@ -313,6 +318,7 @@ impl AppState {
             {
                 self.pinned_mail = None;
             }
+            self.bump_mail_gen();
         }
         for id in &message_ids {
             let _ = self
@@ -769,6 +775,7 @@ impl AppState {
             .delete_mail_messages_by_ids(std::slice::from_ref(&id_owned));
         if let Ok(folders) = self.storage.list_mail_folders() {
             self.mail_folders = folders;
+            self.bump_folders_gen();
         }
 
         let prev_sel = ui.mail_list_scroll.selected_idx.unwrap_or(0);
@@ -781,6 +788,7 @@ impl AppState {
         if self.pinned_mail.as_ref().is_some_and(|p| p.id == id) {
             self.pinned_mail = None;
         }
+        self.bump_mail_gen();
         self.search_results.retain(|h| h.id != id);
         if was_in_list || was_active {
             self.reselect_after_removal(ui, prev_sel);

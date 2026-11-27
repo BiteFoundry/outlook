@@ -983,6 +983,56 @@ pub fn get_mail_message(conn: &Connection, message_id: &str) -> Result<Option<Ma
         .map_err(Into::into)
 }
 
+/// Lightweight check for whether a cached mail message already has its full body loaded,
+/// avoiding fetching large HTML/text blobs and 9 JSON deserializations.
+pub fn is_mail_body_loaded(conn: &Connection, message_id: &str) -> Result<bool> {
+    let mut stmt = conn.prepare_cached("SELECT body_loaded FROM mail_messages WHERE id = ?1")?;
+    let loaded: Option<i32> = stmt.query_row(params![message_id], |row| row.get(0)).optional()?;
+    Ok(loaded.is_some_and(|v| v != 0))
+}
+
+/// Batch lookup returning the subset of `message_ids` whose cached row already has `body_loaded != 0`.
+pub fn mail_body_loaded_set(conn: &Connection, message_ids: &[String]) -> Result<HashSet<String>> {
+    let mut loaded = HashSet::new();
+    if message_ids.is_empty() {
+        return Ok(loaded);
+    }
+    for chunk in message_ids.chunks(500) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            "SELECT id FROM mail_messages WHERE body_loaded != 0 AND id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            row.get::<_, String>(0)
+        })?;
+        for row in rows {
+            loaded.insert(row?);
+        }
+    }
+    Ok(loaded)
+}
+
+/// Batch existence check returning the subset of `message_ids` already present in `mail_messages`.
+pub fn existing_mail_id_set(conn: &Connection, message_ids: &[&str]) -> Result<HashSet<String>> {
+    let mut existing = HashSet::new();
+    if message_ids.is_empty() {
+        return Ok(existing);
+    }
+    for chunk in message_ids.chunks(500) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!("SELECT id FROM mail_messages WHERE id IN ({placeholders})");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            row.get::<_, String>(0)
+        })?;
+        for row in rows {
+            existing.insert(row?);
+        }
+    }
+    Ok(existing)
+}
+
 pub fn set_mail_read_local(conn: &mut Connection, message_id: &str, is_read: bool) -> Result<()> {
     let tx = conn.transaction()?;
     {

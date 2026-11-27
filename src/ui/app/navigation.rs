@@ -191,7 +191,7 @@ impl AppState {
             .unwrap_or_default();
 
         self.select_first_visible_mail(ui);
-        let rows = self.visible_mail_rows(ui);
+        let rows = self.visible_mail_rows_cached(ui);
         if let Some(sel) = ui.mail_list_scroll.selected_idx {
             self.queue_adjacent_mail_prefetch(&rows, sel);
         }
@@ -247,7 +247,7 @@ impl AppState {
     }
 
     pub fn select_first_visible_mail(&mut self, ui: &mut UiState) {
-        let rows = self.visible_mail_rows(ui);
+        let rows = self.visible_mail_rows_cached(ui);
         if let Some(first) = rows.first() {
             ui.mail_list_scroll.selected_idx = Some(0);
             if let Some(msg_id) = self
@@ -266,7 +266,7 @@ impl AppState {
     }
 
     pub fn select_mail_row(&mut self, ui: &mut UiState, row_idx: usize) {
-        let rows = self.visible_mail_rows(ui);
+        let rows = self.visible_mail_rows_cached(ui);
         if rows.is_empty() {
             ui.mail_list_scroll.selected_idx = None;
             self.active_mail_id = None;
@@ -288,6 +288,7 @@ impl AppState {
                 .is_some_and(|p| p.id != msg_id)
             {
                 self.pinned_mail = None;
+                self.bump_mail_gen();
             }
             self.active_mail_id = Some(msg_id);
             self.sync_displayed_mail_details(ui.group_threads, true);
@@ -320,7 +321,7 @@ impl AppState {
     }
 
     pub(super) fn reselect_after_removal(&mut self, ui: &mut UiState, prev_sel: usize) {
-        let rows = self.visible_mail_rows(ui);
+        let rows = self.visible_mail_rows_cached(ui);
         if rows.is_empty() {
             ui.mail_list_scroll.selected_idx = None;
             self.active_mail_id = None;

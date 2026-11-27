@@ -1,6 +1,8 @@
 //! Local cache loading, folder/thread projections, and selection reconciliation.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use chrono::{Datelike, Duration, Local};
 
@@ -10,7 +12,28 @@ use crate::sync::SyncCommand;
 use super::super::nav_pane::{
     find_folder_by_wellknown, VIRTUAL_FLAGGED_FOLDER, VIRTUAL_UNREAD_FOLDER,
 };
+use super::state::{VisibleMailRowsCache, VisibleMailRowsKey};
 use super::{AppState, CalendarRangeFilter, MailListRow, UiState};
+
+fn mail_list_endpoints_sig(messages: &[MailMessage]) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    messages.len().hash(&mut h);
+    if let Some(first) = messages.first() {
+        first.id.hash(&mut h);
+        first.is_read.hash(&mut h);
+        first.flagged.hash(&mut h);
+        first.received_at.hash(&mut h);
+    }
+    if messages.len() > 1 {
+        if let Some(last) = messages.last() {
+            last.id.hash(&mut h);
+            last.is_read.hash(&mut h);
+            last.flagged.hash(&mut h);
+            last.received_at.hash(&mut h);
+        }
+    }
+    h.finish()
+}
 
 impl AppState {
     /// Start-up load: the cached Inbox, with the selection on the first message the active list
@@ -25,6 +48,7 @@ impl AppState {
     pub fn load_cached_initial(&mut self) {
         if let Ok(folders) = self.storage.list_mail_folders() {
             self.mail_folders = folders;
+            self.bump_folders_gen();
             if let Some(inbox) =
                 find_folder_by_wellknown(&self.mail_folders, "inbox", &["Inbox", "받은 편지함"])
             {
@@ -168,6 +192,35 @@ impl AppState {
     }
 
     pub fn visible_mail_rows(&self, ui: &UiState) -> Vec<MailListRow> {
+        self.visible_mail_rows_cached(ui).to_vec()
+    }
+
+    pub fn visible_mail_rows_cached(&self, ui: &UiState) -> Arc<[MailListRow]> {
+        let key = VisibleMailRowsKey {
+            mail_data_gen: self.mail_data_gen,
+            msg_len: self.mail_messages.len(),
+            msg_ptr: self.mail_messages.as_ptr() as usize,
+            endpoints_sig: mail_list_endpoints_sig(&self.mail_messages),
+            active_folder_id: self.active_folder_id.clone(),
+            mail_unread_only: ui.mail_unread_only,
+            focused_only: ui.focused_only,
+            group_threads: ui.group_threads,
+        };
+        if let Some(ref cached) = *self.visible_mail_rows_cache.borrow() {
+            if cached.key == key {
+                return Arc::clone(&cached.rows);
+            }
+        }
+
+        let built: Arc<[MailListRow]> = Arc::from(self.compute_visible_mail_rows(ui));
+        *self.visible_mail_rows_cache.borrow_mut() = Some(VisibleMailRowsCache {
+            key,
+            rows: Arc::clone(&built),
+        });
+        built
+    }
+
+    fn compute_visible_mail_rows(&self, ui: &UiState) -> Vec<MailListRow> {
         let mut indices: Vec<usize> = self
             .mail_messages
             .iter()
@@ -214,17 +267,16 @@ impl AppState {
                 .collect();
         }
 
-        let mut rows: Vec<MailListRow> = Vec::new();
-        let mut conv_to_row: HashMap<String, usize> = HashMap::new();
+        let mut rows: Vec<MailListRow> = Vec::with_capacity(indices.len());
+        let mut conv_to_row: HashMap<&str, usize> = HashMap::with_capacity(indices.len());
         for idx in indices {
             let m = &self.mail_messages[idx];
-            let conv_key = m
+            let conv_key: &str = m
                 .conversation_id
                 .as_deref()
                 .filter(|s| !s.trim().is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| m.id.clone());
-            if let Some(&pos) = conv_to_row.get(&conv_key) {
+                .unwrap_or(m.id.as_str());
+            if let Some(&pos) = conv_to_row.get(conv_key) {
                 let row = &mut rows[pos];
                 row.thread_msg_indices.push(idx);
                 row.unread_count += usize::from(!m.is_read);
@@ -309,11 +361,13 @@ impl AppState {
     pub(crate) fn clear_mail_detail_cache(&mut self) {
         self.mail_detail_cache.clear();
         self.mail_detail_missing.clear();
+        self.bump_mail_gen();
     }
 
     pub(crate) fn cache_loaded_mail_detail(&mut self, msg: MailMessage) {
         self.mail_detail_missing.remove(&msg.id);
         self.mail_detail_cache.insert(msg.id.clone(), msg);
+        self.bump_mail_gen();
     }
 
     pub(crate) fn resolve_mail_for_action(&mut self, id: &str) -> Option<MailMessage> {
@@ -376,6 +430,7 @@ impl AppState {
             match self.storage.get_mail_message(id) {
                 Ok(Some(full)) => {
                     self.mail_detail_cache.insert(id.to_string(), full);
+                    self.bump_mail_gen();
                 }
                 Ok(None) => {
                     self.mail_detail_missing.insert(id.to_string());
@@ -500,6 +555,7 @@ impl AppState {
         if let Some(pinned_id) = self.pinned_mail.as_ref().map(|p| p.id.clone()) {
             if let Ok(Some(fresh)) = self.storage.get_mail_message(&pinned_id) {
                 self.pinned_mail = Some(fresh);
+                self.bump_mail_gen();
             }
         }
         if let Some(ref pinned) = self.pinned_mail {
@@ -507,6 +563,7 @@ impl AppState {
                 && !self.mail_messages.iter().any(|m| m.id == pinned.id)
             {
                 self.mail_messages.push(Self::mail_summary_from(pinned));
+                self.bump_mail_gen();
             }
         }
     }
@@ -519,6 +576,7 @@ impl AppState {
         if let Ok(folders) = self.storage.list_mail_folders() {
             if !folders.is_empty() {
                 self.mail_folders = folders;
+                self.bump_folders_gen();
             }
         }
     }
@@ -527,7 +585,7 @@ impl AppState {
         let Some(ref active_id) = self.active_mail_id else {
             return false;
         };
-        let rows = self.visible_mail_rows(ui);
+        let rows = self.visible_mail_rows_cached(ui);
         rows.iter().any(|r| {
             r.thread_msg_indices
                 .iter()
@@ -551,7 +609,7 @@ impl AppState {
         let Some(ref active_id) = self.active_mail_id else {
             return;
         };
-        let rows = self.visible_mail_rows(ui);
+        let rows = self.visible_mail_rows_cached(ui);
         if let Some(pos) = rows.iter().position(|r| {
             r.thread_msg_indices
                 .iter()

@@ -27,11 +27,11 @@ pub fn search_mail(
     let folder = folder_id.map(str::trim).filter(|s| !s.is_empty());
 
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-    let all_tokens_at_least_3 = tokens.iter().all(|t| t.chars().count() >= 3);
+    let all_tokens_at_least_3 = !tokens.is_empty() && tokens.iter().all(|t| t.chars().count() >= 3);
     if trigram_enabled && trimmed.chars().count() >= 3 {
         if let Some(fts_query) = build_fts_query(trimmed, &tokens, all_tokens_at_least_3) {
             if let Ok(hits) = run_mail_fts_search(conn, &fts_query, trimmed, folder, limit) {
-                if !hits.is_empty() {
+                if !hits.is_empty() || all_tokens_at_least_3 {
                     return Ok(hits);
                 }
             }

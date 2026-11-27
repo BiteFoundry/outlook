@@ -544,6 +544,7 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 if !app.expanded_quoted_ids.remove(&id) {
                     app.expanded_quoted_ids.insert(id);
                 }
+                app.bump_mail_gen();
             }
         }
         Action::DownloadLatestAttachment => {
@@ -793,6 +794,7 @@ fn dispatch_core(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     app.select_mail_folder(ui, fid);
                 } else {
                     app.pinned_mail = None;
+                    app.bump_mail_gen();
                 }
                 let mut needs_hydrate = true;
                 if let Some(msg) = stored_msg {
@@ -1066,7 +1068,7 @@ fn cycle_focus(ui: &mut UiState, forward: bool) {
 }
 
 fn activate_nav_row(app: &mut AppState, ui: &mut UiState, idx: usize) {
-    let rows = super::nav_pane::build_nav_rows(app, ui);
+    let rows = super::nav_pane::build_nav_rows_cached(app, ui);
     let Some(row) = rows.get(idx).cloned() else {
         return;
     };
@@ -1100,8 +1102,8 @@ fn activate_nav_row(app: &mut AppState, ui: &mut UiState, idx: usize) {
 }
 
 /// The folder-pane rows and the index of the selected one (clamped), when there are rows.
-fn selected_nav_row(app: &AppState, ui: &UiState) -> Option<(Vec<NavRow>, usize)> {
-    let rows = super::nav_pane::build_nav_rows(app, ui);
+fn selected_nav_row(app: &AppState, ui: &UiState) -> Option<(std::sync::Arc<[NavRow]>, usize)> {
+    let rows = super::nav_pane::build_nav_rows_cached(app, ui);
     let idx = ui.nav_selected.min(rows.len().checked_sub(1)?);
     Some((rows, idx))
 }
@@ -1121,6 +1123,7 @@ fn nav_collapse_or_select_parent(app: &mut AppState, ui: &mut UiState) {
     };
     if *expanded {
         ui.collapsed_folder_ids.insert(folder_id.clone());
+        ui.bump_nav_fold_gen();
         ui.nav_selected = idx;
     } else if *depth > 0 {
         // Rows are a pre-order listing, so the nearest row one level up is the parent.
@@ -1142,6 +1145,7 @@ fn nav_expand_or_activate(app: &mut AppState, ui: &mut UiState) {
         } = &rows[idx]
         {
             ui.collapsed_folder_ids.remove(folder_id);
+            ui.bump_nav_fold_gen();
             ui.nav_selected = idx;
             return;
         }
@@ -1165,6 +1169,7 @@ fn nav_toggle_folder(app: &mut AppState, ui: &mut UiState) {
         } else {
             ui.collapsed_folder_ids.remove(folder_id);
         }
+        ui.bump_nav_fold_gen();
         ui.nav_selected = idx;
     }
 }
@@ -1208,6 +1213,7 @@ fn toggle_thread_messages(app: &mut AppState, ui: &mut UiState) {
     if any_collapsed {
         let count = older.len();
         app.expanded_thread_ids.extend(older);
+        app.bump_mail_gen();
         app.sync_displayed_mail_details(ui.group_threads, true);
         ui.info(format!(
             "Thread: expanded {count} older message{}",
@@ -1217,6 +1223,7 @@ fn toggle_thread_messages(app: &mut AppState, ui: &mut UiState) {
         for id in &older {
             app.expanded_thread_ids.remove(id);
         }
+        app.bump_mail_gen();
         app.sync_displayed_mail_details(ui.group_threads, false);
         ui.info("Thread: collapsed older messages");
     }
@@ -1225,7 +1232,7 @@ fn toggle_thread_messages(app: &mut AppState, ui: &mut UiState) {
 fn move_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
     match ui.focus() {
         Focus::Nav => {
-            let rows = super::nav_pane::build_nav_rows(app, ui);
+            let rows = super::nav_pane::build_nav_rows_cached(app, ui);
             if rows.is_empty() {
                 return;
             }
@@ -1244,7 +1251,7 @@ fn move_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
         }
         Focus::List => match ui.active_nav_tab {
             TAB_MAIL => {
-                let rows = app.visible_mail_rows(ui);
+                let rows = app.visible_mail_rows_cached(ui);
                 if rows.is_empty() {
                     return;
                 }
@@ -1298,7 +1305,7 @@ fn move_selection(app: &mut AppState, ui: &mut UiState, delta: i32) {
 fn move_list_edge(app: &mut AppState, ui: &mut UiState, top: bool) {
     match ui.active_nav_tab {
         TAB_MAIL => {
-            let len = app.visible_mail_rows(ui).len();
+            let len = app.visible_mail_rows_cached(ui).len();
             if len > 0 {
                 app.select_mail_row(ui, if top { 0 } else { len - 1 });
             }
@@ -1579,6 +1586,7 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
                     app.expanded_thread_ids.insert(id);
                     true
                 };
+                app.bump_mail_gen();
                 app.sync_displayed_mail_details(ui.group_threads, expanded);
             }
             false
@@ -1628,6 +1636,7 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
                 if !app.expanded_quoted_ids.remove(&msg.id) {
                     app.expanded_quoted_ids.insert(msg.id);
                 }
+                app.bump_mail_gen();
             }
             false
         }
@@ -1780,7 +1789,7 @@ fn open_context_menu_at(column: u16, row: u16, app: &mut AppState, ui: &mut UiSt
                 }
             }
             _ => {
-                let rows = app.visible_mail_rows(ui);
+                let rows = app.visible_mail_rows_cached(ui);
                 if idx < rows.len() {
                     ui.set_focus(Focus::List);
                     app.select_mail_row(ui, idx);

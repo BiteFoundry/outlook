@@ -6,6 +6,8 @@
 //! - Tab 2 (`Tasks`): Microsoft To Do lists + `n` to create list
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use ratatui::{
@@ -70,21 +72,59 @@ impl NavRow {
     }
 }
 
-pub fn build_nav_rows(app: &AppState, ui: &UiState) -> Vec<NavRow> {
+fn hash_collapsed_set(collapsed: &HashSet<String>) -> u64 {
+    let mut acc = 0u64;
+    for s in collapsed {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        s.hash(&mut h);
+        acc ^= h.finish();
+    }
+    acc
+}
+
+pub fn build_nav_rows_cached(app: &AppState, ui: &UiState) -> Arc<[NavRow]> {
     match ui.active_nav_tab {
-        TAB_MAIL => build_mail_nav_rows(app, &ui.collapsed_folder_ids),
-        TAB_CALENDAR => build_calendar_nav_rows(),
-        TAB_TASKS => build_todo_nav_rows(app),
-        _ => Vec::new(),
+        TAB_MAIL => {
+            let key = super::app::MailNavRowsKey {
+                mail_folders_gen: app.mail_folders_gen,
+                mail_data_gen: app.mail_data_gen,
+                folders_len: app.mail_folders.len(),
+                folders_ptr: app.mail_folders.as_ptr() as usize,
+                favs_len: app.config.favorite_folders.len(),
+                favs_ptr: app.config.favorite_folders.as_ptr() as usize,
+                nav_fold_gen: ui.nav_fold_gen,
+                collapsed_len: ui.collapsed_folder_ids.len(),
+                collapsed_xor_hash: hash_collapsed_set(&ui.collapsed_folder_ids),
+            };
+            if let Some(ref cached) = *app.mail_nav_rows_cache.borrow() {
+                if cached.key == key {
+                    return Arc::clone(&cached.rows);
+                }
+            }
+            let built: Arc<[NavRow]> =
+                Arc::from(build_mail_nav_rows(app, &ui.collapsed_folder_ids));
+            *app.mail_nav_rows_cache.borrow_mut() = Some(super::app::MailNavRowsCache {
+                key,
+                rows: Arc::clone(&built),
+            });
+            built
+        }
+        TAB_CALENDAR => Arc::from(build_calendar_nav_rows()),
+        TAB_TASKS => Arc::from(build_todo_nav_rows(app)),
+        _ => Arc::from([]),
     }
 }
 
+pub fn build_nav_rows(app: &AppState, ui: &UiState) -> Vec<NavRow> {
+    build_nav_rows_cached(app, ui).to_vec()
+}
+
 pub fn nav_row_count(app: &AppState, ui: &UiState) -> usize {
-    build_nav_rows(app, ui).len()
+    build_nav_rows_cached(app, ui).len()
 }
 
 pub fn nav_row_at(app: &AppState, ui: &UiState, index: usize) -> Option<NavRow> {
-    build_nav_rows(app, ui).into_iter().nth(index)
+    build_nav_rows_cached(app, ui).get(index).cloned()
 }
 
 pub(crate) fn find_folder_by_wellknown<'a>(
@@ -469,7 +509,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hit
         return;
     }
 
-    let rows = build_nav_rows(app, ui);
+    let rows = build_nav_rows_cached(app, ui);
     if rows.is_empty() {
         let empty_style = if theme.no_color {
             theme.muted_style()
@@ -1260,11 +1300,11 @@ mod tests {
             dispatch(action, app, ui);
         };
         let select = |app: &AppState, ui: &mut UiState, id: &str| {
-            let rows = build_nav_rows(app, ui);
+            let rows = build_nav_rows_cached(app, ui);
             ui.nav_selected = row_of(&rows, id)[0].0;
         };
         let sent_row = |app: &AppState, ui: &UiState| {
-            let rows = build_nav_rows(app, ui);
+            let rows = build_nav_rows_cached(app, ui);
             row_of(&rows, "f-sent")[0].1.clone()
         };
         let receipts_visible = |app: &AppState, ui: &UiState| {

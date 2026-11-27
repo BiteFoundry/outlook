@@ -89,6 +89,7 @@ impl AppState {
                 }
                 if !mail_folders.is_empty() {
                     self.mail_folders = mail_folders;
+                    self.bump_folders_gen();
                     if self.active_folder_id.eq_ignore_ascii_case("inbox") {
                         if let Some(inbox_id) = self.find_inbox_folder_id() {
                             self.active_folder_id = inbox_id;
@@ -300,8 +301,10 @@ impl AppState {
                                 {
                                     self.mail_detail_cache.insert(saved.id.clone(), saved);
                                 }
+                                self.bump_mail_gen();
                             } else {
                                 self.mail_detail_cache.remove(&saved.id);
+                                self.bump_mail_gen();
                             }
                         }
                         if send {
@@ -392,7 +395,9 @@ impl AppState {
             UiMsg::MailMoved { moves } => {
                 if let Ok(folders) = self.storage.list_mail_folders() {
                     self.mail_folders = folders;
+                    self.bump_folders_gen();
                 }
+                self.bump_mail_gen();
                 for (old_id, moved) in moves {
                     let moved_id = moved.id.clone();
                     let moved_in_active_folder = self.message_matches_active_folder(&moved);
@@ -460,7 +465,9 @@ impl AppState {
             } => {
                 if let Ok(folders) = self.storage.list_mail_folders() {
                     self.mail_folders = folders;
+                    self.bump_folders_gen();
                 }
+                self.bump_mail_gen();
                 if let Some(msg) = original_message {
                     if self.message_matches_active_folder(&msg) {
                         if !self.mail_messages.iter().any(|m| m.id == msg.id) {
@@ -483,7 +490,9 @@ impl AppState {
             } => {
                 if let Ok(folders) = self.storage.list_mail_folders() {
                     self.mail_folders = folders;
+                    self.bump_folders_gen();
                 }
+                self.bump_mail_gen();
                 let mut reinserted: Option<String> = None;
                 for msg in &restored {
                     if self.message_matches_active_folder(msg)
@@ -532,6 +541,7 @@ impl AppState {
                 if let Some(m) = self.pinned_mail.as_mut().filter(|m| m.id == id) {
                     revert(m);
                 }
+                self.bump_mail_gen();
                 self.refresh_mail_folders_from_storage();
                 if self.active_mail().is_none() || !self.active_mail_is_visible(ui) {
                     self.select_first_visible_mail(ui);
@@ -716,6 +726,7 @@ impl AppState {
                         }
                     }
                 }
+                self.bump_mail_gen();
                 ui.tasks.finish("Calendar RSVP", Some(error.clone()));
                 ui.toasts.error(format!("RSVP failed: {error}"));
             }

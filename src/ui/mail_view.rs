@@ -182,38 +182,63 @@ pub(crate) fn retain_latest_reader_layout() {
 }
 
 pub(crate) struct ReaderMailContent {
-    fingerprint: (u64, u64, usize),
+    mail_id: String,
+    mail_data_gen: u64,
+    body_html_len: usize,
+    attachments_len: usize,
+    fingerprint: parser::html_in::HtmlCacheKey,
     blocks: Arc<[RichBlock]>,
+    image_attachments: Vec<MailAttachment>,
     has_attachments: bool,
     has_images: bool,
     has_quoted: bool,
 }
 
 impl ReaderMailContent {
-    fn refresh(slot: &mut Option<Self>, mail: Option<&MailMessage>) {
+    fn refresh(slot: &mut Option<Self>, mail: Option<&MailMessage>, mail_data_gen: u64) {
         let Some(mail) = mail else {
             *slot = None;
             return;
         };
+        if let Some(content) = slot.as_ref() {
+            if content.mail_id == mail.id
+                && content.mail_data_gen == mail_data_gen
+                && content.body_html_len == mail.body_html.len()
+                && content.attachments_len == mail.attachments.len()
+            {
+                return;
+            }
+        }
         let fingerprint =
             parser::html_in::compute_parse_fingerprint(&mail.body_html, &mail.attachments);
-        if slot
-            .as_ref()
-            .is_some_and(|content| content.fingerprint == fingerprint)
-        {
-            return;
+        if let Some(content) = slot.as_mut() {
+            if content.mail_id == mail.id && content.fingerprint == fingerprint {
+                content.mail_data_gen = mail_data_gen;
+                content.body_html_len = mail.body_html.len();
+                content.attachments_len = mail.attachments.len();
+                return;
+            }
         }
         let blocks = parser::parse_message_blocks_arc(&mail.body_html, &mail.attachments);
         let attachments = parser::effective_mail_attachments_from_blocks(mail, &blocks);
+        let image_attachments: Vec<MailAttachment> = attachments
+            .iter()
+            .filter(|att| img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name)))
+            .cloned()
+            .collect();
+        let has_images = !image_attachments.is_empty();
         *slot = Some(Self {
+            mail_id: mail.id.clone(),
+            mail_data_gen,
+            body_html_len: mail.body_html.len(),
+            attachments_len: mail.attachments.len(),
             fingerprint,
             has_attachments: !attachments.is_empty(),
-            has_images: attachments.iter().any(|att| {
-                img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name))
-            }),
+            has_images,
             has_quoted: blocks
                 .iter()
                 .any(|block| matches!(block, RichBlock::QuotedHistory { .. })),
+            image_attachments,
             blocks,
         });
     }
@@ -294,7 +319,7 @@ pub fn draw_list(
         return;
     }
 
-    let rows = app.visible_mail_rows(ui);
+    let rows = app.visible_mail_rows_cached(ui);
     let theme = &ui.theme;
     if rows.is_empty() {
         ui.mail_list_scroll.total_lines = 0;
@@ -651,7 +676,11 @@ pub fn draw_reader(
     }
 
     app.ensure_displayed_mail_details_local(ui);
-    ReaderMailContent::refresh(&mut ui.mail_reader_content, app.active_mail());
+    ReaderMailContent::refresh(
+        &mut ui.mail_reader_content,
+        app.active_mail(),
+        app.mail_data_gen,
+    );
 
     draw_reader_toolbar(frame, area, app, ui, hitmap);
 
@@ -735,6 +764,25 @@ pub fn draw_reader(
             if !is_last && !is_active && !app.expanded_thread_ids.contains(&msg.id) {
                 continue;
             }
+            if is_active {
+                if let Some(content) = ui
+                    .mail_reader_content
+                    .as_ref()
+                    .filter(|c| c.mail_id == msg.id)
+                {
+                    for att in &content.image_attachments {
+                        app.request_mail_image(
+                            msg.id.clone(),
+                            att.clone(),
+                            thumb_cols,
+                            thumb_rows,
+                            cell_px,
+                            inline_bg,
+                        );
+                    }
+                    continue;
+                }
+            }
             for att in parser::effective_mail_attachments(msg).iter() {
                 if img_preview::is_image_mime_or_name(&att.content_type, Some(&att.name)) {
                     app.request_mail_image(
@@ -755,6 +803,7 @@ pub fn draw_reader(
         app.active_mail_id.as_deref(),
         &app.expanded_thread_ids,
         &app.expanded_quoted_ids,
+        app.mail_data_gen,
         ui.inline_images,
         ui.show_link_urls,
         app.image_cache_gen,
@@ -889,6 +938,7 @@ fn compute_reader_sig(
     active_id: Option<&str>,
     expanded_threads: &std::collections::HashSet<String>,
     expanded_quoted: &std::collections::HashSet<String>,
+    mail_data_gen: u64,
     inline_images: bool,
     show_link_urls: bool,
     image_cache_gen: u64,
@@ -898,16 +948,17 @@ fn compute_reader_sig(
     theme: &Theme,
 ) -> (u64, u64) {
     let mut h = DualHasher::new(0x4d41_494c_5245_4144);
+    h.write_hash(&mail_data_gen);
     h.write_hash(&thread_msgs.len());
     for m in thread_msgs {
         h.write_str(&m.id);
-        h.write_str(&m.subject);
+        h.write_hash(&m.subject.len());
         h.write_hash(&m.is_read);
         h.write_hash(&m.flagged);
         h.write_hash(&m.body_loaded);
-        h.write_str(&m.body_html);
-        h.write_str(&m.body_plain);
-        h.write_str(&m.preview);
+        h.write_hash(&m.body_html.len());
+        h.write_hash(&m.body_plain.len());
+        h.write_hash(&m.preview.len());
         h.write_hash(&m.attachments.len());
         h.write_hash(&expanded_threads.contains(&m.id));
         h.write_hash(&(active_id == Some(m.id.as_str())));

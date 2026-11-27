@@ -73,6 +73,7 @@ impl AppState {
                 }
             }
         }
+        self.bump_mail_gen();
         let _ = self
             .storage
             .update_event_response_local(&event_id, status_str);

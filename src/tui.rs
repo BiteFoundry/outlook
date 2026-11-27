@@ -802,44 +802,18 @@ fn draw_frame(
 
         let term_size = (ui.term_width, ui.term_height);
         let mut desired: Vec<ActivePixelGraphic> = Vec::new();
-        let mut desired_payloads: Vec<String> = Vec::new();
+        let mut desired_payloads: Vec<Option<String>> = Vec::new();
 
         for pg in ui.pending_pixel_graphics.clone() {
             if !pixel_graphics_allowed_for_overlays(&ui.overlays, &pg.cache_key) {
                 continue;
             }
-            let resolved: Option<(Cow<'_, str>, u16, u16)> = if let Some(payload) = pg.payload {
-                Some((Cow::Owned(payload), pg.rect.width, pg.rect.height))
-            } else {
-                let (base_key, crop) = parse_pixel_key(&pg.cache_key);
-                app.image_cache.get(base_key).and_then(|rendered| {
-                    if let Some((sx, sy, vw, vh)) = crop {
-                        rendered
-                            .viewport_pixel_payload(sx, sy, vw, vh)
-                            .map(|(p, c, r)| (Cow::Owned(p), c, r))
-                            .or_else(|| {
-                                if rendered.cols <= vw && rendered.rows <= vh {
-                                    rendered
-                                        .pixel_payload
-                                        .as_deref()
-                                        .map(|p| (Cow::Borrowed(p), rendered.cols, rendered.rows))
-                                } else {
-                                    None
-                                }
-                            })
-                    } else {
-                        rendered
-                            .pixel_payload
-                            .as_deref()
-                            .map(|p| (Cow::Borrowed(p), rendered.cols, rendered.rows))
-                    }
-                })
-            };
-
-            if let Some((payload, draw_cols, draw_rows)) = resolved {
-                // Never allow any pixel graphic to touch the bottom-most status row.
-                let safe_max_h = ui.term_height.saturating_sub(1).saturating_sub(pg.rect.y);
-                let safe_max_w = ui.term_width.saturating_sub(pg.rect.x);
+            // Never allow any pixel graphic to touch the bottom-most status row.
+            let safe_max_h = ui.term_height.saturating_sub(1).saturating_sub(pg.rect.y);
+            let safe_max_w = ui.term_width.saturating_sub(pg.rect.x);
+            if let Some(payload) = pg.payload {
+                let draw_cols = pg.rect.width;
+                let draw_rows = pg.rect.height;
                 if draw_cols > 0
                     && draw_rows > 0
                     && draw_cols <= safe_max_w
@@ -854,9 +828,72 @@ fn draw_frame(
                         rows: draw_rows,
                         payload_len: payload.len(),
                     });
-                    desired_payloads.push(payload.into_owned());
+                    desired_payloads.push(Some(payload));
+                }
+            } else {
+                // Defer expensive `viewport_pixel_payload` encoding until after `plan_transition`
+                // confirms pixels must actually be emitted on this frame.
+                let (base_key, crop) = parse_pixel_key(&pg.cache_key);
+                if let Some(rendered) = app.image_cache.get(base_key) {
+                    if let Some(payload_len) = rendered.pixel_payload.as_deref().map(str::len) {
+                        let dims = match crop {
+                            Some((sx, sy, vw, vh)) => rendered
+                                .viewport_cell_dims(sx, sy, vw, vh)
+                                .or_else(|| {
+                                    (rendered.cols <= vw && rendered.rows <= vh)
+                                        .then_some((rendered.cols, rendered.rows))
+                                }),
+                            None => Some((rendered.cols, rendered.rows)),
+                        };
+                        if let Some((draw_cols, draw_rows)) = dims {
+                            if draw_cols > 0
+                                && draw_rows > 0
+                                && draw_cols <= safe_max_w
+                                && draw_rows <= safe_max_h
+                            {
+                                let placement_rect =
+                                    Rect::new(pg.rect.x, pg.rect.y, draw_cols, draw_rows);
+                                desired.push(ActivePixelGraphic {
+                                    cache_key: pg.cache_key,
+                                    rect: placement_rect,
+                                    protocol: pg.protocol,
+                                    cols: draw_cols,
+                                    rows: draw_rows,
+                                    payload_len,
+                                });
+                                desired_payloads.push(None);
+                            }
+                        }
+                    }
                 }
             }
+        }
+
+        fn resolve_pixel_payload<'a>(
+            graphic: &ActivePixelGraphic,
+            prebuilt: Option<String>,
+            app: &'a AppState,
+        ) -> Option<Cow<'a, str>> {
+            if let Some(p) = prebuilt {
+                return Some(Cow::Owned(p));
+            }
+            let (base_key, crop) = parse_pixel_key(&graphic.cache_key);
+            app.image_cache.get(base_key).and_then(|rendered| {
+                if let Some((sx, sy, vw, vh)) = crop {
+                    rendered
+                        .viewport_pixel_payload(sx, sy, vw, vh)
+                        .map(|(p, _, _)| Cow::Owned(p))
+                        .or_else(|| {
+                            if rendered.cols <= vw && rendered.rows <= vh {
+                                rendered.pixel_payload.as_deref().map(Cow::Borrowed)
+                            } else {
+                                None
+                            }
+                        })
+                } else {
+                    rendered.pixel_payload.as_deref().map(Cow::Borrowed)
+                }
+            })
         }
 
         // Fast-path: avoid full `terminal.clear()` flicker when only the `#crop:...` viewport
@@ -873,7 +910,8 @@ fn draw_frame(
 
         let mut pixels_touched = false;
         if sixel_crop_only_update {
-            if let Some(payload) = desired_payloads.first() {
+            let prebuilt = desired_payloads.into_iter().next().flatten();
+            if let Some(payload) = resolve_pixel_payload(&desired[0], prebuilt, app) {
                 let graphic = &desired[0];
                 crossterm::queue!(
                     terminal.backend_mut(),
@@ -937,7 +975,13 @@ fn draw_frame(
                     guard.kitty_used = true;
                     KITTY_USED_GLOBAL.store(true, Ordering::Relaxed);
                 }
-                for (idx, (graphic, payload)) in desired.iter().zip(desired_payloads.iter()).enumerate() {
+                let mut committed: Vec<ActivePixelGraphic> = Vec::with_capacity(desired.len());
+                for (idx, (graphic, prebuilt)) in
+                    desired.into_iter().zip(desired_payloads).enumerate()
+                {
+                    let Some(payload) = resolve_pixel_payload(&graphic, prebuilt, app) else {
+                        continue;
+                    };
                     let emitted: Cow<'_, str> =
                         if graphic.protocol == TerminalImageProtocol::Kitty && idx > 0 {
                             let from = format!(",i={},", img_preview::KITTY_PREVIEW_IMAGE_ID);
@@ -947,27 +991,30 @@ fn draw_frame(
                             );
                             Cow::Owned(payload.replacen(&from, &to, 1))
                         } else {
-                            Cow::Borrowed(payload.as_str())
+                            payload
                         };
                     crossterm::queue!(
                         terminal.backend_mut(),
                         crossterm::cursor::MoveTo(graphic.rect.x, graphic.rect.y)
                     )?;
                     terminal.backend_mut().write_all(emitted.as_bytes())?;
+                    committed.push(graphic);
                 }
                 terminal.backend_mut().flush()?;
-                ui.active_pixel_graphics = desired
+                ui.active_pixel_graphics = committed
                     .iter()
                     .map(|g| (g.cache_key.clone(), g.rect, g.protocol))
                     .collect();
-            } else if plan.delete_kitty {
-                guard.kitty_used = false;
-                ui.active_pixel_graphics.clear();
-            } else if desired.is_empty() {
-                ui.active_pixel_graphics.clear();
+                guard.pixel_tracker.commit(committed, term_size);
+            } else {
+                if plan.delete_kitty {
+                    guard.kitty_used = false;
+                    ui.active_pixel_graphics.clear();
+                } else if desired.is_empty() {
+                    ui.active_pixel_graphics.clear();
+                }
+                guard.pixel_tracker.commit(desired, term_size);
             }
-
-            guard.pixel_tracker.commit(desired, term_size);
         }
 
         if pixels_touched || !cursor_set_in_draw {

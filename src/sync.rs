@@ -1354,18 +1354,11 @@ fn spawn_prefetch_messages(
             return;
         }
         let uncached: Vec<String> = match run_storage(&storage, move |st| {
-            let mut needed = Vec::new();
-            for id in unique {
-                let loaded = st
-                    .get_mail_message(&id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|m| m.body_loaded);
-                if !loaded {
-                    needed.push(id);
-                }
-            }
-            Ok(needed)
+            let loaded = st.mail_body_loaded_set(&unique)?;
+            Ok(unique
+                .into_iter()
+                .filter(|id| !loaded.contains(id))
+                .collect())
         })
         .await
         {
@@ -2916,10 +2909,19 @@ pub(crate) fn find_new_unread_mail_candidate(
     storage: &Storage,
     incoming: &[MailMessage],
 ) -> Option<NotificationCandidate> {
+    let unread_ids: Vec<&str> = incoming
+        .iter()
+        .filter(|m| !m.is_read && !m.is_draft)
+        .map(|m| m.id.as_str())
+        .collect();
+    if unread_ids.is_empty() {
+        return None;
+    }
+    let existing = storage.existing_mail_id_set(&unread_ids).ok()?;
     let newest = incoming
         .iter()
         .filter(|m| !m.is_read && !m.is_draft)
-        .filter(|m| matches!(storage.get_mail_message(&m.id), Ok(None)))
+        .filter(|m| !existing.contains(&m.id))
         .max_by(|a, b| a.received_at.cmp(&b.received_at).then(a.id.cmp(&b.id)))?;
 
     let folder_name = storage

@@ -44,6 +44,7 @@ impl AppState {
             CoreEvent::MailFoldersUpdated(folders) => {
                 ui.poll_retrying = false;
                 self.mail_folders = folders;
+                self.bump_folders_gen();
                 if self.active_folder_id.eq_ignore_ascii_case("inbox") {
                     if let Some(inbox_id) = self.find_inbox_folder_id() {
                         if inbox_id != self.active_folder_id {
@@ -162,6 +163,8 @@ impl AppState {
                     self.cache_loaded_mail_detail(hydrated);
                 } else if is_displayed {
                     self.cache_loaded_mail_detail(hydrated);
+                } else {
+                    self.bump_mail_gen();
                 }
             }
             CoreEvent::CalendarEventsUpdated(events) => {

@@ -333,6 +333,21 @@ impl Storage {
         outlook::get_mail_message(&conn, id)
     }
 
+    pub fn is_mail_body_loaded(&self, id: &str) -> Result<bool> {
+        let conn = self.read_conn()?;
+        outlook::is_mail_body_loaded(&conn, id)
+    }
+
+    pub fn mail_body_loaded_set(&self, ids: &[String]) -> Result<HashSet<String>> {
+        let conn = self.read_conn()?;
+        outlook::mail_body_loaded_set(&conn, ids)
+    }
+
+    pub fn existing_mail_id_set(&self, ids: &[&str]) -> Result<HashSet<String>> {
+        let conn = self.read_conn()?;
+        outlook::existing_mail_id_set(&conn, ids)
+    }
+
     pub fn set_mail_read_local(&self, id: &str, is_read: bool) -> Result<()> {
         let mut conn = self.lock_conn()?;
         outlook::set_mail_read_local(&mut conn, id, is_read)

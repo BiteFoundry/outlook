@@ -442,6 +442,7 @@ impl HtmlPreviewOverlay {
 
         let inner_w = rect.width.saturating_sub(2);
         let inner_h = rect.height.saturating_sub(2);
+        let body_h = inner_h.saturating_sub(1);
         let content_w = if inner_w > 2 {
             inner_w.saturating_sub(1)
         } else {
@@ -450,15 +451,50 @@ impl HtmlPreviewOverlay {
         let html_theme = html_theme_from_ui(theme);
         let show_urls = self.show_link_urls || ui.show_link_urls;
 
-        // Render document before building title so control counts / doc title are fresh.
-        let (mut lines, control_count, graphics): (Vec<Line<'static>>, usize, Vec<RenderedGraphic>) = {
+        // Render document before building title so control counts / doc title are fresh,
+        // cloning ONLY the visible viewport slice instead of the entire document.
+        let cur_scroll_y = self.session.scroll_y;
+        let raw_mode = self.session.raw_mode;
+        let (total_lines, max_scroll, sy, mut visible_lines, control_count, visible_graphics): (
+            u16,
+            u16,
+            u16,
+            Vec<Line<'static>>,
+            usize,
+            Vec<RenderedGraphic>,
+        ) = {
             let rendered = self.session.render(content_w.max(12), &html_theme, show_urls);
+            let total_len = rendered.lines.len();
+            let total_u16 = total_len.min(u16::MAX as usize) as u16;
+            let max_sc = total_u16.saturating_sub(body_h);
+            let clamped_sy = cur_scroll_y.min(max_sc);
+            let vp_top = (clamped_sy as usize).min(total_len);
+            let vp_bot = vp_top.saturating_add(body_h as usize).min(total_len);
+            let slice = rendered.lines[vp_top..vp_bot].to_vec();
+            let vis_graphics = if !raw_mode && !rendered.graphics.is_empty() && body_h > 0 {
+                rendered
+                    .graphics
+                    .iter()
+                    .filter(|g| {
+                        g.line_count > 0
+                            && g.line_start.saturating_add(g.line_count) > vp_top
+                            && g.line_start < vp_bot
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
             (
-                rendered.lines.clone(),
+                total_u16,
+                max_sc,
+                clamped_sy,
+                slice,
                 rendered.controls.len(),
-                rendered.graphics.clone(),
+                vis_graphics,
             )
         };
+        self.session.scroll_y = sy;
 
         let mode_badge = if self.session.raw_mode {
             "Raw"
@@ -523,7 +559,6 @@ impl HtmlPreviewOverlay {
             return;
         }
 
-        let body_h = inner.height.saturating_sub(1);
         let content_area = Rect::new(inner.x, inner.y, content_w.min(inner.width), body_h);
         let footer_area = Rect::new(inner.x, inner.y + body_h, inner.width, 1);
 
@@ -531,14 +566,9 @@ impl HtmlPreviewOverlay {
         self.last_viewport_height = body_h;
         hitmap.add(content_area, HitTarget::HtmlPreviewBody);
 
-        let total_lines = lines.len().min(u16::MAX as usize) as u16;
-        let max_scroll = total_lines.saturating_sub(body_h);
-        self.session.scroll_y = self.session.scroll_y.min(max_scroll);
-        let sy = self.session.scroll_y;
-
         let mut pixel_skip_rects: Vec<Rect> = Vec::new();
         if !self.session.raw_mode
-            && !graphics.is_empty()
+            && !visible_graphics.is_empty()
             && content_area.width > 0
             && content_area.height > 0
         {
@@ -553,7 +583,7 @@ impl HtmlPreviewOverlay {
             let viewport_top = sy as usize;
             let viewport_bottom = viewport_top.saturating_add(body_h as usize);
 
-            for g in &graphics {
+            for g in &visible_graphics {
                 if g.line_count == 0 {
                     continue;
                 }
@@ -581,28 +611,33 @@ impl HtmlPreviewOverlay {
                     }
                 };
 
+                let vis_top = g_top.max(viewport_top);
+                let vis_bottom = g_bottom.min(viewport_bottom);
+                let local_start = vis_top - viewport_top;
+                let local_end = (vis_bottom - viewport_top).min(visible_lines.len());
+
                 if caps.protocol == TerminalImageProtocol::Halfblock {
                     // Replace reserved placeholder lines in place so total line count and
                     // click coordinates for controls below never shift.
-                    let clear_end = g_bottom.min(lines.len());
-                    for line in lines.iter_mut().take(clear_end).skip(g_top) {
+                    for line in visible_lines.iter_mut().take(local_end).skip(local_start) {
                         *line = Line::default();
                     }
-                    for (offset, img_line) in rendered_img.lines.iter().take(g.line_count).enumerate() {
-                        let dst = g_top + offset;
-                        if dst < lines.len() {
-                            lines[dst] = img_line.clone();
+                    let img_start = vis_top - g_top;
+                    let vis_count = local_end.saturating_sub(local_start);
+                    for offset in 0..vis_count {
+                        let img_idx = img_start + offset;
+                        if img_idx < g.line_count {
+                            if let Some(img_line) = rendered_img.lines.get(img_idx) {
+                                visible_lines[local_start + offset] = img_line.clone();
+                            }
                         }
                     }
                 } else if rendered_img.protocol.is_pixel() {
                     // Clear placeholder text in reserved slot so terminal pixels sit on clean background.
-                    let clear_end = g_bottom.min(lines.len());
-                    for line in lines.iter_mut().take(clear_end).skip(g_top) {
+                    for line in visible_lines.iter_mut().take(local_end).skip(local_start) {
                         *line = Line::default();
                     }
 
-                    let vis_top = g_top.max(viewport_top);
-                    let vis_bottom = g_bottom.min(viewport_bottom);
                     let slice_sy = (vis_top - g_top) as u16;
                     let vis_rows = (vis_bottom - vis_top) as u16;
                     if slice_sy < rendered_img.rows && vis_rows > 0 {
@@ -644,7 +679,7 @@ impl HtmlPreviewOverlay {
             }
         }
 
-        if lines.is_empty() {
+        if total_lines == 0 {
             let empty_msg = match self.session.source_kind() {
                 SourceKind::Markdown => " (Empty Markdown document)",
                 SourceKind::Html => " (Empty HTML document)",
@@ -654,7 +689,7 @@ impl HtmlPreviewOverlay {
                 content_area,
             );
         } else {
-            frame.render_widget(Paragraph::new(lines).scroll((sy, 0)), content_area);
+            frame.render_widget(Paragraph::new(visible_lines), content_area);
         }
 
         if !pixel_skip_rects.is_empty() {

@@ -1,5 +1,6 @@
 //! Core TUI state structs (`AppState`, `UiState`), focus/scroll types, and `UiMsg`.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{atomic::AtomicU64, Arc};
@@ -81,6 +82,41 @@ pub struct MailListRow {
     pub any_flagged: bool,
     pub any_attachments: bool,
     pub count: usize,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct VisibleMailRowsKey {
+    pub mail_data_gen: u64,
+    pub msg_len: usize,
+    pub msg_ptr: usize,
+    pub endpoints_sig: u64,
+    pub active_folder_id: String,
+    pub mail_unread_only: bool,
+    pub focused_only: bool,
+    pub group_threads: bool,
+}
+
+pub(crate) struct VisibleMailRowsCache {
+    pub key: VisibleMailRowsKey,
+    pub rows: Arc<[MailListRow]>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct MailNavRowsKey {
+    pub mail_folders_gen: u64,
+    pub mail_data_gen: u64,
+    pub folders_len: usize,
+    pub folders_ptr: usize,
+    pub favs_len: usize,
+    pub favs_ptr: usize,
+    pub nav_fold_gen: u64,
+    pub collapsed_len: usize,
+    pub collapsed_xor_hash: u64,
+}
+
+pub(crate) struct MailNavRowsCache {
+    pub key: MailNavRowsKey,
+    pub rows: Arc<[super::super::nav_pane::NavRow]>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -296,6 +332,7 @@ pub struct UiState {
     pub nav_area: Rect,
     /// Mail folders whose subfolders are hidden in the folder pane (empty = fully expanded).
     pub collapsed_folder_ids: HashSet<String>,
+    pub nav_fold_gen: u64,
     pub mail_list_scroll: ScrollState,
     pub mail_read_scroll: ScrollState,
     pub(crate) mail_reader_content: Option<super::super::mail_view::ReaderMailContent>,
@@ -351,6 +388,7 @@ impl UiState {
             nav_selected: 1,
             nav_area: Rect::default(),
             collapsed_folder_ids: HashSet::new(),
+            nav_fold_gen: 0,
             mail_list_scroll: ScrollState::default(),
             mail_read_scroll: ScrollState::default(),
             mail_reader_content: None,
@@ -439,6 +477,10 @@ impl UiState {
     pub fn error(&mut self, msg: impl Into<String>) {
         self.toasts.error(msg);
     }
+
+    pub fn bump_nav_fold_gen(&mut self) {
+        self.nav_fold_gen = self.nav_fold_gen.wrapping_add(1);
+    }
 }
 
 pub(super) struct PendingDraftWrite {
@@ -466,6 +508,12 @@ pub struct AppState {
     pub active_mail_id: Option<String>,
     pub expanded_thread_ids: HashSet<String>,
     pub expanded_quoted_ids: HashSet<String>,
+    /// Monotonic generation counter bumped whenever mail list/detail/thread/quote state changes.
+    pub mail_data_gen: u64,
+    /// Monotonic generation counter bumped whenever mail folders or favorite folders change.
+    pub mail_folders_gen: u64,
+    pub(crate) visible_mail_rows_cache: RefCell<Option<VisibleMailRowsCache>>,
+    pub(crate) mail_nav_rows_cache: RefCell<Option<MailNavRowsCache>>,
     pub calendar_events: Vec<CalendarEvent>,
     pub active_event_id: Option<String>,
     pub contacts: Vec<ContactItem>,
@@ -547,6 +595,10 @@ impl AppState {
             active_mail_id: None,
             expanded_thread_ids: HashSet::new(),
             expanded_quoted_ids: HashSet::new(),
+            mail_data_gen: 0,
+            mail_folders_gen: 0,
+            visible_mail_rows_cache: RefCell::new(None),
+            mail_nav_rows_cache: RefCell::new(None),
             calendar_events: Vec::new(),
             active_event_id: None,
             contacts: Vec::new(),
@@ -590,5 +642,15 @@ impl AppState {
             html_server: bitefoundry_html::NativeHtmlServer::new(),
             ui_tx,
         }
+    }
+
+    #[inline]
+    pub fn bump_mail_gen(&mut self) {
+        self.mail_data_gen = self.mail_data_gen.wrapping_add(1);
+    }
+
+    #[inline]
+    pub fn bump_folders_gen(&mut self) {
+        self.mail_folders_gen = self.mail_folders_gen.wrapping_add(1);
     }
 }

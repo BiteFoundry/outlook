@@ -12,6 +12,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use state::{MailNavRowsCache, MailNavRowsKey};
 pub use state::{
     AppState, CalendarRangeFilter, Focus, MailListRow, NarrowPane, PendingPixelGraphic,
     ScrollState, UiMsg, UiState,

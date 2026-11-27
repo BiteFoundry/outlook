@@ -4,6 +4,7 @@
 //! Controls: `j`/`k`/`↑`/`↓` navigate, `Enter` open in browser, `y` copy URL, `Esc`/`q`/`u` close.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use ratatui::{
     layout::Rect,
@@ -288,21 +289,22 @@ pub fn extract_links_from_html_and_text(html: &str, plain: &str) -> Vec<Extracte
     acc.finish()
 }
 
+static LINK_SELECTOR: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("a[href]").expect("valid static link selector"));
+
 fn extract_into_acc(acc: &mut LinkAccumulator, html: &str, plain: &str) {
     if !html.trim().is_empty() {
         let fragment = Html::parse_fragment(html);
-        if let Ok(sel) = Selector::parse("a[href]") {
-            for el in fragment.select(&sel) {
-                if let Some(href) = el.value().attr("href") {
-                    let label: String = el
-                        .text()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    acc.push(&label, href);
-                }
+        for el in fragment.select(&LINK_SELECTOR) {
+            if let Some(href) = el.value().attr("href") {
+                let label: String = el
+                    .text()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                acc.push(&label, href);
             }
         }
         // Also scan visible text nodes inside HTML for Markdown or bare URLs not wrapped in <a>

@@ -1,7 +1,6 @@
 //! Outlook HTML + attachment parser into `Vec<RichBlock>`, plain text, and GFM Markdown.
 
-use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
-use std::hash::{Hash, Hasher};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use bitefoundry_html::pulldown_cmark::{
@@ -15,46 +14,87 @@ use crate::models::{MailAttachment, RichBlock, RichSpan, TextStyleFlags};
 const HTML_CACHE_MAX_ENTRIES: usize = 1024;
 const HTML_CACHE_MAX_HTML_BYTES: usize = 256 * 1024;
 
-type HtmlCacheKey = (u64, u64, usize);
+pub(crate) type HtmlCacheKey = (u64, usize);
+
+struct CacheNode {
+    key: HtmlCacheKey,
+    value: Arc<[RichBlock]>,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
 
 #[derive(Default)]
 struct HtmlParseCache {
-    entries: HashMap<HtmlCacheKey, Arc<[RichBlock]>>,
-    order: VecDeque<HtmlCacheKey>,
+    index: HashMap<HtmlCacheKey, usize>,
+    nodes: Vec<CacheNode>,
+    head: Option<usize>,
+    tail: Option<usize>,
 }
 
 impl HtmlParseCache {
-    fn get(&mut self, key: &HtmlCacheKey) -> Option<Arc<[RichBlock]>> {
-        let val = self.entries.get(key).cloned()?;
-        if self.order.back() != Some(key) {
-            if let Some(pos) = self.order.iter().rposition(|k| k == key) {
-                self.order.remove(pos);
-            }
-            self.order.push_back(*key);
+    fn move_to_front(&mut self, idx: usize) {
+        if self.head == Some(idx) {
+            return;
         }
-        Some(val)
+        let prev = self.nodes[idx].prev;
+        let next = self.nodes[idx].next;
+        if let Some(p) = prev {
+            self.nodes[p].next = next;
+        }
+        if let Some(n) = next {
+            self.nodes[n].prev = prev;
+        } else {
+            self.tail = prev;
+        }
+        let old_head = self.head;
+        self.nodes[idx].prev = None;
+        self.nodes[idx].next = old_head;
+        if let Some(h) = old_head {
+            self.nodes[h].prev = Some(idx);
+        } else {
+            self.tail = Some(idx);
+        }
+        self.head = Some(idx);
+    }
+
+    fn get(&mut self, key: &HtmlCacheKey) -> Option<Arc<[RichBlock]>> {
+        let &idx = self.index.get(key)?;
+        self.move_to_front(idx);
+        Some(Arc::clone(&self.nodes[idx].value))
     }
 
     fn insert(&mut self, key: HtmlCacheKey, value: Arc<[RichBlock]>) {
-        if let std::collections::hash_map::Entry::Occupied(mut entry) = self.entries.entry(key) {
-            entry.insert(value);
-            if self.order.back() != Some(&key) {
-                if let Some(pos) = self.order.iter().rposition(|k| *k == key) {
-                    self.order.remove(pos);
-                }
-                self.order.push_back(key);
-            }
+        if let Some(&idx) = self.index.get(&key) {
+            self.nodes[idx].value = value;
+            self.move_to_front(idx);
             return;
         }
-        while self.entries.len() >= HTML_CACHE_MAX_ENTRIES {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
+        if self.nodes.len() < HTML_CACHE_MAX_ENTRIES {
+            let idx = self.nodes.len();
+            let old_head = self.head;
+            self.nodes.push(CacheNode {
+                key,
+                value,
+                prev: None,
+                next: old_head,
+            });
+            if let Some(h) = old_head {
+                self.nodes[h].prev = Some(idx);
             } else {
-                break;
+                self.tail = Some(idx);
             }
+            self.head = Some(idx);
+            self.index.insert(key, idx);
+            return;
         }
-        self.entries.insert(key, value);
-        self.order.push_back(key);
+        if let Some(evict_idx) = self.tail {
+            let old_key = self.nodes[evict_idx].key;
+            self.index.remove(&old_key);
+            self.nodes[evict_idx].key = key;
+            self.nodes[evict_idx].value = value;
+            self.index.insert(key, evict_idx);
+            self.move_to_front(evict_idx);
+        }
     }
 }
 
@@ -65,78 +105,69 @@ thread_local! {
     pub(crate) static DOM_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-struct Fnv1a64(u64);
+/// Fast single-pass 64-bit word-chunked hasher with splitmix64 finalizer.
+struct FastHash64(u64);
 
-impl Fnv1a64 {
-    fn new() -> Self {
-        Self(0xcbf29ce484222325)
+impl FastHash64 {
+    #[inline]
+    fn new(seed: u64) -> Self {
+        Self(seed)
     }
 
-    fn finish_mixed(&self) -> u64 {
+    #[inline]
+    fn mix_word(&mut self, w: u64) {
+        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    #[inline]
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        self.mix_word(bytes.len() as u64);
+        let (chunks, rem) = bytes.as_chunks::<8>();
+        for chunk in chunks {
+            self.mix_word(u64::from_le_bytes(*chunk));
+        }
+        if !rem.is_empty() {
+            let mut tail = 0u64;
+            for (i, &b) in rem.iter().enumerate() {
+                tail |= (b as u64) << (i * 8);
+            }
+            self.mix_word(tail);
+        }
+    }
+
+    #[inline]
+    fn write_opt_str(&mut self, opt: Option<&str>) {
+        match opt {
+            Some(s) => {
+                self.mix_word(1);
+                self.write_bytes(s.as_bytes());
+            }
+            None => self.mix_word(0),
+        }
+    }
+
+    #[inline]
+    fn finish(self) -> u64 {
         let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
     }
 }
 
-impl Hasher for Fnv1a64 {
-    fn finish(&self) -> u64 {
-        self.finish_mixed()
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 ^= b as u64;
-            self.0 = self.0.wrapping_mul(0x100000001b3);
-        }
-    }
-}
-
-fn hash_str_field(h1: &mut DefaultHasher, h2: &mut Fnv1a64, s: &str) {
-    s.len().hash(h1);
-    s.as_bytes().hash(h1);
-    s.len().hash(h2);
-    s.as_bytes().hash(h2);
-}
-
-fn hash_opt_str_field(h1: &mut DefaultHasher, h2: &mut Fnv1a64, opt: Option<&str>) {
-    match opt {
-        Some(s) => {
-            1u8.hash(h1);
-            1u8.hash(h2);
-            hash_str_field(h1, h2, s);
-        }
-        None => {
-            0u8.hash(h1);
-            0u8.hash(h2);
-        }
-    }
-}
-
 pub(crate) fn compute_parse_fingerprint(html: &str, attachments: &[MailAttachment]) -> HtmlCacheKey {
-    let mut h1 = DefaultHasher::new();
-    let mut h2 = Fnv1a64::new();
-
-    0x4854_4d4c_u32.hash(&mut h1);
-    0x9e37_79b9_u32.hash(&mut h2);
-
-    hash_str_field(&mut h1, &mut h2, html);
-
-    attachments.len().hash(&mut h1);
-    attachments.len().hash(&mut h2);
+    let mut h = FastHash64::new(0x4854_4d4c_9e37_79b9);
+    h.write_bytes(html.as_bytes());
+    h.mix_word(attachments.len() as u64);
     for att in attachments {
-        hash_str_field(&mut h1, &mut h2, &att.id);
-        hash_str_field(&mut h1, &mut h2, &att.name);
-        hash_str_field(&mut h1, &mut h2, &att.content_type);
-        att.size.hash(&mut h1);
-        att.size.hash(&mut h2);
-        att.is_inline.hash(&mut h1);
-        att.is_inline.hash(&mut h2);
-        hash_opt_str_field(&mut h1, &mut h2, att.content_id.as_deref());
+        h.write_bytes(att.id.as_bytes());
+        h.write_bytes(att.name.as_bytes());
+        h.write_bytes(att.content_type.as_bytes());
+        h.mix_word(att.size);
+        h.mix_word(u64::from(att.is_inline));
+        h.write_opt_str(att.content_id.as_deref());
     }
-
-    (h1.finish(), h2.finish(), html.len())
+    (h.finish(), html.len())
 }
 
 fn has_plain_quote_or_reply_marker(text: &str) -> bool {
@@ -2211,12 +2242,12 @@ mod tests {
 
         let mut cache = HtmlParseCache::default();
         for i in 0..HTML_CACHE_MAX_ENTRIES {
-            cache.insert((i as u64, 1, i), Arc::from(Vec::new()));
+            cache.insert((i as u64, i), Arc::from(Vec::new()));
         }
-        assert!(cache.get(&(0, 1, 0)).is_some());
-        cache.insert((99999, 1, 99999), Arc::from(Vec::new()));
-        assert!(cache.get(&(0, 1, 0)).is_some());
-        assert!(cache.get(&(1, 1, 1)).is_none());
+        assert!(cache.get(&(0, 0)).is_some());
+        cache.insert((99999, 99999), Arc::from(Vec::new()));
+        assert!(cache.get(&(0, 0)).is_some());
+        assert!(cache.get(&(1, 1)).is_none());
     }
 
     #[test]
